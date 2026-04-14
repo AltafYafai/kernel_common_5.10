@@ -367,7 +367,6 @@ struct dev_links_info {
 };
 
 /**
- * struct device - The basic device structure
  * @parent:	The device's "parent" device, the device to which it is attached.
  * 		In most cases, a parent device is some sort of bus or host
  * 		controller. If parent is NULL, the device, is a top-level device,
