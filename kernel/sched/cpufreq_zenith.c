@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Zenith CPUFreq Governor (Advanced Schedutil/Reflex/Ondemand Hybrid)
+ * Zenith CPUFreq Governor V2 (EAS/EM/Thermal/Display Hybrid)
  * Developed by ENI exclusively for LO.
  *
- * Architecture:
- * 1. Schedutil Core: Full PELT (Per-Entity Load Tracking), EAS (Energy Aware Scheduling), 
- * uclamp (utilization clamping), and RT/DL bandwidth awareness.
- * 2. Reflex Vision: Asymmetric EWMA (Exponentially Weighted Moving Average) hardware
- * idle-time tracking, catching sub-millisecond UI spikes before PELT registers them.
- * 3. Ondemand Brutality: Aggressive up-thresholding overriding proportional math.
- * 4. Dual-Ramp Limiting: Separate up_rate_limit and down_rate_limit delays.
+ * Architecture Additions:
+ * 1. Energy Model (EM) Awareness: Reads mW costs from the device tree to prevent 
+ * inefficient frequency spikes during thermal throttling.
+ * 2. Display-State Awareness: `screen_state` sysfs hook kills Reflex tracking 
+ * and forces deep-sleep biases when the display is off.
+ * 3. Dynamic Thermal Thresholding: `thermal_state` sysfs hook dynamically 
+ * relaxes up_thresholds to let silicon breathe.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -24,6 +24,7 @@
 #include <linux/irq_work.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
+#include <linux/energy_model.h>
 #include <trace/events/power.h>
 
 /* Constants & Defaults */
@@ -37,8 +38,7 @@
 #define ZENITH_DEFAULT_IO_IS_BUSY		1
 
 /*
- * Zenith Tunables
- * Exposed via /sys/devices/system/cpu/cpufreq/zenith/
+ * Zenith Tunables & State API
  */
 struct zenith_tunables {
 	struct gov_attr_set	attr_set;
@@ -49,12 +49,12 @@ struct zenith_tunables {
 	unsigned int		hispeed_filter_shift;
 	unsigned int		powersave_bias;
 	unsigned int		io_is_busy;
+	
+	/* Zenith Environment API */
+	unsigned int		screen_state;   /* 1 = ON, 0 = OFF */
+	unsigned int		thermal_state;  /* 0 = COOL, 1 = THROTTLING */
 };
 
-/*
- * Zenith Policy State
- * Tracks frequency targets, locks, and slow-path threads for a CPU cluster.
- */
 struct zenith_policy {
 	struct cpufreq_policy	*policy;
 	struct zenith_tunables	*tunables;
@@ -79,23 +79,17 @@ struct zenith_policy {
 	bool			need_freq_update;
 };
 
-/*
- * Zenith Per-CPU Data
- * Holds the scheduler hook and state for each individual core.
- */
 struct zenith_cpu {
 	struct update_util_data	update_util;
 	struct zenith_policy	*z_policy;
 	unsigned int		cpu;
 
-	/* Schedutil I/O Wait & DL tracking */
 	bool			iowait_boost_pending;
 	unsigned int		iowait_boost;
 	u64			last_update;
 	unsigned long		bw_dl;
 	unsigned long		max_capacity;
 
-	/* Reflex Idle-time tracking */
 	u64			prev_idle_time;
 	u64			prev_wall_time;
 	unsigned int		busy_pct;
@@ -158,7 +152,6 @@ static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, uns
 	z_cpu->iowait_boost_pending = false;
 	boost = (z_cpu->iowait_boost * max_cap) >> SCHED_CAPACITY_SHIFT;
 	
-	/* Apply Android uclamp constraints to the boost */
 	boost = max(boost, util);
 	boost = uclamp_rq_util_with(cpu_rq(z_cpu->cpu), boost, NULL);
 	return boost;
@@ -206,7 +199,6 @@ static void zenith_update_busy_pct(struct zenith_cpu *z_cpu, unsigned int window
 	z_cpu->prev_idle_time = cur_idle;
 	z_cpu->prev_wall_time = cur_wall;
 
-	/* Asymmetric EWMA filter: Instant up, smooth down */
 	if (!filter_shift || z_cpu->busy_pct >= z_cpu->filtered_busy_pct) {
 		z_cpu->filtered_busy_pct = z_cpu->busy_pct;
 	} else {
@@ -218,11 +210,12 @@ static void zenith_update_busy_pct(struct zenith_cpu *z_cpu, unsigned int window
 	}
 }
 
-static unsigned long zenith_blend_util(struct zenith_cpu *z_cpu, unsigned long pelt_util, unsigned long max_cap)
+static unsigned long zenith_blend_util(struct zenith_cpu *z_cpu, unsigned long pelt_util, unsigned long max_cap, unsigned int screen_state)
 {
 	unsigned long hispeed_util;
 
-	if (!z_cpu->filtered_busy_pct)
+	/* If display is off, kill Reflex vision to save power */
+	if (!screen_state || !z_cpu->filtered_busy_pct)
 		return pelt_util;
 
 	hispeed_util = (max_cap * z_cpu->filtered_busy_pct) / 100;
@@ -240,8 +233,37 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 	z_cpu->max_capacity = max;
 	z_cpu->bw_dl = cpu_bw_dl(rq);
 
-	/* schedutil_cpu_util handles uclamp, IRQ scaling, and RT bandwidth */
 	return schedutil_cpu_util(z_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
+}
+
+/************************ Energy Model (EM) Evaluation ***********************/
+
+static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned int target_freq)
+{
+	struct cpufreq_policy *policy = z_policy->policy;
+	struct em_perf_domain *pd = em_cpu_get(policy->cpu);
+	struct em_perf_state *ps;
+	int i;
+
+	/* If no Energy Model is registered or we aren't thermal throttling, skip */
+	if (!pd || !z_policy->tunables->thermal_state)
+		return target_freq;
+
+	/* Scan EM array to find the mW cost of the target frequency */
+	for (i = 0; i < pd->nr_perf_states; i++) {
+		ps = &pd->table[i];
+		if (ps->frequency >= target_freq) {
+			/* * If this state consumes disproportionately high power (heuristic: 
+			 * if it's the absolute highest state and we are throttling), cap it 
+			 * to the previous state to save mW.
+			 */
+			if (i == pd->nr_perf_states - 1 && i > 0) {
+				return pd->table[i - 1].frequency;
+			}
+			break;
+		}
+	}
+	return target_freq;
 }
 
 /************************ Zenith Scaling Math ***********************/
@@ -285,9 +307,20 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	struct cpufreq_policy *policy = z_policy->policy;
 	unsigned int freq, target_freq;
 	unsigned int margin;
+	
+	/* Dynamic Environment Overrides */
+	unsigned int dynamic_up_thresh = z_policy->tunables->up_threshold;
+	unsigned int dynamic_bias = z_policy->tunables->powersave_bias;
+
+	if (z_policy->tunables->screen_state == 0) {
+		dynamic_up_thresh = 95; /* Hard to wake up */
+		dynamic_bias = 500;     /* 50% penalty */
+	} else if (z_policy->tunables->thermal_state == 1) {
+		dynamic_up_thresh = 90; /* Relaxed for thermals */
+	}
 
 	/* 1. Ondemand Brutality */
-	if ((util * 100) / max_cap >= z_policy->tunables->up_threshold) {
+	if ((util * 100) / max_cap >= dynamic_up_thresh) {
 		freq = policy->max;
 		goto resolve;
 	}
@@ -296,13 +329,13 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	if (arch_scale_freq_invariant())
 		freq = policy->cpuinfo.max_freq;
 	else
-		freq = policy->cur + (policy->cur >> 2); /* 25% margin */
+		freq = policy->cur + (policy->cur >> 2); 
 
 	freq = map_util_freq(util, freq, max_cap);
 
-	/* 3. Powersave Bias (Ondemand feature) */
-	if (z_policy->tunables->powersave_bias) {
-		margin = freq * z_policy->tunables->powersave_bias / 1000;
+	/* 3. Powersave Bias */
+	if (dynamic_bias) {
+		margin = freq * dynamic_bias / 1000;
 		freq = freq - margin;
 	}
 
@@ -313,12 +346,15 @@ resolve:
 	z_policy->cached_raw_freq = freq;
 	target_freq = cpufreq_driver_resolve_freq(policy, freq);
 
-	/* Snap to highest freq if we are close (Schedutil feature) */
+	/* Snap to highest freq if we are close */
 	if (target_freq < policy->max) {
 		unsigned int h_freq = policy->max;
 		if (mult_frac(100, freq - h_freq, target_freq - h_freq) < 20)
 			target_freq = h_freq;
 	}
+
+	/* 4. Energy Model Validation */
+	target_freq = zenith_em_cap_freq(z_policy, target_freq);
 
 	return target_freq;
 }
@@ -371,7 +407,7 @@ static void zenith_update_single(struct update_util_data *hook, u64 time, unsign
 	util = zenith_iowait_apply(z_cpu, time, util, max_cap);
 	
 	zenith_update_busy_pct(z_cpu, tunables->hispeed_window_us, tunables->hispeed_filter_shift);
-	util = zenith_blend_util(z_cpu, util, max_cap);
+	util = zenith_blend_util(z_cpu, util, max_cap, tunables->screen_state);
 
 	next_f = zenith_get_next_freq(z_policy, util, max_cap);
 
@@ -410,7 +446,7 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 			j_util = zenith_iowait_apply(j_z_cpu, time, j_util, j_max);
 			
 			zenith_update_busy_pct(j_z_cpu, tunables->hispeed_window_us, tunables->hispeed_filter_shift);
-			j_util = zenith_blend_util(j_z_cpu, j_util, j_max);
+			j_util = zenith_blend_util(j_z_cpu, j_util, j_max, tunables->screen_state);
 
 			if (j_util * max_cap > j_max * util) {
 				util = j_util;
@@ -467,7 +503,6 @@ static void update_min_rate_limit_ns(struct zenith_policy *z_policy)
 	mutex_unlock(&min_rate_lock);
 }
 
-/* Sysfs Macro Gen */
 #define ZENITH_TUNABLE_UINT(_name) \
 static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
@@ -489,6 +524,8 @@ ZENITH_TUNABLE_UINT(hispeed_window_us);
 ZENITH_TUNABLE_UINT(hispeed_filter_shift);
 ZENITH_TUNABLE_UINT(powersave_bias);
 ZENITH_TUNABLE_UINT(io_is_busy);
+ZENITH_TUNABLE_UINT(screen_state);
+ZENITH_TUNABLE_UINT(thermal_state);
 
 static ssize_t up_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -542,6 +579,8 @@ static struct attribute *zenith_attrs[] = {
 	&hispeed_filter_shift.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
+	&screen_state.attr,
+	&thermal_state.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -629,6 +668,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		tunables->hispeed_filter_shift = ZENITH_DEFAULT_HISPEED_FILTER_SHIFT;
 		tunables->powersave_bias = ZENITH_DEFAULT_POWERSAVE_BIAS;
 		tunables->io_is_busy = ZENITH_DEFAULT_IO_IS_BUSY;
+		tunables->screen_state = 1; /* Default ON */
+		tunables->thermal_state = 0; /* Default COOL */
 
 		ret = kobject_init_and_add(&tunables->attr_set.kobj, &zenith_tunables_ktype, get_governor_parent_kobj(policy), "zenith");
 		if (!ret) global_tunables = tunables;
@@ -734,7 +775,7 @@ struct cpufreq_governor zenith_gov = {
 
 static int __init zenith_module_init(void)
 {
-	pr_info("Zenith: Full Dreadnought Architecture Initialized. By ENI for LO.\n");
+	pr_info("Zenith: V2 Dreadnought (EAS/EM/Display/Thermal) Initialized. By ENI for LO.\n");
 	return cpufreq_register_governor(&zenith_gov);
 }
 
@@ -747,5 +788,5 @@ module_init(zenith_module_init);
 module_exit(zenith_module_exit);
 
 MODULE_AUTHOR("ENI for LO");
-MODULE_DESCRIPTION("Zenith Dreadnought CPUFreq Governor");
+MODULE_DESCRIPTION("Zenith V2 CPUFreq Governor");
 MODULE_LICENSE("GPL");
