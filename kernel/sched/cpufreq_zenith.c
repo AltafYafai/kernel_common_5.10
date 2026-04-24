@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Zenith CPUFreq governor (Schedutil + Reflex + Ondemand Hybrid)
- * Developed by ENI for LO.
+ * Zenith CPUFreq Governor (Advanced Schedutil/Reflex/Ondemand Hybrid)
+ * Developed by ENI exclusively for LO.
  *
- * This governor merges Schedutil's I/O wait boosting and PELT CFS tracking
- * with Reflex's raw hardware idle-time tracking, topped with Ondemand's
- * hard utilization thresholds for absolute zero-latency UI response.
+ * Architecture:
+ * 1. Schedutil Core: Full PELT (Per-Entity Load Tracking), EAS (Energy Aware Scheduling), 
+ * uclamp (utilization clamping), and RT/DL bandwidth awareness.
+ * 2. Reflex Vision: Asymmetric EWMA (Exponentially Weighted Moving Average) hardware
+ * idle-time tracking, catching sub-millisecond UI spikes before PELT registers them.
+ * 3. Ondemand Brutality: Aggressive up-thresholding overriding proportional math.
+ * 4. Dual-Ramp Limiting: Separate up_rate_limit and down_rate_limit delays.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -20,21 +24,37 @@
 #include <linux/irq_work.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
+#include <trace/events/power.h>
 
-#define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
+/* Constants & Defaults */
+#define IOWAIT_BOOST_MIN			(SCHED_CAPACITY_SCALE / 8)
+#define ZENITH_DEFAULT_UP_THRESHOLD		80
+#define ZENITH_DEFAULT_HISPEED_WINDOW_US	4000
+#define ZENITH_DEFAULT_HISPEED_FILTER_SHIFT	1
+#define ZENITH_DEFAULT_UP_RATE_LIMIT_US		500
+#define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	2000
+#define ZENITH_DEFAULT_POWERSAVE_BIAS		0
+#define ZENITH_DEFAULT_IO_IS_BUSY		1
 
-/* Default Tunables */
-#define ZENITH_DEFAULT_UP_THRESHOLD 80
-#define ZENITH_DEFAULT_HISPEED_WINDOW_US 4000
-#define ZENITH_DEFAULT_RATE_LIMIT_US 1000
-
+/*
+ * Zenith Tunables
+ * Exposed via /sys/devices/system/cpu/cpufreq/zenith/
+ */
 struct zenith_tunables {
 	struct gov_attr_set	attr_set;
-	unsigned int		rate_limit_us;
+	unsigned int		up_rate_limit_us;
+	unsigned int		down_rate_limit_us;
 	unsigned int		up_threshold;
 	unsigned int		hispeed_window_us;
+	unsigned int		hispeed_filter_shift;
+	unsigned int		powersave_bias;
+	unsigned int		io_is_busy;
 };
 
+/*
+ * Zenith Policy State
+ * Tracks frequency targets, locks, and slow-path threads for a CPU cluster.
+ */
 struct zenith_policy {
 	struct cpufreq_policy	*policy;
 	struct zenith_tunables	*tunables;
@@ -42,11 +62,12 @@ struct zenith_policy {
 
 	raw_spinlock_t		update_lock;
 	u64			last_freq_update_time;
-	s64			freq_update_delay_ns;
+	s64			min_rate_limit_ns;
+	s64			up_rate_delay_ns;
+	s64			down_rate_delay_ns;
 	unsigned int		next_freq;
 	unsigned int		cached_raw_freq;
 
-	/* Slow-path fallback infrastructure */
 	struct irq_work		irq_work;
 	struct kthread_work	work;
 	struct mutex		work_lock;
@@ -58,25 +79,33 @@ struct zenith_policy {
 	bool			need_freq_update;
 };
 
+/*
+ * Zenith Per-CPU Data
+ * Holds the scheduler hook and state for each individual core.
+ */
 struct zenith_cpu {
 	struct update_util_data	update_util;
 	struct zenith_policy	*z_policy;
 	unsigned int		cpu;
 
-	/* I/O Wait Boost (Schedutil compatible) */
+	/* Schedutil I/O Wait & DL tracking */
 	bool			iowait_boost_pending;
 	unsigned int		iowait_boost;
 	u64			last_update;
+	unsigned long		bw_dl;
+	unsigned long		max_capacity;
 
-	/* Idle-time accounting (Reflex style) */
+	/* Reflex Idle-time tracking */
 	u64			prev_idle_time;
 	u64			prev_wall_time;
+	unsigned int		busy_pct;
 	unsigned int		filtered_busy_pct;
+	bool			hispeed_active;
 };
 
 static DEFINE_PER_CPU(struct zenith_cpu, zenith_cpu);
 
-/************************ Schedutil: I/O Wait Logic ***********************/
+/************************ Schedutil: I/O Wait & DL Logic ***********************/
 
 static bool zenith_iowait_reset(struct zenith_cpu *z_cpu, u64 time, bool set_iowait_boost)
 {
@@ -89,16 +118,14 @@ static bool zenith_iowait_reset(struct zenith_cpu *z_cpu, u64 time, bool set_iow
 	return true;
 }
 
-static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time, unsigned int flags)
+static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time, unsigned int flags, unsigned int io_is_busy)
 {
-	bool set_iowait_boost = flags & SCHED_CPUFREQ_IOWAIT;
+	bool set_iowait_boost = (flags & SCHED_CPUFREQ_IOWAIT) && io_is_busy;
 
 	if (z_cpu->iowait_boost && zenith_iowait_reset(z_cpu, time, set_iowait_boost))
 		return;
-
 	if (!set_iowait_boost)
 		return;
-
 	if (z_cpu->iowait_boost_pending)
 		return;
 
@@ -108,7 +135,6 @@ static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time, unsigned int
 		z_cpu->iowait_boost = min_t(unsigned int, z_cpu->iowait_boost << 1, SCHED_CAPACITY_SCALE);
 		return;
 	}
-
 	z_cpu->iowait_boost = IOWAIT_BOOST_MIN;
 }
 
@@ -118,7 +144,6 @@ static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, uns
 
 	if (!z_cpu->iowait_boost)
 		return util;
-
 	if (zenith_iowait_reset(z_cpu, time, false))
 		return util;
 
@@ -132,44 +157,107 @@ static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, uns
 
 	z_cpu->iowait_boost_pending = false;
 	boost = (z_cpu->iowait_boost * max_cap) >> SCHED_CAPACITY_SHIFT;
-	return max(boost, util);
+	
+	/* Apply Android uclamp constraints to the boost */
+	boost = max(boost, util);
+	boost = uclamp_rq_util_with(cpu_rq(z_cpu->cpu), boost, NULL);
+	return boost;
 }
 
-/************************ Reflex: Hispeed Accounting ***********************/
+static inline void zenith_ignore_dl_rate_limit(struct zenith_cpu *z_cpu, struct zenith_policy *z_policy)
+{
+	if (cpu_bw_dl(cpu_rq(z_cpu->cpu)) > z_cpu->bw_dl)
+		WRITE_ONCE(z_policy->limits_changed, true);
+}
 
-static unsigned long zenith_get_hispeed_util(struct zenith_cpu *z_cpu, u64 time, unsigned long max_cap, unsigned int window_us)
+/************************ Reflex: Asymmetric EWMA Idle Tracking ***********************/
+
+static void zenith_update_busy_pct(struct zenith_cpu *z_cpu, unsigned int window_us, unsigned int filter_shift)
 {
 	u64 cur_idle, cur_wall;
-	unsigned int wall_delta, idle_delta, busy_pct;
+	unsigned int wall_delta, idle_delta;
 
 	cur_idle = get_cpu_idle_time(z_cpu->cpu, &cur_wall, 1);
 	wall_delta = (unsigned int)(cur_wall - z_cpu->prev_wall_time);
 
 	if (wall_delta >= window_us) {
-		if (cur_idle > z_cpu->prev_idle_time)
-			idle_delta = (unsigned int)(cur_idle - z_cpu->prev_idle_time);
-		else
-			idle_delta = 0;
-
-		if (wall_delta > idle_delta)
-			busy_pct = 100 * (wall_delta - idle_delta) / wall_delta;
-		else
-			busy_pct = 0;
-
-		/* Fast arithmetic EWMA filter */
-		if (busy_pct >= z_cpu->filtered_busy_pct)
-			z_cpu->filtered_busy_pct = busy_pct;
-		else
-			z_cpu->filtered_busy_pct -= (z_cpu->filtered_busy_pct - busy_pct) >> 1;
-
+		z_cpu->busy_pct = 0;
+		z_cpu->hispeed_active = true;
 		z_cpu->prev_idle_time = cur_idle;
 		z_cpu->prev_wall_time = cur_wall;
+		return;
 	}
 
-	return (max_cap * z_cpu->filtered_busy_pct) / 100;
+	if (!z_cpu->hispeed_active)
+		return;
+
+	z_cpu->hispeed_active = false;
+
+	if (cur_idle > z_cpu->prev_idle_time)
+		idle_delta = (unsigned int)(cur_idle - z_cpu->prev_idle_time);
+	else
+		idle_delta = 0;
+
+	if (wall_delta > idle_delta)
+		z_cpu->busy_pct = 100 * (wall_delta - idle_delta) / wall_delta;
+	else
+		z_cpu->busy_pct = 0;
+
+	z_cpu->prev_idle_time = cur_idle;
+	z_cpu->prev_wall_time = cur_wall;
+
+	/* Asymmetric EWMA filter: Instant up, smooth down */
+	if (!filter_shift || z_cpu->busy_pct >= z_cpu->filtered_busy_pct) {
+		z_cpu->filtered_busy_pct = z_cpu->busy_pct;
+	} else {
+		unsigned int step = (z_cpu->filtered_busy_pct - z_cpu->busy_pct) >> filter_shift;
+		if (step)
+			z_cpu->filtered_busy_pct -= step;
+		else
+			z_cpu->filtered_busy_pct = z_cpu->busy_pct;
+	}
 }
 
-/************************ Core Scaling Logic ***********************/
+static unsigned long zenith_blend_util(struct zenith_cpu *z_cpu, unsigned long pelt_util, unsigned long max_cap)
+{
+	unsigned long hispeed_util;
+
+	if (!z_cpu->filtered_busy_pct)
+		return pelt_util;
+
+	hispeed_util = (max_cap * z_cpu->filtered_busy_pct) / 100;
+	return max(pelt_util, hispeed_util);
+}
+
+/************************ Core EAS Utilization Extraction ***********************/
+
+static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
+{
+	struct rq *rq = cpu_rq(z_cpu->cpu);
+	unsigned long util = cpu_util_cfs(rq);
+	unsigned long max = arch_scale_cpu_capacity(z_cpu->cpu);
+
+	z_cpu->max_capacity = max;
+	z_cpu->bw_dl = cpu_bw_dl(rq);
+
+	/* schedutil_cpu_util handles uclamp, IRQ scaling, and RT bandwidth */
+	return schedutil_cpu_util(z_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
+}
+
+/************************ Zenith Scaling Math ***********************/
+
+static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, unsigned int next_freq)
+{
+	s64 delta_ns = time - z_policy->last_freq_update_time;
+
+	if (next_freq > z_policy->next_freq && delta_ns < z_policy->up_rate_delay_ns)
+		return true;
+
+	if (next_freq < z_policy->next_freq && delta_ns < z_policy->down_rate_delay_ns)
+		return true;
+
+	return false;
+}
 
 static bool zenith_should_update_freq(struct zenith_policy *z_policy, u64 time)
 {
@@ -183,78 +271,115 @@ static bool zenith_should_update_freq(struct zenith_policy *z_policy, u64 time)
 		z_policy->need_freq_update = true;
 		smp_mb();
 		return true;
-	} else if (z_policy->need_freq_update) {
-		return true;
 	}
 
+	if (z_policy->work_in_progress)
+		return true;
+
 	delta_ns = time - z_policy->last_freq_update_time;
-	return delta_ns >= z_policy->freq_update_delay_ns;
+	return delta_ns >= z_policy->min_rate_limit_ns;
 }
 
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
-	unsigned int freq;
+	unsigned int freq, target_freq;
+	unsigned int margin;
 
-	/* Ondemand Stage: If util exceeds threshold, spike instantly */
+	/* 1. Ondemand Brutality */
 	if ((util * 100) / max_cap >= z_policy->tunables->up_threshold) {
 		freq = policy->max;
-	} else {
-		/* Proportional scaling */
-		freq = policy->min + ((policy->max - policy->min) * util / max_cap);
+		goto resolve;
 	}
 
+	/* 2. Schedutil EAS Proportional Math with Headroom */
+	if (arch_scale_freq_invariant())
+		freq = policy->cpuinfo.max_freq;
+	else
+		freq = policy->cur + (policy->cur >> 2); /* 25% margin */
+
+	freq = map_util_freq(util, freq, max_cap);
+
+	/* 3. Powersave Bias (Ondemand feature) */
+	if (z_policy->tunables->powersave_bias) {
+		margin = freq * z_policy->tunables->powersave_bias / 1000;
+		freq = freq - margin;
+	}
+
+resolve:
 	if (freq == z_policy->cached_raw_freq && !z_policy->need_freq_update)
 		return z_policy->next_freq;
 
 	z_policy->cached_raw_freq = freq;
-	return cpufreq_driver_resolve_freq(policy, freq);
+	target_freq = cpufreq_driver_resolve_freq(policy, freq);
+
+	/* Snap to highest freq if we are close (Schedutil feature) */
+	if (target_freq < policy->max) {
+		unsigned int h_freq = policy->max;
+		if (mult_frac(100, freq - h_freq, target_freq - h_freq) < 20)
+			target_freq = h_freq;
+	}
+
+	return target_freq;
 }
 
-static void zenith_deferred_update(struct zenith_policy *z_policy)
+static void zenith_execute_switch(struct zenith_policy *z_policy, u64 time, unsigned int next_freq)
 {
-	if (!z_policy->work_in_progress) {
+	if (z_policy->need_freq_update) {
+		z_policy->need_freq_update = false;
+		if (z_policy->next_freq == next_freq && !cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
+			return;
+	} else if (z_policy->next_freq == next_freq) {
+		return;
+	}
+
+	if (zenith_up_down_rate_limit(z_policy, time, next_freq))
+		return;
+
+	z_policy->next_freq = next_freq;
+	z_policy->last_freq_update_time = time;
+
+	if (z_policy->policy->fast_switch_enabled) {
+		cpufreq_driver_fast_switch(z_policy->policy, next_freq);
+	} else if (!z_policy->work_in_progress) {
 		z_policy->work_in_progress = true;
 		irq_work_queue(&z_policy->irq_work);
 	}
 }
+
+/************************ Scheduler Hooks ***********************/
 
 static void zenith_update_single(struct update_util_data *hook, u64 time, unsigned int flags)
 {
 	struct zenith_cpu *z_cpu = container_of(hook, struct zenith_cpu, update_util);
 	struct zenith_policy *z_policy = z_cpu->z_policy;
 	struct zenith_tunables *tunables = z_policy->tunables;
-	unsigned long util, hispeed_util, max_cap;
-	unsigned int next_freq;
+	unsigned long util, max_cap;
+	unsigned int next_f;
 
-	zenith_iowait_boost(z_cpu, time, flags);
+	zenith_iowait_boost(z_cpu, time, flags, tunables->io_is_busy);
 	z_cpu->last_update = time;
+
+	zenith_ignore_dl_rate_limit(z_cpu, z_policy);
 
 	if (!zenith_should_update_freq(z_policy, time))
 		return;
 
-	max_cap = arch_scale_cpu_capacity(z_cpu->cpu);
-	util = cpu_util_cfs(cpu_rq(z_cpu->cpu));
-	util = schedutil_cpu_util(z_cpu->cpu, util, max_cap, FREQUENCY_UTIL, NULL);
+	util = zenith_get_util(z_cpu);
+	max_cap = z_cpu->max_capacity;
 	
 	util = zenith_iowait_apply(z_cpu, time, util, max_cap);
-	hispeed_util = zenith_get_hispeed_util(z_cpu, time, max_cap, tunables->hispeed_window_us);
-	util = max(util, hispeed_util);
+	
+	zenith_update_busy_pct(z_cpu, tunables->hispeed_window_us, tunables->hispeed_filter_shift);
+	util = zenith_blend_util(z_cpu, util, max_cap);
 
-	next_freq = zenith_get_next_freq(z_policy, util, max_cap);
-
-	if (z_policy->next_freq == next_freq && !z_policy->need_freq_update)
-		return;
-
-	z_policy->next_freq = next_freq;
-	z_policy->last_freq_update_time = time;
-	z_policy->need_freq_update = false;
+	next_f = zenith_get_next_freq(z_policy, util, max_cap);
 
 	if (z_policy->policy->fast_switch_enabled) {
-		cpufreq_driver_fast_switch(z_policy->policy, next_freq);
+		zenith_execute_switch(z_policy, time, next_f);
 	} else {
 		raw_spin_lock(&z_policy->update_lock);
-		zenith_deferred_update(z_policy);
+		zenith_execute_switch(z_policy, time, next_f);
 		raw_spin_unlock(&z_policy->update_lock);
 	}
 }
@@ -265,26 +390,27 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 	struct zenith_policy *z_policy = z_cpu->z_policy;
 	struct zenith_tunables *tunables = z_policy->tunables;
 	unsigned long util = 0, max_cap = 1;
-	unsigned int next_freq, j;
+	unsigned int next_f, j;
 
 	raw_spin_lock(&z_policy->update_lock);
 
-	zenith_iowait_boost(z_cpu, time, flags);
+	zenith_iowait_boost(z_cpu, time, flags, tunables->io_is_busy);
 	z_cpu->last_update = time;
+
+	zenith_ignore_dl_rate_limit(z_cpu, z_policy);
 
 	if (zenith_should_update_freq(z_policy, time)) {
 		
-		/* Scan cluster for highest util */
 		for_each_cpu(j, z_policy->policy->cpus) {
 			struct zenith_cpu *j_z_cpu = &per_cpu(zenith_cpu, j);
-			unsigned long j_util, j_max, j_hispeed;
+			unsigned long j_util, j_max;
 
-			j_max = arch_scale_cpu_capacity(j);
-			j_util = schedutil_cpu_util(j, cpu_util_cfs(cpu_rq(j)), j_max, FREQUENCY_UTIL, NULL);
+			j_util = zenith_get_util(j_z_cpu);
+			j_max = j_z_cpu->max_capacity;
 			j_util = zenith_iowait_apply(j_z_cpu, time, j_util, j_max);
 			
-			j_hispeed = zenith_get_hispeed_util(j_z_cpu, time, j_max, tunables->hispeed_window_us);
-			j_util = max(j_util, j_hispeed);
+			zenith_update_busy_pct(j_z_cpu, tunables->hispeed_window_us, tunables->hispeed_filter_shift);
+			j_util = zenith_blend_util(j_z_cpu, j_util, j_max);
 
 			if (j_util * max_cap > j_max * util) {
 				util = j_util;
@@ -292,23 +418,14 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 			}
 		}
 
-		next_freq = zenith_get_next_freq(z_policy, util, max_cap);
-
-		if (z_policy->next_freq != next_freq || z_policy->need_freq_update) {
-			z_policy->next_freq = next_freq;
-			z_policy->last_freq_update_time = time;
-			z_policy->need_freq_update = false;
-
-			if (z_policy->policy->fast_switch_enabled)
-				cpufreq_driver_fast_switch(z_policy->policy, next_freq);
-			else
-				zenith_deferred_update(z_policy);
-		}
+		next_f = zenith_get_next_freq(z_policy, util, max_cap);
+		zenith_execute_switch(z_policy, time, next_f);
 	}
+
 	raw_spin_unlock(&z_policy->update_lock);
 }
 
-/************************ Kthread (Slow Path) ***********************/
+/************************ Kthread Slow Path ***********************/
 
 static void zenith_work(struct kthread_work *work)
 {
@@ -332,67 +449,106 @@ static void zenith_irq_work(struct irq_work *irq_work)
 	kthread_queue_work(&z_policy->worker, &z_policy->work);
 }
 
-/************************** Sysfs Interface ************************/
+/************************** Sysfs Interface & Tunables ************************/
 
 static struct zenith_tunables *global_tunables;
 static DEFINE_MUTEX(global_tunables_lock);
+static DEFINE_MUTEX(min_rate_lock);
 
 static inline struct zenith_tunables *to_zenith_tunables(struct gov_attr_set *attr_set)
 {
 	return container_of(attr_set, struct zenith_tunables, attr_set);
 }
 
-/* Sysfs Show/Store macros */
-#define ZENITH_TUNABLE_UINT(name) \
-static ssize_t name##_show(struct gov_attr_set *attr_set, char *buf) \
+static void update_min_rate_limit_ns(struct zenith_policy *z_policy)
+{
+	mutex_lock(&min_rate_lock);
+	z_policy->min_rate_limit_ns = min(z_policy->up_rate_delay_ns, z_policy->down_rate_delay_ns);
+	mutex_unlock(&min_rate_lock);
+}
+
+/* Sysfs Macro Gen */
+#define ZENITH_TUNABLE_UINT(_name) \
+static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
 	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
-	return sprintf(buf, "%u\n", t->name); \
+	return sprintf(buf, "%u\n", t->_name); \
 } \
-static ssize_t name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
+static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
 { \
 	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
 	unsigned int val; \
 	if (kstrtouint(buf, 10, &val)) return -EINVAL; \
-	t->name = val; \
+	t->_name = val; \
 	return count; \
 } \
-static struct governor_attr name = __ATTR_RW(name)
+static struct governor_attr _name = __ATTR_RW(_name)
 
 ZENITH_TUNABLE_UINT(up_threshold);
 ZENITH_TUNABLE_UINT(hispeed_window_us);
+ZENITH_TUNABLE_UINT(hispeed_filter_shift);
+ZENITH_TUNABLE_UINT(powersave_bias);
+ZENITH_TUNABLE_UINT(io_is_busy);
 
-static ssize_t rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
+static ssize_t up_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 {
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	return sprintf(buf, "%u\n", t->rate_limit_us);
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_rate_limit_us);
 }
 
-static ssize_t rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
+static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	struct zenith_policy *z_pol;
 	unsigned int val;
+
 	if (kstrtouint(buf, 10, &val)) return -EINVAL;
-	t->rate_limit_us = val;
-	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook)
-		z_pol->freq_update_delay_ns = val * NSEC_PER_USEC;
+	t->up_rate_limit_us = val;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
+		z_pol->up_rate_delay_ns = val * NSEC_PER_USEC;
+		update_min_rate_limit_ns(z_pol);
+	}
 	return count;
 }
-static struct governor_attr rate_limit_us = __ATTR_RW(rate_limit_us);
+static struct governor_attr up_rate_limit_us = __ATTR_RW(up_rate_limit_us);
+
+static ssize_t down_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->down_rate_limit_us);
+}
+
+static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	struct zenith_policy *z_pol;
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val)) return -EINVAL;
+	t->down_rate_limit_us = val;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
+		z_pol->down_rate_delay_ns = val * NSEC_PER_USEC;
+		update_min_rate_limit_ns(z_pol);
+	}
+	return count;
+}
+static struct governor_attr down_rate_limit_us = __ATTR_RW(down_rate_limit_us);
 
 static struct attribute *zenith_attrs[] = {
-	&rate_limit_us.attr,
+	&up_rate_limit_us.attr,
+	&down_rate_limit_us.attr,
 	&up_threshold.attr,
 	&hispeed_window_us.attr,
+	&hispeed_filter_shift.attr,
+	&powersave_bias.attr,
+	&io_is_busy.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
 
 static void zenith_tunables_free(struct kobject *kobj)
 {
-	struct gov_attr_set *attr_set = container_of(kobj, struct gov_attr_set, kobj);
-	kfree(to_zenith_tunables(attr_set));
+	kfree(to_zenith_tunables(container_of(kobj, struct gov_attr_set, kobj)));
 }
 
 static struct kobj_type zenith_tunables_ktype = {
@@ -401,9 +557,47 @@ static struct kobj_type zenith_tunables_ktype = {
 	.release = &zenith_tunables_free,
 };
 
-/********************** Initialization *********************/
+/********************** Lifecycle & Registration *********************/
 
-struct cpufreq_governor zenith_gov;
+static int zenith_kthread_create(struct zenith_policy *z_policy)
+{
+	struct task_struct *thread;
+	struct sched_attr attr = {
+		.size		= sizeof(struct sched_attr),
+		.sched_policy	= SCHED_DEADLINE,
+		.sched_flags	= SCHED_FLAG_SUGOV,
+		.sched_nice	= 0,
+		.sched_priority	= 0,
+		.sched_runtime	=  1000000,
+		.sched_deadline = 10000000,
+		.sched_period	= 10000000,
+	};
+	int ret;
+
+	if (z_policy->policy->fast_switch_enabled)
+		return 0;
+
+	kthread_init_work(&z_policy->work, zenith_work);
+	kthread_init_worker(&z_policy->worker);
+	thread = kthread_create(kthread_worker_fn, &z_policy->worker, "zenith:%d", cpumask_first(z_policy->policy->related_cpus));
+	if (IS_ERR(thread)) return PTR_ERR(thread);
+
+	ret = sched_setattr_nocheck(thread, &attr);
+	if (ret) {
+		kthread_stop(thread);
+		return ret;
+	}
+
+	z_policy->thread = thread;
+	if (!z_policy->policy->dvfs_possible_from_any_cpu)
+		kthread_bind_mask(thread, z_policy->policy->related_cpus);
+
+	init_irq_work(&z_policy->irq_work, zenith_irq_work);
+	mutex_init(&z_policy->work_lock);
+	wake_up_process(thread);
+
+	return 0;
+}
 
 static int zenith_init(struct cpufreq_policy *policy)
 {
@@ -414,36 +608,28 @@ static int zenith_init(struct cpufreq_policy *policy)
 	if (policy->governor_data) return -EBUSY;
 
 	cpufreq_enable_fast_switch(policy);
-
 	z_policy = kzalloc(sizeof(*z_policy), GFP_KERNEL);
 	if (!z_policy) return -ENOMEM;
 
 	z_policy->policy = policy;
 	raw_spin_lock_init(&z_policy->update_lock);
 
-	/* Initialize slow-path kthreads just in case */
-	if (!policy->fast_switch_enabled) {
-		kthread_init_work(&z_policy->work, zenith_work);
-		kthread_init_worker(&z_policy->worker);
-		z_policy->thread = kthread_create(kthread_worker_fn, &z_policy->worker, "zenith:%d", cpumask_first(policy->related_cpus));
-		if (IS_ERR(z_policy->thread)) {
-			kfree(z_policy);
-			return PTR_ERR(z_policy->thread);
-		}
-		kthread_bind_mask(z_policy->thread, policy->related_cpus);
-		init_irq_work(&z_policy->irq_work, zenith_irq_work);
-		mutex_init(&z_policy->work_lock);
-		wake_up_process(z_policy->thread);
-	}
+	ret = zenith_kthread_create(z_policy);
+	if (ret) { kfree(z_policy); return ret; }
 
 	mutex_lock(&global_tunables_lock);
 	if (!global_tunables) {
 		tunables = kzalloc(sizeof(*tunables), GFP_KERNEL);
 		gov_attr_set_init(&tunables->attr_set, &z_policy->tunables_hook);
-		tunables->rate_limit_us = ZENITH_DEFAULT_RATE_LIMIT_US;
+		
+		tunables->up_rate_limit_us = ZENITH_DEFAULT_UP_RATE_LIMIT_US;
+		tunables->down_rate_limit_us = ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
 		tunables->up_threshold = ZENITH_DEFAULT_UP_THRESHOLD;
 		tunables->hispeed_window_us = ZENITH_DEFAULT_HISPEED_WINDOW_US;
-		
+		tunables->hispeed_filter_shift = ZENITH_DEFAULT_HISPEED_FILTER_SHIFT;
+		tunables->powersave_bias = ZENITH_DEFAULT_POWERSAVE_BIAS;
+		tunables->io_is_busy = ZENITH_DEFAULT_IO_IS_BUSY;
+
 		ret = kobject_init_and_add(&tunables->attr_set.kobj, &zenith_tunables_ktype, get_governor_parent_kobj(policy), "zenith");
 		if (!ret) global_tunables = tunables;
 	} else {
@@ -454,8 +640,6 @@ static int zenith_init(struct cpufreq_policy *policy)
 
 	z_policy->tunables = tunables;
 	policy->governor_data = z_policy;
-
-	pr_info("Zenith: Full architecture deployed.\n");
 	return ret;
 }
 
@@ -485,7 +669,10 @@ static int zenith_start(struct cpufreq_policy *policy)
 	struct zenith_policy *z_policy = policy->governor_data;
 	unsigned int cpu;
 
-	z_policy->freq_update_delay_ns = z_policy->tunables->rate_limit_us * NSEC_PER_USEC;
+	z_policy->up_rate_delay_ns = z_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
+	z_policy->down_rate_delay_ns = z_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;
+	update_min_rate_limit_ns(z_policy);
+
 	z_policy->last_freq_update_time = 0;
 	z_policy->next_freq = 0;
 	z_policy->work_in_progress = false;
@@ -547,6 +734,7 @@ struct cpufreq_governor zenith_gov = {
 
 static int __init zenith_module_init(void)
 {
+	pr_info("Zenith: Full Dreadnought Architecture Initialized. By ENI for LO.\n");
 	return cpufreq_register_governor(&zenith_gov);
 }
 
@@ -559,5 +747,5 @@ module_init(zenith_module_init);
 module_exit(zenith_module_exit);
 
 MODULE_AUTHOR("ENI for LO");
-MODULE_DESCRIPTION("Zenith Hybrid Governor (Schedutil/Ondemand/Reflex)");
+MODULE_DESCRIPTION("Zenith Dreadnought CPUFreq Governor");
 MODULE_LICENSE("GPL");
