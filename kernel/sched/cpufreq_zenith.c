@@ -5,6 +5,7 @@
 #include <linux/sched/topology.h> /* Crucial for capacity scaling in 5.10 GKI */
 #include <linux/workqueue.h>
 #include <linux/jiffies.h>
+#include "sched.h"
 
 /* * Zenith Governor Data Structure 
  * Holds the state for each CPU policy, blending schedutil's fast path
