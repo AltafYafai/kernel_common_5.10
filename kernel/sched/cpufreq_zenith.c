@@ -239,11 +239,6 @@ static unsigned int zenith_input_boost_active_ms = ZENITH_DEFAULT_INPUT_BOOST_MS
  */
 static atomic64_t zenith_auto_input_events = ATOMIC64_INIT(0);
 #define ZENITH_AUTO_TUNE_PERIOD_MS	10000	/* classify every 10s  */
-#define ZENITH_AUTO_TUNE_SAT_LOAD	70	/* load_pct >= 70 = saturated */
-#define ZENITH_AUTO_TUNE_HI_SAT_PCT	60	/* gaming trigger */
-#define ZENITH_AUTO_TUNE_LO_SAT_PCT	10	/* idle trigger */
-#define ZENITH_AUTO_TUNE_HI_EVENTS_X2	(2 * 2)	/* > 2.0 events/s in 2s units */
-#define ZENITH_AUTO_TUNE_LO_EVENTS_X2	1	/* < 0.5 events/s  */
 
 struct zenith_policy {
 	struct cpufreq_policy	*policy;
