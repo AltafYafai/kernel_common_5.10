@@ -48,8 +48,10 @@
 #include <linux/cpuidle.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/sched/clock.h>
 #include <linux/tick.h>
+#include <linux/topology.h>
 
 /*
  * The PULSE value is added to metrics when they grow and the DECAY_SHIFT value
@@ -57,6 +59,18 @@
  */
 #define PULSE		1024
 #define DECAY_SHIFT	3
+
+/*
+ * Util-awareness threshold shift (backported from 6.x; ARM 2022).
+ *
+ * If sched_cpu_util(cpu) exceeds (max_capacity >> UTIL_THRESHOLD_SHIFT)
+ * the CPU is considered "utilized" and TEO will pick a shallower
+ * non-polling idle state to reduce wake-up latency. The shift of 6
+ * was chosen upstream as a balance between power and performance:
+ * high enough to ignore background noise, low enough to react quickly
+ * when activity ramps up.
+ */
+#define UTIL_THRESHOLD_SHIFT	6
 
 /*
  * Number of the most recent idle duration values to take into consideration for
@@ -98,6 +112,8 @@ struct teo_idle_state {
  * @states: Idle states data corresponding to this CPU.
  * @interval_idx: Index of the most recent saved idle interval.
  * @intervals: Saved idle duration values.
+ * @util_threshold: Threshold above which the CPU is considered utilized
+ *                  (see teo_cpu_is_utilized()).
  */
 struct teo_cpu {
 	u64 time_span_ns;
@@ -105,9 +121,36 @@ struct teo_cpu {
 	struct teo_idle_state states[CPUIDLE_STATE_MAX];
 	int interval_idx;
 	u64 intervals[INTERVALS];
+	unsigned long util_threshold;
 };
 
 static DEFINE_PER_CPU(struct teo_cpu, teo_cpus);
+
+/**
+ * teo_cpu_is_utilized - Check if the CPU's util is above the threshold.
+ * @cpu: Target CPU.
+ * @cpu_data: Governor CPU data for the target CPU.
+ *
+ * Backported from 6.x. Returns true when the scheduler-tracked util
+ * (CFS + RT + DL + IRQ scaling, via sched_cpu_util()) exceeds the
+ * per-CPU threshold computed at enable time as
+ * arch_scale_cpu_capacity() >> UTIL_THRESHOLD_SHIFT.
+ *
+ * Compiled out on !SMP builds: there is no scheduler util signal
+ * worth thresholding on a single-CPU system, and tick stops there
+ * are not a latency-sensitive workload anyway.
+ */
+#ifdef CONFIG_SMP
+static bool teo_cpu_is_utilized(int cpu, struct teo_cpu *cpu_data)
+{
+	return sched_cpu_util(cpu) > cpu_data->util_threshold;
+}
+#else
+static bool teo_cpu_is_utilized(int cpu, struct teo_cpu *cpu_data)
+{
+	return false;
+}
+#endif
 
 /**
  * teo_update - Update CPU data after wakeup.
@@ -213,15 +256,19 @@ static bool teo_time_ok(u64 interval_ns)
  * @dev: Target CPU.
  * @state_idx: Index of the capping idle state.
  * @duration_ns: Idle duration value to match.
+ * @no_poll: When true, polling states are skipped (used by the
+ *           util-awareness path so we never demote a deep-idle pick
+ *           into a busy-wait).
  */
 static int teo_find_shallower_state(struct cpuidle_driver *drv,
 				    struct cpuidle_device *dev, int state_idx,
-				    u64 duration_ns)
+				    u64 duration_ns, bool no_poll)
 {
 	int i;
 
 	for (i = state_idx - 1; i >= 0; i--) {
-		if (dev->states_usage[i].disable)
+		if (dev->states_usage[i].disable ||
+		    (no_poll && (drv->states[i].flags & CPUIDLE_FLAG_POLLING)))
 			continue;
 
 		state_idx = i;
@@ -409,9 +456,32 @@ static int teo_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 				duration_ns = avg_ns;
 				if (drv->states[idx].target_residency_ns > avg_ns)
 					idx = teo_find_shallower_state(drv, dev,
-								       idx, avg_ns);
+								       idx, avg_ns,
+								       false);
 			}
 		}
+	}
+
+	/*
+	 * Util-awareness (backported from 6.x; ARM 2022).
+	 *
+	 * If the CPU is currently being utilized over the threshold,
+	 * pick the shallowest non-polling idle state we can find that
+	 * is still deep enough for the current tick-stop policy. This
+	 * trades a small amount of idle power for substantially lower
+	 * wake-up latency on workloads where the CPU is briefly idle
+	 * but is about to be busy again (canonical case: Android UI
+	 * thread micro-idles between input frames).
+	 *
+	 * Bypassed transparently when sched_cpu_util() <= threshold,
+	 * so deep-idle workloads (screen-off, background) are not
+	 * affected.
+	 */
+	if (idx > 0 && teo_cpu_is_utilized(dev->cpu, cpu_data)) {
+		int shallow = teo_find_shallower_state(drv, dev, idx,
+						       KTIME_MAX, true);
+		if (teo_time_ok(drv->states[shallow].target_residency_ns))
+			idx = shallow;
 	}
 
 	/*
@@ -429,7 +499,8 @@ static int teo_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		 * that.
 		 */
 		if (idx > 0 && drv->states[idx].target_residency_ns > delta_tick)
-			idx = teo_find_shallower_state(drv, dev, idx, delta_tick);
+			idx = teo_find_shallower_state(drv, dev, idx, delta_tick,
+						       false);
 	}
 
 	return idx;
@@ -468,9 +539,13 @@ static int teo_enable_device(struct cpuidle_driver *drv,
 			     struct cpuidle_device *dev)
 {
 	struct teo_cpu *cpu_data = per_cpu_ptr(&teo_cpus, dev->cpu);
+	unsigned long max_capacity = arch_scale_cpu_capacity(dev->cpu);
 	int i;
 
 	memset(cpu_data, 0, sizeof(*cpu_data));
+
+	/* Threshold for teo_cpu_is_utilized(); see UTIL_THRESHOLD_SHIFT. */
+	cpu_data->util_threshold = max_capacity >> UTIL_THRESHOLD_SHIFT;
 
 	for (i = 0; i < INTERVALS; i++)
 		cpu_data->intervals[i] = U64_MAX;
