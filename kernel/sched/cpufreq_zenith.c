@@ -1935,7 +1935,14 @@ static int zenith_init(struct cpufreq_policy *policy)
 				   get_governor_parent_kobj(policy),
 				   "zenith");
 	if (ret) {
-		kfree(tunables);
+		/* kobject_init_and_add() always initialises the kobject
+		 * refcount; on failure we must drop that reference via
+		 * kobject_put(), which invokes zenith_tunables_free() and
+		 * kfrees the backing tunables. Calling kfree() directly
+		 * would bypass the release callback and leak any resources
+		 * later attached to the ktype.
+		 */
+		kobject_put(&tunables->attr_set.kobj);
 		goto unlock;
 	}
 
