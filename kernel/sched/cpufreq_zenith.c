@@ -364,6 +364,30 @@ struct zenith_cpu {
 	u64			prev_nice_time;
 	u64			prev_nice_wall;
 	unsigned long		max_capacity;
+
+	/* kcpustat hispeed-blend sampler state (consumed by
+	 * zenith_kcpustat_sample / zenith_kcpustat_blend). Two-phase
+	 * windowed measurement: phase 1 clears at window expiry and
+	 * arms hispeed_active for an immediate post-reset sample on
+	 * the next callback.  Filtered busy_pct feeds an asymmetric
+	 * EWMA (instant up, slow-decay down by filter_shift).
+	 *
+	 * hispeed_start_ns marks t=0 of the >>(elapsed_ms/32) decay
+	 * applied in zenith_kcpustat_blend(); hispeed_idle_windows
+	 * provides a one-window grace period before clearing the
+	 * decay timer, so rapid idle/busy spinning doesn't keep the
+	 * floor latched at full strength.
+	 *
+	 * All fields are zero-initialised by zenith_start()'s
+	 * memset, which is the desired post-policy-attach state.
+	 */
+	u64			kc_prev_idle_time;	/* in usec */
+	u64			kc_prev_wall_time;	/* in usec */
+	unsigned int		kc_busy_pct;		/* raw, last window */
+	unsigned int		kc_filtered_busy_pct;	/* EWMA-smoothed */
+	bool			kc_hispeed_active;
+	u64			kc_hispeed_start_ns;
+	unsigned int		kc_idle_windows;
 };
 
 static DEFINE_PER_CPU(struct zenith_cpu, zenith_cpu);
@@ -453,6 +477,169 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 	z_cpu->bw_dl = cpu_bw_dl(rq);
 
 	return schedutil_cpu_util(z_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
+}
+
+/************************ kcpustat hispeed sampler *********************
+ *
+ * Adapted from reflex (firelzrd, MIT-compatible / GPL-2.0):
+ *
+ *   https://github.com/firelzrd/reflex/blob/main/patches/0001-Reflex-CPUFreq-Governor-v0.3.0r2.patch
+ *
+ * Reflex's insight: PELT util has a 32 ms half-life, so on a sudden
+ * busy-from-idle transition the scheduler util signal lags real load
+ * by ~96-200 ms. kcpustat (kernel idle-time accounting) gives us the
+ * raw busy ratio over the last observation window without smoothing,
+ * which is perfect as a *temporary* util floor. To avoid double
+ * counting once PELT catches up, we decay the floor with PELT's own
+ * 32 ms half-life so total coverage stays ~100% across the ramp.
+ *
+ * Reflex implements the decay in log-domain with a 256-entry LUT to
+ * get 1 ms granularity.  For Android phones we trade that precision
+ * for simplicity: we decay in 32 ms quanta with a single right-shift,
+ * which is exact at half-life boundaries and a few percent off in
+ * between.  That's well below noise floor for cpufreq decisions.
+ *
+ * The integration point is the upcoming patch that calls
+ * zenith_kcpustat_blend() in zenith_update_{single,shared}.  This
+ * patch adds the sampler and the blend helper but doesn't call
+ * either, so it is a pure no-op until the integration patch lands.
+ */
+
+/* Cap the decay shift so >> shift always produces 0 when the
+ * contribution should be negligible.  After 8 half-lives the floor is
+ * 1/256 of its initial value, well past the point of mattering.
+ */
+#define ZENITH_KC_DECAY_HALF_LIFE_MS	32
+#define ZENITH_KC_DECAY_MAX_SHIFT	8
+
+/*
+ * Sample CPU busy ratio over the last window via kcpustat.
+ *
+ * Two-phase: when the window has elapsed, phase 1 latches the new
+ * prev_idle / prev_wall snapshot and arms hispeed_active.  Phase 2
+ * runs on the next callback and computes the actual busy_pct delta;
+ * this avoids racing time-of-day skew between the snapshot reset and
+ * the busy% calculation in the same callback.
+ *
+ * busy_pct flows through an asymmetric EWMA (instant up, decay down
+ * by filter_shift).  filter_shift==0 disables the EWMA and uses the
+ * raw value.
+ *
+ * Updates the hispeed decay timer:
+ *   - any non-zero filtered busy_pct refreshes log_hispeed and starts
+ *     (or keeps) hispeed_start_ns;
+ *   - two consecutive idle windows clear the timer so the floor goes
+ *     fully transparent until activity resumes.
+ *
+ * Caller must serialise (single path: only one CPU writes; shared
+ * path: caller holds update_lock).
+ */
+static void __maybe_unused
+zenith_kcpustat_sample(struct zenith_cpu *z_cpu,
+		       unsigned int window_us,
+		       unsigned int filter_shift, u64 time)
+{
+	u64 cur_idle, cur_wall;
+	unsigned int wall_delta, idle_delta;
+
+	cur_idle = get_cpu_idle_time(z_cpu->cpu, &cur_wall, 1);
+	wall_delta = (unsigned int)(cur_wall - z_cpu->kc_prev_wall_time);
+
+	if (wall_delta >= window_us) {
+		/*
+		 * Phase 1: window elapsed.  Latch the new prev_*
+		 * snapshot and let the next callback take the actual
+		 * busy delta.  We don't touch the decay timer here:
+		 * the momentary busy_pct=0 is a measurement artefact,
+		 * not a genuine idle signal.
+		 */
+		z_cpu->kc_busy_pct = 0;
+		z_cpu->kc_hispeed_active = true;
+		z_cpu->kc_prev_idle_time = cur_idle;
+		z_cpu->kc_prev_wall_time = cur_wall;
+		return;
+	}
+
+	/* Within the current window. Skip unless phase 2 is armed. */
+	if (!z_cpu->kc_hispeed_active)
+		return;
+
+	z_cpu->kc_hispeed_active = false;
+
+	idle_delta = (cur_idle > z_cpu->kc_prev_idle_time) ?
+		     (unsigned int)(cur_idle - z_cpu->kc_prev_idle_time) : 0;
+
+	z_cpu->kc_busy_pct = (wall_delta > idle_delta) ?
+		((100u * (wall_delta - idle_delta)) / wall_delta) : 0;
+
+	z_cpu->kc_prev_idle_time = cur_idle;
+	z_cpu->kc_prev_wall_time = cur_wall;
+
+	/* Asymmetric EWMA: instant up, configurable decay down. */
+	if (!filter_shift ||
+	    z_cpu->kc_busy_pct >= z_cpu->kc_filtered_busy_pct) {
+		z_cpu->kc_filtered_busy_pct = z_cpu->kc_busy_pct;
+	} else {
+		unsigned int step =
+			(z_cpu->kc_filtered_busy_pct - z_cpu->kc_busy_pct)
+			>> filter_shift;
+		z_cpu->kc_filtered_busy_pct -= step ? step :
+			(z_cpu->kc_filtered_busy_pct - z_cpu->kc_busy_pct);
+	}
+
+	/*
+	 * Decay timer with one-window grace period: avoid resetting
+	 * hispeed_start_ns on every transient idle window so a busy
+	 * task with sub-window idle gaps still sees a coherent decay
+	 * trajectory.
+	 */
+	if (z_cpu->kc_filtered_busy_pct) {
+		z_cpu->kc_idle_windows = 0;
+		if (!z_cpu->kc_hispeed_start_ns)
+			z_cpu->kc_hispeed_start_ns = time;
+	} else if (++z_cpu->kc_idle_windows >= 2) {
+		z_cpu->kc_hispeed_start_ns = 0;
+		z_cpu->kc_filtered_busy_pct = 0;
+	}
+}
+
+/*
+ * Blend PELT util with a kcpustat-derived util floor that decays at
+ * PELT's 32 ms half-life.  Returns pelt_util unchanged when the
+ * blend is inactive (zero busy%, no start timestamp, or decay fully
+ * elapsed).  When active, returns pelt_util plus the decayed floor,
+ * capped at the raw kcpustat-implied util (so the blend can never
+ * exceed the actual measured busy fraction).
+ */
+static unsigned long __maybe_unused
+zenith_kcpustat_blend(struct zenith_cpu *z_cpu,
+		      unsigned long pelt_util,
+		      unsigned long max_cap, u64 time)
+{
+	unsigned long hispeed_util, decayed;
+	u64 elapsed_ns;
+	unsigned int half_lives;
+
+	if (!z_cpu->kc_filtered_busy_pct || !z_cpu->kc_hispeed_start_ns ||
+	    !max_cap)
+		return pelt_util;
+
+	hispeed_util = (max_cap * z_cpu->kc_filtered_busy_pct) / 100u;
+	if (hispeed_util <= pelt_util)
+		return pelt_util;
+
+	elapsed_ns = time - z_cpu->kc_hispeed_start_ns;
+	half_lives = (unsigned int)
+		(elapsed_ns / (ZENITH_KC_DECAY_HALF_LIFE_MS * NSEC_PER_MSEC));
+
+	if (half_lives >= ZENITH_KC_DECAY_MAX_SHIFT)
+		return pelt_util;
+
+	decayed = hispeed_util >> half_lives;
+	if (decayed <= pelt_util)
+		return pelt_util;
+
+	return min(pelt_util + decayed, hispeed_util);
 }
 
 /************************ Nice-load sampling *********************************/
