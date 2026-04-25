@@ -46,6 +46,9 @@
 #endif
 #include <trace/events/power.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/cpufreq_zenith.h>
+
 /* Constants & Defaults */
 #define IOWAIT_BOOST_MIN			(SCHED_CAPACITY_SCALE / 8)
 #define ZENITH_DEFAULT_UP_THRESHOLD		80
@@ -497,7 +500,12 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	struct cpufreq_policy *policy = z_policy->policy;
 	unsigned int freq, target_freq;
 	unsigned int margin;
-	
+	/* Tracepoint breadcrumb: updated at each decision branch. Read
+	 * once at the end of the function when the event is enabled.
+	 */
+	const char *tp_path = "eas";
+	unsigned int tp_load_pct = 0;
+
 	/* Dynamic Environment Overrides */
 	unsigned int dynamic_up_thresh = z_policy->tunables->up_threshold;
 	unsigned int dynamic_bias = z_policy->tunables->powersave_bias;
@@ -510,6 +518,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		dynamic_up_thresh = 90; /* Relaxed for thermals */
 	}
 
+	if (max_cap)
+		tp_load_pct = (unsigned int)((util * 100) / max_cap);
+
 	/* 0. Input Boost — pin to policy->max for input_boost_ms after a key
 	 * or touch event. Gated by screen_state so we don't wake clusters
 	 * while the display is off.
@@ -518,6 +529,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	    z_policy->tunables->screen_state &&
 	    ktime_get_ns() < (u64)atomic64_read(&zenith_input_boost_until_ns)) {
 		freq = policy->max;
+		tp_path = "input_boost";
 		goto resolve;
 	}
 
@@ -563,10 +575,12 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				if (freq > policy->max)
 					freq = policy->max;
 				z_policy->brutal_active = false;
+				tp_path = "climb_step";
 				goto resolve;
 			}
 			z_policy->brutal_active = true;
 			freq = policy->max;
+			tp_path = "snap_max";
 			goto resolve;
 		}
 
@@ -574,6 +588,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		    z_policy->brutal_active &&
 		    load_pct >= z_policy->tunables->down_threshold) {
 			freq = policy->max;
+			tp_path = "brutal_hold";
 			goto resolve;
 		}
 
@@ -603,8 +618,10 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	if (z_policy->tunables->hispeed_freq && max_cap) {
 		unsigned int load_pct = (util * 100) / max_cap;
 		if (load_pct >= z_policy->tunables->hispeed_load &&
-		    freq < z_policy->tunables->hispeed_freq)
+		    freq < z_policy->tunables->hispeed_freq) {
 			freq = z_policy->tunables->hispeed_freq;
+			tp_path = "hispeed";
+		}
 	}
 
 	/* 3. Powersave Bias.
@@ -692,11 +709,18 @@ resolve:
 	 */
 	if (z_policy->tunables->light_load_freq && max_cap &&
 	    (util * 100) / max_cap < z_policy->tunables->light_load_threshold &&
-	    target_freq > z_policy->tunables->light_load_freq)
+	    target_freq > z_policy->tunables->light_load_freq) {
 		target_freq = z_policy->tunables->light_load_freq;
+		tp_path = "light_cap";
+	}
 
 	/* 6. Energy Model Validation */
-	target_freq = zenith_em_cap_freq(z_policy, target_freq);
+	{
+		unsigned int em_in = target_freq;
+		target_freq = zenith_em_cap_freq(z_policy, target_freq);
+		if (target_freq != em_in)
+			tp_path = "em_cap";
+	}
 
 	/* 7. Sampling-down multiplier: while we are sitting at policy->max,
 	 * extend the down-rate delay by sampling_down_factor so we do not
@@ -707,6 +731,10 @@ resolve:
 			max(z_policy->tunables->sampling_down_factor, 1U);
 	else
 		z_policy->down_rate_mult = 1;
+
+	if (trace_zenith_decision_enabled())
+		trace_zenith_decision(policy->cpu, tp_path, util, max_cap,
+				      tp_load_pct, freq, target_freq);
 
 	return target_freq;
 }
@@ -1043,6 +1071,11 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		target = ZENITH_PROFILE_BATTERY;
 	else
 		target = ZENITH_PROFILE_BALANCED;
+
+	if (trace_zenith_auto_tune_enabled())
+		trace_zenith_auto_tune(z_policy->policy->cpu, sat_pct,
+				       events_rate_x2, t->active_profile,
+				       target);
 
 	if (target != t->active_profile) {
 		zenith_apply_profile(t, target);
