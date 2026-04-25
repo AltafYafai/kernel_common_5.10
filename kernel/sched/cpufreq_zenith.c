@@ -38,6 +38,10 @@
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
 #define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
 #define ZENITH_DEFAULT_HISPEED_LOAD		90
+#define ZENITH_CLIMB_MODE_SNAP			0	/* default */
+#define ZENITH_CLIMB_MODE_STEP			1
+#define ZENITH_DEFAULT_CLIMB_MODE		ZENITH_CLIMB_MODE_SNAP
+#define ZENITH_DEFAULT_FREQ_STEP_PCT		5
 #define ZENITH_DEFAULT_THERMAL_AUTO		0
 #define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		500
@@ -69,6 +73,16 @@ struct zenith_tunables {
 	 */
 	unsigned int		hispeed_freq;
 	unsigned int		hispeed_load;
+
+	/* Alternative climb mechanism when load crosses up_threshold.
+	 * SNAP (0) pins policy->max (the original ondemand-style
+	 * behaviour). STEP (1) bumps target_freq by freq_step_pct
+	 * percent of policy->max per sample, giving a slower,
+	 * conservative-style climb. STEP mode bypasses the
+	 * brutal_active / down_threshold hysteresis.
+	 */
+	unsigned int		climb_mode;
+	unsigned int		freq_step_pct;
 	unsigned int		powersave_bias;
 	unsigned int		io_is_busy;
 
@@ -456,12 +470,30 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			load_pct = load_pct * (100 - z_policy->nice_pct) / 100;
 
 		if (load_pct >= dynamic_up_thresh) {
+			if (z_policy->tunables->climb_mode ==
+			    ZENITH_CLIMB_MODE_STEP) {
+				/* Gentle climb: step by freq_step_pct of
+				 * policy->max from the current bin.
+				 * Bypasses hysteresis entirely.
+				 */
+				unsigned int step =
+				    (policy->max *
+				     z_policy->tunables->freq_step_pct) / 100;
+				if (!step)
+					step = 1;
+				freq = policy->cur + step;
+				if (freq > policy->max)
+					freq = policy->max;
+				z_policy->brutal_active = false;
+				goto resolve;
+			}
 			z_policy->brutal_active = true;
 			freq = policy->max;
 			goto resolve;
 		}
 
-		if (z_policy->brutal_active &&
+		if (z_policy->tunables->climb_mode == ZENITH_CLIMB_MODE_SNAP &&
+		    z_policy->brutal_active &&
 		    load_pct >= z_policy->tunables->down_threshold) {
 			freq = policy->max;
 			goto resolve;
@@ -1002,6 +1034,42 @@ static ssize_t hispeed_load_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr hispeed_load = __ATTR_RW(hispeed_load);
 
+static ssize_t climb_mode_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->climb_mode);
+}
+
+static ssize_t climb_mode_store(struct gov_attr_set *attr_set,
+				const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_CLIMB_MODE_STEP)
+		return -EINVAL;
+	t->climb_mode = val;
+	return count;
+}
+static struct governor_attr climb_mode = __ATTR_RW(climb_mode);
+
+static ssize_t freq_step_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->freq_step_pct);
+}
+
+static ssize_t freq_step_pct_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
+		return -EINVAL;
+	t->freq_step_pct = val;
+	return count;
+}
+static struct governor_attr freq_step_pct = __ATTR_RW(freq_step_pct);
+
 static ssize_t powersave_bias_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n",
@@ -1072,6 +1140,8 @@ static struct attribute *zenith_attrs[] = {
 	&down_threshold.attr,
 	&hispeed_freq.attr,
 	&hispeed_load.attr,
+	&climb_mode.attr,
+	&freq_step_pct.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&ignore_nice_load.attr,
@@ -1189,6 +1259,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->down_threshold	= ZENITH_DEFAULT_DOWN_THRESHOLD;
 	tunables->hispeed_freq		= ZENITH_DEFAULT_HISPEED_FREQ;
 	tunables->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
+	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
+	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->ignore_nice_load	= 0;
