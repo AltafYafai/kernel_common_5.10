@@ -19,9 +19,11 @@ TRACE_EVENT(zenith_decision,
 
 	TP_PROTO(int cpu, const char *path, unsigned long util,
 		 unsigned long max_cap, unsigned int load_pct,
-		 unsigned int freq_in, unsigned int freq_out),
+		 unsigned int freq_in, unsigned int freq_out,
+		 unsigned int kcpustat_pct),
 
-	TP_ARGS(cpu, path, util, max_cap, load_pct, freq_in, freq_out),
+	TP_ARGS(cpu, path, util, max_cap, load_pct, freq_in, freq_out,
+		kcpustat_pct),
 
 	TP_STRUCT__entry(
 		__field(int,		cpu)
@@ -31,6 +33,7 @@ TRACE_EVENT(zenith_decision,
 		__field(unsigned int,	load_pct)
 		__field(unsigned int,	freq_in)
 		__field(unsigned int,	freq_out)
+		__field(unsigned int,	kcpustat_pct)
 	),
 
 	TP_fast_assign(
@@ -41,12 +44,14 @@ TRACE_EVENT(zenith_decision,
 		__entry->load_pct	= load_pct;
 		__entry->freq_in	= freq_in;
 		__entry->freq_out	= freq_out;
+		__entry->kcpustat_pct	= kcpustat_pct;
 	),
 
-	TP_printk("cpu=%d path=%s util=%lu max=%lu load=%u%% in=%u out=%u",
+	TP_printk("cpu=%d path=%s util=%lu max=%lu load=%u%% in=%u out=%u kcpustat=%u%%",
 		  __entry->cpu, __get_str(path), __entry->util,
 		  __entry->max_cap, __entry->load_pct,
-		  __entry->freq_in, __entry->freq_out)
+		  __entry->freq_in, __entry->freq_out,
+		  __entry->kcpustat_pct)
 );
 
 /* Auto-tune classifier decision emitted once per ZENITH_AUTO_TUNE_PERIOD_MS. */

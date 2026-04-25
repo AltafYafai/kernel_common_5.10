@@ -1025,9 +1025,20 @@ resolve:
 	else
 		z_policy->down_rate_mult = 1;
 
-	if (trace_zenith_decision_enabled())
+	if (trace_zenith_decision_enabled()) {
+		/* Report the leader CPU's filtered kcpustat busy% so a
+		 * trace consumer can tell at a glance whether the
+		 * decision was lifted by the kcpustat blend.  Reads 0
+		 * when the feature is off (sampler is gated by
+		 * kcpustat_hispeed_enable in update_util) or when no
+		 * recent activity has populated the sampler.
+		 */
+		unsigned int kc_pct =
+			per_cpu(zenith_cpu, policy->cpu).kc_filtered_busy_pct;
+
 		trace_zenith_decision(policy->cpu, tp_path, util, max_cap,
-				      tp_load_pct, freq, target_freq);
+				      tp_load_pct, freq, target_freq, kc_pct);
+	}
 
 	return target_freq;
 }
