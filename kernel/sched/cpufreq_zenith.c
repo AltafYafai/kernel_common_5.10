@@ -44,6 +44,8 @@
 #define ZENITH_DEFAULT_UP_DELAY_US		4000
 #define ZENITH_DEFAULT_LIGHT_LOAD_FREQ		0
 #define ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD	20
+#define ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR	1
+#define ZENITH_MAX_SAMPLING_DOWN_FACTOR		10
 
 /*
  * Zenith Tunables & State API
@@ -72,6 +74,9 @@ struct zenith_tunables {
 	/* Light-load hard cap. light_load_freq=0 disables. */
 	unsigned int		light_load_freq;
 	unsigned int		light_load_threshold;	/* in % of max_cap */
+
+	/* Hold-at-max multiplier for down_rate_limit. 1 = disabled. */
+	unsigned int		sampling_down_factor;
 };
 
 /*
@@ -108,6 +113,12 @@ struct zenith_policy {
 	 * until ktime_get_ns() reaches this deadline. 0 = idle, no clamp.
 	 */
 	u64			efficient_unlock_at_ns;
+
+	/* Multiplier currently applied to down_rate_delay_ns. Bumped to
+	 * tunables->sampling_down_factor while sitting at policy->max,
+	 * reset to 1 the moment we leave max. Mirrors ondemand.
+	 */
+	unsigned int		down_rate_mult;
 };
 
 struct zenith_cpu {
@@ -302,11 +313,13 @@ static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned 
 static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, unsigned int next_freq)
 {
 	s64 delta_ns = time - z_policy->last_freq_update_time;
+	s64 down_delay = z_policy->down_rate_delay_ns *
+			 (s64)max(z_policy->down_rate_mult, 1U);
 
 	if (next_freq > z_policy->next_freq && delta_ns < z_policy->up_rate_delay_ns)
 		return true;
 
-	if (next_freq < z_policy->next_freq && delta_ns < z_policy->down_rate_delay_ns)
+	if (next_freq < z_policy->next_freq && delta_ns < down_delay)
 		return true;
 
 	return false;
@@ -428,6 +441,16 @@ resolve:
 
 	/* 6. Energy Model Validation */
 	target_freq = zenith_em_cap_freq(z_policy, target_freq);
+
+	/* 7. Sampling-down multiplier: while we are sitting at policy->max,
+	 * extend the down-rate delay by sampling_down_factor so we do not
+	 * ping-pong off the peak bin. Reset the moment we step away.
+	 */
+	if (target_freq >= policy->max)
+		z_policy->down_rate_mult =
+			max(z_policy->tunables->sampling_down_factor, 1U);
+	else
+		z_policy->down_rate_mult = 1;
 
 	return target_freq;
 }
@@ -691,6 +714,26 @@ static ssize_t light_load_threshold_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr light_load_threshold = __ATTR_RW(light_load_threshold);
 
+static ssize_t sampling_down_factor_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->sampling_down_factor);
+}
+
+static ssize_t sampling_down_factor_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val == 0 ||
+	    val > ZENITH_MAX_SAMPLING_DOWN_FACTOR)
+		return -EINVAL;
+	t->sampling_down_factor = val;
+	return count;
+}
+static struct governor_attr sampling_down_factor = __ATTR_RW(sampling_down_factor);
+
 static ssize_t up_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_threshold);
@@ -807,6 +850,7 @@ static struct attribute *zenith_attrs[] = {
 	&up_delay_us.attr,
 	&light_load_freq.attr,
 	&light_load_threshold.attr,
+	&sampling_down_factor.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -918,6 +962,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->up_delay_us		= ZENITH_DEFAULT_UP_DELAY_US;
 	tunables->light_load_freq	= ZENITH_DEFAULT_LIGHT_LOAD_FREQ;
 	tunables->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
+	tunables->sampling_down_factor	= ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	ret = kobject_init_and_add(&tunables->attr_set.kobj,
