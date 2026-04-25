@@ -978,6 +978,13 @@ static struct cpufreq_governor zenith_gov = {
 	.flags      = CPUFREQ_GOV_DYNAMIC_SWITCHING,
 };
 
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_ZENITH
+struct cpufreq_governor *cpufreq_default_governor(void)
+{
+	return &zenith_gov;
+}
+#endif
+
 /************************ Input Boost ***********************/
 
 static void zenith_input_event(struct input_handle *handle, unsigned int type,
