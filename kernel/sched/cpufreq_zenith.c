@@ -346,13 +346,6 @@ resolve:
 	z_policy->cached_raw_freq = freq;
 	target_freq = cpufreq_driver_resolve_freq(policy, freq);
 
-	/* Snap to highest freq if we are close */
-	if (target_freq < policy->max) {
-		unsigned int h_freq = policy->max;
-		if (mult_frac(100, freq - h_freq, target_freq - h_freq) < 20)
-			target_freq = h_freq;
-	}
-
 	/* 4. Energy Model Validation */
 	target_freq = zenith_em_cap_freq(z_policy, target_freq);
 
@@ -519,13 +512,67 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 } \
 static struct governor_attr _name = __ATTR_RW(_name)
 
-ZENITH_TUNABLE_UINT(up_threshold);
 ZENITH_TUNABLE_UINT(hispeed_window_us);
-ZENITH_TUNABLE_UINT(hispeed_filter_shift);
-ZENITH_TUNABLE_UINT(powersave_bias);
 ZENITH_TUNABLE_UINT(io_is_busy);
 ZENITH_TUNABLE_UINT(screen_state);
 ZENITH_TUNABLE_UINT(thermal_state);
+
+static ssize_t up_threshold_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_threshold);
+}
+
+static ssize_t up_threshold_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
+		return -EINVAL;
+	t->up_threshold = val;
+	return count;
+}
+static struct governor_attr up_threshold = __ATTR_RW(up_threshold);
+
+static ssize_t hispeed_filter_shift_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->hispeed_filter_shift);
+}
+
+static ssize_t hispeed_filter_shift_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val >= 32)
+		return -EINVAL;
+	t->hispeed_filter_shift = val;
+	return count;
+}
+static struct governor_attr hispeed_filter_shift =
+	__ATTR_RW(hispeed_filter_shift);
+
+static ssize_t powersave_bias_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->powersave_bias);
+}
+
+static ssize_t powersave_bias_store(struct gov_attr_set *attr_set,
+				    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1000)
+		return -EINVAL;
+	t->powersave_bias = val;
+	return count;
+}
+static struct governor_attr powersave_bias = __ATTR_RW(powersave_bias);
 
 static ssize_t up_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -642,45 +689,79 @@ static int zenith_init(struct cpufreq_policy *policy)
 {
 	struct zenith_policy *z_policy;
 	struct zenith_tunables *tunables;
-	int ret = 0;
+	int ret;
 
-	if (policy->governor_data) return -EBUSY;
+	if (policy->governor_data)
+		return -EBUSY;
 
 	cpufreq_enable_fast_switch(policy);
+
 	z_policy = kzalloc(sizeof(*z_policy), GFP_KERNEL);
-	if (!z_policy) return -ENOMEM;
+	if (!z_policy) {
+		ret = -ENOMEM;
+		goto disable_fast_switch;
+	}
 
 	z_policy->policy = policy;
 	raw_spin_lock_init(&z_policy->update_lock);
 
 	ret = zenith_kthread_create(z_policy);
-	if (ret) { kfree(z_policy); return ret; }
+	if (ret)
+		goto free_z_policy;
 
 	mutex_lock(&global_tunables_lock);
-	if (!global_tunables) {
-		tunables = kzalloc(sizeof(*tunables), GFP_KERNEL);
-		gov_attr_set_init(&tunables->attr_set, &z_policy->tunables_hook);
-		
-		tunables->up_rate_limit_us = ZENITH_DEFAULT_UP_RATE_LIMIT_US;
-		tunables->down_rate_limit_us = ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
-		tunables->up_threshold = ZENITH_DEFAULT_UP_THRESHOLD;
-		tunables->hispeed_window_us = ZENITH_DEFAULT_HISPEED_WINDOW_US;
-		tunables->hispeed_filter_shift = ZENITH_DEFAULT_HISPEED_FILTER_SHIFT;
-		tunables->powersave_bias = ZENITH_DEFAULT_POWERSAVE_BIAS;
-		tunables->io_is_busy = ZENITH_DEFAULT_IO_IS_BUSY;
-		tunables->screen_state = 1; /* Default ON */
-		tunables->thermal_state = 0; /* Default COOL */
 
-		ret = kobject_init_and_add(&tunables->attr_set.kobj, &zenith_tunables_ktype, get_governor_parent_kobj(policy), "zenith");
-		if (!ret) global_tunables = tunables;
-	} else {
+	if (global_tunables) {
 		tunables = global_tunables;
 		gov_attr_set_get(&tunables->attr_set, &z_policy->tunables_hook);
+		goto out;
 	}
-	mutex_unlock(&global_tunables_lock);
 
+	tunables = kzalloc(sizeof(*tunables), GFP_KERNEL);
+	if (!tunables) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+
+	gov_attr_set_init(&tunables->attr_set, &z_policy->tunables_hook);
+
+	tunables->up_rate_limit_us	= ZENITH_DEFAULT_UP_RATE_LIMIT_US;
+	tunables->down_rate_limit_us	= ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
+	tunables->up_threshold		= ZENITH_DEFAULT_UP_THRESHOLD;
+	tunables->hispeed_window_us	= ZENITH_DEFAULT_HISPEED_WINDOW_US;
+	tunables->hispeed_filter_shift	= ZENITH_DEFAULT_HISPEED_FILTER_SHIFT;
+	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
+	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
+	tunables->screen_state		= 1;
+	tunables->thermal_state		= 0;
+
+	ret = kobject_init_and_add(&tunables->attr_set.kobj,
+				   &zenith_tunables_ktype,
+				   get_governor_parent_kobj(policy),
+				   "zenith");
+	if (ret) {
+		kfree(tunables);
+		goto unlock;
+	}
+
+	global_tunables = tunables;
+
+out:
+	mutex_unlock(&global_tunables_lock);
 	z_policy->tunables = tunables;
 	policy->governor_data = z_policy;
+	return 0;
+
+unlock:
+	mutex_unlock(&global_tunables_lock);
+	if (!policy->fast_switch_enabled && z_policy->thread) {
+		kthread_stop(z_policy->thread);
+		mutex_destroy(&z_policy->work_lock);
+	}
+free_z_policy:
+	kfree(z_policy);
+disable_fast_switch:
+	cpufreq_disable_fast_switch(policy);
 	return ret;
 }
 
@@ -762,7 +843,7 @@ static void zenith_limits(struct cpufreq_policy *policy)
 	WRITE_ONCE(z_policy->limits_changed, true);
 }
 
-struct cpufreq_governor zenith_gov = {
+static struct cpufreq_governor zenith_gov = {
 	.name       = "zenith",
 	.init       = zenith_init,
 	.exit       = zenith_exit,
@@ -773,20 +854,9 @@ struct cpufreq_governor zenith_gov = {
 	.flags      = CPUFREQ_GOV_DYNAMIC_SWITCHING,
 };
 
-static int __init zenith_module_init(void)
+static int __init zenith_gov_init(void)
 {
 	pr_info("Zenith: V2 Dreadnought (EAS/EM/Display/Thermal) Initialized. By ENI for LO.\n");
 	return cpufreq_register_governor(&zenith_gov);
 }
-
-static void __exit zenith_module_exit(void)
-{
-	cpufreq_unregister_governor(&zenith_gov);
-}
-
-module_init(zenith_module_init);
-module_exit(zenith_module_exit);
-
-MODULE_AUTHOR("ENI for LO");
-MODULE_DESCRIPTION("Zenith V2 CPUFreq Governor");
-MODULE_LICENSE("GPL");
+fs_initcall(zenith_gov_init);
