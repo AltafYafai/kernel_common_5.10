@@ -46,6 +46,7 @@
 #define ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD	20
 #define ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR	1
 #define ZENITH_MAX_SAMPLING_DOWN_FACTOR		10
+#define ZENITH_DEFAULT_BIAS_LOAD_THRESHOLD	50
 
 /*
  * Zenith Tunables & State API
@@ -77,6 +78,11 @@ struct zenith_tunables {
 
 	/* Hold-at-max multiplier for down_rate_limit. 1 = disabled. */
 	unsigned int		sampling_down_factor;
+
+	/* powersave_bias only applies below this load (% of max_cap).
+	 * 100 = always apply (legacy behaviour); 0 = never apply.
+	 */
+	unsigned int		bias_load_threshold;
 };
 
 /*
@@ -388,8 +394,15 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 
 	freq = map_util_freq(util, freq, max_cap);
 
-	/* 3. Powersave Bias */
-	if (dynamic_bias) {
+	/* 3. Powersave Bias.
+	 *
+	 * Only apply when current util is below bias_load_threshold so
+	 * heavy work is not penalised. A threshold of 100 keeps the legacy
+	 * "always-bias" behaviour; 0 disables the bias entirely without
+	 * having to also write powersave_bias=0.
+	 */
+	if (dynamic_bias && max_cap &&
+	    (util * 100) / max_cap < z_policy->tunables->bias_load_threshold) {
 		margin = freq * dynamic_bias / 1000;
 		freq = freq - margin;
 	}
@@ -734,6 +747,25 @@ static ssize_t sampling_down_factor_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr sampling_down_factor = __ATTR_RW(sampling_down_factor);
 
+static ssize_t bias_load_threshold_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->bias_load_threshold);
+}
+
+static ssize_t bias_load_threshold_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->bias_load_threshold = val;
+	return count;
+}
+static struct governor_attr bias_load_threshold = __ATTR_RW(bias_load_threshold);
+
 static ssize_t up_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_threshold);
@@ -851,6 +883,7 @@ static struct attribute *zenith_attrs[] = {
 	&light_load_freq.attr,
 	&light_load_threshold.attr,
 	&sampling_down_factor.attr,
+	&bias_load_threshold.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -963,6 +996,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->light_load_freq	= ZENITH_DEFAULT_LIGHT_LOAD_FREQ;
 	tunables->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
 	tunables->sampling_down_factor	= ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR;
+	tunables->bias_load_threshold	= ZENITH_DEFAULT_BIAS_LOAD_THRESHOLD;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	ret = kobject_init_and_add(&tunables->attr_set.kobj,
