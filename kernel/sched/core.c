@@ -5393,6 +5393,34 @@ int available_idle_cpu(int cpu)
 }
 EXPORT_SYMBOL_GPL(available_idle_cpu);
 
+#ifdef CONFIG_SMP
+/**
+ * sched_cpu_util - effective scheduler-tracked utilization of a CPU.
+ * @cpu: the CPU in question.
+ *
+ * Returns a single number combining the effective CFS, RT and DL
+ * utilization of @cpu, in the same SCHED_CAPACITY_SCALE-relative
+ * units as arch_scale_cpu_capacity(). Intended for callers outside
+ * kernel/sched/ (e.g. cpuidle governors) that cannot reach
+ * cpu_util_cfs() / schedutil_cpu_util() directly.
+ *
+ * Backport of the 6.x sched_cpu_util() helper, adapted to the 5.10
+ * schedutil_cpu_util() signature (which still takes @max). On
+ * configs without CPU_FREQ_GOV_SCHEDUTIL/_SCHEDHORIZON the inline
+ * fallback in sched.h returns 0, which is fine for util-awareness
+ * consumers (any threshold > 0 silently disables the feature).
+ */
+unsigned long sched_cpu_util(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	unsigned long util = cpu_util_cfs(rq);
+	unsigned long max = arch_scale_cpu_capacity(cpu);
+
+	return schedutil_cpu_util(cpu, util, max, ENERGY_UTIL, NULL);
+}
+EXPORT_SYMBOL_GPL(sched_cpu_util);
+#endif /* CONFIG_SMP */
+
 /**
  * idle_task - return the idle task for a given CPU.
  * @cpu: the processor in question.
