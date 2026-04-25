@@ -55,6 +55,7 @@
  */
 #define ZENITH_DEFAULT_IOWAIT_BOOST_MIN		125
 #define ZENITH_DEFAULT_UP_THRESHOLD		80
+#define ZENITH_DEFAULT_UP_THRESHOLD_HISPEED	0	/* disabled */
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
 #define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
 #define ZENITH_DEFAULT_HISPEED_LOAD		90
@@ -109,6 +110,17 @@ struct zenith_tunables {
 	 */
 	unsigned int		hispeed_freq;
 	unsigned int		hispeed_load;
+
+	/* Secondary up_threshold applied only when policy->cur has
+	 * already climbed to hispeed_freq or above. 0 disables the
+	 * substitution and falls back to up_threshold at every bin.
+	 *
+	 * The common shape is up_threshold=70 to get from idle to
+	 * hispeed_freq aggressively, with up_threshold_hispeed=90 to
+	 * demand a clearly heavier workload before committing to
+	 * policy->max. Requires hispeed_freq != 0.
+	 */
+	unsigned int		up_threshold_hispeed;
 
 	/* Alternative climb mechanism when load crosses up_threshold.
 	 * SNAP (0) pins policy->max (the original ondemand-style
@@ -561,6 +573,16 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		z_policy->brutal_active = false; /* no hysteresis screen-off */
 	} else if (zenith_thermal_active(z_policy)) {
 		dynamic_up_thresh = 90; /* Relaxed for thermals */
+	} else if (z_policy->tunables->up_threshold_hispeed &&
+		   z_policy->tunables->hispeed_freq &&
+		   policy->cur >= z_policy->tunables->hispeed_freq) {
+		/* Above the hispeed floor, require the stiffer
+		 * threshold before escalating all the way to
+		 * policy->max. Screen-off and thermal overrides take
+		 * precedence because both already pin an even
+		 * higher value.
+		 */
+		dynamic_up_thresh = z_policy->tunables->up_threshold_hispeed;
 	}
 
 	if (max_cap)
@@ -1565,6 +1587,33 @@ static ssize_t up_threshold_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr up_threshold = __ATTR_RW(up_threshold);
 
+static ssize_t up_threshold_hispeed_show(struct gov_attr_set *attr_set,
+					 char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->up_threshold_hispeed);
+}
+
+static ssize_t up_threshold_hispeed_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	/* 0 = disabled (fall back to up_threshold). >100 is nonsense for
+	 * a load percentage; up_threshold_hispeed < up_threshold is also
+	 * nonsense because it would widen the hispeed capture zone
+	 * rather than narrow it, but the user is free to do that if they
+	 * really want to.
+	 */
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->up_threshold_hispeed = val;
+	return count;
+}
+static struct governor_attr up_threshold_hispeed =
+	__ATTR_RW(up_threshold_hispeed);
+
 static ssize_t down_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->down_threshold);
@@ -1722,6 +1771,7 @@ static struct attribute *zenith_attrs[] = {
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
 	&up_threshold.attr,
+	&up_threshold_hispeed.attr,
 	&down_threshold.attr,
 	&hispeed_freq.attr,
 	&hispeed_load.attr,
@@ -1850,6 +1900,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->up_rate_limit_us	= ZENITH_DEFAULT_UP_RATE_LIMIT_US;
 	tunables->down_rate_limit_us	= ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
 	tunables->up_threshold		= ZENITH_DEFAULT_UP_THRESHOLD;
+	tunables->up_threshold_hispeed	= ZENITH_DEFAULT_UP_THRESHOLD_HISPEED;
 	tunables->down_threshold	= ZENITH_DEFAULT_DOWN_THRESHOLD;
 	tunables->hispeed_freq		= ZENITH_DEFAULT_HISPEED_FREQ;
 	tunables->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
