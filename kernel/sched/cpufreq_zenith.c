@@ -94,6 +94,38 @@
 #define ZENITH_DEFAULT_AT_HI_EVENTS_X2		4
 #define ZENITH_DEFAULT_AT_LO_EVENTS_X2		1
 
+/* kcpustat-derived hispeed-floor blend (see cpufreq_zenith.c "kcpustat
+ * hispeed blend" section for the algorithm). The feature ships OFF;
+ * userspace flips kcpustat_hispeed_enable=1 once trace data shows the
+ * blend actually lifts cold-start frequencies on the target SoC.
+ *
+ *   kcpustat_window_us     - observation window in microseconds. Each
+ *                            window samples idle / wall delta from
+ *                            kcpustat to compute a raw busy_pct (0..100).
+ *                            Smaller windows respond faster but get
+ *                            noisier. 4 ms matches reflex's default.
+ *   kcpustat_filter_shift  - asymmetric EWMA shift on busy_pct. Up
+ *                            transitions are instant; down transitions
+ *                            decay by (filtered - measured) >> shift
+ *                            per window. 0 disables the EWMA.
+ *   kcpustat_hispeed_enable- master gate. 0 (default) = sampler runs
+ *                            for tracing but does not influence freq.
+ *                            1 = blend the decayed kcpustat util into
+ *                            the PELT util consumed by every tier of
+ *                            zenith_get_next_freq().
+ */
+#define ZENITH_DEFAULT_KCPUSTAT_WINDOW_US	4000
+#define ZENITH_DEFAULT_KCPUSTAT_FILTER_SHIFT	1
+#define ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE	0
+
+/* kcpustat tunable bounds. window_us is clamped on store to keep the
+ * sampler from thrashing or overflowing; filter_shift caps below the
+ * width of an unsigned int.
+ */
+#define ZENITH_KCPUSTAT_WINDOW_MIN_US		1000
+#define ZENITH_KCPUSTAT_WINDOW_MAX_US		100000
+#define ZENITH_KCPUSTAT_FILTER_SHIFT_MAX	8
+
 /*
  * Zenith Tunables & State API
  */
@@ -224,6 +256,15 @@ struct zenith_tunables {
 	unsigned int		auto_tune_lo_sat_pct;
 	unsigned int		auto_tune_hi_events_x2;
 	unsigned int		auto_tune_lo_events_x2;
+
+	/* kcpustat hispeed blend tunables (see ZENITH_DEFAULT_KCPUSTAT_*
+	 * comments for semantics). All three default to safe values:
+	 * sampler runs at 4 ms windows with EWMA shift=1, but the blend
+	 * is gated off until userspace flips kcpustat_hispeed_enable.
+	 */
+	unsigned int		kcpustat_window_us;
+	unsigned int		kcpustat_filter_shift;
+	unsigned int		kcpustat_hispeed_enable;
 };
 
 /*
@@ -1822,6 +1863,83 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set, const cha
 }
 static struct governor_attr down_rate_limit_us = __ATTR_RW(down_rate_limit_us);
 
+/* kcpustat tunables. _store paths invalidate the freq cache so a
+ * userspace write takes effect on the very next scheduler tick rather
+ * than waiting for the prev_freq cache shortcut to drift. window_us is
+ * clamped to a sane range; filter_shift is capped to keep the >>shift
+ * idiom well-defined; hispeed_enable is a strict boolean.
+ */
+static ssize_t kcpustat_window_us_show(struct gov_attr_set *attr_set,
+				       char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->kcpustat_window_us);
+}
+
+static ssize_t kcpustat_window_us_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val < ZENITH_KCPUSTAT_WINDOW_MIN_US ||
+	    val > ZENITH_KCPUSTAT_WINDOW_MAX_US)
+		return -EINVAL;
+	t->kcpustat_window_us = val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr kcpustat_window_us =
+	__ATTR_RW(kcpustat_window_us);
+
+static ssize_t kcpustat_filter_shift_show(struct gov_attr_set *attr_set,
+					  char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->kcpustat_filter_shift);
+}
+
+static ssize_t kcpustat_filter_shift_store(struct gov_attr_set *attr_set,
+					   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > ZENITH_KCPUSTAT_FILTER_SHIFT_MAX)
+		return -EINVAL;
+	t->kcpustat_filter_shift = val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr kcpustat_filter_shift =
+	__ATTR_RW(kcpustat_filter_shift);
+
+static ssize_t kcpustat_hispeed_enable_show(struct gov_attr_set *attr_set,
+					    char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->kcpustat_hispeed_enable);
+}
+
+static ssize_t kcpustat_hispeed_enable_store(struct gov_attr_set *attr_set,
+					     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->kcpustat_hispeed_enable = !!val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr kcpustat_hispeed_enable =
+	__ATTR_RW(kcpustat_hispeed_enable);
+
 static struct attribute *zenith_attrs[] = {
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
@@ -1854,6 +1972,9 @@ static struct attribute *zenith_attrs[] = {
 	&light_load_threshold.attr,
 	&sampling_down_factor.attr,
 	&bias_load_threshold.attr,
+	&kcpustat_window_us.attr,
+	&kcpustat_filter_shift.attr,
+	&kcpustat_hispeed_enable.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -1983,6 +2104,9 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
 	tunables->sampling_down_factor	= ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR;
 	tunables->bias_load_threshold	= ZENITH_DEFAULT_BIAS_LOAD_THRESHOLD;
+	tunables->kcpustat_window_us	= ZENITH_DEFAULT_KCPUSTAT_WINDOW_US;
+	tunables->kcpustat_filter_shift	= ZENITH_DEFAULT_KCPUSTAT_FILTER_SHIFT;
+	tunables->kcpustat_hispeed_enable = ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	ret = kobject_init_and_add(&tunables->attr_set.kobj,
