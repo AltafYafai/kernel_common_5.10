@@ -40,6 +40,8 @@
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
 #define ZENITH_DEFAULT_IO_IS_BUSY		1
 #define ZENITH_DEFAULT_INPUT_BOOST_MS		80
+#define ZENITH_DEFAULT_EFFICIENT_FREQ		0
+#define ZENITH_DEFAULT_UP_DELAY_US		4000
 
 /*
  * Zenith Tunables & State API
@@ -60,6 +62,10 @@ struct zenith_tunables {
 
 	/* Input boost duration (ms). 0 = disabled. */
 	unsigned int		input_boost_ms;
+
+	/* Efficient-frequency soft cap. efficient_freq=0 disables. */
+	unsigned int		efficient_freq;
+	unsigned int		up_delay_us;
 };
 
 /*
@@ -91,6 +97,11 @@ struct zenith_policy {
 
 	bool			limits_changed;
 	bool			need_freq_update;
+
+	/* When >0, target_freq stays clamped at tunables->efficient_freq
+	 * until ktime_get_ns() reaches this deadline. 0 = idle, no clamp.
+	 */
+	u64			efficient_unlock_at_ns;
 };
 
 struct zenith_cpu {
@@ -371,7 +382,32 @@ resolve:
 	z_policy->cached_raw_freq = freq;
 	target_freq = cpufreq_driver_resolve_freq(policy, freq);
 
-	/* 4. Energy Model Validation */
+	/* 4. Efficient-frequency soft cap.
+	 *
+	 * If a configured efficient_freq is set and the request would push
+	 * past it, hold at efficient_freq until the request has been
+	 * sustained for up_delay_us. Same idea as schedhorizon's
+	 * efficient_freq[]/up_delay[] ladder, just collapsed to a single
+	 * step for predictability.
+	 */
+	if (z_policy->tunables->efficient_freq &&
+	    target_freq > z_policy->tunables->efficient_freq) {
+		u64 now = ktime_get_ns();
+		u64 delay_ns = (u64)z_policy->tunables->up_delay_us *
+				NSEC_PER_USEC;
+
+		if (!z_policy->efficient_unlock_at_ns) {
+			z_policy->efficient_unlock_at_ns = now + delay_ns;
+			target_freq = z_policy->tunables->efficient_freq;
+		} else if (now < z_policy->efficient_unlock_at_ns) {
+			target_freq = z_policy->tunables->efficient_freq;
+		}
+		/* else: delay elapsed, allow target_freq through. */
+	} else {
+		z_policy->efficient_unlock_at_ns = 0;
+	}
+
+	/* 5. Energy Model Validation */
 	target_freq = zenith_em_cap_freq(z_policy, target_freq);
 
 	return target_freq;
@@ -561,6 +597,43 @@ static ssize_t input_boost_ms_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr input_boost_ms = __ATTR_RW(input_boost_ms);
 
+static ssize_t efficient_freq_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->efficient_freq);
+}
+
+static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
+				    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->efficient_freq = val;
+	return count;
+}
+static struct governor_attr efficient_freq = __ATTR_RW(efficient_freq);
+
+static ssize_t up_delay_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_delay_us);
+}
+
+static ssize_t up_delay_us_store(struct gov_attr_set *attr_set,
+				 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1000000)
+		return -EINVAL;
+	t->up_delay_us = val;
+	return count;
+}
+static struct governor_attr up_delay_us = __ATTR_RW(up_delay_us);
+
 static ssize_t up_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_threshold);
@@ -673,6 +746,8 @@ static struct attribute *zenith_attrs[] = {
 	&screen_state.attr,
 	&thermal_state.attr,
 	&input_boost_ms.attr,
+	&efficient_freq.attr,
+	&up_delay_us.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -780,6 +855,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->screen_state		= 1;
 	tunables->thermal_state		= 0;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
+	tunables->efficient_freq	= ZENITH_DEFAULT_EFFICIENT_FREQ;
+	tunables->up_delay_us		= ZENITH_DEFAULT_UP_DELAY_US;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	ret = kobject_init_and_add(&tunables->attr_set.kobj,
