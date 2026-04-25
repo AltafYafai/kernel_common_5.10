@@ -29,6 +29,7 @@
 #include <linux/ktime.h>
 #include <linux/fb.h>
 #include <linux/notifier.h>
+#include <linux/kernel_stat.h>
 #include <trace/events/power.h>
 
 /* Constants & Defaults */
@@ -70,6 +71,12 @@ struct zenith_tunables {
 	unsigned int		hispeed_load;
 	unsigned int		powersave_bias;
 	unsigned int		io_is_busy;
+
+	/* When 1, dampen the brutality-path load_pct by the fraction
+	 * of recent CPU time spent in niced-user mode. Approximation
+	 * of ondemand's ignore_nice_load for a PELT-based governor.
+	 */
+	unsigned int		ignore_nice_load;
 	
 	/* Zenith Environment API */
 	unsigned int		screen_state;   /* 1 = ON, 0 = OFF */
@@ -156,6 +163,13 @@ struct zenith_policy {
 	 * down_threshold >= up_threshold.
 	 */
 	bool			brutal_active;
+
+	/* Cached nice-load ratio for the policy (0..100). Sampled in
+	 * the update_util hook when ignore_nice_load=1 and read from
+	 * zenith_get_next_freq. Guarded by update_lock in the shared
+	 * path; on the single path only one CPU writes it.
+	 */
+	unsigned int		nice_pct;
 };
 
 struct zenith_cpu {
@@ -167,6 +181,12 @@ struct zenith_cpu {
 	unsigned int		iowait_boost;
 	u64			last_update;
 	unsigned long		bw_dl;
+
+	/* Delta tracking for ignore_nice_load. Only read when the
+	 * corresponding tunable is set.
+	 */
+	u64			prev_nice_time;
+	u64			prev_nice_wall;
 	unsigned long		max_capacity;
 };
 
@@ -246,6 +266,40 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 	z_cpu->bw_dl = cpu_bw_dl(rq);
 
 	return schedutil_cpu_util(z_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
+}
+
+/************************ Nice-load sampling *********************************/
+
+/* Return the fraction (0..100) of wall time since the last call that
+ * this CPU spent in niced-user mode. Uses the scheduler's cputime
+ * accounting (same source as /proc/stat). Only called when
+ * ignore_nice_load=1 so the cost is paid lazily.
+ */
+static unsigned int zenith_sample_nice_pct(struct zenith_cpu *z_cpu, u64 now)
+{
+	struct kernel_cpustat *kcs = &kcpustat_cpu(z_cpu->cpu);
+	u64 cur_nice = kcpustat_field(kcs, CPUTIME_NICE, z_cpu->cpu);
+	u64 nice_delta, wall_delta;
+	unsigned int pct;
+
+	if (unlikely(!z_cpu->prev_nice_wall)) {
+		z_cpu->prev_nice_time = cur_nice;
+		z_cpu->prev_nice_wall = now;
+		return 0;
+	}
+
+	nice_delta = cur_nice - z_cpu->prev_nice_time;
+	wall_delta = now - z_cpu->prev_nice_wall;
+	z_cpu->prev_nice_time = cur_nice;
+	z_cpu->prev_nice_wall = now;
+
+	if (!wall_delta)
+		return 0;
+	if (nice_delta > wall_delta)
+		nice_delta = wall_delta;
+
+	pct = (unsigned int)((nice_delta * 100) / wall_delta);
+	return pct > 100 ? 100 : pct;
 }
 
 /************************ Thermal State Resolution ***************************/
@@ -391,6 +445,15 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 */
 	if (max_cap) {
 		unsigned int load_pct = (util * 100) / max_cap;
+
+		/* ignore_nice_load: dampen the load percentage by the
+		 * fraction of wall time recently spent in niced-user
+		 * mode, so background niced work does not trigger
+		 * snap-to-max. Approximate — PELT-based util already
+		 * weighs niced tasks by their scheduler weight.
+		 */
+		if (z_policy->tunables->ignore_nice_load && z_policy->nice_pct)
+			load_pct = load_pct * (100 - z_policy->nice_pct) / 100;
 
 		if (load_pct >= dynamic_up_thresh) {
 			z_policy->brutal_active = true;
@@ -554,7 +617,9 @@ static void zenith_update_single(struct update_util_data *hook, u64 time, unsign
 	max_cap = z_cpu->max_capacity;
 	
 	util = zenith_iowait_apply(z_cpu, time, util, max_cap);
-	
+
+	z_policy->nice_pct = tunables->ignore_nice_load ?
+		zenith_sample_nice_pct(z_cpu, time) : 0;
 
 	next_f = zenith_get_next_freq(z_policy, util, max_cap);
 
@@ -584,6 +649,8 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 
 	if (zenith_should_update_freq(z_policy, time)) {
 		
+		unsigned int nice_pct_max = 0;
+
 		for_each_cpu(j, z_policy->policy->cpus) {
 			struct zenith_cpu *j_z_cpu = &per_cpu(zenith_cpu, j);
 			unsigned long j_util, j_max;
@@ -591,13 +658,20 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 			j_util = zenith_get_util(j_z_cpu);
 			j_max = j_z_cpu->max_capacity;
 			j_util = zenith_iowait_apply(j_z_cpu, time, j_util, j_max);
-			
+
+			if (tunables->ignore_nice_load) {
+				unsigned int p = zenith_sample_nice_pct(j_z_cpu, time);
+				if (p > nice_pct_max)
+					nice_pct_max = p;
+			}
 
 			if (j_util * max_cap > j_max * util) {
 				util = j_util;
 				max_cap = j_max;
 			}
 		}
+
+		z_policy->nice_pct = tunables->ignore_nice_load ? nice_pct_max : 0;
 
 		next_f = zenith_get_next_freq(z_policy, util, max_cap);
 		zenith_execute_switch(z_policy, time, next_f);
@@ -665,6 +739,25 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 static struct governor_attr _name = __ATTR_RW(_name)
 
 ZENITH_TUNABLE_UINT(io_is_busy);
+
+static ssize_t ignore_nice_load_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->ignore_nice_load);
+}
+
+static ssize_t ignore_nice_load_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->ignore_nice_load = val;
+	return count;
+}
+static struct governor_attr ignore_nice_load = __ATTR_RW(ignore_nice_load);
 ZENITH_TUNABLE_UINT(screen_state);
 
 static ssize_t screen_auto_show(struct gov_attr_set *attr_set, char *buf)
@@ -981,6 +1074,7 @@ static struct attribute *zenith_attrs[] = {
 	&hispeed_load.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
+	&ignore_nice_load.attr,
 	&screen_state.attr,
 	&screen_auto.attr,
 	&thermal_state.attr,
@@ -1097,6 +1191,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
+	tunables->ignore_nice_load	= 0;
 	tunables->screen_state		= 1;
 	tunables->screen_auto		= 0;
 	tunables->thermal_state		= 0;
