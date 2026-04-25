@@ -118,6 +118,15 @@
 #define ZENITH_DEFAULT_KCPUSTAT_FILTER_SHIFT	1
 #define ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE	0
 
+/* util_math_v2 (default 0): when 1, zenith_get_util() folds the cfs_rq
+ * runnable_avg into the util signal alongside util_avg / util_est, in
+ * the same shape as 6.x cpu_util_cfs_boost(). Helps intermittent
+ * tasks (UI thread + render thread spikes) without changing PELT or
+ * util_est semantics. Off by default; flip after trace data confirms
+ * the v2 signal lifts decisions you actually want lifted.
+ */
+#define ZENITH_DEFAULT_UTIL_MATH_V2		0
+
 /* kcpustat tunable bounds. window_us is clamped on store to keep the
  * sampler from thrashing or overflowing; filter_shift caps below the
  * width of an unsigned int.
@@ -265,6 +274,13 @@ struct zenith_tunables {
 	unsigned int		kcpustat_window_us;
 	unsigned int		kcpustat_filter_shift;
 	unsigned int		kcpustat_hispeed_enable;
+
+	/* util_math_v2: 0 (default) keeps the historical
+	 * cpu_util_cfs() input unchanged; 1 enables the
+	 * 6.x-style runnable-aware util computation in
+	 * zenith_get_util().
+	 */
+	unsigned int		util_math_v2;
 };
 
 /*
@@ -467,14 +483,60 @@ static inline void zenith_ignore_dl_rate_limit(struct zenith_cpu *z_cpu, struct 
 		WRITE_ONCE(z_policy->limits_changed, true);
 }
 
+/*
+ * Compute the cfs_rq util_cfs input fed into schedutil_cpu_util().
+ *
+ * v1 (default): cpu_util_cfs(rq), which on 5.10 returns
+ *
+ *      util_avg, optionally maxed with util_est.enqueued when the
+ *      UTIL_EST sched_feat is on.
+ *
+ * v2 (tunable->util_math_v2 = 1): replicates the 6.x-style
+ * cpu_util_cfs_boost() shape to give zenith a more responsive signal
+ * for short, intermittent tasks (Android UI/render threads). The v2
+ * formula is
+ *
+ *      util_v2 = max(util_avg,
+ *                    util_est.enqueued (& ~UTIL_AVG_UNCHANGED),
+ *                    runnable_avg)
+ *
+ * runnable_avg is what tasks contribute *while runnable* (regardless
+ * of whether they are currently running), so spikes from
+ * intermittent threads land in the util signal one PELT half-life
+ * earlier than they do via util_avg alone. The UTIL_AVG_UNCHANGED
+ * MSB on util_est.enqueued is masked defensively (cfs_rq sums tasks'
+ * enqueued so the bit shouldn't be set there in practice, but
+ * guarding against future kernel changes is cheap).
+ *
+ * Flipping the tunable does not change PELT or util_est accounting --
+ * only what zenith feeds into the proportional math. It is safe to
+ * toggle at runtime; zenith_invalidate_cache() is hit by the _store
+ * path so the next callback recomputes immediately.
+ */
 static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 {
 	struct rq *rq = cpu_rq(z_cpu->cpu);
-	unsigned long util = cpu_util_cfs(rq);
+	unsigned long util;
 	unsigned long max = arch_scale_cpu_capacity(z_cpu->cpu);
 
 	z_cpu->max_capacity = max;
 	z_cpu->bw_dl = cpu_bw_dl(rq);
+
+	if (z_cpu->z_policy->tunables->util_math_v2) {
+		unsigned long util_avg = READ_ONCE(rq->cfs.avg.util_avg);
+		unsigned long runnable = READ_ONCE(rq->cfs.avg.runnable_avg);
+
+		util = util_avg;
+		if (sched_feat(UTIL_EST)) {
+			unsigned long enq = READ_ONCE(rq->cfs.avg.util_est.enqueued);
+
+			enq &= ~UTIL_AVG_UNCHANGED;
+			util = max(util, enq);
+		}
+		util = max(util, runnable);
+	} else {
+		util = cpu_util_cfs(rq);
+	}
 
 	return schedutil_cpu_util(z_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
 }
@@ -2153,6 +2215,31 @@ static ssize_t kcpustat_hispeed_enable_store(struct gov_attr_set *attr_set,
 static struct governor_attr kcpustat_hispeed_enable =
 	__ATTR_RW(kcpustat_hispeed_enable);
 
+/* Strict-bool tunable selecting v1 (legacy cpu_util_cfs()) vs v2
+ * (6.x-style runnable-aware util) input to schedutil_cpu_util in
+ * zenith_get_util().  Invalidates the prev_freq cache so toggles
+ * take effect on the next tick.
+ */
+static ssize_t util_math_v2_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->util_math_v2);
+}
+
+static ssize_t util_math_v2_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->util_math_v2 = !!val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr util_math_v2 = __ATTR_RW(util_math_v2);
+
 static struct attribute *zenith_attrs[] = {
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
@@ -2188,6 +2275,7 @@ static struct attribute *zenith_attrs[] = {
 	&kcpustat_window_us.attr,
 	&kcpustat_filter_shift.attr,
 	&kcpustat_hispeed_enable.attr,
+	&util_math_v2.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -2320,6 +2408,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->kcpustat_window_us	= ZENITH_DEFAULT_KCPUSTAT_WINDOW_US;
 	tunables->kcpustat_filter_shift	= ZENITH_DEFAULT_KCPUSTAT_FILTER_SHIFT;
 	tunables->kcpustat_hispeed_enable = ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE;
+	tunables->util_math_v2		= ZENITH_DEFAULT_UTIL_MATH_V2;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	ret = kobject_init_and_add(&tunables->attr_set.kobj,
