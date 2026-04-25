@@ -32,6 +32,7 @@
 /* Constants & Defaults */
 #define IOWAIT_BOOST_MIN			(SCHED_CAPACITY_SCALE / 8)
 #define ZENITH_DEFAULT_UP_THRESHOLD		80
+#define ZENITH_DEFAULT_DOWN_THRESHOLD		60
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		500
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	2000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
@@ -53,6 +54,7 @@ struct zenith_tunables {
 	unsigned int		up_rate_limit_us;
 	unsigned int		down_rate_limit_us;
 	unsigned int		up_threshold;
+	unsigned int		down_threshold;	/* hysteresis lower bound */
 	unsigned int		powersave_bias;
 	unsigned int		io_is_busy;
 	
@@ -120,6 +122,13 @@ struct zenith_policy {
 	 * reset to 1 the moment we leave max. Mirrors ondemand.
 	 */
 	unsigned int		down_rate_mult;
+
+	/* True once load crossed up_threshold. Stays true, holding us at
+	 * policy->max, until load drops below down_threshold. Collapses
+	 * to old snap-on-every-sample behaviour when
+	 * down_threshold >= up_threshold.
+	 */
+	bool			brutal_active;
 };
 
 struct zenith_cpu {
@@ -293,6 +302,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	if (z_policy->tunables->screen_state == 0) {
 		dynamic_up_thresh = 95; /* Hard to wake up */
 		dynamic_bias = 500;     /* 50% penalty */
+		z_policy->brutal_active = false; /* no hysteresis screen-off */
 	} else if (z_policy->tunables->thermal_state == 1) {
 		dynamic_up_thresh = 90; /* Relaxed for thermals */
 	}
@@ -308,10 +318,30 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		goto resolve;
 	}
 
-	/* 1. Ondemand Brutality */
-	if ((util * 100) / max_cap >= dynamic_up_thresh) {
-		freq = policy->max;
-		goto resolve;
+	/* 1. Ondemand Brutality (with hysteresis).
+	 *
+	 * Snap to policy->max when load crosses up_threshold and stay there
+	 * while load remains above down_threshold. This creates a band
+	 * around the transition so we do not ping-pong between policy->max
+	 * and the bin just below it on every tick. Clearing brutal_active
+	 * falls through to the EAS proportional path.
+	 */
+	if (max_cap) {
+		unsigned int load_pct = (util * 100) / max_cap;
+
+		if (load_pct >= dynamic_up_thresh) {
+			z_policy->brutal_active = true;
+			freq = policy->max;
+			goto resolve;
+		}
+
+		if (z_policy->brutal_active &&
+		    load_pct >= z_policy->tunables->down_threshold) {
+			freq = policy->max;
+			goto resolve;
+		}
+
+		z_policy->brutal_active = false;
 	}
 
 	/* 2. Schedutil EAS Proportional Math with Headroom */
@@ -707,6 +737,24 @@ static ssize_t up_threshold_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr up_threshold = __ATTR_RW(up_threshold);
 
+static ssize_t down_threshold_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->down_threshold);
+}
+
+static ssize_t down_threshold_store(struct gov_attr_set *attr_set,
+				    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->down_threshold = val;
+	return count;
+}
+static struct governor_attr down_threshold = __ATTR_RW(down_threshold);
+
 static ssize_t powersave_bias_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n",
@@ -774,6 +822,7 @@ static struct attribute *zenith_attrs[] = {
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
 	&up_threshold.attr,
+	&down_threshold.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&screen_state.attr,
@@ -885,6 +934,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->up_rate_limit_us	= ZENITH_DEFAULT_UP_RATE_LIMIT_US;
 	tunables->down_rate_limit_us	= ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
 	tunables->up_threshold		= ZENITH_DEFAULT_UP_THRESHOLD;
+	tunables->down_threshold	= ZENITH_DEFAULT_DOWN_THRESHOLD;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->screen_state		= 1;
