@@ -42,6 +42,8 @@
 #define ZENITH_DEFAULT_INPUT_BOOST_MS		80
 #define ZENITH_DEFAULT_EFFICIENT_FREQ		0
 #define ZENITH_DEFAULT_UP_DELAY_US		4000
+#define ZENITH_DEFAULT_LIGHT_LOAD_FREQ		0
+#define ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD	20
 
 /*
  * Zenith Tunables & State API
@@ -66,6 +68,10 @@ struct zenith_tunables {
 	/* Efficient-frequency soft cap. efficient_freq=0 disables. */
 	unsigned int		efficient_freq;
 	unsigned int		up_delay_us;
+
+	/* Light-load hard cap. light_load_freq=0 disables. */
+	unsigned int		light_load_freq;
+	unsigned int		light_load_threshold;	/* in % of max_cap */
 };
 
 /*
@@ -407,7 +413,20 @@ resolve:
 		z_policy->efficient_unlock_at_ns = 0;
 	}
 
-	/* 5. Energy Model Validation */
+	/* 5. Light-load hard cap.
+	 *
+	 * Independent of the efficient_freq soft cap (which gates climbs):
+	 * when current util is below light_load_threshold, hard-clamp the
+	 * resolved target_freq down to light_load_freq. Saves power on
+	 * idle-ish workloads (background sync, screen-on hold) where PELT
+	 * jitter would otherwise push us into a mid bin we do not need.
+	 */
+	if (z_policy->tunables->light_load_freq && max_cap &&
+	    (util * 100) / max_cap < z_policy->tunables->light_load_threshold &&
+	    target_freq > z_policy->tunables->light_load_freq)
+		target_freq = z_policy->tunables->light_load_freq;
+
+	/* 6. Energy Model Validation */
 	target_freq = zenith_em_cap_freq(z_policy, target_freq);
 
 	return target_freq;
@@ -634,6 +653,44 @@ static ssize_t up_delay_us_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr up_delay_us = __ATTR_RW(up_delay_us);
 
+static ssize_t light_load_freq_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->light_load_freq);
+}
+
+static ssize_t light_load_freq_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->light_load_freq = val;
+	return count;
+}
+static struct governor_attr light_load_freq = __ATTR_RW(light_load_freq);
+
+static ssize_t light_load_threshold_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->light_load_threshold);
+}
+
+static ssize_t light_load_threshold_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->light_load_threshold = val;
+	return count;
+}
+static struct governor_attr light_load_threshold = __ATTR_RW(light_load_threshold);
+
 static ssize_t up_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_threshold);
@@ -748,6 +805,8 @@ static struct attribute *zenith_attrs[] = {
 	&input_boost_ms.attr,
 	&efficient_freq.attr,
 	&up_delay_us.attr,
+	&light_load_freq.attr,
+	&light_load_threshold.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -857,6 +916,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 	tunables->efficient_freq	= ZENITH_DEFAULT_EFFICIENT_FREQ;
 	tunables->up_delay_us		= ZENITH_DEFAULT_UP_DELAY_US;
+	tunables->light_load_freq	= ZENITH_DEFAULT_LIGHT_LOAD_FREQ;
+	tunables->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	ret = kobject_init_and_add(&tunables->attr_set.kobj,
