@@ -33,6 +33,8 @@
 #define IOWAIT_BOOST_MIN			(SCHED_CAPACITY_SCALE / 8)
 #define ZENITH_DEFAULT_UP_THRESHOLD		80
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
+#define ZENITH_DEFAULT_THERMAL_AUTO		0
+#define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		500
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	2000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
@@ -61,6 +63,12 @@ struct zenith_tunables {
 	/* Zenith Environment API */
 	unsigned int		screen_state;   /* 1 = ON, 0 = OFF */
 	unsigned int		thermal_state;  /* 0 = COOL, 1 = THROTTLING */
+
+	/* When 1, thermal_state is additionally inferred from
+	 * arch_scale_thermal_pressure() on every update_util tick.
+	 * thermal_state=1 written from userspace still forces it.
+	 */
+	unsigned int		thermal_auto;
 
 	/* Input boost duration (ms). 0 = disabled. */
 	unsigned int		input_boost_ms;
@@ -221,6 +229,42 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 	return schedutil_cpu_util(z_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
 }
 
+/************************ Thermal State Resolution ***************************/
+
+/* Return true when zenith should behave as if thermally throttled.
+ *
+ * Userspace-written thermal_state=1 always wins. When thermal_auto=1 is
+ * set, we additionally consult arch_scale_thermal_pressure() on the
+ * first CPU of the policy and consider the policy throttled when
+ * pressure has eaten at least ZENITH_THERMAL_AUTO_PRESSURE_PCT of the
+ * capacity. This lets the governor respond to the kernel thermal
+ * framework (via arch_update_thermal_pressure) with no userspace in
+ * the loop.
+ */
+static bool zenith_thermal_active(struct zenith_policy *z_policy)
+{
+	struct cpufreq_policy *policy = z_policy->policy;
+	struct zenith_tunables *tunables = z_policy->tunables;
+	unsigned long pressure, cap;
+	int cpu;
+
+	if (tunables->thermal_state)
+		return true;
+	if (!tunables->thermal_auto)
+		return false;
+
+	cpu = cpumask_first(policy->cpus);
+	if (cpu >= nr_cpu_ids)
+		return false;
+
+	cap = arch_scale_cpu_capacity(cpu);
+	if (!cap)
+		return false;
+
+	pressure = arch_scale_thermal_pressure(cpu);
+	return (pressure * 100 / cap) >= ZENITH_THERMAL_AUTO_PRESSURE_PCT;
+}
+
 /************************ Energy Model (EM) Evaluation ***********************/
 
 static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned int target_freq)
@@ -231,7 +275,7 @@ static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned 
 	int i;
 
 	/* If no Energy Model is registered or we aren't thermal throttling, skip */
-	if (!pd || !z_policy->tunables->thermal_state)
+	if (!pd || !zenith_thermal_active(z_policy))
 		return target_freq;
 
 	/* Scan EM array to find the mW cost of the target frequency */
@@ -303,7 +347,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		dynamic_up_thresh = 95; /* Hard to wake up */
 		dynamic_bias = 500;     /* 50% penalty */
 		z_policy->brutal_active = false; /* no hysteresis screen-off */
-	} else if (z_policy->tunables->thermal_state == 1) {
+	} else if (zenith_thermal_active(z_policy)) {
 		dynamic_up_thresh = 90; /* Relaxed for thermals */
 	}
 
@@ -586,6 +630,24 @@ ZENITH_TUNABLE_UINT(io_is_busy);
 ZENITH_TUNABLE_UINT(screen_state);
 ZENITH_TUNABLE_UINT(thermal_state);
 
+static ssize_t thermal_auto_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->thermal_auto);
+}
+
+static ssize_t thermal_auto_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->thermal_auto = val;
+	return count;
+}
+static struct governor_attr thermal_auto = __ATTR_RW(thermal_auto);
+
 static ssize_t input_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->input_boost_ms);
@@ -827,6 +889,7 @@ static struct attribute *zenith_attrs[] = {
 	&io_is_busy.attr,
 	&screen_state.attr,
 	&thermal_state.attr,
+	&thermal_auto.attr,
 	&input_boost_ms.attr,
 	&efficient_freq.attr,
 	&up_delay_us.attr,
@@ -939,6 +1002,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->screen_state		= 1;
 	tunables->thermal_state		= 0;
+	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 	tunables->efficient_freq	= ZENITH_DEFAULT_EFFICIENT_FREQ;
 	tunables->up_delay_us		= ZENITH_DEFAULT_UP_DELAY_US;
