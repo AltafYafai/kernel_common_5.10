@@ -35,6 +35,8 @@
 #define IOWAIT_BOOST_MIN			(SCHED_CAPACITY_SCALE / 8)
 #define ZENITH_DEFAULT_UP_THRESHOLD		80
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
+#define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
+#define ZENITH_DEFAULT_HISPEED_LOAD		90
 #define ZENITH_DEFAULT_THERMAL_AUTO		0
 #define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		500
@@ -59,6 +61,13 @@ struct zenith_tunables {
 	unsigned int		down_rate_limit_us;
 	unsigned int		up_threshold;
 	unsigned int		down_threshold;	/* hysteresis lower bound */
+
+	/* Hispeed floor tier: when load >= hispeed_load (% of max_cap),
+	 * ensure the chosen target_freq is at least hispeed_freq (kHz).
+	 * hispeed_freq=0 disables the tier.
+	 */
+	unsigned int		hispeed_freq;
+	unsigned int		hispeed_load;
 	unsigned int		powersave_bias;
 	unsigned int		io_is_busy;
 	
@@ -405,6 +414,25 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		freq = policy->cur + (policy->cur >> 2); 
 
 	freq = map_util_freq(util, freq, max_cap);
+
+	/* 2b. Hispeed floor — intermediate snap tier.
+	 *
+	 * When load has crossed hispeed_load but is still below
+	 * up_threshold, we are in an "active but not saturated" regime.
+	 * Rather than letting proportional math pick a freq based on a
+	 * noisy PELT signal, floor the target at hispeed_freq so the
+	 * cluster is at least at its "fast but efficient" bin. Above
+	 * up_threshold we already went straight to policy->max in
+	 * step 1, so this tier never competes with brutality.
+	 *
+	 * hispeed_freq=0 disables the tier.
+	 */
+	if (z_policy->tunables->hispeed_freq && max_cap) {
+		unsigned int load_pct = (util * 100) / max_cap;
+		if (load_pct >= z_policy->tunables->hispeed_load &&
+		    freq < z_policy->tunables->hispeed_freq)
+			freq = z_policy->tunables->hispeed_freq;
+	}
 
 	/* 3. Powersave Bias.
 	 *
@@ -845,6 +873,42 @@ static ssize_t down_threshold_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr down_threshold = __ATTR_RW(down_threshold);
 
+static ssize_t hispeed_freq_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->hispeed_freq);
+}
+
+static ssize_t hispeed_freq_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->hispeed_freq = val;
+	return count;
+}
+static struct governor_attr hispeed_freq = __ATTR_RW(hispeed_freq);
+
+static ssize_t hispeed_load_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->hispeed_load);
+}
+
+static ssize_t hispeed_load_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
+		return -EINVAL;
+	t->hispeed_load = val;
+	return count;
+}
+static struct governor_attr hispeed_load = __ATTR_RW(hispeed_load);
+
 static ssize_t powersave_bias_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n",
@@ -913,6 +977,8 @@ static struct attribute *zenith_attrs[] = {
 	&down_rate_limit_us.attr,
 	&up_threshold.attr,
 	&down_threshold.attr,
+	&hispeed_freq.attr,
+	&hispeed_load.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&screen_state.attr,
@@ -1027,6 +1093,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->down_rate_limit_us	= ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
 	tunables->up_threshold		= ZENITH_DEFAULT_UP_THRESHOLD;
 	tunables->down_threshold	= ZENITH_DEFAULT_DOWN_THRESHOLD;
+	tunables->hispeed_freq		= ZENITH_DEFAULT_HISPEED_FREQ;
+	tunables->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->screen_state		= 1;
