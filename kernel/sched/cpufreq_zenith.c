@@ -6,8 +6,8 @@
  * Architecture Additions:
  * 1. Energy Model (EM) Awareness: Reads mW costs from the device tree to prevent 
  * inefficient frequency spikes during thermal throttling.
- * 2. Display-State Awareness: `screen_state` sysfs hook kills Reflex tracking 
- * and forces deep-sleep biases when the display is off.
+ * 2. Display-State Awareness: `screen_state` sysfs hook forces deep-sleep
+ * biases (raised up_threshold, powersave_bias) when the display is off.
  * 3. Dynamic Thermal Thresholding: `thermal_state` sysfs hook dynamically 
  * relaxes up_thresholds to let silicon breathe.
  */
@@ -20,7 +20,6 @@
 #include <linux/sched/cpufreq.h>
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/tick.h>
 #include <linux/irq_work.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
@@ -33,8 +32,6 @@
 /* Constants & Defaults */
 #define IOWAIT_BOOST_MIN			(SCHED_CAPACITY_SCALE / 8)
 #define ZENITH_DEFAULT_UP_THRESHOLD		80
-#define ZENITH_DEFAULT_HISPEED_WINDOW_US	4000
-#define ZENITH_DEFAULT_HISPEED_FILTER_SHIFT	1
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		500
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	2000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
@@ -56,8 +53,6 @@ struct zenith_tunables {
 	unsigned int		up_rate_limit_us;
 	unsigned int		down_rate_limit_us;
 	unsigned int		up_threshold;
-	unsigned int		hispeed_window_us;
-	unsigned int		hispeed_filter_shift;
 	unsigned int		powersave_bias;
 	unsigned int		io_is_busy;
 	
@@ -137,12 +132,6 @@ struct zenith_cpu {
 	u64			last_update;
 	unsigned long		bw_dl;
 	unsigned long		max_capacity;
-
-	u64			prev_idle_time;
-	u64			prev_wall_time;
-	unsigned int		busy_pct;
-	unsigned int		filtered_busy_pct;
-	bool			hispeed_active;
 };
 
 static DEFINE_PER_CPU(struct zenith_cpu, zenith_cpu);
@@ -210,67 +199,6 @@ static inline void zenith_ignore_dl_rate_limit(struct zenith_cpu *z_cpu, struct 
 	if (cpu_bw_dl(cpu_rq(z_cpu->cpu)) > z_cpu->bw_dl)
 		WRITE_ONCE(z_policy->limits_changed, true);
 }
-
-/************************ Reflex: Asymmetric EWMA Idle Tracking ***********************/
-
-static void zenith_update_busy_pct(struct zenith_cpu *z_cpu, unsigned int window_us, unsigned int filter_shift)
-{
-	u64 cur_idle, cur_wall;
-	unsigned int wall_delta, idle_delta;
-
-	cur_idle = get_cpu_idle_time(z_cpu->cpu, &cur_wall, 1);
-	wall_delta = (unsigned int)(cur_wall - z_cpu->prev_wall_time);
-
-	if (wall_delta >= window_us) {
-		z_cpu->busy_pct = 0;
-		z_cpu->hispeed_active = true;
-		z_cpu->prev_idle_time = cur_idle;
-		z_cpu->prev_wall_time = cur_wall;
-		return;
-	}
-
-	if (!z_cpu->hispeed_active)
-		return;
-
-	z_cpu->hispeed_active = false;
-
-	if (cur_idle > z_cpu->prev_idle_time)
-		idle_delta = (unsigned int)(cur_idle - z_cpu->prev_idle_time);
-	else
-		idle_delta = 0;
-
-	if (wall_delta > idle_delta)
-		z_cpu->busy_pct = 100 * (wall_delta - idle_delta) / wall_delta;
-	else
-		z_cpu->busy_pct = 0;
-
-	z_cpu->prev_idle_time = cur_idle;
-	z_cpu->prev_wall_time = cur_wall;
-
-	if (!filter_shift || z_cpu->busy_pct >= z_cpu->filtered_busy_pct) {
-		z_cpu->filtered_busy_pct = z_cpu->busy_pct;
-	} else {
-		unsigned int step = (z_cpu->filtered_busy_pct - z_cpu->busy_pct) >> filter_shift;
-		if (step)
-			z_cpu->filtered_busy_pct -= step;
-		else
-			z_cpu->filtered_busy_pct = z_cpu->busy_pct;
-	}
-}
-
-static unsigned long zenith_blend_util(struct zenith_cpu *z_cpu, unsigned long pelt_util, unsigned long max_cap, unsigned int screen_state)
-{
-	unsigned long hispeed_util;
-
-	/* If display is off, kill Reflex vision to save power */
-	if (!screen_state || !z_cpu->filtered_busy_pct)
-		return pelt_util;
-
-	hispeed_util = (max_cap * z_cpu->filtered_busy_pct) / 100;
-	return max(pelt_util, hispeed_util);
-}
-
-/************************ Core EAS Utilization Extraction ***********************/
 
 static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 {
@@ -515,8 +443,6 @@ static void zenith_update_single(struct update_util_data *hook, u64 time, unsign
 	
 	util = zenith_iowait_apply(z_cpu, time, util, max_cap);
 	
-	zenith_update_busy_pct(z_cpu, tunables->hispeed_window_us, tunables->hispeed_filter_shift);
-	util = zenith_blend_util(z_cpu, util, max_cap, tunables->screen_state);
 
 	next_f = zenith_get_next_freq(z_policy, util, max_cap);
 
@@ -554,8 +480,6 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 			j_max = j_z_cpu->max_capacity;
 			j_util = zenith_iowait_apply(j_z_cpu, time, j_util, j_max);
 			
-			zenith_update_busy_pct(j_z_cpu, tunables->hispeed_window_us, tunables->hispeed_filter_shift);
-			j_util = zenith_blend_util(j_z_cpu, j_util, j_max, tunables->screen_state);
 
 			if (j_util * max_cap > j_max * util) {
 				util = j_util;
@@ -628,7 +552,6 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 } \
 static struct governor_attr _name = __ATTR_RW(_name)
 
-ZENITH_TUNABLE_UINT(hispeed_window_us);
 ZENITH_TUNABLE_UINT(io_is_busy);
 ZENITH_TUNABLE_UINT(screen_state);
 ZENITH_TUNABLE_UINT(thermal_state);
@@ -784,26 +707,6 @@ static ssize_t up_threshold_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr up_threshold = __ATTR_RW(up_threshold);
 
-static ssize_t hispeed_filter_shift_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->hispeed_filter_shift);
-}
-
-static ssize_t hispeed_filter_shift_store(struct gov_attr_set *attr_set,
-					  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val >= 32)
-		return -EINVAL;
-	t->hispeed_filter_shift = val;
-	return count;
-}
-static struct governor_attr hispeed_filter_shift =
-	__ATTR_RW(hispeed_filter_shift);
-
 static ssize_t powersave_bias_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n",
@@ -871,8 +774,6 @@ static struct attribute *zenith_attrs[] = {
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
 	&up_threshold.attr,
-	&hispeed_window_us.attr,
-	&hispeed_filter_shift.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&screen_state.attr,
@@ -984,8 +885,6 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->up_rate_limit_us	= ZENITH_DEFAULT_UP_RATE_LIMIT_US;
 	tunables->down_rate_limit_us	= ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
 	tunables->up_threshold		= ZENITH_DEFAULT_UP_THRESHOLD;
-	tunables->hispeed_window_us	= ZENITH_DEFAULT_HISPEED_WINDOW_US;
-	tunables->hispeed_filter_shift	= ZENITH_DEFAULT_HISPEED_FILTER_SHIFT;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->screen_state		= 1;
@@ -1071,7 +970,6 @@ static int zenith_start(struct cpufreq_policy *policy)
 		memset(z_cpu, 0, sizeof(*z_cpu));
 		z_cpu->cpu = cpu;
 		z_cpu->z_policy = z_policy;
-		z_cpu->prev_idle_time = get_cpu_idle_time(cpu, &z_cpu->prev_wall_time, 1);
 		
 		cpufreq_add_update_util_hook(cpu, &z_cpu->update_util, 
 			policy_is_shared(policy) ? zenith_update_shared : zenith_update_single);
