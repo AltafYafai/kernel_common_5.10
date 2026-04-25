@@ -1796,7 +1796,7 @@ static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set, const char 
 	t->up_rate_limit_us = val;
 
 	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
-		z_pol->up_rate_delay_ns = val * NSEC_PER_USEC;
+		z_pol->up_rate_delay_ns = (u64)val * NSEC_PER_USEC;
 		update_min_rate_limit_ns(z_pol);
 	}
 	return count;
@@ -1818,7 +1818,7 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set, const cha
 	t->down_rate_limit_us = val;
 
 	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
-		z_pol->down_rate_delay_ns = val * NSEC_PER_USEC;
+		z_pol->down_rate_delay_ns = (u64)val * NSEC_PER_USEC;
 		update_min_rate_limit_ns(z_pol);
 	}
 	return count;
@@ -2058,8 +2058,8 @@ static int zenith_start(struct cpufreq_policy *policy)
 	struct zenith_policy *z_policy = policy->governor_data;
 	unsigned int cpu;
 
-	z_policy->up_rate_delay_ns = z_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
-	z_policy->down_rate_delay_ns = z_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;
+	z_policy->up_rate_delay_ns = (u64)z_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
+	z_policy->down_rate_delay_ns = (u64)z_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;
 	update_min_rate_limit_ns(z_policy);
 
 	z_policy->last_freq_update_time = 0;
