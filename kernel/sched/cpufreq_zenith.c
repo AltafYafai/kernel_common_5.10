@@ -293,11 +293,16 @@ struct zenith_policy {
 	/* Auto-tune observer state. Counters are incremented in the
 	 * hot path when tunables->auto_tune=1; the delayed_work handler
 	 * samples and resets them every ZENITH_AUTO_TUNE_PERIOD_MS and
-	 * chooses a preset. Protected by update_lock (shared path) or
-	 * single-writer (single path).
+	 * chooses a preset.
+	 *
+	 * They are atomic because the single-CPU update path runs
+	 * zenith_get_next_freq() without holding update_lock, while the
+	 * delayed_work handler reads+resets them (and runs on any CPU).
+	 * atomic_inc in the hot path and atomic_xchg(..., 0) in the
+	 * worker give us lockless correctness for the sample window.
 	 */
-	unsigned int		at_samples_total;
-	unsigned int		at_samples_saturated;
+	atomic_t		at_samples_total;
+	atomic_t		at_samples_saturated;
 	u64			at_last_events;
 	struct delayed_work	at_work;
 };
@@ -607,9 +612,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		unsigned int load_pct = (util * 100) / max_cap;
 
 		if (z_policy->tunables->auto_tune) {
-			z_policy->at_samples_total++;
+			atomic_inc(&z_policy->at_samples_total);
 			if (load_pct >= z_policy->tunables->auto_tune_sat_load_pct)
-				z_policy->at_samples_saturated++;
+				atomic_inc(&z_policy->at_samples_saturated);
 		}
 
 		/* ignore_nice_load: dampen the load percentage by the
@@ -1150,8 +1155,10 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 /************************ Auto-tune observer *****************************/
 
 /* Classify the workload seen since the last pass and pick a profile.
- * Runs from a delayed_work context, so it can hold the policy's
- * update_lock to sample the counters without racing the hot path.
+ * Runs from a delayed_work context on an arbitrary CPU. The per-policy
+ * sample counters are atomics, so no lock is needed to sample+reset
+ * them here even though zenith_update_single() increments them without
+ * holding update_lock.
  */
 static void zenith_auto_tune_work(struct work_struct *w)
 {
@@ -1162,17 +1169,12 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	u64 events_now, events_delta;
 	unsigned int events_rate_x2;
 	unsigned int target;
-	unsigned long flags;
 
 	if (!t->auto_tune)
 		return;	/* tunable turned off; stop the chain */
 
-	raw_spin_lock_irqsave(&z_policy->update_lock, flags);
-	total = z_policy->at_samples_total;
-	saturated = z_policy->at_samples_saturated;
-	z_policy->at_samples_total = 0;
-	z_policy->at_samples_saturated = 0;
-	raw_spin_unlock_irqrestore(&z_policy->update_lock, flags);
+	total = (unsigned int)atomic_xchg(&z_policy->at_samples_total, 0);
+	saturated = (unsigned int)atomic_xchg(&z_policy->at_samples_saturated, 0);
 
 	events_now = atomic64_read(&zenith_auto_input_events);
 	events_delta = events_now - z_policy->at_last_events;
@@ -1233,8 +1235,8 @@ static ssize_t auto_tune_store(struct gov_attr_set *attr_set,
 		if (val) {
 			z_policy->at_last_events =
 				atomic64_read(&zenith_auto_input_events);
-			z_policy->at_samples_total = 0;
-			z_policy->at_samples_saturated = 0;
+			atomic_set(&z_policy->at_samples_total, 0);
+			atomic_set(&z_policy->at_samples_saturated, 0);
 			schedule_delayed_work(&z_policy->at_work,
 				msecs_to_jiffies(ZENITH_AUTO_TUNE_PERIOD_MS));
 		} else {
