@@ -27,6 +27,8 @@
 #include <linux/input.h>
 #include <linux/atomic.h>
 #include <linux/ktime.h>
+#include <linux/fb.h>
+#include <linux/notifier.h>
 #include <trace/events/power.h>
 
 /* Constants & Defaults */
@@ -62,6 +64,14 @@ struct zenith_tunables {
 	
 	/* Zenith Environment API */
 	unsigned int		screen_state;   /* 1 = ON, 0 = OFF */
+
+	/* When 1, zenith subscribes to the fb notifier chain and updates
+	 * screen_state automatically on FB_EVENT_BLANK. screen_state
+	 * written from userspace still takes effect and is only
+	 * overridden on the next blank/unblank event.
+	 */
+	unsigned int		screen_auto;
+
 	unsigned int		thermal_state;  /* 0 = COOL, 1 = THROTTLING */
 
 	/* When 1, thermal_state is additionally inferred from
@@ -628,6 +638,24 @@ static struct governor_attr _name = __ATTR_RW(_name)
 
 ZENITH_TUNABLE_UINT(io_is_busy);
 ZENITH_TUNABLE_UINT(screen_state);
+
+static ssize_t screen_auto_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->screen_auto);
+}
+
+static ssize_t screen_auto_store(struct gov_attr_set *attr_set,
+				 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->screen_auto = val;
+	return count;
+}
+static struct governor_attr screen_auto = __ATTR_RW(screen_auto);
 ZENITH_TUNABLE_UINT(thermal_state);
 
 static ssize_t thermal_auto_show(struct gov_attr_set *attr_set, char *buf)
@@ -888,6 +916,7 @@ static struct attribute *zenith_attrs[] = {
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&screen_state.attr,
+	&screen_auto.attr,
 	&thermal_state.attr,
 	&thermal_auto.attr,
 	&input_boost_ms.attr,
@@ -1001,6 +1030,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->screen_state		= 1;
+	tunables->screen_auto		= 0;
 	tunables->thermal_state		= 0;
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
@@ -1225,6 +1255,43 @@ static struct input_handler zenith_input_handler = {
 	.id_table	= zenith_input_ids,
 };
 
+/************************ FB blank notifier (screen_auto) ********************/
+
+static int zenith_fb_notifier_cb(struct notifier_block *nb,
+				 unsigned long action, void *data)
+{
+	struct fb_event *evdata = data;
+	int blank;
+	unsigned int new_state;
+
+	/* Only one of FB_EVENT_BLANK / FB_EARLY_EVENT_BLANK is used per
+	 * transition; handle both for portability across panel drivers.
+	 */
+	if (action != FB_EVENT_BLANK && action != FB_EARLY_EVENT_BLANK)
+		return NOTIFY_OK;
+	if (!evdata || !evdata->data)
+		return NOTIFY_OK;
+
+	blank = *(int *)evdata->data;
+	new_state = (blank == FB_BLANK_UNBLANK) ? 1 : 0;
+
+	/* All zenith policies share one global_tunables (per-cluster
+	 * clones hold a reference to the same struct), so a single write
+	 * propagates everywhere.
+	 */
+	mutex_lock(&global_tunables_lock);
+	if (global_tunables && global_tunables->screen_auto)
+		WRITE_ONCE(global_tunables->screen_state, new_state);
+	mutex_unlock(&global_tunables_lock);
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block zenith_fb_notifier = {
+	.notifier_call	= zenith_fb_notifier_cb,
+	.priority	= 0,
+};
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
@@ -1234,6 +1301,11 @@ static int __init zenith_gov_init(void)
 	ret = input_register_handler(&zenith_input_handler);
 	if (ret)
 		pr_warn("Zenith: input handler register failed (%d), boost disabled\n",
+			ret);
+
+	ret = fb_register_client(&zenith_fb_notifier);
+	if (ret)
+		pr_warn("Zenith: fb notifier register failed (%d), screen_auto disabled\n",
 			ret);
 
 	return cpufreq_register_governor(&zenith_gov);
