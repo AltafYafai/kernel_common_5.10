@@ -50,7 +50,10 @@
 #include <trace/events/cpufreq_zenith.h>
 
 /* Constants & Defaults */
-#define IOWAIT_BOOST_MIN			(SCHED_CAPACITY_SCALE / 8)
+/* Permille of SCHED_CAPACITY_SCALE at which iowait boost starts.
+ * 125 == SCHED_CAPACITY_SCALE / 8, preserving the historical default.
+ */
+#define ZENITH_DEFAULT_IOWAIT_BOOST_MIN		125
 #define ZENITH_DEFAULT_UP_THRESHOLD		80
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
 #define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
@@ -123,6 +126,16 @@ struct zenith_tunables {
 	 * which recipe they last applied.
 	 */
 	unsigned int		active_profile;
+
+	/* Permille (0..1000) of SCHED_CAPACITY_SCALE at which
+	 * zenith_iowait_boost() arms and below which a doubling
+	 * decay exits the boost. 125 (12.5%) matches the legacy
+	 * SCHED_CAPACITY_SCALE / 8 constant. 0 disables the minimum
+	 * floor but still allows the doubling climb to take effect
+	 * from its first sample; use io_is_busy=0 to disable iowait
+	 * boost wholesale instead.
+	 */
+	unsigned int		iowait_boost_min;
 
 	/* When 1, a per-policy delayed_work periodically classifies the
 	 * recent workload from load-saturation rate and input-event
@@ -304,13 +317,23 @@ static DEFINE_PER_CPU(struct zenith_cpu, zenith_cpu);
 
 /************************ Schedutil: I/O Wait & DL Logic ***********************/
 
+/* Resolve the configured iowait floor for the policy owning z_cpu, in
+ * absolute SCHED_CAPACITY_SCALE units. Called from every iowait path so
+ * kept inline and trivial.
+ */
+static inline unsigned int zenith_iowait_floor(struct zenith_cpu *z_cpu)
+{
+	unsigned int permille = z_cpu->z_policy->tunables->iowait_boost_min;
+	return (SCHED_CAPACITY_SCALE * permille) / 1000;
+}
+
 static bool zenith_iowait_reset(struct zenith_cpu *z_cpu, u64 time, bool set_iowait_boost)
 {
 	s64 delta_ns = time - z_cpu->last_update;
 	if (delta_ns <= TICK_NSEC)
 		return false;
 
-	z_cpu->iowait_boost = set_iowait_boost ? IOWAIT_BOOST_MIN : 0;
+	z_cpu->iowait_boost = set_iowait_boost ? zenith_iowait_floor(z_cpu) : 0;
 	z_cpu->iowait_boost_pending = set_iowait_boost;
 	return true;
 }
@@ -332,12 +355,13 @@ static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time, unsigned int
 		z_cpu->iowait_boost = min_t(unsigned int, z_cpu->iowait_boost << 1, SCHED_CAPACITY_SCALE);
 		return;
 	}
-	z_cpu->iowait_boost = IOWAIT_BOOST_MIN;
+	z_cpu->iowait_boost = zenith_iowait_floor(z_cpu);
 }
 
 static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, unsigned long util, unsigned long max_cap)
 {
 	unsigned long boost;
+	unsigned int floor = zenith_iowait_floor(z_cpu);
 
 	if (!z_cpu->iowait_boost)
 		return util;
@@ -346,7 +370,7 @@ static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, uns
 
 	if (!z_cpu->iowait_boost_pending) {
 		z_cpu->iowait_boost >>= 1;
-		if (z_cpu->iowait_boost < IOWAIT_BOOST_MIN) {
+		if (z_cpu->iowait_boost < floor) {
 			z_cpu->iowait_boost = 0;
 			return util;
 		}
@@ -928,6 +952,28 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 static struct governor_attr _name = __ATTR_RW(_name)
 
 ZENITH_TUNABLE_UINT(io_is_busy);
+
+static ssize_t iowait_boost_min_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->iowait_boost_min);
+}
+
+static ssize_t iowait_boost_min_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	/* 0..1000 permille of SCHED_CAPACITY_SCALE. >1000 would overshoot
+	 * capacity on the first arm, which is never what we want.
+	 */
+	if (kstrtouint(buf, 10, &val) || val > 1000)
+		return -EINVAL;
+	t->iowait_boost_min = val;
+	return count;
+}
+static struct governor_attr iowait_boost_min = __ATTR_RW(iowait_boost_min);
 
 static ssize_t ignore_nice_load_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -1690,6 +1736,7 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_lo_events_x2.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
+	&iowait_boost_min.attr,
 	&ignore_nice_load.attr,
 	&screen_state.attr,
 	&screen_auto.attr,
@@ -1817,6 +1864,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->auto_tune_lo_events_x2 = ZENITH_DEFAULT_AT_LO_EVENTS_X2;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
+	tunables->iowait_boost_min	= ZENITH_DEFAULT_IOWAIT_BOOST_MIN;
 	tunables->ignore_nice_load	= 0;
 	tunables->screen_state		= 1;
 	tunables->screen_auto		= 0;
