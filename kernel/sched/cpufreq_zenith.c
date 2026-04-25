@@ -96,6 +96,13 @@ struct zenith_tunables {
 	 * which recipe they last applied.
 	 */
 	unsigned int		active_profile;
+
+	/* When 1, a per-policy delayed_work periodically classifies the
+	 * recent workload from load-saturation rate and input-event
+	 * rate, and auto-selects performance / balanced / battery via
+	 * zenith_apply_profile(). Default 0 (off).
+	 */
+	unsigned int		auto_tune;
 	unsigned int		powersave_bias;
 	unsigned int		io_is_busy;
 
@@ -163,6 +170,18 @@ struct zenith_tunables {
 static atomic64_t zenith_input_boost_until_ns = ATOMIC64_INIT(0);
 static unsigned int zenith_input_boost_active_ms = ZENITH_DEFAULT_INPUT_BOOST_MS;
 
+/* Monotonically-increasing global count of qualifying input events seen
+ * by zenith_input_event. Auto-tune workers sample this periodically and
+ * subtract their last-observed value to get an events-per-window rate.
+ */
+static atomic64_t zenith_auto_input_events = ATOMIC64_INIT(0);
+#define ZENITH_AUTO_TUNE_PERIOD_MS	10000	/* classify every 10s  */
+#define ZENITH_AUTO_TUNE_SAT_LOAD	70	/* load_pct >= 70 = saturated */
+#define ZENITH_AUTO_TUNE_HI_SAT_PCT	60	/* gaming trigger */
+#define ZENITH_AUTO_TUNE_LO_SAT_PCT	10	/* idle trigger */
+#define ZENITH_AUTO_TUNE_HI_EVENTS_X2	(2 * 2)	/* > 2.0 events/s in 2s units */
+#define ZENITH_AUTO_TUNE_LO_EVENTS_X2	1	/* < 0.5 events/s  */
+
 struct zenith_policy {
 	struct cpufreq_policy	*policy;
 	struct zenith_tunables	*tunables;
@@ -212,6 +231,17 @@ struct zenith_policy {
 	 * path; on the single path only one CPU writes it.
 	 */
 	unsigned int		nice_pct;
+
+	/* Auto-tune observer state. Counters are incremented in the
+	 * hot path when tunables->auto_tune=1; the delayed_work handler
+	 * samples and resets them every ZENITH_AUTO_TUNE_PERIOD_MS and
+	 * chooses a preset. Protected by update_lock (shared path) or
+	 * single-writer (single path).
+	 */
+	unsigned int		at_samples_total;
+	unsigned int		at_samples_saturated;
+	u64			at_last_events;
+	struct delayed_work	at_work;
 };
 
 struct zenith_cpu {
@@ -487,6 +517,12 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 */
 	if (max_cap) {
 		unsigned int load_pct = (util * 100) / max_cap;
+
+		if (z_policy->tunables->auto_tune) {
+			z_policy->at_samples_total++;
+			if (load_pct >= ZENITH_AUTO_TUNE_SAT_LOAD)
+				z_policy->at_samples_saturated++;
+		}
 
 		/* ignore_nice_load: dampen the load percentage by the
 		 * fraction of wall time recently spent in niced-user
@@ -944,6 +980,100 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	 */
 	WRITE_ONCE(zenith_input_boost_active_ms, t->input_boost_ms);
 }
+
+/************************ Auto-tune observer *****************************/
+
+/* Classify the workload seen since the last pass and pick a profile.
+ * Runs from a delayed_work context, so it can hold the policy's
+ * update_lock to sample the counters without racing the hot path.
+ */
+static void zenith_auto_tune_work(struct work_struct *w)
+{
+	struct zenith_policy *z_policy =
+		container_of(to_delayed_work(w), struct zenith_policy, at_work);
+	struct zenith_tunables *t = z_policy->tunables;
+	unsigned int total, saturated, sat_pct;
+	u64 events_now, events_delta;
+	unsigned int events_rate_x2;
+	unsigned int target;
+	unsigned long flags;
+
+	if (!t->auto_tune)
+		return;	/* tunable turned off; stop the chain */
+
+	raw_spin_lock_irqsave(&z_policy->update_lock, flags);
+	total = z_policy->at_samples_total;
+	saturated = z_policy->at_samples_saturated;
+	z_policy->at_samples_total = 0;
+	z_policy->at_samples_saturated = 0;
+	raw_spin_unlock_irqrestore(&z_policy->update_lock, flags);
+
+	events_now = atomic64_read(&zenith_auto_input_events);
+	events_delta = events_now - z_policy->at_last_events;
+	z_policy->at_last_events = events_now;
+
+	sat_pct = total ? (saturated * 100 / total) : 0;
+	/* events per 2s, i.e. half-events/s * 2, kept integer-friendly:
+	 * ZENITH_AUTO_TUNE_HI_EVENTS_X2=4 corresponds to > 2.0/s, and
+	 * ZENITH_AUTO_TUNE_LO_EVENTS_X2=1 corresponds to < 0.5/s, over
+	 * the ZENITH_AUTO_TUNE_PERIOD_MS window (10s by default).
+	 */
+	events_rate_x2 = (unsigned int)((events_delta * 2000) /
+					ZENITH_AUTO_TUNE_PERIOD_MS);
+
+	if (sat_pct >= ZENITH_AUTO_TUNE_HI_SAT_PCT &&
+	    events_rate_x2 >= ZENITH_AUTO_TUNE_HI_EVENTS_X2)
+		target = ZENITH_PROFILE_PERFORMANCE;
+	else if (sat_pct <= ZENITH_AUTO_TUNE_LO_SAT_PCT &&
+		 events_rate_x2 <= ZENITH_AUTO_TUNE_LO_EVENTS_X2)
+		target = ZENITH_PROFILE_BATTERY;
+	else
+		target = ZENITH_PROFILE_BALANCED;
+
+	if (target != t->active_profile) {
+		zenith_apply_profile(t, target);
+		t->active_profile = target;
+	}
+
+	/* Re-arm for the next classification window. */
+	schedule_delayed_work(&z_policy->at_work,
+			      msecs_to_jiffies(ZENITH_AUTO_TUNE_PERIOD_MS));
+}
+
+static ssize_t auto_tune_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->auto_tune);
+}
+
+static ssize_t auto_tune_store(struct gov_attr_set *attr_set,
+			       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	struct zenith_policy *z_policy;
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	if (t->auto_tune == val)
+		return count;
+	t->auto_tune = val;
+
+	list_for_each_entry(z_policy, &t->attr_set.policy_list, tunables_hook) {
+		if (val) {
+			z_policy->at_last_events =
+				atomic64_read(&zenith_auto_input_events);
+			z_policy->at_samples_total = 0;
+			z_policy->at_samples_saturated = 0;
+			schedule_delayed_work(&z_policy->at_work,
+				msecs_to_jiffies(ZENITH_AUTO_TUNE_PERIOD_MS));
+		} else {
+			cancel_delayed_work_sync(&z_policy->at_work);
+		}
+	}
+
+	return count;
+}
+static struct governor_attr auto_tune = __ATTR_RW(auto_tune);
 
 static ssize_t profile_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -1449,6 +1579,7 @@ static struct attribute *zenith_attrs[] = {
 	&climb_mode.attr,
 	&freq_step_pct.attr,
 	&profile.attr,
+	&auto_tune.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&ignore_nice_load.attr,
@@ -1539,6 +1670,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 
 	z_policy->policy = policy;
 	raw_spin_lock_init(&z_policy->update_lock);
+	INIT_DELAYED_WORK(&z_policy->at_work, zenith_auto_tune_work);
 
 	ret = zenith_kthread_create(z_policy);
 	if (ret)
@@ -1569,6 +1701,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->active_profile	= ZENITH_PROFILE_CUSTOM;
+	tunables->auto_tune		= 0;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->ignore_nice_load	= 0;
@@ -1619,6 +1752,8 @@ static void zenith_exit(struct cpufreq_policy *policy)
 {
 	struct zenith_policy *z_policy = policy->governor_data;
 	struct zenith_tunables *tunables = z_policy->tunables;
+
+	cancel_delayed_work_sync(&z_policy->at_work);
 
 	mutex_lock(&global_tunables_lock);
 	if (!gov_attr_set_put(&tunables->attr_set, &z_policy->tunables_hook))
@@ -1718,9 +1853,15 @@ static void zenith_input_event(struct input_handle *handle, unsigned int type,
 	unsigned int active = READ_ONCE(zenith_input_boost_active_ms);
 	u64 deadline;
 
-	if (!active)
-		return;
 	if (type != EV_KEY && type != EV_ABS && type != EV_REL)
+		return;
+
+	/* Always bump the auto-tune counter so a policy that enables
+	 * auto_tune mid-session has recent data. Cheap atomic inc.
+	 */
+	atomic64_inc(&zenith_auto_input_events);
+
+	if (!active)
 		return;
 
 	deadline = ktime_get_ns() + (u64)active * NSEC_PER_MSEC;
