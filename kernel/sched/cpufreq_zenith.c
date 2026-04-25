@@ -27,9 +27,23 @@
 #include <linux/input.h>
 #include <linux/atomic.h>
 #include <linux/ktime.h>
-#include <linux/fb.h>
 #include <linux/notifier.h>
 #include <linux/kernel_stat.h>
+
+/* linux/fb.h transitively pulls linux/acpi.h, which redefines the
+ * ACPI_PROBE_TABLE macro already defined by sched.h ->
+ * asm-generic/vmlinux.lds.h. The linker-section variant from
+ * vmlinux.lds.h is only meaningful in the kernel link stage and
+ * unused in this translation unit, so undefining it before the
+ * fb.h chain lets the acpi.h definition win without a warning.
+ * Guarding the include on CONFIG_FB_NOTIFY also lets panels that
+ * use a non-fb notifier framework skip the dependency entirely.
+ */
+#ifdef CONFIG_FB_NOTIFY
+#undef ACPI_PROBE_TABLE
+#undef ACPI_PROBE_TABLE_END
+#include <linux/fb.h>
+#endif
 #include <trace/events/power.h>
 
 /* Constants & Defaults */
@@ -1941,6 +1955,7 @@ static struct input_handler zenith_input_handler = {
 
 /************************ FB blank notifier (screen_auto) ********************/
 
+#ifdef CONFIG_FB_NOTIFY
 static int zenith_fb_notifier_cb(struct notifier_block *nb,
 				 unsigned long action, void *data)
 {
@@ -1948,10 +1963,12 @@ static int zenith_fb_notifier_cb(struct notifier_block *nb,
 	int blank;
 	unsigned int new_state;
 
-	/* Only one of FB_EVENT_BLANK / FB_EARLY_EVENT_BLANK is used per
-	 * transition; handle both for portability across panel drivers.
+	/* FB_EVENT_BLANK is the only blank event defined in
+	 * android-common-5.10. Some older trees also ship
+	 * FB_EARLY_EVENT_BLANK, but this one does not — including
+	 * the symbol there breaks the build when CONFIG_FB_NOTIFY=y.
 	 */
-	if (action != FB_EVENT_BLANK && action != FB_EARLY_EVENT_BLANK)
+	if (action != FB_EVENT_BLANK)
 		return NOTIFY_OK;
 	if (!evdata || !evdata->data)
 		return NOTIFY_OK;
@@ -1975,6 +1992,7 @@ static struct notifier_block zenith_fb_notifier = {
 	.notifier_call	= zenith_fb_notifier_cb,
 	.priority	= 0,
 };
+#endif /* CONFIG_FB_NOTIFY */
 
 static int __init zenith_gov_init(void)
 {
@@ -1987,10 +2005,12 @@ static int __init zenith_gov_init(void)
 		pr_warn("Zenith: input handler register failed (%d), boost disabled\n",
 			ret);
 
+#ifdef CONFIG_FB_NOTIFY
 	ret = fb_register_client(&zenith_fb_notifier);
 	if (ret)
 		pr_warn("Zenith: fb notifier register failed (%d), screen_auto disabled\n",
 			ret);
+#endif
 
 	return cpufreq_register_governor(&zenith_gov);
 }
