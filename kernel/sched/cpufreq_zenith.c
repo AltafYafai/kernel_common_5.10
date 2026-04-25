@@ -1965,12 +1965,17 @@ static void zenith_exit(struct cpufreq_policy *policy)
 	struct zenith_policy *z_policy = policy->governor_data;
 	struct zenith_tunables *tunables = z_policy->tunables;
 
-	cancel_delayed_work_sync(&z_policy->at_work);
-
+	/* Remove from the shared tunables' policy_list first so a concurrent
+	 * sysfs store (e.g. auto_tune=1) can no longer iterate this policy
+	 * and re-schedule at_work against it. Only after the list unlink
+	 * is it safe to cancel the delayed work and free z_policy.
+	 */
 	mutex_lock(&global_tunables_lock);
 	if (!gov_attr_set_put(&tunables->attr_set, &z_policy->tunables_hook))
 		global_tunables = NULL;
 	mutex_unlock(&global_tunables_lock);
+
+	cancel_delayed_work_sync(&z_policy->at_work);
 
 	if (!policy->fast_switch_enabled) {
 		kthread_flush_worker(&z_policy->worker);
