@@ -957,6 +957,22 @@ static void update_min_rate_limit_ns(struct zenith_policy *z_policy)
 	mutex_unlock(&min_rate_lock);
 }
 
+/* Force the next zenith_get_next_freq() call on every policy sharing
+ * this tunables set to recompute from scratch, bypassing the
+ * cached_raw_freq shortcut. Call this from any sysfs _store that
+ * changes a value which feeds into the freq decision, so the user's
+ * write takes effect on the very next scheduler tick rather than
+ * waiting for pre-resolve freq to drift. Must be called with the
+ * attr_set->update_lock held (governor_store always takes it).
+ */
+static void zenith_invalidate_cache(struct gov_attr_set *attr_set)
+{
+	struct zenith_policy *z_pol;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook)
+		z_pol->need_freq_update = true;
+}
+
 #define ZENITH_TUNABLE_UINT(_name) \
 static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
@@ -973,7 +989,29 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 } \
 static struct governor_attr _name = __ATTR_RW(_name)
 
-ZENITH_TUNABLE_UINT(io_is_busy);
+/* Same as ZENITH_TUNABLE_UINT but invalidates the per-policy freq
+ * cache after the write so the new value takes effect on the next
+ * scheduler tick. Use this for fields that feed into the
+ * zenith_get_next_freq() decision.
+ */
+#define ZENITH_TUNABLE_UINT_INVAL(_name) \
+static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
+{ \
+	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
+	return sprintf(buf, "%u\n", t->_name); \
+} \
+static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
+{ \
+	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
+	unsigned int val; \
+	if (kstrtouint(buf, 10, &val)) return -EINVAL; \
+	t->_name = val; \
+	zenith_invalidate_cache(attr_set); \
+	return count; \
+} \
+static struct governor_attr _name = __ATTR_RW(_name)
+
+ZENITH_TUNABLE_UINT_INVAL(io_is_busy);
 
 static ssize_t iowait_boost_min_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -993,6 +1031,7 @@ static ssize_t iowait_boost_min_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val > 1000)
 		return -EINVAL;
 	t->iowait_boost_min = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr iowait_boost_min = __ATTR_RW(iowait_boost_min);
@@ -1012,6 +1051,7 @@ static ssize_t ignore_nice_load_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
 	t->ignore_nice_load = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr ignore_nice_load = __ATTR_RW(ignore_nice_load);
@@ -1280,10 +1320,11 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 
 	zenith_apply_profile(t, prof);
 	t->active_profile = prof;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr profile = __ATTR_RW(profile);
-ZENITH_TUNABLE_UINT(screen_state);
+ZENITH_TUNABLE_UINT_INVAL(screen_state);
 
 static ssize_t screen_auto_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -1302,7 +1343,7 @@ static ssize_t screen_auto_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr screen_auto = __ATTR_RW(screen_auto);
-ZENITH_TUNABLE_UINT(thermal_state);
+ZENITH_TUNABLE_UINT_INVAL(thermal_state);
 
 static ssize_t thermal_auto_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -1337,6 +1378,7 @@ static ssize_t input_boost_ms_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 	t->input_boost_ms = val;
 	WRITE_ONCE(zenith_input_boost_active_ms, val);
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr input_boost_ms = __ATTR_RW(input_boost_ms);
@@ -1411,6 +1453,7 @@ static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
 	if (n == 1 && parsed[0] == 0) {
 		t->eff_nr = 0;
 		t->efficient_freq = 0;
+		zenith_invalidate_cache(attr_set);
 		return count;
 	}
 
@@ -1436,6 +1479,7 @@ static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
 
 	t->eff_nr = n;
 	t->efficient_freq = t->eff_freq[0];
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr efficient_freq = __ATTR_RW(efficient_freq);
@@ -1478,6 +1522,7 @@ static ssize_t up_delay_us_store(struct gov_attr_set *attr_set,
 		t->up_delay_us = parsed[0];
 		for (i = 0; i < ZENITH_EFF_BINS_MAX; i++)
 			t->eff_delay_us[i] = parsed[0];
+		zenith_invalidate_cache(attr_set);
 		return count;
 	}
 
@@ -1488,6 +1533,7 @@ static ssize_t up_delay_us_store(struct gov_attr_set *attr_set,
 	for (i = 0; i < n; i++)
 		t->eff_delay_us[i] = parsed[i];
 	t->up_delay_us = parsed[0];
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr up_delay_us = __ATTR_RW(up_delay_us);
@@ -1507,6 +1553,7 @@ static ssize_t light_load_freq_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val))
 		return -EINVAL;
 	t->light_load_freq = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr light_load_freq = __ATTR_RW(light_load_freq);
@@ -1526,6 +1573,7 @@ static ssize_t light_load_threshold_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val > 100)
 		return -EINVAL;
 	t->light_load_threshold = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr light_load_threshold = __ATTR_RW(light_load_threshold);
@@ -1546,6 +1594,7 @@ static ssize_t sampling_down_factor_store(struct gov_attr_set *attr_set,
 	    val > ZENITH_MAX_SAMPLING_DOWN_FACTOR)
 		return -EINVAL;
 	t->sampling_down_factor = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr sampling_down_factor = __ATTR_RW(sampling_down_factor);
@@ -1565,6 +1614,7 @@ static ssize_t bias_load_threshold_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val > 100)
 		return -EINVAL;
 	t->bias_load_threshold = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr bias_load_threshold = __ATTR_RW(bias_load_threshold);
@@ -1583,6 +1633,7 @@ static ssize_t up_threshold_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
 		return -EINVAL;
 	t->up_threshold = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr up_threshold = __ATTR_RW(up_threshold);
@@ -1609,6 +1660,7 @@ static ssize_t up_threshold_hispeed_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val > 100)
 		return -EINVAL;
 	t->up_threshold_hispeed = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr up_threshold_hispeed =
@@ -1628,6 +1680,7 @@ static ssize_t down_threshold_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val > 100)
 		return -EINVAL;
 	t->down_threshold = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr down_threshold = __ATTR_RW(down_threshold);
@@ -1646,6 +1699,7 @@ static ssize_t hispeed_freq_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val))
 		return -EINVAL;
 	t->hispeed_freq = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr hispeed_freq = __ATTR_RW(hispeed_freq);
@@ -1664,6 +1718,7 @@ static ssize_t hispeed_load_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
 		return -EINVAL;
 	t->hispeed_load = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr hispeed_load = __ATTR_RW(hispeed_load);
@@ -1682,6 +1737,7 @@ static ssize_t climb_mode_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val > ZENITH_CLIMB_MODE_STEP)
 		return -EINVAL;
 	t->climb_mode = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr climb_mode = __ATTR_RW(climb_mode);
@@ -1700,6 +1756,7 @@ static ssize_t freq_step_pct_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
 		return -EINVAL;
 	t->freq_step_pct = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr freq_step_pct = __ATTR_RW(freq_step_pct);
@@ -1719,6 +1776,7 @@ static ssize_t powersave_bias_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val > 1000)
 		return -EINVAL;
 	t->powersave_bias = val;
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr powersave_bias = __ATTR_RW(powersave_bias);
