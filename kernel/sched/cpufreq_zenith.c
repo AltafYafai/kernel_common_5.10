@@ -80,6 +80,16 @@
 #define ZENITH_MAX_SAMPLING_DOWN_FACTOR		10
 #define ZENITH_DEFAULT_BIAS_LOAD_THRESHOLD	50
 
+/* auto_tune classifier thresholds. Exposed as tunables so userspace can
+ * tune what the observer considers "saturated" and the saturation /
+ * input-event cutoffs that select performance vs battery.
+ */
+#define ZENITH_DEFAULT_AT_SAT_LOAD_PCT		70
+#define ZENITH_DEFAULT_AT_HI_SAT_PCT		60
+#define ZENITH_DEFAULT_AT_LO_SAT_PCT		10
+#define ZENITH_DEFAULT_AT_HI_EVENTS_X2		4
+#define ZENITH_DEFAULT_AT_LO_EVENTS_X2		1
+
 /*
  * Zenith Tunables & State API
  */
@@ -178,6 +188,17 @@ struct zenith_tunables {
 	 * 100 = always apply (legacy behaviour); 0 = never apply.
 	 */
 	unsigned int		bias_load_threshold;
+
+	/* auto_tune observer thresholds (see per-field comments at the
+	 * ZENITH_DEFAULT_AT_* macros). All are in percent except the
+	 * events_x2 pair, which are integer event counts per 2 seconds
+	 * over the classification window.
+	 */
+	unsigned int		auto_tune_sat_load_pct;
+	unsigned int		auto_tune_hi_sat_pct;
+	unsigned int		auto_tune_lo_sat_pct;
+	unsigned int		auto_tune_hi_events_x2;
+	unsigned int		auto_tune_lo_events_x2;
 };
 
 /*
@@ -546,7 +567,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 
 		if (z_policy->tunables->auto_tune) {
 			z_policy->at_samples_total++;
-			if (load_pct >= ZENITH_AUTO_TUNE_SAT_LOAD)
+			if (load_pct >= z_policy->tunables->auto_tune_sat_load_pct)
 				z_policy->at_samples_saturated++;
 		}
 
@@ -1063,11 +1084,11 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	events_rate_x2 = (unsigned int)((events_delta * 2000) /
 					ZENITH_AUTO_TUNE_PERIOD_MS);
 
-	if (sat_pct >= ZENITH_AUTO_TUNE_HI_SAT_PCT &&
-	    events_rate_x2 >= ZENITH_AUTO_TUNE_HI_EVENTS_X2)
+	if (sat_pct >= t->auto_tune_hi_sat_pct &&
+	    events_rate_x2 >= t->auto_tune_hi_events_x2)
 		target = ZENITH_PROFILE_PERFORMANCE;
-	else if (sat_pct <= ZENITH_AUTO_TUNE_LO_SAT_PCT &&
-		 events_rate_x2 <= ZENITH_AUTO_TUNE_LO_EVENTS_X2)
+	else if (sat_pct <= t->auto_tune_lo_sat_pct &&
+		 events_rate_x2 <= t->auto_tune_lo_events_x2)
 		target = ZENITH_PROFILE_BATTERY;
 	else
 		target = ZENITH_PROFILE_BALANCED;
@@ -1121,6 +1142,41 @@ static ssize_t auto_tune_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr auto_tune = __ATTR_RW(auto_tune);
+
+/* auto_tune_* threshold tunables. The three *_pct fields are clamped to
+ * the 0..100 range; the events_x2 fields accept any uint but only
+ * values that can realistically occur in the 10 s observation window
+ * are meaningful (events_x2 = events_per_2s, so 10 == 5 events/s).
+ */
+#define ZENITH_AT_PCT_STORE(_name) \
+static ssize_t _name##_store(struct gov_attr_set *attr_set, \
+			     const char *buf, size_t count) \
+{ \
+	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
+	unsigned int val; \
+	if (kstrtouint(buf, 10, &val) || val > 100) \
+		return -EINVAL; \
+	t->_name = val; \
+	return count; \
+}
+
+#define ZENITH_AT_PCT_SHOW(_name) \
+static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
+{ \
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->_name); \
+}
+
+#define ZENITH_AT_PCT_TUNABLE(_name) \
+	ZENITH_AT_PCT_SHOW(_name) \
+	ZENITH_AT_PCT_STORE(_name) \
+	static struct governor_attr _name = __ATTR_RW(_name)
+
+ZENITH_AT_PCT_TUNABLE(auto_tune_sat_load_pct);
+ZENITH_AT_PCT_TUNABLE(auto_tune_hi_sat_pct);
+ZENITH_AT_PCT_TUNABLE(auto_tune_lo_sat_pct);
+
+ZENITH_TUNABLE_UINT(auto_tune_hi_events_x2);
+ZENITH_TUNABLE_UINT(auto_tune_lo_events_x2);
 
 static ssize_t profile_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -1627,6 +1683,11 @@ static struct attribute *zenith_attrs[] = {
 	&freq_step_pct.attr,
 	&profile.attr,
 	&auto_tune.attr,
+	&auto_tune_sat_load_pct.attr,
+	&auto_tune_hi_sat_pct.attr,
+	&auto_tune_lo_sat_pct.attr,
+	&auto_tune_hi_events_x2.attr,
+	&auto_tune_lo_events_x2.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&ignore_nice_load.attr,
@@ -1749,6 +1810,11 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->active_profile	= ZENITH_PROFILE_CUSTOM;
 	tunables->auto_tune		= 0;
+	tunables->auto_tune_sat_load_pct = ZENITH_DEFAULT_AT_SAT_LOAD_PCT;
+	tunables->auto_tune_hi_sat_pct	= ZENITH_DEFAULT_AT_HI_SAT_PCT;
+	tunables->auto_tune_lo_sat_pct	= ZENITH_DEFAULT_AT_LO_SAT_PCT;
+	tunables->auto_tune_hi_events_x2 = ZENITH_DEFAULT_AT_HI_EVENTS_X2;
+	tunables->auto_tune_lo_events_x2 = ZENITH_DEFAULT_AT_LO_EVENTS_X2;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->ignore_nice_load	= 0;
