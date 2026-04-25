@@ -38,6 +38,7 @@
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
 #define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
 #define ZENITH_DEFAULT_HISPEED_LOAD		90
+#define ZENITH_EFF_BINS_MAX			4
 #define ZENITH_CLIMB_MODE_SNAP			0	/* default */
 #define ZENITH_CLIMB_MODE_STEP			1
 #define ZENITH_DEFAULT_CLIMB_MODE		ZENITH_CLIMB_MODE_SNAP
@@ -113,9 +114,22 @@ struct zenith_tunables {
 	/* Input boost duration (ms). 0 = disabled. */
 	unsigned int		input_boost_ms;
 
-	/* Efficient-frequency soft cap. efficient_freq=0 disables. */
+	/* Efficient-frequency soft-cap ladder, up to ZENITH_EFF_BINS_MAX
+	 * entries. Sorted ascending by frequency. The up_delay_us array
+	 * is paired 1:1 with eff_freq; writing a single scalar to
+	 * up_delay_us broadcasts it to every bin.
+	 *
+	 * eff_nr == 0 disables the ladder entirely (equivalent to the
+	 * pre-ladder "efficient_freq=0" state). The scalar shadows
+	 * efficient_freq / up_delay_us remain for backward-compatible
+	 * sysfs reads: efficient_freq = eff_freq[0], up_delay_us =
+	 * up_delay[0].
+	 */
 	unsigned int		efficient_freq;
 	unsigned int		up_delay_us;
+	unsigned int		eff_nr;
+	unsigned int		eff_freq[ZENITH_EFF_BINS_MAX];
+	unsigned int		eff_delay_us[ZENITH_EFF_BINS_MAX];
 
 	/* Light-load hard cap. light_load_freq=0 disables. */
 	unsigned int		light_load_freq;
@@ -160,10 +174,12 @@ struct zenith_policy {
 	bool			limits_changed;
 	bool			need_freq_update;
 
-	/* When >0, target_freq stays clamped at tunables->efficient_freq
-	 * until ktime_get_ns() reaches this deadline. 0 = idle, no clamp.
+	/* Per-bin unlock deadlines for the multi-step efficient_freq
+	 * ladder. eff_unlock_at_ns[i] is the ktime_get_ns() time after
+	 * which target_freq is allowed past tunables->eff_freq[i].
+	 * Zero means "idle" — not currently gating. Indexed 0..eff_nr-1.
 	 */
-	u64			efficient_unlock_at_ns;
+	u64			eff_unlock_at_ns[ZENITH_EFF_BINS_MAX];
 
 	/* Multiplier currently applied to down_rate_delay_ns. Bumped to
 	 * tunables->sampling_down_factor while sitting at policy->max,
@@ -549,29 +565,59 @@ resolve:
 	z_policy->cached_raw_freq = freq;
 	target_freq = cpufreq_driver_resolve_freq(policy, freq);
 
-	/* 4. Efficient-frequency soft cap.
+	/* 4. Efficient-frequency ladder (soft cap).
 	 *
-	 * If a configured efficient_freq is set and the request would push
-	 * past it, hold at efficient_freq until the request has been
-	 * sustained for up_delay_us. Same idea as schedhorizon's
-	 * efficient_freq[]/up_delay[] ladder, just collapsed to a single
-	 * step for predictability.
+	 * The ladder is an array of (efficient_freq, up_delay_us) pairs
+	 * sorted ascending by freq. For each bin i that the requested
+	 * target_freq wants to cross, the governor holds at eff_freq[i]
+	 * until the request has been sustained for eff_delay_us[i]. If
+	 * target drops back below eff_freq[i] the corresponding
+	 * deadline is cleared, so transient bursts do not accumulate
+	 * climbing progress.
+	 *
+	 * eff_nr == 0 disables the ladder (identical to pre-ladder
+	 * efficient_freq=0).
 	 */
-	if (z_policy->tunables->efficient_freq &&
-	    target_freq > z_policy->tunables->efficient_freq) {
+	if (z_policy->tunables->eff_nr) {
+		unsigned int nr = z_policy->tunables->eff_nr;
 		u64 now = ktime_get_ns();
-		u64 delay_ns = (u64)z_policy->tunables->up_delay_us *
-				NSEC_PER_USEC;
+		int i;
 
-		if (!z_policy->efficient_unlock_at_ns) {
-			z_policy->efficient_unlock_at_ns = now + delay_ns;
-			target_freq = z_policy->tunables->efficient_freq;
-		} else if (now < z_policy->efficient_unlock_at_ns) {
-			target_freq = z_policy->tunables->efficient_freq;
+		if (nr > ZENITH_EFF_BINS_MAX)
+			nr = ZENITH_EFF_BINS_MAX;
+
+		for (i = 0; i < nr; i++) {
+			unsigned int bin_freq = z_policy->tunables->eff_freq[i];
+			u64 delay_ns = (u64)z_policy->tunables->eff_delay_us[i] *
+				       NSEC_PER_USEC;
+
+			if (target_freq <= bin_freq) {
+				/* Target is at or below this bin. Reset
+				 * its own and every higher bin's
+				 * deadline so a later climb has to earn
+				 * them again.
+				 */
+				int j;
+				for (j = i; j < nr; j++)
+					z_policy->eff_unlock_at_ns[j] = 0;
+				break;
+			}
+
+			/* Target wants to cross bin i. Arm its deadline
+			 * on first sight, hold at bin_freq until the
+			 * sustained time expires.
+			 */
+			if (!z_policy->eff_unlock_at_ns[i]) {
+				z_policy->eff_unlock_at_ns[i] = now + delay_ns;
+				target_freq = bin_freq;
+				break;
+			}
+			if (now < z_policy->eff_unlock_at_ns[i]) {
+				target_freq = bin_freq;
+				break;
+			}
+			/* Bin already unlocked; try the next one. */
 		}
-		/* else: delay elapsed, allow target_freq through. */
-	} else {
-		z_policy->efficient_unlock_at_ns = 0;
 	}
 
 	/* 5. Light-load hard cap.
@@ -848,39 +894,153 @@ static ssize_t input_boost_ms_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr input_boost_ms = __ATTR_RW(input_boost_ms);
 
+/* Parse up to ZENITH_EFF_BINS_MAX unsigned ints separated by whitespace
+ * into out[], returning the number parsed. Extra tokens are ignored.
+ * Returns -EINVAL if any token fails kstrtouint or if no tokens parse.
+ */
+static int zenith_parse_uint_list(const char *buf, unsigned int *out,
+				  unsigned int max)
+{
+	char tmp[16];
+	const char *p = buf;
+	unsigned int nr = 0;
+	int ret;
+
+	while (*p && nr < max) {
+		size_t len = 0;
+		unsigned int val;
+
+		while (*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		if (!*p)
+			break;
+
+		while (p[len] && p[len] != ' ' && p[len] != '\t' &&
+		       p[len] != '\n' && len < sizeof(tmp) - 1)
+			len++;
+		if (!len)
+			break;
+		memcpy(tmp, p, len);
+		tmp[len] = '\0';
+		p += len;
+
+		ret = kstrtouint(tmp, 10, &val);
+		if (ret)
+			return -EINVAL;
+		out[nr++] = val;
+	}
+
+	return nr ? (int)nr : -EINVAL;
+}
+
 static ssize_t efficient_freq_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->efficient_freq);
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int i;
+	ssize_t len = 0;
+
+	if (!t->eff_nr)
+		return sprintf(buf, "0\n");
+
+	for (i = 0; i < t->eff_nr; i++)
+		len += sprintf(buf + len, "%u%c",
+			       t->eff_freq[i],
+			       (i + 1 == t->eff_nr) ? '\n' : ' ');
+	return len;
 }
 
 static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
 				    const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
+	unsigned int parsed[ZENITH_EFF_BINS_MAX];
+	int n, i;
 
-	if (kstrtouint(buf, 10, &val))
-		return -EINVAL;
-	t->efficient_freq = val;
+	n = zenith_parse_uint_list(buf, parsed, ZENITH_EFF_BINS_MAX);
+	if (n < 0)
+		return n;
+
+	/* "efficient_freq=0" disables the ladder. */
+	if (n == 1 && parsed[0] == 0) {
+		t->eff_nr = 0;
+		t->efficient_freq = 0;
+		return count;
+	}
+
+	/* Require strictly ascending sort — the ladder walks from low
+	 * to high, and equal / decreasing entries would create
+	 * unreachable bins.
+	 */
+	for (i = 1; i < n; i++) {
+		if (parsed[i] <= parsed[i - 1])
+			return -EINVAL;
+	}
+
+	for (i = 0; i < n; i++)
+		t->eff_freq[i] = parsed[i];
+
+	/* Broadcast the existing scalar up_delay_us to any new bins
+	 * that don't yet have a delay. The user can then write a
+	 * matching list to up_delay_us to override per-bin.
+	 */
+	for (i = 0; i < n; i++)
+		if (!t->eff_delay_us[i])
+			t->eff_delay_us[i] = t->up_delay_us;
+
+	t->eff_nr = n;
+	t->efficient_freq = t->eff_freq[0];
 	return count;
 }
 static struct governor_attr efficient_freq = __ATTR_RW(efficient_freq);
 
 static ssize_t up_delay_us_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_delay_us);
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int i;
+	ssize_t len = 0;
+
+	if (!t->eff_nr)
+		return sprintf(buf, "%u\n", t->up_delay_us);
+
+	for (i = 0; i < t->eff_nr; i++)
+		len += sprintf(buf + len, "%u%c",
+			       t->eff_delay_us[i],
+			       (i + 1 == t->eff_nr) ? '\n' : ' ');
+	return len;
 }
 
 static ssize_t up_delay_us_store(struct gov_attr_set *attr_set,
 				 const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
+	unsigned int parsed[ZENITH_EFF_BINS_MAX];
+	int n, i;
 
-	if (kstrtouint(buf, 10, &val) || val > 1000000)
+	n = zenith_parse_uint_list(buf, parsed, ZENITH_EFF_BINS_MAX);
+	if (n < 0)
+		return n;
+
+	for (i = 0; i < n; i++)
+		if (parsed[i] > 1000000)
+			return -EINVAL;
+
+	if (n == 1) {
+		/* Scalar write: broadcast to every existing bin and
+		 * keep the scalar shadow up-to-date.
+		 */
+		t->up_delay_us = parsed[0];
+		for (i = 0; i < ZENITH_EFF_BINS_MAX; i++)
+			t->eff_delay_us[i] = parsed[0];
+		return count;
+	}
+
+	/* Vector write: must match eff_nr exactly. */
+	if (!t->eff_nr || (unsigned int)n != t->eff_nr)
 		return -EINVAL;
-	t->up_delay_us = val;
+
+	for (i = 0; i < n; i++)
+		t->eff_delay_us[i] = parsed[i];
+	t->up_delay_us = parsed[0];
 	return count;
 }
 static struct governor_attr up_delay_us = __ATTR_RW(up_delay_us);
