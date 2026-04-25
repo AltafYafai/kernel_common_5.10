@@ -41,6 +41,11 @@
 #define ZENITH_EFF_BINS_MAX			4
 #define ZENITH_CLIMB_MODE_SNAP			0	/* default */
 #define ZENITH_CLIMB_MODE_STEP			1
+#define ZENITH_PROFILE_CUSTOM			0	/* default */
+#define ZENITH_PROFILE_PERFORMANCE		1
+#define ZENITH_PROFILE_BALANCED			2
+#define ZENITH_PROFILE_BATTERY			3
+#define ZENITH_PROFILE_LEGACY			4
 #define ZENITH_DEFAULT_CLIMB_MODE		ZENITH_CLIMB_MODE_SNAP
 #define ZENITH_DEFAULT_FREQ_STEP_PCT		5
 #define ZENITH_DEFAULT_THERMAL_AUTO		0
@@ -84,6 +89,13 @@ struct zenith_tunables {
 	 */
 	unsigned int		climb_mode;
 	unsigned int		freq_step_pct;
+
+	/* Last-applied preset, or CUSTOM if one was never written. The
+	 * tunable does NOT auto-revert to CUSTOM when individual fields
+	 * are later modified — the user can always check sysfs to see
+	 * which recipe they last applied.
+	 */
+	unsigned int		active_profile;
 	unsigned int		powersave_bias;
 	unsigned int		io_is_busy;
 
@@ -836,6 +848,140 @@ static ssize_t ignore_nice_load_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr ignore_nice_load = __ATTR_RW(ignore_nice_load);
+
+/* Apply one of the preset recipes to all tunables in-place. Leaves
+ * light_load_freq, hispeed_freq, efficient_freq ladder and other
+ * device-specific frequencies untouched because their correct values
+ * depend on the SoC's actual freq table. The user can layer those on
+ * top after picking a profile.
+ */
+static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
+{
+	switch (prof) {
+	case ZENITH_PROFILE_PERFORMANCE:
+		t->up_rate_limit_us	= 200;
+		t->down_rate_limit_us	= 4000;
+		t->up_threshold		= 70;
+		t->down_threshold	= 50;
+		t->hispeed_load		= 80;
+		t->climb_mode		= ZENITH_CLIMB_MODE_SNAP;
+		t->freq_step_pct	= 10;
+		t->powersave_bias	= 0;
+		t->bias_load_threshold	= 50;
+		t->ignore_nice_load	= 0;
+		t->input_boost_ms	= 150;
+		t->light_load_threshold	= 20;
+		t->sampling_down_factor	= 4;
+		t->thermal_auto		= 1;
+		t->screen_auto		= 1;
+		break;
+
+	case ZENITH_PROFILE_BALANCED:
+		t->up_rate_limit_us	= ZENITH_DEFAULT_UP_RATE_LIMIT_US;
+		t->down_rate_limit_us	= ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
+		t->up_threshold		= ZENITH_DEFAULT_UP_THRESHOLD;
+		t->down_threshold	= ZENITH_DEFAULT_DOWN_THRESHOLD;
+		t->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
+		t->climb_mode		= ZENITH_CLIMB_MODE_SNAP;
+		t->freq_step_pct	= ZENITH_DEFAULT_FREQ_STEP_PCT;
+		t->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
+		t->bias_load_threshold	= ZENITH_DEFAULT_BIAS_LOAD_THRESHOLD;
+		t->ignore_nice_load	= 0;
+		t->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
+		t->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
+		t->sampling_down_factor	= ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR;
+		t->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
+		t->screen_auto		= 0;
+		break;
+
+	case ZENITH_PROFILE_BATTERY:
+		t->up_rate_limit_us	= 1000;
+		t->down_rate_limit_us	= 1000;
+		t->up_threshold		= 85;
+		t->down_threshold	= 40;
+		t->hispeed_load		= 95;
+		t->climb_mode		= ZENITH_CLIMB_MODE_STEP;
+		t->freq_step_pct	= 10;
+		t->powersave_bias	= 100;	/* 10% */
+		t->bias_load_threshold	= 40;
+		t->ignore_nice_load	= 1;
+		t->input_boost_ms	= 60;
+		t->light_load_threshold	= 30;
+		t->sampling_down_factor	= 1;
+		t->thermal_auto		= 1;
+		t->screen_auto		= 1;
+		break;
+
+	case ZENITH_PROFILE_LEGACY:
+		/* Approximates cpufreq_ondemand: plain up_threshold with
+		 * no hysteresis, no input boost, nice-load ignored.
+		 */
+		t->up_rate_limit_us	= 2000;
+		t->down_rate_limit_us	= 4000;
+		t->up_threshold		= 80;
+		t->down_threshold	= 80;	/* collapses hysteresis */
+		t->hispeed_load		= 90;
+		t->climb_mode		= ZENITH_CLIMB_MODE_SNAP;
+		t->freq_step_pct	= 5;
+		t->powersave_bias	= 0;
+		t->bias_load_threshold	= 50;
+		t->ignore_nice_load	= 1;
+		t->input_boost_ms	= 0;
+		t->light_load_threshold	= 20;
+		t->sampling_down_factor	= 1;
+		t->thermal_auto		= 0;
+		t->screen_auto		= 0;
+		break;
+
+	case ZENITH_PROFILE_CUSTOM:
+	default:
+		/* No mutation — leaving CUSTOM simply records intent. */
+		return;
+	}
+
+	/* Mirror input_boost_ms to the governor-wide cache used by the
+	 * input handler fast path.
+	 */
+	WRITE_ONCE(zenith_input_boost_active_ms, t->input_boost_ms);
+}
+
+static ssize_t profile_show(struct gov_attr_set *attr_set, char *buf)
+{
+	switch (to_zenith_tunables(attr_set)->active_profile) {
+	case ZENITH_PROFILE_PERFORMANCE:	return sprintf(buf, "performance\n");
+	case ZENITH_PROFILE_BALANCED:		return sprintf(buf, "balanced\n");
+	case ZENITH_PROFILE_BATTERY:		return sprintf(buf, "battery\n");
+	case ZENITH_PROFILE_LEGACY:		return sprintf(buf, "legacy\n");
+	case ZENITH_PROFILE_CUSTOM:
+	default:				return sprintf(buf, "custom\n");
+	}
+}
+
+static ssize_t profile_store(struct gov_attr_set *attr_set,
+			     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int prof;
+
+	/* Accept the canonical name with optional trailing whitespace. */
+	if (sysfs_streq(buf, "performance"))
+		prof = ZENITH_PROFILE_PERFORMANCE;
+	else if (sysfs_streq(buf, "balanced"))
+		prof = ZENITH_PROFILE_BALANCED;
+	else if (sysfs_streq(buf, "battery"))
+		prof = ZENITH_PROFILE_BATTERY;
+	else if (sysfs_streq(buf, "legacy"))
+		prof = ZENITH_PROFILE_LEGACY;
+	else if (sysfs_streq(buf, "custom"))
+		prof = ZENITH_PROFILE_CUSTOM;
+	else
+		return -EINVAL;
+
+	zenith_apply_profile(t, prof);
+	t->active_profile = prof;
+	return count;
+}
+static struct governor_attr profile = __ATTR_RW(profile);
 ZENITH_TUNABLE_UINT(screen_state);
 
 static ssize_t screen_auto_show(struct gov_attr_set *attr_set, char *buf)
@@ -1302,6 +1448,7 @@ static struct attribute *zenith_attrs[] = {
 	&hispeed_load.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
+	&profile.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&ignore_nice_load.attr,
@@ -1421,6 +1568,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
+	tunables->active_profile	= ZENITH_PROFILE_CUSTOM;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->ignore_nice_load	= 0;
