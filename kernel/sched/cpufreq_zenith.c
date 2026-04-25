@@ -534,10 +534,9 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
  * Caller must serialise (single path: only one CPU writes; shared
  * path: caller holds update_lock).
  */
-static void __maybe_unused
-zenith_kcpustat_sample(struct zenith_cpu *z_cpu,
-		       unsigned int window_us,
-		       unsigned int filter_shift, u64 time)
+static void zenith_kcpustat_sample(struct zenith_cpu *z_cpu,
+				   unsigned int window_us,
+				   unsigned int filter_shift, u64 time)
 {
 	u64 cur_idle, cur_wall;
 	unsigned int wall_delta, idle_delta;
@@ -611,10 +610,9 @@ zenith_kcpustat_sample(struct zenith_cpu *z_cpu,
  * capped at the raw kcpustat-implied util (so the blend can never
  * exceed the actual measured busy fraction).
  */
-static unsigned long __maybe_unused
-zenith_kcpustat_blend(struct zenith_cpu *z_cpu,
-		      unsigned long pelt_util,
-		      unsigned long max_cap, u64 time)
+static unsigned long zenith_kcpustat_blend(struct zenith_cpu *z_cpu,
+					   unsigned long pelt_util,
+					   unsigned long max_cap, u64 time)
 {
 	unsigned long hispeed_util, decayed;
 	u64 elapsed_ns;
@@ -1081,6 +1079,14 @@ static void zenith_update_single(struct update_util_data *hook, u64 time, unsign
 	
 	util = zenith_iowait_apply(z_cpu, time, util, max_cap);
 
+	if (tunables->kcpustat_hispeed_enable) {
+		zenith_kcpustat_sample(z_cpu,
+				       tunables->kcpustat_window_us,
+				       tunables->kcpustat_filter_shift,
+				       time);
+		util = zenith_kcpustat_blend(z_cpu, util, max_cap, time);
+	}
+
 	z_policy->nice_pct = tunables->ignore_nice_load ?
 		zenith_sample_nice_pct(z_cpu, time) : 0;
 
@@ -1121,6 +1127,15 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 			j_util = zenith_get_util(j_z_cpu);
 			j_max = j_z_cpu->max_capacity;
 			j_util = zenith_iowait_apply(j_z_cpu, time, j_util, j_max);
+
+			if (tunables->kcpustat_hispeed_enable) {
+				zenith_kcpustat_sample(j_z_cpu,
+					tunables->kcpustat_window_us,
+					tunables->kcpustat_filter_shift,
+					time);
+				j_util = zenith_kcpustat_blend(j_z_cpu, j_util,
+							       j_max, time);
+			}
 
 			if (tunables->ignore_nice_load) {
 				unsigned int p = zenith_sample_nice_pct(j_z_cpu, time);
