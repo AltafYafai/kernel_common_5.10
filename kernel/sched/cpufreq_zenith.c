@@ -25,6 +25,9 @@
 #include <linux/kthread.h>
 #include <linux/mutex.h>
 #include <linux/energy_model.h>
+#include <linux/input.h>
+#include <linux/atomic.h>
+#include <linux/ktime.h>
 #include <trace/events/power.h>
 
 /* Constants & Defaults */
@@ -36,6 +39,7 @@
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	2000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
 #define ZENITH_DEFAULT_IO_IS_BUSY		1
+#define ZENITH_DEFAULT_INPUT_BOOST_MS		80
 
 /*
  * Zenith Tunables & State API
@@ -53,7 +57,17 @@ struct zenith_tunables {
 	/* Zenith Environment API */
 	unsigned int		screen_state;   /* 1 = ON, 0 = OFF */
 	unsigned int		thermal_state;  /* 0 = COOL, 1 = THROTTLING */
+
+	/* Input boost duration (ms). 0 = disabled. */
+	unsigned int		input_boost_ms;
 };
+
+/*
+ * Set by the input handler on every key/abs event. Read from the hot path
+ * with atomic64_read so no governor lock is needed in the producer.
+ */
+static atomic64_t zenith_input_boost_until_ns = ATOMIC64_INIT(0);
+static unsigned int zenith_input_boost_active_ms = ZENITH_DEFAULT_INPUT_BOOST_MS;
 
 struct zenith_policy {
 	struct cpufreq_policy	*policy;
@@ -319,6 +333,17 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		dynamic_up_thresh = 90; /* Relaxed for thermals */
 	}
 
+	/* 0. Input Boost — pin to policy->max for input_boost_ms after a key
+	 * or touch event. Gated by screen_state so we don't wake clusters
+	 * while the display is off.
+	 */
+	if (z_policy->tunables->input_boost_ms &&
+	    z_policy->tunables->screen_state &&
+	    ktime_get_ns() < (u64)atomic64_read(&zenith_input_boost_until_ns)) {
+		freq = policy->max;
+		goto resolve;
+	}
+
 	/* 1. Ondemand Brutality */
 	if ((util * 100) / max_cap >= dynamic_up_thresh) {
 		freq = policy->max;
@@ -517,6 +542,25 @@ ZENITH_TUNABLE_UINT(io_is_busy);
 ZENITH_TUNABLE_UINT(screen_state);
 ZENITH_TUNABLE_UINT(thermal_state);
 
+static ssize_t input_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->input_boost_ms);
+}
+
+static ssize_t input_boost_ms_store(struct gov_attr_set *attr_set,
+				    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1000)
+		return -EINVAL;
+	t->input_boost_ms = val;
+	WRITE_ONCE(zenith_input_boost_active_ms, val);
+	return count;
+}
+static struct governor_attr input_boost_ms = __ATTR_RW(input_boost_ms);
+
 static ssize_t up_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_threshold);
@@ -628,6 +672,7 @@ static struct attribute *zenith_attrs[] = {
 	&io_is_busy.attr,
 	&screen_state.attr,
 	&thermal_state.attr,
+	&input_boost_ms.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -734,6 +779,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->screen_state		= 1;
 	tunables->thermal_state		= 0;
+	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
+	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	ret = kobject_init_and_add(&tunables->attr_set.kobj,
 				   &zenith_tunables_ktype,
@@ -854,9 +901,105 @@ static struct cpufreq_governor zenith_gov = {
 	.flags      = CPUFREQ_GOV_DYNAMIC_SWITCHING,
 };
 
+/************************ Input Boost ***********************/
+
+static void zenith_input_event(struct input_handle *handle, unsigned int type,
+			       unsigned int code, int value)
+{
+	unsigned int active = READ_ONCE(zenith_input_boost_active_ms);
+	u64 deadline;
+
+	if (!active)
+		return;
+	if (type != EV_KEY && type != EV_ABS && type != EV_REL)
+		return;
+
+	deadline = ktime_get_ns() + (u64)active * NSEC_PER_MSEC;
+	atomic64_set(&zenith_input_boost_until_ns, deadline);
+}
+
+static int zenith_input_connect(struct input_handler *handler,
+				struct input_dev *dev,
+				const struct input_device_id *id)
+{
+	struct input_handle *handle;
+	int ret;
+
+	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!handle)
+		return -ENOMEM;
+
+	handle->dev = dev;
+	handle->handler = handler;
+	handle->name = "zenith";
+
+	ret = input_register_handle(handle);
+	if (ret)
+		goto err_free;
+
+	ret = input_open_device(handle);
+	if (ret)
+		goto err_unregister;
+
+	return 0;
+
+err_unregister:
+	input_unregister_handle(handle);
+err_free:
+	kfree(handle);
+	return ret;
+}
+
+static void zenith_input_disconnect(struct input_handle *handle)
+{
+	input_close_device(handle);
+	input_unregister_handle(handle);
+	kfree(handle);
+}
+
+static const struct input_device_id zenith_input_ids[] = {
+	/* Multitouch screens */
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
+			 INPUT_DEVICE_ID_MATCH_ABSBIT,
+		.evbit = { BIT_MASK(EV_ABS) },
+		.absbit = { [BIT_WORD(ABS_MT_POSITION_X)] =
+				BIT_MASK(ABS_MT_POSITION_X) },
+	},
+	/* Touchpads */
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_KEYBIT |
+			 INPUT_DEVICE_ID_MATCH_ABSBIT,
+		.keybit = { [BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH) },
+		.absbit = { [BIT_WORD(ABS_X)] = BIT_MASK(ABS_X) },
+	},
+	/* Keyboards */
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT,
+		.evbit = { BIT_MASK(EV_KEY) },
+	},
+	{ },
+};
+
+static struct input_handler zenith_input_handler = {
+	.event		= zenith_input_event,
+	.connect	= zenith_input_connect,
+	.disconnect	= zenith_input_disconnect,
+	.name		= "zenith",
+	.id_table	= zenith_input_ids,
+};
+
 static int __init zenith_gov_init(void)
 {
+	int ret;
+
 	pr_info("Zenith: V2 Dreadnought (EAS/EM/Display/Thermal) Initialized. By ENI for LO.\n");
+
+	ret = input_register_handler(&zenith_input_handler);
+	if (ret)
+		pr_warn("Zenith: input handler register failed (%d), boost disabled\n",
+			ret);
+
 	return cpufreq_register_governor(&zenith_gov);
 }
 fs_initcall(zenith_gov_init);
