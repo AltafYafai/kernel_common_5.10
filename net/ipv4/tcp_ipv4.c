@@ -2931,8 +2931,12 @@ static int __net_init tcp_sk_init(struct net *net)
 	 * which are too large can cause TCP streams to be bursty.
 	 */
 	net->ipv4.sysctl_tcp_tso_win_divisor = 3;
-	/* Default TSQ limit of 16 TSO segments */
-	net->ipv4.sysctl_tcp_limit_output_bytes = 16 * 65536;
+	/* Default TSQ limit of four TSO segments worth of pacing budget.
+	 * Originally 16 * 65536 (1 MB); bumped to 4 MB to give BBR enough
+	 * headroom on high-BDP mobile/cellular paths where 1 MB throttles
+	 * pacing well below the link's actual capacity.
+	 */
+	net->ipv4.sysctl_tcp_limit_output_bytes = 4 * 1024 * 1024;
 	/* rfc5961 challenge ack rate limiting */
 	net->ipv4.sysctl_tcp_challenge_ack_limit = 1000;
 	net->ipv4.sysctl_tcp_min_tso_segs = 2;
