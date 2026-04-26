@@ -270,8 +270,17 @@ static int ksm_max_page_sharing = 256;
 /* Number of pages ksmd should scan in one batch */
 static unsigned int ksm_thread_pages_to_scan = 100;
 
-/* Milliseconds ksmd should sleep between batches */
-static unsigned int ksm_thread_sleep_millisecs = 20;
+/*
+ * Milliseconds ksmd should sleep between batches.
+ *
+ * Default 200 ms (was 20 ms upstream): on phone-class devices we want
+ * KSM scanning to be a slow background reclaim assistant, not a
+ * meaningful CPU consumer. With 100 pages/batch this still merges a
+ * meaningful amount of pages over a few minutes of foreground work
+ * while keeping ksmd well under 1 % of a single CPU. Userspace can
+ * still tune via /sys/kernel/mm/ksm/sleep_millisecs at runtime.
+ */
+static unsigned int ksm_thread_sleep_millisecs = 200;
 
 /* Checksum of an empty (zeroed) page */
 static unsigned int zero_checksum __read_mostly;
