@@ -1105,9 +1105,14 @@ void tcp_mark_skb_lost(struct sock *sk, struct sk_buff *skb)
 			tcp_notify_skb_loss_event(tp, skb);
 		}
 	} else {
+		const struct inet_connection_sock *icsk = inet_csk(sk);
+
+		tp->lost += tcp_skb_pcount(skb);
 		tp->lost_out += tcp_skb_pcount(skb);
 		TCP_SKB_CB(skb)->sacked |= TCPCB_LOST;
 		tcp_notify_skb_loss_event(tp, skb);
+		if (icsk->icsk_ca_ops->skb_marked_lost)
+			icsk->icsk_ca_ops->skb_marked_lost(sk, skb);
 	}
 }
 
@@ -3953,6 +3958,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	delivered = tcp_newly_delivered(sk, delivered, flag);
 	lost = tp->lost - lost;			/* freshly marked lost */
 	rs.is_ack_delayed = !!(flag & FLAG_ACK_MAYBE_DELAYED);
+	sack_state.rate->is_ece = !!(flag & FLAG_ECE);
 	tcp_rate_gen(sk, delivered, lost, is_sack_reneg, sack_state.rate);
 	tcp_cong_control(sk, ack, delivered, flag, sack_state.rate);
 	tcp_xmit_recovery(sk, rexmit);
