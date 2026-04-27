@@ -69,9 +69,6 @@ static inline void psi_enqueue(struct task_struct *p, bool wakeup)
 	if (static_branch_likely(&psi_disabled))
 		return;
 
-	if (p->in_memstall)
-		set |= TSK_MEMSTALL_RUNNING;
-
 	if (!wakeup || p->sched_psi_wake_requeue) {
 		if (p->in_memstall)
 			set |= TSK_MEMSTALL;
@@ -91,14 +88,6 @@ static inline void psi_dequeue(struct task_struct *p, bool sleep)
 
 	if (static_branch_likely(&psi_disabled))
 		return;
-
-	/*
-	 * A task leaving the rq stops being a "running memstall task"
-	 * regardless of whether it's truly going to sleep or just being
-	 * migrated/requeued.
-	 */
-	if (p->in_memstall)
-		clear |= TSK_MEMSTALL_RUNNING;
 
 	if (!sleep) {
 		if (p->in_memstall)

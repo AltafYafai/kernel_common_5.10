@@ -15,29 +15,20 @@ enum psi_task_count {
 	NR_MEMSTALL,
 	NR_RUNNING,
 	/*
-	 * For each task that is in memory stall, we need to know if it
-	 * is also runnable/oncpu, so that PSI_MEM_FULL doesn't fire
-	 * while reclaim is *actively* burning CPU (which is by
-	 * definition not "no working tasks"). Tracked separately from
-	 * NR_MEMSTALL so the existing add/remove paths stay simple.
-	 */
-	NR_MEMSTALL_RUNNING,
-	/*
 	 * This can't have values other than 0 or 1 and could be
 	 * implemented as a bit flag. But for now we still have room
 	 * in the first cacheline of psi_group_cpu, and this way we
 	 * don't have to special case any state tracking for it.
 	 */
 	NR_ONCPU,
-	NR_PSI_TASK_COUNTS = 5,
+	NR_PSI_TASK_COUNTS = 4,
 };
 
 /* Task state bitmasks */
-#define TSK_IOWAIT		(1 << NR_IOWAIT)
-#define TSK_MEMSTALL		(1 << NR_MEMSTALL)
-#define TSK_RUNNING		(1 << NR_RUNNING)
-#define TSK_MEMSTALL_RUNNING	(1 << NR_MEMSTALL_RUNNING)
-#define TSK_ONCPU		(1 << NR_ONCPU)
+#define TSK_IOWAIT	(1 << NR_IOWAIT)
+#define TSK_MEMSTALL	(1 << NR_MEMSTALL)
+#define TSK_RUNNING	(1 << NR_RUNNING)
+#define TSK_ONCPU	(1 << NR_ONCPU)
 
 /* Resources that workloads could be stalled on */
 enum psi_res {
