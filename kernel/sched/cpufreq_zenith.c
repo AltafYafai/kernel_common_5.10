@@ -54,7 +54,7 @@
  * 125 == SCHED_CAPACITY_SCALE / 8, preserving the historical default.
  */
 #define ZENITH_DEFAULT_IOWAIT_BOOST_MIN		125
-#define ZENITH_DEFAULT_UP_THRESHOLD		80
+#define ZENITH_DEFAULT_UP_THRESHOLD		75
 #define ZENITH_DEFAULT_UP_THRESHOLD_HISPEED	0	/* disabled */
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
 #define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
@@ -77,10 +77,10 @@
 static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_CLIMB_MODE		ZENITH_CLIMB_MODE_SNAP
 #define ZENITH_DEFAULT_FREQ_STEP_PCT		5
-#define ZENITH_DEFAULT_THERMAL_AUTO		0
+#define ZENITH_DEFAULT_THERMAL_AUTO		1
 #define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
-#define ZENITH_DEFAULT_UP_RATE_LIMIT_US		500
-#define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	2000
+#define ZENITH_DEFAULT_UP_RATE_LIMIT_US		250
+#define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	4000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
 #define ZENITH_DEFAULT_IO_IS_BUSY		1
 #define ZENITH_DEFAULT_INPUT_BOOST_MS		80
@@ -88,7 +88,7 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_UP_DELAY_US		4000
 #define ZENITH_DEFAULT_LIGHT_LOAD_FREQ		0
 #define ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD	20
-#define ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR	1
+#define ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR	2
 #define ZENITH_MAX_SAMPLING_DOWN_FACTOR		10
 #define ZENITH_DEFAULT_BIAS_LOAD_THRESHOLD	50
 
@@ -106,6 +106,7 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
  * hispeed blend" section for the algorithm). The feature ships OFF;
  * userspace flips kcpustat_hispeed_enable=1 once trace data shows the
  * blend actually lifts cold-start frequencies on the target SoC.
+ * Enabled by default to compensate PELT's 32 ms cold-start lag.
  *
  *   kcpustat_window_us     - observation window in microseconds. Each
  *                            window samples idle / wall delta from
@@ -124,16 +125,16 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
  */
 #define ZENITH_DEFAULT_KCPUSTAT_WINDOW_US	4000
 #define ZENITH_DEFAULT_KCPUSTAT_FILTER_SHIFT	1
-#define ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE	0
+#define ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE	1
 
-/* util_math_v2 (default 0): when 1, zenith_get_util() folds the cfs_rq
+/* util_math_v2 (default 1): when 1, zenith_get_util() folds the cfs_rq
  * runnable_avg into the util signal alongside util_avg / util_est, in
  * the same shape as 6.x cpu_util_cfs_boost(). Helps intermittent
  * tasks (UI thread + render thread spikes) without changing PELT or
- * util_est semantics. Off by default; flip after trace data confirms
- * the v2 signal lifts decisions you actually want lifted.
+ * util_est semantics. Enabled by default for better responsiveness
+ * to short burst workloads (UI/render threads).
  */
-#define ZENITH_DEFAULT_UTIL_MATH_V2		0
+#define ZENITH_DEFAULT_UTIL_MATH_V2		1
 
 /* uclamp_min_respect (default 1): make zenith honour ADPF-style
  * uclamp_min hints more robustly than the stock schedutil_cpu_util()
@@ -2579,7 +2580,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->iowait_boost_min	= ZENITH_DEFAULT_IOWAIT_BOOST_MIN;
 	tunables->ignore_nice_load	= 0;
 	tunables->screen_state		= 1;
-	tunables->screen_auto		= 0;
+	tunables->screen_auto		= 1;
 	tunables->thermal_state		= 0;
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
