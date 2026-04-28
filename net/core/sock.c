@@ -267,9 +267,17 @@ static struct lock_class_key af_elock_keys[AF_MAX];
 static struct lock_class_key af_kern_callback_keys[AF_MAX];
 
 /* Run time adjustable parameters. */
-__u32 sysctl_wmem_max __read_mostly = SK_WMEM_MAX;
+/*
+ * 16 MiB ceiling on a single socket's send / receive buffer is enough
+ * for ~100 ms of 5G mid-band (1.3 Gbps) and Wi-Fi 6 in real-world
+ * conditions, while still being a small fraction of phone-class RAM.
+ * The default (= the actually allocated buffer for new sockets, set in
+ * sysctl_{w,r}mem_default below) stays at the conservative SK_*_MAX so
+ * we don't pre-allocate megabytes per socket.
+ */
+__u32 sysctl_wmem_max __read_mostly = 16 * 1024 * 1024;
 EXPORT_SYMBOL(sysctl_wmem_max);
-__u32 sysctl_rmem_max __read_mostly = SK_RMEM_MAX;
+__u32 sysctl_rmem_max __read_mostly = 16 * 1024 * 1024;
 EXPORT_SYMBOL(sysctl_rmem_max);
 __u32 sysctl_wmem_default __read_mostly = SK_WMEM_MAX;
 __u32 sysctl_rmem_default __read_mostly = SK_RMEM_MAX;
