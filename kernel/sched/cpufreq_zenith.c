@@ -135,6 +135,37 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
  */
 #define ZENITH_DEFAULT_UTIL_MATH_V2		0
 
+/* uclamp_min_respect (default 1): make zenith honour ADPF-style
+ * uclamp_min hints more robustly than the stock schedutil_cpu_util()
+ * path alone.  Two behaviours are gated by this tunable:
+ *
+ *   (a) an explicit final-freq floor of map_util_freq(uclamp_min_eff)
+ *       applied after every other decision tier (powersave_bias,
+ *       light_load_freq cap, efficient_freq ladder), so rate-limit
+ *       windows and soft caps cannot erode ADPF hints;
+ *   (b) when screen_state == 0, the aggressive
+ *       dynamic_bias = 500 / up_threshold = 95 screen-off override is
+ *       suppressed if the policy's effective uclamp_min is at least
+ *       ZENITH_UCLAMP_MIN_MEANINGFUL_PCT of SCHED_CAPACITY_SCALE.
+ *       This keeps Android's PerformanceHint sessions effective for
+ *       legitimate screen-off work (audio decode, nav, sync) without
+ *       opening the screen-off budget for every task.
+ *
+ * Set 0 to revert to the pre-patch behaviour (uclamp_min still flows
+ * through schedutil_cpu_util() via the RQ aggregate, but no explicit
+ * floor / screen-off suppression is applied on top).
+ */
+#define ZENITH_DEFAULT_UCLAMP_MIN_RESPECT	1
+
+/* uclamp_min threshold (in percent of SCHED_CAPACITY_SCALE) above
+ * which the screen-off override suppression kicks in. 10 %% means the
+ * task's ADPF hint has to reach uclamp_min >= ~102/1024 (about big-core
+ * idle-loop capacity) before zenith considers it worth bypassing the
+ * screen-off penalty.  Hardcoded rather than tunable -- it is a
+ * definition of "meaningful", not a policy knob.
+ */
+#define ZENITH_UCLAMP_MIN_MEANINGFUL_PCT	10
+
 /* kcpustat tunable bounds. window_us is clamped on store to keep the
  * sampler from thrashing or overflowing; filter_shift caps below the
  * width of an unsigned int.
@@ -289,6 +320,17 @@ struct zenith_tunables {
 	 * zenith_get_util().
 	 */
 	unsigned int		util_math_v2;
+
+	/* uclamp_min_respect: see the ZENITH_DEFAULT_UCLAMP_MIN_RESPECT
+	 * block at the top of this file for full semantics. In short:
+	 *   1 (default) = apply an explicit final-freq floor derived
+	 *                  from RQ-aggregated uclamp_min, AND suppress
+	 *                  the screen-off penalty when a meaningful
+	 *                  uclamp_min is set;
+	 *   0           = rely solely on schedutil_cpu_util() RQ uclamp
+	 *                  aggregation (pre-G.1 behaviour).
+	 */
+	unsigned int		uclamp_min_respect;
 };
 
 /*
@@ -848,6 +890,38 @@ static bool zenith_should_update_freq(struct zenith_policy *z_policy, u64 time)
 	return delta_ns >= z_policy->min_rate_limit_ns;
 }
 
+/*
+ * Return the max RQ-aggregated UCLAMP_MIN (in capacity units) across all
+ * CPUs in this policy.  Uses uclamp_rq_get() which is just a READ_ONCE
+ * on the rq->uclamp[UCLAMP_MIN].value field already maintained by the
+ * scheduler on every enqueue/dequeue -- no locking needed, no
+ * measurable fast-path cost even on 8-CPU policies.
+ *
+ * Returns 0 if CONFIG_UCLAMP_TASK is off (uclamp_rq_get stub returns 0)
+ * or if uclamp is compiled in but no task on the policy has set
+ * uclamp_min.  Callers use the 0 return as "no floor to apply".
+ */
+static unsigned long zenith_policy_uclamp_min(struct zenith_policy *z_policy)
+{
+#ifdef CONFIG_UCLAMP_TASK
+	unsigned long max_umin = 0;
+	int cpu;
+
+	if (!uclamp_is_used())
+		return 0;
+
+	for_each_cpu(cpu, z_policy->policy->cpus) {
+		unsigned long umin = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN);
+
+		if (umin > max_umin)
+			max_umin = umin;
+	}
+	return max_umin;
+#else
+	return 0;
+#endif
+}
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
@@ -863,10 +937,31 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	unsigned int dynamic_up_thresh = z_policy->tunables->up_threshold;
 	unsigned int dynamic_bias = z_policy->tunables->powersave_bias;
 
-	if (z_policy->tunables->screen_state == 0) {
+	/* ADPF / uclamp_min floor.  Sampled once here so every decision
+	 * tier below (screen-off override, light-load cap, powersave_bias,
+	 * final resolve) sees a consistent view.  zero when CONFIG_UCLAMP_TASK
+	 * is off, when no task on the policy has set uclamp_min, or when
+	 * the governor-level tunable disables respect entirely.
+	 */
+	unsigned long uclamp_min = z_policy->tunables->uclamp_min_respect ?
+		zenith_policy_uclamp_min(z_policy) : 0;
+	bool uclamp_min_meaningful = uclamp_min >=
+		((SCHED_CAPACITY_SCALE * ZENITH_UCLAMP_MIN_MEANINGFUL_PCT) / 100);
+
+	if (z_policy->tunables->screen_state == 0 && !uclamp_min_meaningful) {
 		dynamic_up_thresh = 95; /* Hard to wake up */
 		dynamic_bias = 500;     /* 50% penalty */
 		z_policy->brutal_active = false; /* no hysteresis screen-off */
+	} else if (z_policy->tunables->screen_state == 0) {
+		/* Screen is off but userspace has set a meaningful ADPF
+		 * uclamp_min on at least one task in this policy --
+		 * respect the hint.  Skip the 50 %% penalty and the
+		 * 95 %% up_threshold bump; fall through to the normal
+		 * eval path.  The final-freq floor applied below still
+		 * guarantees we deliver at least the uclamp_min-implied
+		 * frequency.
+		 */
+		z_policy->brutal_active = false;
 	} else if (zenith_thermal_active(z_policy)) {
 		dynamic_up_thresh = 90; /* Relaxed for thermals */
 	} else if (z_policy->tunables->up_threshold_hispeed &&
@@ -998,6 +1093,33 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	    (util * 100) / max_cap < z_policy->tunables->bias_load_threshold) {
 		margin = freq * dynamic_bias / 1000;
 		freq = freq - margin;
+	}
+
+	/* 3b. uclamp_min floor (ADPF PerformanceHint).
+	 *
+	 * After every other tier has had its say, guarantee that the
+	 * chosen freq is at least what uclamp_min would imply via
+	 * map_util_freq().  Catches three concrete cases schedutil's
+	 * RQ-aggregate path alone would miss:
+	 *
+	 *   - light_load_freq cap undershooting an ADPF hint;
+	 *   - powersave_bias shaving the proportional freq below the hint;
+	 *   - cached_raw_freq short-circuit below returning a rate-limited
+	 *     stale value while uclamp_min has been raised in between ticks.
+	 *
+	 * Applied regardless of screen_state: the boolean above has
+	 * already picked whether the screen-off override suppression
+	 * fires, but the floor is useful in screen-on paths too (e.g.
+	 * a light-load cap would otherwise clip a meaningful hint).
+	 */
+	if (uclamp_min && max_cap) {
+		unsigned int uclamp_floor = map_util_freq(uclamp_min,
+							  policy->cpuinfo.max_freq,
+							  max_cap);
+		if (freq < uclamp_floor) {
+			freq = uclamp_floor;
+			tp_path = "uclamp_min_floor";
+		}
 	}
 
 resolve:
@@ -2276,6 +2398,31 @@ static ssize_t util_math_v2_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr util_math_v2 = __ATTR_RW(util_math_v2);
 
+/*
+ * uclamp_min_respect sysfs knob.  See the ZENITH_DEFAULT_UCLAMP_MIN_RESPECT
+ * comment block at the top of this file for full semantics.  Normalised to
+ * 0/1 on store.  No cache invalidation required -- the value is re-read
+ * from tunables on every zenith_get_next_freq() call.
+ */
+static ssize_t uclamp_min_respect_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->uclamp_min_respect);
+}
+
+static ssize_t uclamp_min_respect_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->uclamp_min_respect = !!val;
+	return count;
+}
+static struct governor_attr uclamp_min_respect = __ATTR_RW(uclamp_min_respect);
+
 static struct attribute *zenith_attrs[] = {
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
@@ -2312,6 +2459,7 @@ static struct attribute *zenith_attrs[] = {
 	&kcpustat_filter_shift.attr,
 	&kcpustat_hispeed_enable.attr,
 	&util_math_v2.attr,
+	&uclamp_min_respect.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -2445,6 +2593,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->kcpustat_filter_shift	= ZENITH_DEFAULT_KCPUSTAT_FILTER_SHIFT;
 	tunables->kcpustat_hispeed_enable = ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE;
 	tunables->util_math_v2		= ZENITH_DEFAULT_UTIL_MATH_V2;
+	tunables->uclamp_min_respect	= ZENITH_DEFAULT_UCLAMP_MIN_RESPECT;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	/* If zenith.profile= was passed on the kernel cmdline, apply it
