@@ -419,10 +419,6 @@ struct task_group {
 	struct list_head	siblings;
 	struct list_head	children;
 
-#ifdef CONFIG_SCHED_AUTOGROUP
-	struct autogroup	*autogroup;
-#endif
-
 	struct cfs_bandwidth	cfs_bandwidth;
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
@@ -438,7 +434,11 @@ struct task_group {
 	ANDROID_VENDOR_DATA_ARRAY(1, 4);
 #endif
 
+#ifdef CONFIG_SCHED_AUTOGROUP
+	ANDROID_KABI_USE(1, struct autogroup *autogroup);
+#else
 	ANDROID_KABI_RESERVE(1);
+#endif
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
