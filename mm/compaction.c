@@ -2651,8 +2651,18 @@ int sysctl_compact_memory;
  * Tunable for proactive compaction. It determines how
  * aggressively the kernel should compact memory in the
  * background. It takes values in the range [0, 100].
+ *
+ * Upstream default is 20; on long-uptime Android devices that value is
+ * too conservative — external fragmentation grows over days of use and
+ * THP / CMA allocations degrade, which on a phone manifests as slowly
+ * worsening app cold-launch times the longer you go without a reboot.
+ * Raising the default to 40 keeps kcompactd slightly more active in the
+ * background but still well below the point at which it would compete
+ * with userspace for CPU under load (kcompactd is rate-limited and
+ * fragmentation-gated). Userspace can still tune at runtime via
+ * /proc/sys/vm/compaction_proactiveness.
  */
-unsigned int __read_mostly sysctl_compaction_proactiveness = 20;
+unsigned int __read_mostly sysctl_compaction_proactiveness = 40;
 
 int compaction_proactiveness_sysctl_handler(struct ctl_table *table, int write,
 		void *buffer, size_t *length, loff_t *ppos)
