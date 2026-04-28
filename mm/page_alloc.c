@@ -354,7 +354,18 @@ int watermark_boost_factor __read_mostly;
 #else
 int watermark_boost_factor __read_mostly = 15000;
 #endif
-int watermark_scale_factor = 100;
+/*
+ * watermark_scale_factor is expressed in units of 0.01% of total memory.
+ * The upstream default is 10 (0.1%); we already ship 100 (1%) from the
+ * phone-class mm/TCP defaults drop. Bumping to 200 (2%) widens the
+ * low..high watermark band further so kswapd wakes earlier and direct
+ * reclaim is correspondingly rarer on 8 GiB+ devices running with a
+ * bursty foreground allocator (camera, games, Chrome). This trades a
+ * small amount of steady-state "free" memory for noticeably fewer
+ * allocation stalls under load; userspace can still lower it at runtime
+ * via /proc/sys/vm/watermark_scale_factor.
+ */
+int watermark_scale_factor = 200;
 
 /*
  * Extra memory for the system to try freeing. Used to temporarily
