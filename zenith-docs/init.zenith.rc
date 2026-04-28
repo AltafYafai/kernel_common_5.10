@@ -1,0 +1,132 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# init.zenith.rc — Android init.rc example for activating zenith
+#
+# Copy this file to your vendor
+# /etc/init/init.zenith.rc, fix the on-trigger requirements for your
+# device, and import it from your top-level init.rc with
+# ex: in init.mt6789.rc > or any init.mtxxx.rc
+#    import /vendor/etc/init/init.zenith.rc
+#
+# All kernel-side phone-class defaults (mm/, net/ipv4/, net/core/) are
+# baked into the kernel image and need no userspace setup. This file
+# only handles knobs that can NOT be hard-coded into the kernel:
+#
+#   - Switching the active CPUFreq governor to zenith on every policy.
+#     (Switching governors is per-policy at runtime; it can't be done
+#     from the kernel itself once another governor is up.)
+#   - Picking a zenith profile preset.
+#   - Enabling KSM (kernel default is off by design).
+#   - Optional BORE tunables for users who want to deviate from
+#     defaults.
+#
+# Triggers used:
+#
+#   on early-boot           -- runs after `init` but before zygote.
+#                              Suitable for governor switch.
+#   on property:sys.boot_completed=1
+#                           -- runs after Android boot completion. Used
+#                              for KSM since it is genuinely opt-in
+#                              (we do not want it scanning during the
+#                              boot critical path).
+#
+# Author: ENI (exclusively for LO)
+
+# -------------------------------------------------------------------
+# CPUFreq governor switch
+# -------------------------------------------------------------------
+# Switch every cpufreq policy to zenith. The cpu0/cpu1/... globbing
+# pattern in init.rc is a single line per policy; on a 8-core SoC with
+# two clusters (Helio P65 / 6-2 split) you need cpu0 and cpu6, plus
+# the rest of cpu1..cpu5 / cpu7 are followers and inherit. We list
+# them all explicitly to be robust against the platform reporting
+# different policy ownership.
+
+on early-boot
+    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor zenith
+    write /sys/devices/system/cpu/cpu1/cpufreq/scaling_governor zenith
+    write /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor zenith
+    write /sys/devices/system/cpu/cpu3/cpufreq/scaling_governor zenith
+    write /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor zenith
+    write /sys/devices/system/cpu/cpu5/cpufreq/scaling_governor zenith
+    write /sys/devices/system/cpu/cpu6/cpufreq/scaling_governor zenith
+    write /sys/devices/system/cpu/cpu7/cpufreq/scaling_governor zenith
+
+    # Pick a profile preset. See zenith.rst for full descriptions:
+    #   performance / balanced / battery / legacy / custom
+    write /sys/devices/system/cpu/cpufreq/zenith/profile balanced
+
+    # Enable the auto-tune classifier so up_threshold / down_threshold
+    # rebalance based on observed input rate and saturation.
+    write /sys/devices/system/cpu/cpufreq/zenith/auto_tune 1
+
+    # Auto-track display blank/unblank for screen_state, and thermal
+    # framework for thermal_state, instead of relying on userspace.
+    write /sys/devices/system/cpu/cpufreq/zenith/screen_auto 1
+    write /sys/devices/system/cpu/cpufreq/zenith/thermal_auto 1
+
+    # Reasonable input boost duration. Default is already 80, listed
+    # here for clarity.
+    write /sys/devices/system/cpu/cpufreq/zenith/input_boost_ms 80
+
+# -------------------------------------------------------------------
+# Optional BORE retunes
+# -------------------------------------------------------------------
+# All BORE knobs are sane out of the box. Uncomment any of these
+# lines only if you have a measured reason to deviate from defaults
+# (see Documentation/admin-guide/pm/zenith-stack.rst).
+
+#on early-boot
+#    # Stronger latency-vs-burst penalty (default 1280; ~1.25× scale).
+#    write /proc/sys/kernel/sched_burst_penalty_scale 1536
+#
+#    # Slightly more lenient burst offset (default 22).
+#    write /proc/sys/kernel/sched_burst_penalty_offset 18
+#
+#    # Disable BORE entirely for an A/B test with stock CFS.
+#    write /proc/sys/kernel/sched_bore 0
+
+# -------------------------------------------------------------------
+# KSM (Kernel Samepage Merging)
+# -------------------------------------------------------------------
+# KSM is off by default in this kernel — deliberately, because it
+# adds CPU cost during the boot critical path. Enable after Android
+# boot completes so the dedup scan never delays an app launch.
+
+on property:sys.boot_completed=1
+    # 0 = stop+unmerge, 1 = scan, 2 = unmerge+stop. Want 1.
+    write /sys/kernel/mm/ksm/run 1
+
+    # Pages per ksmd wakeup. 100 is a good default; raise for higher
+    # dedup convergence at the cost of background CPU.
+    write /sys/kernel/mm/ksm/pages_to_scan 100
+
+    # ksmd sleep duration between batches.
+    write /sys/kernel/mm/ksm/sleep_millisecs 200
+
+# -------------------------------------------------------------------
+# Notes on what is NOT here
+# -------------------------------------------------------------------
+# The following are intentionally OMITTED because the kernel already
+# ships them as compile-time defaults (see zenith-stack.rst):
+#
+#   /proc/sys/vm/swappiness            (=100, baked)
+#   /proc/sys/vm/dirty_ratio           (=10, baked)
+#   /proc/sys/vm/dirty_background_ratio(=5, baked)
+#   /proc/sys/vm/watermark_scale_factor(=100, baked)
+#   /proc/sys/vm/vfs_cache_pressure    (=200, baked)
+#   /proc/sys/net/core/rmem_max        (=16777216, baked)
+#   /proc/sys/net/core/wmem_max        (=16777216, baked)
+#   /proc/sys/net/core/netdev_max_backlog (=16384, baked)
+#   /proc/sys/net/core/default_qdisc   (=cake, baked)
+#   /proc/sys/net/ipv4/tcp_slow_start_after_idle (=0, baked)
+#   /proc/sys/net/ipv4/tcp_nometrics_save (=1, baked)
+#   /proc/sys/net/ipv4/tcp_fastopen    (=0x3, baked)
+#   /proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout (=0, baked)
+#   /proc/sys/net/ipv4/tcp_limit_output_bytes (=4194304, baked)
+#   /proc/sys/net/ipv4/tcp_congestion_control (=bbr, baked via defconfig)
+#
+# If you intentionally want different values from kernel defaults,
+# add `write` lines for them under `on early-boot` here. Do not edit
+# the kernel image to revert any of the above unless you genuinely
+# need device-specific values that diverge from phone-class baseline.
