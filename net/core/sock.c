@@ -282,8 +282,31 @@ EXPORT_SYMBOL(sysctl_rmem_max);
 __u32 sysctl_wmem_default __read_mostly = SK_WMEM_MAX;
 __u32 sysctl_rmem_default __read_mostly = SK_RMEM_MAX;
 
-/* Maximal space eaten by iovec or ancillary data plus some space */
-int sysctl_optmem_max __read_mostly = sizeof(unsigned long)*(2*UIO_MAXIOV+512);
+/* Maximal space eaten by iovec or ancillary data plus some space.
+ *
+ * The mainline 5.10 default sizes to sizeof(long)*(2*UIO_MAXIOV+512),
+ * which is ~20 KiB on 64-bit. On modern phones this is a recurring
+ * pain point:
+ *
+ *  - BPF socket filters attached by userspace (cBPF and eBPF) count
+ *    against optmem_max (see net/core/filter.c:sk_attach_filter()).
+ *    A realistic Android filter set (SO_ATTACH_BPF for packet
+ *    classification + a logging filter + SO_EE_ORIGIN_TIMESTAMPING
+ *    ancillary) can exceed 20 KiB per socket, which is why modern
+ *    distros have shipped 64 KiB as the de-facto default since 5.17.
+ *
+ *  - SO_TIMESTAMPING_OPT_STATS cmsg bursts on a busy VoLTE/VoNR flow
+ *    can also push past the ceiling and get silently truncated, losing
+ *    the hardware-timestamp diagnostic data the radio stack relies on.
+ *
+ *  - TLS 1.3 ULP + MSG_ZEROCOPY ancillary queue up per-skb error
+ *    cmsgs; at ~2 KiB each, 20 KiB is ~10 in flight before drops.
+ *
+ * Bump to 64 KiB, matching the post-5.17 mainline default. This is
+ * only a *ceiling* on ancillary/optval allocations -- no pre-alloc,
+ * no per-socket memory cost unless the socket actually uses it.
+ */
+int sysctl_optmem_max __read_mostly = 64 * 1024;
 EXPORT_SYMBOL(sysctl_optmem_max);
 
 int sysctl_tstamp_allow_data __read_mostly = 1;
