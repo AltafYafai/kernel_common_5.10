@@ -126,6 +126,61 @@ All KSM tunables live under ``/sys/kernel/mm/ksm/``.
     Read-only statistics. Useful for measuring whether KSM is doing
     real work.
 
+KSM Advisor (mainline 6.7+ backport)
+------------------------------------
+
+This kernel backports the KSM Advisor (Stefan Roesch, SuSE). When
+enabled, the advisor automatically retunes ``pages_to_scan`` based on
+how long each full scan takes versus a configured target, so users no
+longer need to babysit ``pages_to_scan`` to balance dedup latency
+against ksmd CPU cost.
+
+Default is **disabled** — KSM behaves exactly as before until the
+advisor is opted into.
+
+``advisor_mode``
+    ``[none] scan-time`` (default) — advisor disabled, manual tuning
+    only. Write ``scan-time`` to enable the scan-time advisor. Write
+    ``none`` to disable. Switching modes resets the advisor context
+    and rebases ``pages_to_scan`` to either the default (none) or
+    ``advisor_min_pages_to_scan`` (scan-time).
+
+``advisor_max_cpu``
+    Cap on percent of one CPU that ksmd may consume on average,
+    enforced by capping the next ``pages_to_scan`` value.
+    Default ``70``.
+
+``advisor_min_pages_to_scan``
+    Floor for ``pages_to_scan`` when the advisor is active. Default
+    ``500``.
+
+``advisor_max_pages_to_scan``
+    Ceiling for ``pages_to_scan`` when the advisor is active.
+    Default ``30000``.
+
+``advisor_target_scan_time``
+    Target time (seconds) to complete one full scan of all candidate
+    pages. Default ``200``. **Most important parameter.** Lower =
+    advisor scans more aggressively (more dedup, more CPU); higher =
+    less aggressive.
+
+When the advisor is active in ``scan-time`` mode, writes to
+``pages_to_scan`` are refused with ``-EINVAL`` (the advisor owns the
+value). Disable the advisor to set ``pages_to_scan`` manually again.
+
+When to retune (advisor)
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+* **You want hands-off KSM** — set ``advisor_mode=scan-time``, leave
+  the rest at defaults. ksmd will rebalance itself.
+* **You want more aggressive dedup at higher CPU cost** — keep
+  advisor enabled, lower ``advisor_target_scan_time`` to 60.
+* **You want more conservative dedup** — raise
+  ``advisor_target_scan_time`` toward 600. Or lower
+  ``advisor_max_cpu`` to 30.
+* **Mainline reference**: see ``Documentation/admin-guide/mm/ksm.rst``
+  upstream.
+
 When to retune
 --------------
 

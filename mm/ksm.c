@@ -20,6 +20,7 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/coredump.h>
+#include <linux/sched/cputime.h>
 #include <linux/rwsem.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
@@ -288,6 +289,65 @@ static unsigned int zero_checksum __read_mostly;
 /* Whether to merge empty (zeroed) pages with actual zero pages */
 static bool ksm_use_zero_pages __read_mostly;
 
+/*
+ * KSM Advisor
+ * ===========
+ *
+ * Backport of mainline 6.7+ KSM Advisor (Stefan Roesch, SuSE).
+ *
+ * The advisor automatically tunes ksm_thread_pages_to_scan based on
+ * how long a full scan takes vs ksm_advisor_target_scan_time. With
+ * the advisor disabled (default) KSM behaves exactly as before. With
+ * advisor_mode=scan-time, every full scan rebalances pages_to_scan so
+ * that:
+ *
+ *      observed_scan_time -> ksm_advisor_target_scan_time
+ *
+ * subject to caps from ksm_advisor_max_cpu (max % of one CPU that
+ * ksmd is allowed to consume) and the absolute floor / ceiling in
+ * ksm_advisor_min_pages_to_scan / ksm_advisor_max_pages_to_scan.
+ */
+
+/* Don't scan more than max pages per batch. */
+static unsigned long ksm_advisor_max_pages_to_scan = 30000;
+
+/* Min CPU for scanning pages per scan. */
+#define KSM_ADVISOR_MIN_CPU 10
+
+/* Max CPU for scanning pages per scan. */
+static unsigned int ksm_advisor_max_cpu = 70;
+
+/* Target scan time in seconds to analyze all KSM candidate pages. */
+static unsigned long ksm_advisor_target_scan_time = 200;
+
+/* Exponentially weighted moving average weight (out of 100). */
+#define KSM_ADVISOR_EWMA_WEIGHT 30
+
+/**
+ * struct ksm_advisor_ctx - per-mode state for the KSM Advisor
+ * @start_scan: ktime_t when the current full scan began
+ * @scan_time:  duration in seconds of the previous full scan
+ * @change:     EWMA-smoothed change-factor (in percent) applied last
+ * @cpu_time:   ksmd's task_sched_runtime() at end of previous scan
+ */
+struct ksm_advisor_ctx {
+	ktime_t start_scan;
+	unsigned long scan_time;
+	unsigned long change;
+	unsigned long long cpu_time;
+};
+static struct ksm_advisor_ctx advisor_ctx;
+
+/* Define different advisors. */
+enum ksm_advisor_type {
+	KSM_ADVISOR_NONE,
+	KSM_ADVISOR_SCAN_TIME,
+};
+static enum ksm_advisor_type ksm_advisor;
+
+/* At least scan this many pages per batch (advisor floor). */
+static unsigned long ksm_advisor_min_pages_to_scan = 500;
+
 #ifdef CONFIG_NUMA
 /* Zeroed when merging across nodes is not allowed */
 static unsigned int ksm_merge_across_nodes = 1;
@@ -303,6 +363,107 @@ static int ksm_nr_node_ids = 1;
 #define KSM_RUN_OFFLINE	4
 static unsigned long ksm_run = KSM_RUN_STOP;
 static void wait_while_offlining(void);
+
+#define KSM_DEFAULT_PAGES_TO_SCAN 100
+
+static void set_advisor_defaults(void)
+{
+	if (ksm_advisor == KSM_ADVISOR_NONE) {
+		ksm_thread_pages_to_scan = KSM_DEFAULT_PAGES_TO_SCAN;
+	} else if (ksm_advisor == KSM_ADVISOR_SCAN_TIME) {
+		advisor_ctx = (const struct ksm_advisor_ctx){ 0 };
+		ksm_thread_pages_to_scan = ksm_advisor_min_pages_to_scan;
+	}
+}
+
+static inline void advisor_start_scan(void)
+{
+	if (ksm_advisor == KSM_ADVISOR_SCAN_TIME)
+		advisor_ctx.start_scan = ktime_get();
+}
+
+static inline unsigned long ksm_advisor_prev_scan_time(
+		struct ksm_advisor_ctx *ctx, unsigned long scan_time)
+{
+	return ctx->scan_time ? ctx->scan_time : scan_time;
+}
+
+static unsigned long ksm_advisor_ewma(unsigned long prev, unsigned long curr)
+{
+	return ((100 - KSM_ADVISOR_EWMA_WEIGHT) * prev +
+		KSM_ADVISOR_EWMA_WEIGHT * curr) / 100;
+}
+
+/*
+ * Recompute ksm_thread_pages_to_scan from observed scan time.
+ * Mirrors the mainline scan_time_advisor() exactly.
+ */
+static void ksm_scan_time_advisor(void)
+{
+	unsigned int cpu_percent;
+	unsigned long cpu_time;
+	unsigned long cpu_time_diff;
+	unsigned long cpu_time_diff_ms;
+	unsigned long pages;
+	unsigned long per_page_cost;
+	unsigned long factor;
+	unsigned long change;
+	unsigned long last_scan_time;
+	unsigned long scan_time;
+
+	/* Convert scan time to seconds. */
+	scan_time = div_s64(
+		ktime_ms_delta(ktime_get(), advisor_ctx.start_scan),
+		MSEC_PER_SEC);
+	scan_time = scan_time ? scan_time : 1;
+
+	/* Calculate CPU consumption of ksmd background thread. */
+	cpu_time = task_sched_runtime(current);
+	cpu_time_diff = cpu_time - advisor_ctx.cpu_time;
+	cpu_time_diff_ms = cpu_time_diff / 1000 / 1000;
+
+	cpu_percent = (cpu_time_diff_ms * 100) / (scan_time * 1000);
+	cpu_percent = cpu_percent ? cpu_percent : 1;
+	last_scan_time = ksm_advisor_prev_scan_time(&advisor_ctx, scan_time);
+
+	/* Calculate scan time as percentage of target scan time. */
+	factor = ksm_advisor_target_scan_time * 100 / scan_time;
+	factor = factor ? factor : 1;
+
+	/*
+	 * Calculate scan time as percentage of last scan time, EWMA-smooth.
+	 */
+	change = scan_time * 100 / last_scan_time;
+	change = change ? change : 1;
+	change = ksm_advisor_ewma(advisor_ctx.change, change);
+
+	/* Calculate new scan rate based on target scan rate. */
+	pages = ksm_thread_pages_to_scan * 100 / factor;
+	/* Update pages_to_scan by weighted change percentage. */
+	pages = pages * change / 100;
+
+	/* Cap new pages_to_scan value. */
+	per_page_cost = ksm_thread_pages_to_scan / cpu_percent;
+	per_page_cost = per_page_cost ? per_page_cost : 1;
+
+	pages = min(pages, per_page_cost * ksm_advisor_max_cpu);
+	pages = max(pages, per_page_cost * KSM_ADVISOR_MIN_CPU);
+	pages = min(pages, ksm_advisor_max_pages_to_scan);
+	pages = max(pages, ksm_advisor_min_pages_to_scan);
+
+	/* Update advisor context. */
+	advisor_ctx.change = change;
+	advisor_ctx.scan_time = scan_time;
+	advisor_ctx.cpu_time = cpu_time;
+
+	ksm_thread_pages_to_scan = pages;
+}
+
+static void advisor_stop_scan(void)
+{
+	if (ksm_advisor == KSM_ADVISOR_SCAN_TIME)
+		ksm_scan_time_advisor();
+}
 
 static DECLARE_WAIT_QUEUE_HEAD(ksm_thread_wait);
 static DECLARE_WAIT_QUEUE_HEAD(ksm_iter_wait);
@@ -2329,6 +2490,7 @@ static struct rmap_item *scan_get_next_rmap_item(struct page **page)
 
 	slot = ksm_scan.mm_slot;
 	if (slot == &ksm_mm_head) {
+		advisor_start_scan();
 		/*
 		 * A number of pages can hang around indefinitely on per-cpu
 		 * pagevecs, raised page count preventing write_protect_page
@@ -2481,6 +2643,8 @@ next_mm:
 	slot = ksm_scan.mm_slot;
 	if (slot != &ksm_mm_head)
 		goto next_mm;
+
+	advisor_stop_scan();
 
 	ksm_scan.seqnr++;
 	return NULL;
@@ -2978,6 +3142,14 @@ static ssize_t pages_to_scan_store(struct kobject *kobj,
 	int err;
 	unsigned long nr_pages;
 
+	/*
+	 * The advisor owns ksm_thread_pages_to_scan when active; refuse
+	 * userspace writes to it so the next scan_time_advisor() pass
+	 * doesn't immediately clobber the user value.
+	 */
+	if (ksm_advisor != KSM_ADVISOR_NONE)
+		return -EINVAL;
+
 	err = kstrtoul(buf, 10, &nr_pages);
 	if (err || nr_pages > UINT_MAX)
 		return -EINVAL;
@@ -3242,6 +3414,137 @@ static ssize_t full_scans_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(full_scans);
 
+/*
+ * Advisor sysfs surface (mainline 6.7+ backport).
+ */
+
+static ssize_t advisor_mode_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	const char *output;
+
+	if (ksm_advisor == KSM_ADVISOR_NONE)
+		output = "[none] scan-time";
+	else
+		output = "none [scan-time]";
+
+	return sysfs_emit(buf, "%s\n", output);
+}
+
+static ssize_t advisor_mode_store(struct kobject *kobj,
+				  struct kobj_attribute *attr, const char *buf,
+				  size_t count)
+{
+	enum ksm_advisor_type curr_advisor = ksm_advisor;
+
+	if (sysfs_streq("scan-time", buf))
+		ksm_advisor = KSM_ADVISOR_SCAN_TIME;
+	else if (sysfs_streq("none", buf))
+		ksm_advisor = KSM_ADVISOR_NONE;
+	else
+		return -EINVAL;
+
+	/* Set advisor default values when advisor is changed. */
+	if (curr_advisor != ksm_advisor)
+		set_advisor_defaults();
+
+	return count;
+}
+KSM_ATTR(advisor_mode);
+
+static ssize_t advisor_max_cpu_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", ksm_advisor_max_cpu);
+}
+
+static ssize_t advisor_max_cpu_store(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	int err;
+	unsigned long value;
+
+	err = kstrtoul(buf, 10, &value);
+	if (err)
+		return -EINVAL;
+
+	ksm_advisor_max_cpu = value;
+	return count;
+}
+KSM_ATTR(advisor_max_cpu);
+
+static ssize_t advisor_min_pages_to_scan_show(struct kobject *kobj,
+					      struct kobj_attribute *attr,
+					      char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", ksm_advisor_min_pages_to_scan);
+}
+
+static ssize_t advisor_min_pages_to_scan_store(struct kobject *kobj,
+					       struct kobj_attribute *attr,
+					       const char *buf, size_t count)
+{
+	int err;
+	unsigned long value;
+
+	err = kstrtoul(buf, 10, &value);
+	if (err)
+		return -EINVAL;
+
+	ksm_advisor_min_pages_to_scan = value;
+	return count;
+}
+KSM_ATTR(advisor_min_pages_to_scan);
+
+static ssize_t advisor_max_pages_to_scan_show(struct kobject *kobj,
+					      struct kobj_attribute *attr,
+					      char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", ksm_advisor_max_pages_to_scan);
+}
+
+static ssize_t advisor_max_pages_to_scan_store(struct kobject *kobj,
+					       struct kobj_attribute *attr,
+					       const char *buf, size_t count)
+{
+	int err;
+	unsigned long value;
+
+	err = kstrtoul(buf, 10, &value);
+	if (err)
+		return -EINVAL;
+
+	ksm_advisor_max_pages_to_scan = value;
+	return count;
+}
+KSM_ATTR(advisor_max_pages_to_scan);
+
+static ssize_t advisor_target_scan_time_show(struct kobject *kobj,
+					     struct kobj_attribute *attr,
+					     char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", ksm_advisor_target_scan_time);
+}
+
+static ssize_t advisor_target_scan_time_store(struct kobject *kobj,
+					      struct kobj_attribute *attr,
+					      const char *buf, size_t count)
+{
+	int err;
+	unsigned long value;
+
+	err = kstrtoul(buf, 10, &value);
+	if (err)
+		return -EINVAL;
+	if (value < 1)
+		return -EINVAL;
+
+	ksm_advisor_target_scan_time = value;
+	return count;
+}
+KSM_ATTR(advisor_target_scan_time);
+
 static struct attribute *ksm_attrs[] = {
 	&sleep_millisecs_attr.attr,
 	&pages_to_scan_attr.attr,
@@ -3259,6 +3562,11 @@ static struct attribute *ksm_attrs[] = {
 	&stable_node_dups_attr.attr,
 	&stable_node_chains_prune_millisecs_attr.attr,
 	&use_zero_pages_attr.attr,
+	&advisor_mode_attr.attr,
+	&advisor_max_cpu_attr.attr,
+	&advisor_min_pages_to_scan_attr.attr,
+	&advisor_max_pages_to_scan_attr.attr,
+	&advisor_target_scan_time_attr.attr,
 	NULL,
 };
 
