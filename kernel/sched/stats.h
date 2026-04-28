@@ -69,6 +69,17 @@ static inline void psi_enqueue(struct task_struct *p, bool wakeup)
 	if (static_branch_likely(&psi_disabled))
 		return;
 
+	/*
+	 * A task coming onto an rq while in memstall resumes burning CPU
+	 * on reclaim, so mark it as such. TSK_MEMSTALL_RUNNING flows
+	 * through psi_task_change() into the nr_memstall_running counter
+	 * kept on the per-cpu psi_group_cpu_ext wrapper; it is NOT an
+	 * index into groupc->tasks[] and therefore does not grow
+	 * NR_PSI_TASK_COUNTS.
+	 */
+	if (p->in_memstall)
+		set |= TSK_MEMSTALL_RUNNING;
+
 	if (!wakeup || p->sched_psi_wake_requeue) {
 		if (p->in_memstall)
 			set |= TSK_MEMSTALL;
@@ -88,6 +99,15 @@ static inline void psi_dequeue(struct task_struct *p, bool sleep)
 
 	if (static_branch_likely(&psi_disabled))
 		return;
+
+	/*
+	 * A task leaving the rq stops being a "running memstall task"
+	 * regardless of whether it is truly going to sleep or just
+	 * being migrated/requeued. Symmetric counterpart of the
+	 * psi_enqueue() case above.
+	 */
+	if (p->in_memstall)
+		clear |= TSK_MEMSTALL_RUNNING;
 
 	if (!sleep) {
 		if (p->in_memstall)

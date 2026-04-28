@@ -29,6 +29,24 @@ enum psi_task_count {
 #define TSK_MEMSTALL	(1 << NR_MEMSTALL)
 #define TSK_RUNNING	(1 << NR_RUNNING)
 #define TSK_ONCPU	(1 << NR_ONCPU)
+/*
+ * TSK_MEMSTALL_RUNNING is the "currently burning CPU on reclaim" signal
+ * used to distinguish PSI_MEM_FULL (no productive work) from
+ * PSI_MEM_SOME (reclaim running = still productive). It intentionally
+ * does NOT have a matching NR_MEMSTALL_RUNNING slot in
+ * enum psi_task_count: growing NR_PSI_TASK_COUNTS would change the
+ * layout of struct psi_group_cpu and break the GKI kABI chain
+ * (psi_group_cpu -> psi_group -> cgroup -> task_struct).
+ *
+ * Instead, the bit lives at (1 << NR_PSI_TASK_COUNTS), is routed
+ * through the same psi_task_change() clear/set fast path as the other
+ * TSK_* flags, and is accounted in a parallel per-cpu counter that
+ * hangs off an internal psi_group_cpu_ext wrapper allocated alongside
+ * each psi_group_cpu. Defining the bit here keeps psi_enqueue() /
+ * psi_dequeue() in kernel/sched/stats.h symmetric with the rest of
+ * the TSK_* set.
+ */
+#define TSK_MEMSTALL_RUNNING	(1U << NR_PSI_TASK_COUNTS)
 
 /* Resources that workloads could be stalled on */
 enum psi_res {
