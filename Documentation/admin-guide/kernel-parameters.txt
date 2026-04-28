@@ -6422,3 +6422,15 @@
 				memory, and other data can't be written using
 				xmon commands.
 			off	xmon is disabled.
+
+	zenith.profile=	[KNL]
+			Format: { performance | balanced | battery | legacy | custom }
+			Pre-select one of the zenith CPUFreq governor's
+			preset profiles before the first cpufreq policy is
+			initialised, instead of waiting for userspace to
+			write /sys/devices/system/cpu/cpufreq/zenith/profile.
+			Useful so init scripts don't race the governor's
+			first decisions with a one-shot sysfs write.
+			Unknown values are ignored with a pr_warn() and
+			the governor comes up in the "custom" (defaults)
+			state. Default: custom.

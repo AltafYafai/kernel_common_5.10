@@ -67,6 +67,14 @@
 #define ZENITH_PROFILE_BALANCED			2
 #define ZENITH_PROFILE_BATTERY			3
 #define ZENITH_PROFILE_LEGACY			4
+
+/* Profile selected via the zenith.profile= kernel cmdline. Parsed by
+ * zenith_setup_profile() at early_param time and consumed on the
+ * first-init branch of zenith_init() so the governor comes up on the
+ * requested preset before any userspace can write to the profile sysfs
+ * node. Defaults to CUSTOM, which means "no cmdline override".
+ */
+static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_CLIMB_MODE		ZENITH_CLIMB_MODE_SNAP
 #define ZENITH_DEFAULT_FREQ_STEP_PCT		5
 #define ZENITH_DEFAULT_THERMAL_AUTO		0
@@ -1468,6 +1476,34 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(zenith_input_boost_active_ms, t->input_boost_ms);
 }
 
+/* early_param("zenith.profile", ...) — accepts one of the canonical
+ * preset names (performance / balanced / battery / legacy / custom).
+ * Anything else is ignored and leaves zenith_cmdline_profile at CUSTOM.
+ *
+ * Returning 1 tells the early-param core "consumed, do not append to
+ * the residual cmdline"; returning 0 would leak the value into init
+ * env via the unknown-param fallback.
+ */
+static int __init zenith_setup_profile(char *s)
+{
+	if (!s)
+		return 1;
+	if (!strcmp(s, "performance"))
+		zenith_cmdline_profile = ZENITH_PROFILE_PERFORMANCE;
+	else if (!strcmp(s, "balanced"))
+		zenith_cmdline_profile = ZENITH_PROFILE_BALANCED;
+	else if (!strcmp(s, "battery"))
+		zenith_cmdline_profile = ZENITH_PROFILE_BATTERY;
+	else if (!strcmp(s, "legacy"))
+		zenith_cmdline_profile = ZENITH_PROFILE_LEGACY;
+	else if (!strcmp(s, "custom"))
+		zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
+	else
+		pr_warn("zenith.profile=%s: unknown preset, ignored\n", s);
+	return 1;
+}
+early_param("zenith.profile", zenith_setup_profile);
+
 /************************ Auto-tune observer *****************************/
 
 /* Classify the workload seen since the last pass and pick a profile.
@@ -2410,6 +2446,17 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->kcpustat_hispeed_enable = ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE;
 	tunables->util_math_v2		= ZENITH_DEFAULT_UTIL_MATH_V2;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
+
+	/* If zenith.profile= was passed on the kernel cmdline, apply it
+	 * now (once, on the first policy that triggers global_tunables
+	 * creation). This happens before the sysfs attr set is published
+	 * by kobject_init_and_add() below, so userspace sees the
+	 * cmdline-picked preset as the initial state of the profile node.
+	 */
+	if (zenith_cmdline_profile != ZENITH_PROFILE_CUSTOM) {
+		zenith_apply_profile(tunables, zenith_cmdline_profile);
+		tunables->active_profile = zenith_cmdline_profile;
+	}
 
 	ret = kobject_init_and_add(&tunables->attr_set.kobj,
 				   &zenith_tunables_ktype,
