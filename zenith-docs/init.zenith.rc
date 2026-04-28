@@ -104,6 +104,28 @@ on property:sys.boot_completed=1
     # ksmd sleep duration between batches.
     write /sys/kernel/mm/ksm/sleep_millisecs 200
 
+    # KSM Advisor (mainline 6.7+ backport): hands-off auto-tune of
+    # pages_to_scan based on observed full-scan duration.
+    # Setting advisor_mode=scan-time makes pages_to_scan a self-tuning
+    # variable; it converges so a full scan takes
+    # advisor_target_scan_time seconds, capped by advisor_max_cpu and
+    # advisor_max_pages_to_scan. Recommended for phones.
+    write /sys/kernel/mm/ksm/advisor_mode scan-time
+
+    # ----------------------------------------------------------------
+    # DAMON_RECLAIM activation
+    # ----------------------------------------------------------------
+    # Already CONFIG_DAMON_RECLAIM=y in this kernel; just activate it.
+    # The watermark gate keeps it dormant when the system has plenty
+    # of free memory, so this is safe to enable unconditionally.
+    write /sys/module/damon_reclaim/parameters/enabled Y
+
+    # Optionally tune for phone-class:
+    #   - lower min_age to 60s (default 120s) for snappier reclaim
+    #   - raise wmarks_high to 800 (=8% free) to activate earlier
+    # write /sys/module/damon_reclaim/parameters/min_age 60000000
+    # write /sys/module/damon_reclaim/parameters/wmarks_high 800
+
 # -------------------------------------------------------------------
 # Notes on what is NOT here
 # -------------------------------------------------------------------

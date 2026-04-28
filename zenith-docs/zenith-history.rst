@@ -191,6 +191,122 @@ When to retune
 * **Low dedup ratio** (single foreground app, small user-space) →
   consider just leaving ksm off.
 
+DAMON_RECLAIM — Proactive cold-page reclaim
+===========================================
+
+DAMON_RECLAIM is a kernel module that uses the **D**\ ata **A**\ ccess
+**MON**\ itoring framework to identify memory pages that have not been
+accessed for a configurable cold age, and reclaims them ahead of
+direct-reclaim pressure. The result is fewer frame drops under memory
+pressure, since the slow part of reclaim happens in the background
+while the phone has spare CPU.
+
+This kernel ships DAMON_RECLAIM **enabled at build time but not
+activated at runtime** (``enabled=N`` by default). The author of
+DAMON_RECLAIM (SeongJae Park, Amazon) explicitly recommends watermark-
+gated activation, so userspace turns it on once and the watermarks
+keep it dormant unless memory is genuinely pressured.
+
+Build state in this kernel::
+
+    CONFIG_DAMON=y
+    CONFIG_DAMON_PADDR=y
+    CONFIG_DAMON_RECLAIM=y
+
+Activate at runtime by writing ``Y`` to::
+
+    /sys/module/damon_reclaim/parameters/enabled
+
+(see ``init.zenith.rc.example`` for a vendor-init recipe)
+
+All knobs live under ``/sys/module/damon_reclaim/parameters/``:
+
+``enabled``
+    Master switch. ``N`` (default) = inactive. ``Y`` = activate the
+    DAMON_RECLAIM kthread (will still gate on the watermarks below).
+
+``min_age``
+    Microseconds of no-access required for a page to be considered
+    cold. Default ``120000000`` (120 s). Lower → more aggressive
+    reclaim; higher → only truly idle pages get evicted.
+
+``quota_ms``
+    Maximum CPU time (ms) DAMON_RECLAIM may spend on reclaim within
+    one quota window. Default ``10``.
+
+``quota_sz``
+    Maximum bytes reclaimed within one quota window. Default ``128
+    MiB``.
+
+``quota_reset_interval_ms``
+    Length of one quota window. Default ``1000`` (1 s). With the
+    defaults above, DAMON_RECLAIM is allowed to spend up to 10 ms of
+    CPU and reclaim up to 128 MiB every second.
+
+``wmarks_interval``
+    How often (microseconds) the watermark gate is re-evaluated.
+    Default ``5000000`` (5 s).
+
+``wmarks_high``
+    Percentage of free memory above which DAMON_RECLAIM goes
+    inactive. Default ``500`` (= 5 % free; i.e., when free memory >=
+    5 %, don't reclaim). Phone-class systems with zRAM may want to
+    raise this so DAMON_RECLAIM activates earlier.
+
+``wmarks_mid``
+    Percentage at which DAMON_RECLAIM activates if currently
+    inactive. Default ``400`` (= 4 % free).
+
+``wmarks_low``
+    Percentage at which DAMON_RECLAIM goes inactive (independent of
+    high). Default ``200`` (= 2 % free).
+
+``sample_interval`` / ``aggr_interval`` / ``min_nr_regions`` / ``max_nr_regions``
+    DAMON sampling parameters. Defaults are ``5000`` µs / ``100000``
+    µs / ``10`` / ``1000``. Don't change without reading
+    ``Documentation/admin-guide/mm/damon/usage.rst``.
+
+``monitor_region_start`` / ``monitor_region_end``
+    Restrict monitoring to a physical address range. Default ``0`` /
+    ``0`` = whole RAM.
+
+``nr_reclaim_tried_regions`` / ``bytes_reclaim_tried_regions`` / ``nr_reclaimed_regions`` / ``bytes_reclaimed_regions`` / ``nr_quota_exceeds``
+    Read-only counters. Useful for measuring whether DAMON_RECLAIM is
+    doing real work.
+
+``kdamond_pid``
+    PID of the DAMON_RECLAIM kthread when active, ``-1`` otherwise.
+
+When to activate
+----------------
+
+DAMON_RECLAIM is **complementary to KSM and zRAM**, not a replacement.
+KSM dedupes already-paged-in memory; zRAM compresses anon pages on
+swap; DAMON_RECLAIM proactively swaps cold anon pages and drops cold
+file pages so the system never enters direct-reclaim. All three
+together give you:
+
+  KSM (dedup) → DAMON_RECLAIM (proactive eviction) → zRAM (cheap swap)
+
+Recommended phone-class enable sequence (see
+``init.zenith.rc.example``)::
+
+    echo Y > /sys/module/damon_reclaim/parameters/enabled
+
+You may want to raise ``wmarks_high`` (e.g. to ``800`` = 8 %) so
+DAMON_RECLAIM activates a little earlier on phones, since the cost of
+direct-reclaim during scroll/swipe is unusually high.
+
+When to retune
+~~~~~~~~~~~~~~
+
+* **Want more aggressive proactive reclaim** → lower ``min_age`` to
+  60s, raise ``wmarks_high`` toward 800.
+* **DAMON_RECLAIM CPU cost is too high** → lower ``quota_ms`` to 5,
+  raise ``aggr_interval`` to ``200000``.
+* **You see DAMON_RECLAIM reclaim a lot but you still see direct
+  reclaim stalls** → raise ``quota_sz`` to 256 MiB.
+
 ADIOS — Adaptive Deadline I/O Scheduler
 =======================================
 
