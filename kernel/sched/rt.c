@@ -474,7 +474,34 @@ static inline bool rt_task_fits_capacity(struct task_struct *p, int cpu)
 	min_cap = uclamp_eff_value(p, UCLAMP_MIN);
 	max_cap = uclamp_eff_value(p, UCLAMP_MAX);
 
+	/*
+	 * First-pass check uses capacity_orig_of() so short, transient
+	 * thermal pressure spikes don't evict an RT task from a big
+	 * core that can still nominally hold it (otherwise audio / input
+	 * threads would thrash between clusters every time the SoC
+	 * throttled for a few ticks).
+	 */
 	cpu_cap = capacity_orig_of(cpu);
+	if (cpu_cap < min(min_cap, max_cap))
+		return false;
+
+	/*
+	 * Second-pass check subtracts the current thermal pressure on
+	 * the CPU.  When a big core is under sustained throttling, its
+	 * effective capacity can drop below what the RT task requires
+	 * (via uclamp_min on audio / InputDispatcher / SurfaceFlinger).
+	 * Returning false here lets the push / pull balancer route the
+	 * task to a currently-healthier CPU (either the other big core
+	 * or, if all bigs are throttled alike, a little core that is
+	 * thermally fresh), which empirically avoids audio underruns
+	 * and scroll stutters during combined game+record workloads.
+	 *
+	 * arch_scale_thermal_pressure() is already used in fair.c's
+	 * scale_rt_capacity() for the load balancer's view; mirroring
+	 * it here aligns RT placement with CFS placement when both are
+	 * competing for the same throttled CPU.
+	 */
+	cpu_cap -= arch_scale_thermal_pressure(cpu);
 
 	return cpu_cap >= min(min_cap, max_cap);
 }
