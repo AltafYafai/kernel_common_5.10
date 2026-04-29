@@ -421,8 +421,24 @@ struct sched_avg {
 	struct util_est			util_est;
 } ____cacheline_aligned;
 
+/*
+ * Keep sched_statistics layout stable regardless of CONFIG_SCHEDSTATS.
+ *
+ * The struct is embedded inline in struct sched_entity (and transitively
+ * in struct task_struct), and its layout is part of the Android GKI KMI
+ * (abi_gki_aarch64.xml records it as size-in-bits='1728').  Gating the
+ * fields on CONFIG_SCHEDSTATS collapsed the struct to zero size when
+ * the feature was disabled, shifting every subsequent field of
+ * sched_entity / task_struct and breaking every vendor module compiled
+ * against the published ABI.
+ *
+ * Keeping the fields unconditional costs 216 B per task_struct but has
+ * no runtime cost: the __schedstat_{inc,add,set} macros expand to
+ * do {} while (0) when CONFIG_SCHEDSTATS=n, so the compiler never
+ * emits a load/store for any of these counters.  The memory is
+ * reserved but dead.
+ */
 struct sched_statistics {
-#ifdef CONFIG_SCHEDSTATS
 	u64				wait_start;
 	u64				wait_max;
 	u64				wait_count;
@@ -454,7 +470,6 @@ struct sched_statistics {
 	u64				nr_wakeups_affine_attempts;
 	u64				nr_wakeups_passive;
 	u64				nr_wakeups_idle;
-#endif
 };
 
 struct sched_entity {
