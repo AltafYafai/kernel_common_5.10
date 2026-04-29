@@ -847,7 +847,22 @@ EXPORT_SYMBOL_GPL(__page_mapcount);
 int sysctl_overcommit_memory __read_mostly = OVERCOMMIT_GUESS;
 int sysctl_overcommit_ratio __read_mostly = 50;
 unsigned long sysctl_overcommit_kbytes __read_mostly;
-int sysctl_max_map_count __read_mostly = DEFAULT_MAX_MAP_COUNT;
+/*
+ * Default raised from DEFAULT_MAX_MAP_COUNT (USHRT_MAX - 5 = 65530)
+ * to 1048576 (1 << 20).  The legacy ceiling is a 16-bit relic that
+ * predates JIT runtimes that mmap() arenas per allocation class
+ * (Hermes, V8, ART, Wasmtime, BoringSSL session caches), GPU drivers
+ * that grow per-process VMA fans on large texture / buffer sets,
+ * and games / browsers that hit the cap during normal operation and
+ * crash with -ENOMEM from mmap().  Most distros and Android vendors
+ * already bump this in init.rc / sysctl.d; doing it in the kernel
+ * default removes the dependency on userspace touching the knob
+ * during early boot, which in turn closes a small window where
+ * services that mmap heavily during init can fail before the userspace
+ * bump runs.  Userspace can still set this lower at runtime via
+ * /proc/sys/vm/max_map_count.
+ */
+int sysctl_max_map_count __read_mostly = 1U << 20;
 unsigned long sysctl_user_reserve_kbytes __read_mostly = 1UL << 17; /* 128MB */
 unsigned long sysctl_admin_reserve_kbytes __read_mostly = 1UL << 13; /* 8MB */
 
