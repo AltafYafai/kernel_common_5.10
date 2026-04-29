@@ -161,6 +161,21 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
  */
 #define ZENITH_DEFAULT_UCLAMP_MIN_RESPECT	1
 
+/* uclamp_max_respect (default 1): symmetric counterpart to
+ * uclamp_min_respect.  When set, zenith_get_next_freq() applies an
+ * explicit final-freq _cap_ derived from the RQ-aggregated uclamp_max
+ * just before the ladder/rate-limit stage, mirroring the uclamp_min
+ * floor.  This honours Android's PerformanceHint power-efficiency
+ * hint (setPreferPowerEfficiency() -> per-task UCLAMP_MAX) for every
+ * decision tier including the brutality snap, hispeed floor, and
+ * input boost, which would otherwise walk over the cap.
+ *
+ * Set 0 to revert to pre-patch behaviour (uclamp_max still flows
+ * through schedutil_cpu_util() via the RQ aggregate but no explicit
+ * final cap is applied on top).
+ */
+#define ZENITH_DEFAULT_UCLAMP_MAX_RESPECT	1
+
 /* uclamp_min threshold (in percent of SCHED_CAPACITY_SCALE) above
  * which the screen-off override suppression kicks in. 10 %% means the
  * task's ADPF hint has to reach uclamp_min >= ~102/1024 (about big-core
@@ -345,6 +360,7 @@ struct zenith_tunables {
 	 *                  aggregation (pre-G.1 behaviour).
 	 */
 	unsigned int		uclamp_min_respect;
+	unsigned int		uclamp_max_respect;
 };
 
 /*
@@ -950,6 +966,46 @@ static unsigned long zenith_policy_uclamp_min(struct zenith_policy *z_policy)
 #endif
 }
 
+/* Collect the effective uclamp_max for the policy.
+ *
+ * uclamp_max is Android's opt-in power-saving hint
+ * (PerformanceHint.setPreferPowerEfficiency() -> per-task UCLAMP_MAX).
+ * uclamp_rq_get(rq, UCLAMP_MAX) returns the maximum UCLAMP_MAX over
+ * currently enqueued tasks, which honours the rule "if any task on
+ * this rq wants no cap, don't cap".  The same rule has to hold at
+ * policy granularity: if any CPU in the policy has a task that
+ * doesn't want the freq capped, we must not cap the freq for the
+ * whole cluster.  That's an _max_ reduction across per-rq values.
+ *
+ * SCHED_CAPACITY_SCALE is the canonical "no cap" sentinel (tasks
+ * with no explicit UCLAMP_MAX set).  Callers treat any value
+ * >= SCHED_CAPACITY_SCALE as "tier disabled, apply no freq cap".
+ *
+ * Returns SCHED_CAPACITY_SCALE if CONFIG_UCLAMP_TASK is off or uclamp
+ * is not in use -- callers interpret that as "no cap".
+ */
+static unsigned long zenith_policy_uclamp_max(struct zenith_policy *z_policy)
+{
+#ifdef CONFIG_UCLAMP_TASK
+	unsigned long max_umax = 0;
+	int cpu;
+
+	if (!uclamp_is_used())
+		return SCHED_CAPACITY_SCALE;
+
+	for_each_cpu(cpu, z_policy->policy->cpus) {
+		unsigned long umax = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX);
+
+		if (umax > max_umax)
+			max_umax = umax;
+	}
+	/* Empty cpumask / no tasks enqueued anywhere -> no cap. */
+	return max_umax ? max_umax : SCHED_CAPACITY_SCALE;
+#else
+	return SCHED_CAPACITY_SCALE;
+#endif
+}
+
 /* Effective hispeed floor in kHz for this policy.  If tunables->hispeed_freq
  * is set explicitly, honour it verbatim (legacy behaviour).  Otherwise fall
  * back to the per-cluster auto-default: (policy->max * hispeed_freq_pct / 100).
@@ -999,6 +1055,15 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * boost at all).
 	 */
 	unsigned int input_boost_floor = 0;
+
+	/* ADPF / uclamp_max cap.  Sampled once so every decision tier
+	 * below sees a consistent view.  SCHED_CAPACITY_SCALE means
+	 * "no cap" -- the helper returns that sentinel when uclamp is
+	 * not in use, when no task has set a UCLAMP_MAX, or when the
+	 * governor-level respect tunable is off.
+	 */
+	unsigned long uclamp_max = z_policy->tunables->uclamp_max_respect ?
+		zenith_policy_uclamp_max(z_policy) : SCHED_CAPACITY_SCALE;
 
 	if (z_policy->tunables->screen_state == 0 && !uclamp_min_meaningful) {
 		dynamic_up_thresh = 95; /* Hard to wake up */
@@ -1220,6 +1285,25 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	if (input_boost_floor && freq < input_boost_floor) {
 		freq = input_boost_floor;
 		tp_path = "input_boost_decay";
+	}
+
+	/* 3d. uclamp_max final-freq cap.  Applied after every other tier
+	 * so that brutality snap, hispeed floor, input boost, and the
+	 * uclamp_min / input_boost_decay floors can't walk over an
+	 * explicit power-efficiency hint.  A uclamp_min floor higher
+	 * than the uclamp_max cap wins by construction (floor applies
+	 * first, cap would clamp it down below uclamp_min only when the
+	 * two hints disagree, and per-task uclamp validation already
+	 * prevents that at the scheduler layer).
+	 */
+	if (uclamp_max < SCHED_CAPACITY_SCALE && max_cap) {
+		unsigned int uclamp_cap = map_util_freq(uclamp_max,
+							policy->cpuinfo.max_freq,
+							max_cap);
+		if (freq > uclamp_cap) {
+			freq = uclamp_cap;
+			tp_path = "uclamp_max_cap";
+		}
 	}
 
 resolve:
@@ -2577,6 +2661,30 @@ static ssize_t uclamp_min_respect_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr uclamp_min_respect = __ATTR_RW(uclamp_min_respect);
 
+/*
+ * uclamp_max_respect sysfs knob.  See the ZENITH_DEFAULT_UCLAMP_MAX_RESPECT
+ * comment block at the top of this file for full semantics.  Normalised to
+ * 0/1 on store.
+ */
+static ssize_t uclamp_max_respect_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->uclamp_max_respect);
+}
+
+static ssize_t uclamp_max_respect_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->uclamp_max_respect = !!val;
+	return count;
+}
+static struct governor_attr uclamp_max_respect = __ATTR_RW(uclamp_max_respect);
+
 static struct attribute *zenith_attrs[] = {
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
@@ -2616,6 +2724,7 @@ static struct attribute *zenith_attrs[] = {
 	&kcpustat_hispeed_enable.attr,
 	&util_math_v2.attr,
 	&uclamp_min_respect.attr,
+	&uclamp_max_respect.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -2752,6 +2861,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->kcpustat_hispeed_enable = ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE;
 	tunables->util_math_v2		= ZENITH_DEFAULT_UTIL_MATH_V2;
 	tunables->uclamp_min_respect	= ZENITH_DEFAULT_UCLAMP_MIN_RESPECT;
+	tunables->uclamp_max_respect	= ZENITH_DEFAULT_UCLAMP_MAX_RESPECT;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	/* If zenith.profile= was passed on the kernel cmdline, apply it
