@@ -99,6 +99,7 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_INPUT_BOOST_MS		80
 #define ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS	30
 #define ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY	1
+#define ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT	80	/* 0 = no cap, pin to policy->max */
 #define ZENITH_DEFAULT_EFFICIENT_FREQ		0
 #define ZENITH_DEFAULT_UP_DELAY_US		4000
 #define ZENITH_DEFAULT_LIGHT_LOAD_FREQ		0
@@ -341,6 +342,20 @@ struct zenith_tunables {
 	 * Set 0 to restore pre-patch behaviour (boost every policy).
 	 */
 	unsigned int		input_boost_big_only;
+
+	/* Per-profile cap on the input-boost ceiling, expressed as a
+	 * percentage of policy->max.  When non-zero, the full-pin phase
+	 * targets policy->max * input_boost_cap_pct / 100 instead of
+	 * policy->max, and the trailing decay phase ramps from that
+	 * capped ceiling down to policy->min over input_boost_decay_ms.
+	 * 0 (legacy / PERFORMANCE) means "no cap" -- pin to policy->max.
+	 * Sized per-profile so BALANCED / BATTERY get a moderate boost
+	 * (PELT can still climb past it under genuine load via the
+	 * normal eval tiers, since the boost only sets a floor in the
+	 * decay window) without spending the energy of a max-pin on
+	 * every tap.  Range 0..100; values > 100 rejected by sysfs.
+	 */
+	unsigned int		input_boost_cap_pct;
 
 	/* Efficient-frequency soft-cap ladder, up to ZENITH_EFF_BINS_MAX
 	 * entries. Sorted ascending by frequency. The up_delay_us array
@@ -1232,29 +1247,43 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			u64 decay_ns = (u64)z_policy->tunables->input_boost_decay_ms *
 				       NSEC_PER_MSEC;
 			u64 remaining = until - now;
+			unsigned int cap_pct =
+				z_policy->tunables->input_boost_cap_pct;
+			unsigned int boost_ceiling = (cap_pct && cap_pct <= 100) ?
+				(policy->max / 100) * cap_pct : policy->max;
+
+			/* A capped ceiling that lands below policy->min would
+			 * push the decay floor negative; clamp to min so the
+			 * floor always remains a no-op or upward force.
+			 */
+			if (boost_ceiling < policy->min)
+				boost_ceiling = policy->min;
 
 			if (remaining > decay_ns) {
-				/* Full-boost phase: pin to policy->max. */
-				freq = policy->max;
+				/* Full-boost phase: pin to the capped ceiling
+				 * (or policy->max when no cap is set).
+				 */
+				freq = boost_ceiling;
 				tp_path = "input_boost";
 				goto resolve;
 			} else if (decay_ns) {
 				/* Decay phase: linearly ramp a floor from
-				 * policy->max down toward policy->min over the
-				 * trailing decay_ns.  Normal eval runs after
-				 * this point and may pick a higher freq; the
-				 * floor only kicks in if the load has already
-				 * dropped so far that eval undershoots the ramp.
+				 * boost_ceiling down toward policy->min over
+				 * the trailing decay_ns.  Normal eval runs
+				 * after this point and may pick a higher freq;
+				 * the floor only kicks in if the load has
+				 * already dropped so far that eval undershoots
+				 * the ramp.
 				 */
 				u64 elapsed = decay_ns - remaining;
-				u64 span = policy->max - policy->min;
+				u64 span = boost_ceiling - policy->min;
 
-				input_boost_floor = policy->max -
+				input_boost_floor = boost_ceiling -
 					(unsigned int)div64_u64(span * elapsed,
 								decay_ns);
 			} else {
 				/* Decay window not configured: original cliff. */
-				freq = policy->max;
+				freq = boost_ceiling;
 				tp_path = "input_boost";
 				goto resolve;
 			}
@@ -1862,6 +1891,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->ignore_nice_load	= 0;
 		t->input_boost_ms	= 150;
 		t->input_boost_decay_ms	= 50;
+		t->input_boost_cap_pct	= 0;	/* PERFORMANCE: pin all the way to max */
 		t->light_load_threshold	= 15;
 		t->sampling_down_factor	= 4;
 		t->thermal_auto		= 1;
@@ -1884,6 +1914,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->ignore_nice_load	= 1;
 		t->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 		t->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
+		t->input_boost_cap_pct	= ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT;
 		t->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
 		t->sampling_down_factor	= ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR;
 		t->thermal_auto		= 1;
@@ -1906,6 +1937,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->ignore_nice_load	= 1;
 		t->input_boost_ms	= 40;
 		t->input_boost_decay_ms	= 10;
+		t->input_boost_cap_pct	= 60;	/* BATTERY: cap boost ceiling at 60%% of max */
 		t->light_load_threshold	= 30;
 		t->sampling_down_factor	= 1;
 		t->thermal_auto		= 1;
@@ -1931,6 +1963,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->ignore_nice_load	= 1;
 		t->input_boost_ms	= 0;
 		t->input_boost_decay_ms	= 0;
+		t->input_boost_cap_pct	= 0;	/* LEGACY: boost disabled, cap is moot */
 		t->light_load_threshold	= 20;
 		t->sampling_down_factor	= 1;
 		t->thermal_auto		= 0;
@@ -2245,6 +2278,26 @@ static ssize_t input_boost_big_only_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr input_boost_big_only =
 	__ATTR_RW(input_boost_big_only);
+
+static ssize_t input_boost_cap_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->input_boost_cap_pct);
+}
+
+static ssize_t input_boost_cap_pct_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->input_boost_cap_pct = val;
+	return count;
+}
+static struct governor_attr input_boost_cap_pct =
+	__ATTR_RW(input_boost_cap_pct);
 
 /* Parse up to ZENITH_EFF_BINS_MAX unsigned ints separated by whitespace
  * into out[], returning the number parsed. Extra tokens are ignored.
@@ -2908,6 +2961,7 @@ static struct attribute *zenith_attrs[] = {
 	&input_boost_ms.attr,
 	&input_boost_decay_ms.attr,
 	&input_boost_big_only.attr,
+	&input_boost_cap_pct.attr,
 	&efficient_freq.attr,
 	&up_delay_us.attr,
 	&light_load_freq.attr,
@@ -3048,6 +3102,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 	tunables->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
 	tunables->input_boost_big_only	= ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY;
+	tunables->input_boost_cap_pct	= ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT;
 	tunables->efficient_freq	= ZENITH_DEFAULT_EFFICIENT_FREQ;
 	tunables->up_delay_us		= ZENITH_DEFAULT_UP_DELAY_US;
 	tunables->light_load_freq	= ZENITH_DEFAULT_LIGHT_LOAD_FREQ;
