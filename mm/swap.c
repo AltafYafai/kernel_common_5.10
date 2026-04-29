@@ -1308,17 +1308,16 @@ EXPORT_SYMBOL(pagevec_lookup_range_nr_tag);
  */
 void __init swap_setup(void)
 {
-	unsigned long megs = totalram_pages() >> (20 - PAGE_SHIFT);
-
 	/* ZRAM (the dominant Android swap backend) is random-access with
 	 * no seek penalty, so readahead wastes decompression bandwidth.
 	 * page_cluster=0 means read exactly one page per swap-in.
+	 *
+	 * The pre-Android upstream heuristic of scaling page_cluster off
+	 * totalram_pages() was dropped in the "tune VM defaults" retune;
+	 * the local megs variable became dead and now trips -Werror=
+	 * unused-variable.
 	 */
 	page_cluster = 0;
-	/*
-	 * Right now other parts of the system means that we
-	 * _really_ don't want to cluster much more
-	 */
 }
 
 #ifdef CONFIG_DEV_PAGEMAP_OPS
