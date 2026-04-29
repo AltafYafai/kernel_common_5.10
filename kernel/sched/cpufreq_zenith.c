@@ -27,6 +27,7 @@
 #include <linux/input.h>
 #include <linux/atomic.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/notifier.h>
 #include <linux/kernel_stat.h>
 
@@ -85,6 +86,7 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
 #define ZENITH_DEFAULT_IO_IS_BUSY		1
 #define ZENITH_DEFAULT_INPUT_BOOST_MS		80
+#define ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS	30
 #define ZENITH_DEFAULT_EFFICIENT_FREQ		0
 #define ZENITH_DEFAULT_UP_DELAY_US		4000
 #define ZENITH_DEFAULT_LIGHT_LOAD_FREQ		0
@@ -275,6 +277,7 @@ struct zenith_tunables {
 
 	/* Input boost duration (ms). 0 = disabled. */
 	unsigned int		input_boost_ms;
+	unsigned int		input_boost_decay_ms;
 
 	/* Efficient-frequency soft-cap ladder, up to ZENITH_EFF_BINS_MAX
 	 * entries. Sorted ascending by frequency. The up_delay_us array
@@ -989,6 +992,14 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	bool uclamp_min_meaningful = uclamp_min >=
 		((SCHED_CAPACITY_SCALE * ZENITH_UCLAMP_MIN_MEANINGFUL_PCT) / 100);
 
+	/* Input-boost decay floor.  Computed in the input-boost block
+	 * below when we are in the trailing decay window of an active
+	 * boost; applied as a minimum on the final freq just before the
+	 * resolve label.  Zero means no floor (full-boost phase, or no
+	 * boost at all).
+	 */
+	unsigned int input_boost_floor = 0;
+
 	if (z_policy->tunables->screen_state == 0 && !uclamp_min_meaningful) {
 		dynamic_up_thresh = 95; /* Hard to wake up */
 		dynamic_bias = 500;     /* 50% penalty */
@@ -1020,16 +1031,49 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	if (max_cap)
 		tp_load_pct = (unsigned int)((util * 100) / max_cap);
 
-	/* 0. Input Boost — pin to policy->max for input_boost_ms after a key
-	 * or touch event. Gated by screen_state so we don't wake clusters
-	 * while the display is off.
+	/* 0. Input Boost — pin to policy->max for the non-decay portion of
+	 * input_boost_ms after a key or touch event, then linearly ramp
+	 * down across the trailing input_boost_decay_ms so the gesture
+	 * tail doesn't cliff-drop back to the load-dependent target.
+	 * Gated by screen_state so we don't wake clusters while the
+	 * display is off.
 	 */
 	if (z_policy->tunables->input_boost_ms &&
-	    z_policy->tunables->screen_state &&
-	    ktime_get_ns() < (u64)atomic64_read(&zenith_input_boost_until_ns)) {
-		freq = policy->max;
-		tp_path = "input_boost";
-		goto resolve;
+	    z_policy->tunables->screen_state) {
+		u64 now = ktime_get_ns();
+		u64 until = (u64)atomic64_read(&zenith_input_boost_until_ns);
+
+		if (now < until) {
+			u64 decay_ns = (u64)z_policy->tunables->input_boost_decay_ms *
+				       NSEC_PER_MSEC;
+			u64 remaining = until - now;
+
+			if (remaining > decay_ns) {
+				/* Full-boost phase: pin to policy->max. */
+				freq = policy->max;
+				tp_path = "input_boost";
+				goto resolve;
+			} else if (decay_ns) {
+				/* Decay phase: linearly ramp a floor from
+				 * policy->max down toward policy->min over the
+				 * trailing decay_ns.  Normal eval runs after
+				 * this point and may pick a higher freq; the
+				 * floor only kicks in if the load has already
+				 * dropped so far that eval undershoots the ramp.
+				 */
+				u64 elapsed = decay_ns - remaining;
+				u64 span = policy->max - policy->min;
+
+				input_boost_floor = policy->max -
+					(unsigned int)div64_u64(span * elapsed,
+								decay_ns);
+			} else {
+				/* Decay window not configured: original cliff. */
+				freq = policy->max;
+				tp_path = "input_boost";
+				goto resolve;
+			}
+		}
 	}
 
 	/* 1. Ondemand Brutality (with hysteresis).
@@ -1165,6 +1209,17 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			freq = uclamp_floor;
 			tp_path = "uclamp_min_floor";
 		}
+	}
+
+	/* 3c. Input-boost decay floor.  When a boost is in its trailing
+	 * decay window, the ramp floor computed in step 0 overrides
+	 * anything lower the eval tiers produced.  Applied last so it
+	 * doesn't short-circuit the normal load-demand logic when the
+	 * load genuinely calls for more than the ramp allows.
+	 */
+	if (input_boost_floor && freq < input_boost_floor) {
+		freq = input_boost_floor;
+		tp_path = "input_boost_decay";
 	}
 
 resolve:
@@ -1569,6 +1624,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->bias_load_threshold	= 50;
 		t->ignore_nice_load	= 0;
 		t->input_boost_ms	= 150;
+		t->input_boost_decay_ms	= 50;
 		t->light_load_threshold	= 15;
 		t->sampling_down_factor	= 4;
 		t->thermal_auto		= 1;
@@ -1590,6 +1646,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->bias_load_threshold	= 40;
 		t->ignore_nice_load	= 1;
 		t->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
+		t->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
 		t->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
 		t->sampling_down_factor	= ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR;
 		t->thermal_auto		= 1;
@@ -1611,6 +1668,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->bias_load_threshold	= 35;
 		t->ignore_nice_load	= 1;
 		t->input_boost_ms	= 40;
+		t->input_boost_decay_ms	= 10;
 		t->light_load_threshold	= 30;
 		t->sampling_down_factor	= 1;
 		t->thermal_auto		= 1;
@@ -1635,6 +1693,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->bias_load_threshold	= 50;
 		t->ignore_nice_load	= 1;
 		t->input_boost_ms	= 0;
+		t->input_boost_decay_ms	= 0;
 		t->light_load_threshold	= 20;
 		t->sampling_down_factor	= 1;
 		t->thermal_auto		= 0;
@@ -1908,6 +1967,27 @@ static ssize_t input_boost_ms_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr input_boost_ms = __ATTR_RW(input_boost_ms);
+
+static ssize_t input_boost_decay_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->input_boost_decay_ms);
+}
+
+static ssize_t input_boost_decay_ms_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1000)
+		return -EINVAL;
+	t->input_boost_decay_ms = val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr input_boost_decay_ms =
+	__ATTR_RW(input_boost_decay_ms);
 
 /* Parse up to ZENITH_EFF_BINS_MAX unsigned ints separated by whitespace
  * into out[], returning the number parsed. Extra tokens are ignored.
@@ -2524,6 +2604,7 @@ static struct attribute *zenith_attrs[] = {
 	&thermal_state.attr,
 	&thermal_auto.attr,
 	&input_boost_ms.attr,
+	&input_boost_decay_ms.attr,
 	&efficient_freq.attr,
 	&up_delay_us.attr,
 	&light_load_freq.attr,
@@ -2659,6 +2740,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->thermal_state		= 0;
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
+	tunables->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
 	tunables->efficient_freq	= ZENITH_DEFAULT_EFFICIENT_FREQ;
 	tunables->up_delay_us		= ZENITH_DEFAULT_UP_DELAY_US;
 	tunables->light_load_freq	= ZENITH_DEFAULT_LIGHT_LOAD_FREQ;
