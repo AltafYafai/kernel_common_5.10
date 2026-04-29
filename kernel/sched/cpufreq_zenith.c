@@ -62,6 +62,15 @@
 #define ZENITH_DEFAULT_HISPEED_FREQ_PCT		55	/* fallback when hispeed_freq=0 */
 #define ZENITH_DEFAULT_HISPEED_LOAD		65
 #define ZENITH_DEFAULT_HISPEED_HYST_PCT		10	/* exit hysteresis margin */
+
+/* Time-based cache TTL for the uclamp_{min,max} per-policy walks.  The
+ * per-rq UCLAMP values are maintained by the scheduler on every
+ * enqueue / dequeue, so a 1 ms staleness bound on the cached
+ * aggregate is imperceptible to userspace (ADPF sessions are open
+ * for tens of milliseconds to seconds) but drops the per-policy rq
+ * walk from every freq eval down to once per millisecond.
+ */
+#define ZENITH_UCLAMP_CACHE_TTL_NS		(1 * NSEC_PER_MSEC)
 #define ZENITH_EFF_BINS_MAX			4
 #define ZENITH_CLIMB_MODE_SNAP			0	/* default */
 #define ZENITH_CLIMB_MODE_STEP			1
@@ -453,6 +462,18 @@ struct zenith_policy {
 	 * hispeed_load, the same way brutal_active does for up_threshold.
 	 */
 	bool			hispeed_active;
+
+	/* Time-bounded cache for the per-policy uclamp_{min,max}
+	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
+	 * (cheap, no locks, no cachelines dirtied) but the eval path
+	 * can run every rate_limit_us, i.e. 10 000 Hz on up_rate path;
+	 * caching for ZENITH_UCLAMP_CACHE_TTL_NS drops the rq walks by
+	 * ~10x on an 8-CPU policy with zero user-visible staleness.
+	 * Valid when uclamp_cache_valid_ns != 0 and now < valid_ns + TTL.
+	 */
+	unsigned long		cached_uclamp_min;
+	unsigned long		cached_uclamp_max;
+	u64			uclamp_cache_stamp_ns;
 
 	/* Cached nice-load ratio for the policy (0..100). Sampled in
 	 * the update_util hook when ignore_nice_load=1 and read from
@@ -989,25 +1010,58 @@ static bool zenith_should_update_freq(struct zenith_policy *z_policy, u64 time)
  * or if uclamp is compiled in but no task on the policy has set
  * uclamp_min.  Callers use the 0 return as "no floor to apply".
  */
-static unsigned long zenith_policy_uclamp_min(struct zenith_policy *z_policy)
+/* Refresh both per-policy uclamp aggregates in a single rq walk when
+ * the cache is cold or stale.  Called from the uclamp_min / uclamp_max
+ * helpers below; not meant to be invoked directly.
+ */
+static void zenith_uclamp_cache_refresh(struct zenith_policy *z_policy)
 {
 #ifdef CONFIG_UCLAMP_TASK
 	unsigned long max_umin = 0;
+	unsigned long max_umax = 0;
 	int cpu;
 
-	if (!uclamp_is_used())
-		return 0;
+	if (!uclamp_is_used()) {
+		z_policy->cached_uclamp_min = 0;
+		z_policy->cached_uclamp_max = SCHED_CAPACITY_SCALE;
+		z_policy->uclamp_cache_stamp_ns = ktime_get_ns();
+		return;
+	}
 
 	for_each_cpu(cpu, z_policy->policy->cpus) {
-		unsigned long umin = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN);
+		struct rq *rq = cpu_rq(cpu);
+		unsigned long umin = uclamp_rq_get(rq, UCLAMP_MIN);
+		unsigned long umax = uclamp_rq_get(rq, UCLAMP_MAX);
 
 		if (umin > max_umin)
 			max_umin = umin;
+		if (umax > max_umax)
+			max_umax = umax;
 	}
-	return max_umin;
+	z_policy->cached_uclamp_min = max_umin;
+	z_policy->cached_uclamp_max = max_umax ? max_umax : SCHED_CAPACITY_SCALE;
+	z_policy->uclamp_cache_stamp_ns = ktime_get_ns();
 #else
-	return 0;
+	z_policy->cached_uclamp_min = 0;
+	z_policy->cached_uclamp_max = SCHED_CAPACITY_SCALE;
+	z_policy->uclamp_cache_stamp_ns = ktime_get_ns();
 #endif
+}
+
+static inline bool zenith_uclamp_cache_fresh(struct zenith_policy *z_policy)
+{
+	u64 stamp = z_policy->uclamp_cache_stamp_ns;
+
+	if (!stamp)
+		return false;
+	return ktime_get_ns() - stamp < ZENITH_UCLAMP_CACHE_TTL_NS;
+}
+
+static unsigned long zenith_policy_uclamp_min(struct zenith_policy *z_policy)
+{
+	if (!zenith_uclamp_cache_fresh(z_policy))
+		zenith_uclamp_cache_refresh(z_policy);
+	return z_policy->cached_uclamp_min;
 }
 
 /* Collect the effective uclamp_max for the policy.
@@ -1030,24 +1084,9 @@ static unsigned long zenith_policy_uclamp_min(struct zenith_policy *z_policy)
  */
 static unsigned long zenith_policy_uclamp_max(struct zenith_policy *z_policy)
 {
-#ifdef CONFIG_UCLAMP_TASK
-	unsigned long max_umax = 0;
-	int cpu;
-
-	if (!uclamp_is_used())
-		return SCHED_CAPACITY_SCALE;
-
-	for_each_cpu(cpu, z_policy->policy->cpus) {
-		unsigned long umax = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX);
-
-		if (umax > max_umax)
-			max_umax = umax;
-	}
-	/* Empty cpumask / no tasks enqueued anywhere -> no cap. */
-	return max_umax ? max_umax : SCHED_CAPACITY_SCALE;
-#else
-	return SCHED_CAPACITY_SCALE;
-#endif
+	if (!zenith_uclamp_cache_fresh(z_policy))
+		zenith_uclamp_cache_refresh(z_policy);
+	return z_policy->cached_uclamp_max;
 }
 
 /* Effective hispeed floor in kHz for this policy.  If tunables->hispeed_freq
@@ -3072,6 +3111,14 @@ static int zenith_start(struct cpufreq_policy *policy)
 			break;
 		}
 	}
+
+	/* Zero the uclamp cache so zenith_policy_uclamp_{min,max} refresh
+	 * on the first eval after start rather than returning stale
+	 * zeros cached from a previous attach cycle.
+	 */
+	z_policy->cached_uclamp_min = 0;
+	z_policy->cached_uclamp_max = SCHED_CAPACITY_SCALE;
+	z_policy->uclamp_cache_stamp_ns = 0;
 
 	for_each_cpu(cpu, policy->cpus) {
 		struct zenith_cpu *z_cpu = &per_cpu(zenith_cpu, cpu);
