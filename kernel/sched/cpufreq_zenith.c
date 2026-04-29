@@ -58,6 +58,7 @@
 #define ZENITH_DEFAULT_UP_THRESHOLD_HISPEED	0	/* disabled */
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
 #define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
+#define ZENITH_DEFAULT_HISPEED_FREQ_PCT		55	/* fallback when hispeed_freq=0 */
 #define ZENITH_DEFAULT_HISPEED_LOAD		65
 #define ZENITH_EFF_BINS_MAX			4
 #define ZENITH_CLIMB_MODE_SNAP			0	/* default */
@@ -187,9 +188,18 @@ struct zenith_tunables {
 
 	/* Hispeed floor tier: when load >= hispeed_load (% of max_cap),
 	 * ensure the chosen target_freq is at least hispeed_freq (kHz).
-	 * hispeed_freq=0 disables the tier.
+	 * hispeed_freq=0 disables the explicit tier.
+	 *
+	 * When hispeed_freq=0 and hispeed_freq_pct>0, the tier falls
+	 * back to a per-cluster auto-default: the effective hispeed
+	 * floor for the policy becomes (policy->max * hispeed_freq_pct
+	 * / 100).  This gives sensible defaults on both the little and
+	 * big clusters without userspace having to read policyN/max and
+	 * write one absolute kHz value per policy.  hispeed_freq_pct=0
+	 * preserves the legacy "tier disabled" semantics.
 	 */
 	unsigned int		hispeed_freq;
+	unsigned int		hispeed_freq_pct;
 	unsigned int		hispeed_load;
 
 	/* Secondary up_threshold applied only when policy->cur has
@@ -937,6 +947,22 @@ static unsigned long zenith_policy_uclamp_min(struct zenith_policy *z_policy)
 #endif
 }
 
+/* Effective hispeed floor in kHz for this policy.  If tunables->hispeed_freq
+ * is set explicitly, honour it verbatim (legacy behaviour).  Otherwise fall
+ * back to the per-cluster auto-default: (policy->max * hispeed_freq_pct / 100).
+ * Returns 0 when the tier is disabled (both absolute and percentage values
+ * are zero, or hispeed_freq_pct is zero while hispeed_freq is zero).
+ */
+static inline unsigned int zenith_eff_hispeed_freq(struct zenith_policy *z_policy)
+{
+	unsigned int eff = z_policy->tunables->hispeed_freq;
+
+	if (!eff && z_policy->tunables->hispeed_freq_pct)
+		eff = (z_policy->policy->max *
+		       z_policy->tunables->hispeed_freq_pct) / 100;
+	return eff;
+}
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
@@ -980,8 +1006,8 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	} else if (zenith_thermal_active(z_policy)) {
 		dynamic_up_thresh = 90; /* Relaxed for thermals */
 	} else if (z_policy->tunables->up_threshold_hispeed &&
-		   z_policy->tunables->hispeed_freq &&
-		   policy->cur >= z_policy->tunables->hispeed_freq) {
+		   zenith_eff_hispeed_freq(z_policy) &&
+		   policy->cur >= zenith_eff_hispeed_freq(z_policy)) {
 		/* Above the hispeed floor, require the stiffer
 		 * threshold before escalating all the way to
 		 * policy->max. Screen-off and thermal overrides take
@@ -1088,12 +1114,16 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 *
 	 * hispeed_freq=0 disables the tier.
 	 */
-	if (z_policy->tunables->hispeed_freq && max_cap) {
-		unsigned int load_pct = (util * 100) / max_cap;
-		if (load_pct >= z_policy->tunables->hispeed_load &&
-		    freq < z_policy->tunables->hispeed_freq) {
-			freq = z_policy->tunables->hispeed_freq;
-			tp_path = "hispeed";
+	{
+		unsigned int eff_hispeed = zenith_eff_hispeed_freq(z_policy);
+
+		if (eff_hispeed && max_cap) {
+			unsigned int load_pct = (util * 100) / max_cap;
+			if (load_pct >= z_policy->tunables->hispeed_load &&
+			    freq < eff_hispeed) {
+				freq = eff_hispeed;
+				tp_path = "hispeed";
+			}
 		}
 	}
 
@@ -1531,6 +1561,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->down_rate_limit_us	= 8000;
 		t->up_threshold		= 65;
 		t->down_threshold	= 45;
+		t->hispeed_freq_pct	= 60;	/* engage tier at 60%% policy->max */
 		t->hispeed_load		= 55;	/* must stay < up_threshold */
 		t->climb_mode		= ZENITH_CLIMB_MODE_SNAP;
 		t->freq_step_pct	= 15;
@@ -1551,6 +1582,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->down_rate_limit_us	= ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
 		t->up_threshold		= ZENITH_DEFAULT_UP_THRESHOLD;
 		t->down_threshold	= ZENITH_DEFAULT_DOWN_THRESHOLD;
+		t->hispeed_freq_pct	= ZENITH_DEFAULT_HISPEED_FREQ_PCT;
 		t->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
 		t->climb_mode		= ZENITH_CLIMB_MODE_SNAP;
 		t->freq_step_pct	= ZENITH_DEFAULT_FREQ_STEP_PCT;
@@ -1571,6 +1603,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->down_rate_limit_us	= 2000;
 		t->up_threshold		= 85;
 		t->down_threshold	= 40;
+		t->hispeed_freq_pct	= 0;	/* battery: skip tier entirely */
 		t->hispeed_load		= 75;	/* must stay < up_threshold */
 		t->climb_mode		= ZENITH_CLIMB_MODE_STEP;
 		t->freq_step_pct	= 8;
@@ -1594,6 +1627,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->down_rate_limit_us	= 4000;
 		t->up_threshold		= 80;
 		t->down_threshold	= 80;	/* collapses hysteresis */
+		t->hispeed_freq_pct	= 0;	/* legacy: plain up_threshold only */
 		t->hispeed_load		= 90;
 		t->climb_mode		= ZENITH_CLIMB_MODE_SNAP;
 		t->freq_step_pct	= 5;
@@ -2196,6 +2230,25 @@ static ssize_t hispeed_freq_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr hispeed_freq = __ATTR_RW(hispeed_freq);
 
+static ssize_t hispeed_freq_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->hispeed_freq_pct);
+}
+
+static ssize_t hispeed_freq_pct_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->hispeed_freq_pct = val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr hispeed_freq_pct = __ATTR_RW(hispeed_freq_pct);
+
 static ssize_t hispeed_load_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->hispeed_load);
@@ -2451,6 +2504,7 @@ static struct attribute *zenith_attrs[] = {
 	&up_threshold_hispeed.attr,
 	&down_threshold.attr,
 	&hispeed_freq.attr,
+	&hispeed_freq_pct.attr,
 	&hispeed_load.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -2585,6 +2639,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->up_threshold_hispeed	= ZENITH_DEFAULT_UP_THRESHOLD_HISPEED;
 	tunables->down_threshold	= ZENITH_DEFAULT_DOWN_THRESHOLD;
 	tunables->hispeed_freq		= ZENITH_DEFAULT_HISPEED_FREQ;
+	tunables->hispeed_freq_pct	= ZENITH_DEFAULT_HISPEED_FREQ_PCT;
 	tunables->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
