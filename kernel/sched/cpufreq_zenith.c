@@ -55,6 +55,7 @@
  * 125 == SCHED_CAPACITY_SCALE / 8, preserving the historical default.
  */
 #define ZENITH_DEFAULT_IOWAIT_BOOST_MIN		125
+#define ZENITH_DEFAULT_IOWAIT_STACK_PCT		50	/* 0 = legacy max(util, boost) */
 #define ZENITH_DEFAULT_UP_THRESHOLD		75
 #define ZENITH_DEFAULT_UP_THRESHOLD_HISPEED	0	/* disabled */
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
@@ -276,6 +277,20 @@ struct zenith_tunables {
 	 * boost wholesale instead.
 	 */
 	unsigned int		iowait_boost_min;
+
+	/* Percentage (0..100) of the iowait-derived boost that is added
+	 * to util when stacking is active.  0 is the legacy behaviour
+	 * (max(util, boost)); 100 is full stacking (util + boost, clamped
+	 * to max_cap).  The default 50 is a conservative middle ground:
+	 * when a CPU is already under compute load and also servicing
+	 * I/O, it gets a half-weighted boost on top of its current util
+	 * rather than the original "freq takes whichever is larger" which
+	 * loses the I/O signal entirely when util is high.  Uses
+	 * upstream 6.x schedutil's observation that a task that's both
+	 * CPU-heavy and I/O-heavy needs more headroom than either demand
+	 * alone would justify.
+	 */
+	unsigned int		iowait_stack_pct;
 
 	/* When 1, a per-policy delayed_work periodically classifies the
 	 * recent workload from load-saturation rate and input-event
@@ -616,8 +631,27 @@ static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, uns
 
 	z_cpu->iowait_boost_pending = false;
 	boost = (z_cpu->iowait_boost * max_cap) >> SCHED_CAPACITY_SHIFT;
-	
-	boost = max(boost, util);
+
+	{
+		unsigned int stack_pct =
+			z_cpu->z_policy->tunables->iowait_stack_pct;
+
+		if (stack_pct && stack_pct <= 100) {
+			/* Blend: util + (boost * stack_pct / 100), clamped
+			 * to max_cap.  Take max with the legacy result so
+			 * we never do worse than the old path on a
+			 * util-light / iowait-heavy workload.
+			 */
+			unsigned long stacked = util +
+				((boost * stack_pct) / 100);
+
+			if (stacked > max_cap)
+				stacked = max_cap;
+			boost = max3(boost, util, stacked);
+		} else {
+			boost = max(boost, util);
+		}
+	}
 	boost = uclamp_rq_util_with(cpu_rq(z_cpu->cpu), boost, NULL);
 	return boost;
 }
@@ -1766,6 +1800,25 @@ static ssize_t iowait_boost_min_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr iowait_boost_min = __ATTR_RW(iowait_boost_min);
 
+static ssize_t iowait_stack_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->iowait_stack_pct);
+}
+
+static ssize_t iowait_stack_pct_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->iowait_stack_pct = val;
+	return count;
+}
+static struct governor_attr iowait_stack_pct = __ATTR_RW(iowait_stack_pct);
+
 static ssize_t ignore_nice_load_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n",
@@ -2846,6 +2899,7 @@ static struct attribute *zenith_attrs[] = {
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&iowait_boost_min.attr,
+	&iowait_stack_pct.attr,
 	&ignore_nice_load.attr,
 	&screen_state.attr,
 	&screen_auto.attr,
@@ -2985,6 +3039,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->iowait_boost_min	= ZENITH_DEFAULT_IOWAIT_BOOST_MIN;
+	tunables->iowait_stack_pct	= ZENITH_DEFAULT_IOWAIT_STACK_PCT;
 	tunables->ignore_nice_load	= 0;
 	tunables->screen_state		= 1;
 	tunables->screen_auto		= 1;
