@@ -101,15 +101,30 @@ unsigned long vm_dirty_bytes;
 
 /*
  * The interval between `kupdate'-style writebacks
+ *
+ * Default raised from 5 s to 15 s.  On modern flash (UFS / NVMe / eMMC
+ * with internal write-coalescing) the periodic flusher wakeup is the
+ * single biggest writeback overhead under light load, and the flash
+ * already groups dirty pages internally; firing kupdate every 5 s
+ * mostly buys frequent CPU wakeups for no measurable durability win.
+ * 15 s gives writeback more grouping room (longer batch of adjacent
+ * dirty pages reaches the device per flush) and visibly reduces idle
+ * CPU wakeups on Android-class workloads.  fsync(), explicit sync(),
+ * and the dirty-ratio path are unaffected by this change.
  */
-unsigned int dirty_writeback_interval = 5 * 100; /* centiseconds */
+unsigned int dirty_writeback_interval = 15 * 100; /* centiseconds */
 
 EXPORT_SYMBOL_GPL(dirty_writeback_interval);
 
 /*
  * The longest time for which data is allowed to remain dirty
+ *
+ * Raised from 20 s to 30 s to track the writeback interval bump
+ * above; without this, dirty_writeback_interval > dirty_expire_interval
+ * would force the flusher to age pages out faster than the periodic
+ * wakeup can collect them, defeating the point of the longer interval.
  */
-unsigned int dirty_expire_interval = 20 * 100; /* centiseconds */
+unsigned int dirty_expire_interval = 30 * 100; /* centiseconds */
 
 /*
  * Flag that makes the machine dump writes/reads and block dirtyings.
