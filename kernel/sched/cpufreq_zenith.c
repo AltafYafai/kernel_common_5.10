@@ -106,6 +106,7 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD	20
 #define ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR	2
 #define ZENITH_MAX_SAMPLING_DOWN_FACTOR		10
+#define ZENITH_DEFAULT_BOOST_EXIT_EXTEND	1	/* stretch down-rate after a boost ends */
 #define ZENITH_DEFAULT_BIAS_LOAD_THRESHOLD	50
 
 /* auto_tune classifier thresholds. Exposed as tunables so userspace can
@@ -381,6 +382,18 @@ struct zenith_tunables {
 	/* Hold-at-max multiplier for down_rate_limit. 1 = disabled. */
 	unsigned int		sampling_down_factor;
 
+	/* When 1 (default), keep the sampling_down_factor multiplier in
+	 * effect for one stretched down-rate window after an input boost
+	 * exits, even after target_freq has fallen below policy->max.  The
+	 * stretched window is sampling_down_factor * down_rate_limit_us
+	 * long.  Mirrors the rationale for sit-at-max stretching: PELT
+	 * needs a moment to catch up after a synthetic peak (the boost),
+	 * and dropping the multiplier the instant target falls produces
+	 * a tail-stutter on gestures whose load profile is bursty around
+	 * the boost expiry.  Set 0 to restore pre-patch behaviour.
+	 */
+	unsigned int		boost_exit_extend;
+
 	/* powersave_bias only applies below this load (% of max_cap).
 	 * 100 = always apply (legacy behaviour); 0 = never apply.
 	 */
@@ -537,6 +550,17 @@ struct zenith_policy {
 	 * boosting small-cluster policies on heterogeneous SoCs.
 	 */
 	bool			is_big_cluster;
+
+	/* Last seen zenith_input_boost_until_ns deadline observed inside
+	 * an active boost window for this policy.  Latched in the input
+	 * boost step (0) and consumed by the sampling-down step (7) to
+	 * keep the down-rate multiplier elevated for one stretched
+	 * down-rate window after the boost exits, smoothing the boost
+	 * tail when target_freq immediately falls below policy->max.
+	 * Cleared once the stretched window passes.  Zero means "no
+	 * recent boost to extend".
+	 */
+	u64			boost_active_until_ns;
 };
 
 struct zenith_cpu {
@@ -1252,6 +1276,14 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			unsigned int boost_ceiling = (cap_pct && cap_pct <= 100) ?
 				(policy->max / 100) * cap_pct : policy->max;
 
+			/* Latch the deadline for the boost-exit hold-down
+			 * (step 7).  Refreshed on every active-boost tick so
+			 * the stretched down-rate window starts from the
+			 * actual boost expiry, not from when the latch was
+			 * first set.
+			 */
+			z_policy->boost_active_until_ns = until;
+
 			/* A capped ceiling that lands below policy->min would
 			 * push the decay floor negative; clamp to min so the
 			 * floor always remains a no-op or upward force.
@@ -1554,15 +1586,40 @@ resolve:
 			tp_path = "em_cap";
 	}
 
-	/* 7. Sampling-down multiplier: while we are sitting at policy->max,
-	 * extend the down-rate delay by sampling_down_factor so we do not
-	 * ping-pong off the peak bin. Reset the moment we step away.
+	/* 7. Sampling-down multiplier: extend the down-rate delay by
+	 * sampling_down_factor while we are either (a) sitting at
+	 * policy->max, or (b) within one stretched down-rate window of
+	 * a recently-exited input boost (boost_exit_extend).  The latter
+	 * smooths the gesture tail: after the input-boost full-pin phase
+	 * ends, normal eval may briefly pick a much lower freq while
+	 * PELT catches up to the post-boost workload, and dropping the
+	 * sampling multiplier the instant target falls below max
+	 * produces a perceptible undershoot.  Reset the multiplier (and
+	 * clear the latch) the moment both conditions are false.
 	 */
-	if (target_freq >= policy->max)
-		z_policy->down_rate_mult =
-			max(z_policy->tunables->sampling_down_factor, 1U);
-	else
-		z_policy->down_rate_mult = 1;
+	{
+		unsigned int sdf = max(z_policy->tunables->sampling_down_factor,
+					1U);
+		bool boost_exit_active = false;
+
+		if (z_policy->tunables->boost_exit_extend &&
+		    z_policy->boost_active_until_ns) {
+			u64 now_ns = ktime_get_ns();
+			u64 stretch_ns = (u64)z_policy->tunables->down_rate_limit_us *
+					 NSEC_PER_USEC * sdf;
+
+			if (now_ns < z_policy->boost_active_until_ns +
+				     stretch_ns)
+				boost_exit_active = true;
+			else
+				z_policy->boost_active_until_ns = 0;
+		}
+
+		if (target_freq >= policy->max || boost_exit_active)
+			z_policy->down_rate_mult = sdf;
+		else
+			z_policy->down_rate_mult = 1;
+	}
 
 	if (trace_zenith_decision_enabled()) {
 		/* Report the leader CPU's filtered kcpustat busy% so a
@@ -2515,6 +2572,25 @@ static ssize_t sampling_down_factor_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr sampling_down_factor = __ATTR_RW(sampling_down_factor);
 
+static ssize_t boost_exit_extend_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->boost_exit_extend);
+}
+
+static ssize_t boost_exit_extend_store(struct gov_attr_set *attr_set,
+				       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->boost_exit_extend = !!val;
+	return count;
+}
+static struct governor_attr boost_exit_extend = __ATTR_RW(boost_exit_extend);
+
 static ssize_t bias_load_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n",
@@ -2967,6 +3043,7 @@ static struct attribute *zenith_attrs[] = {
 	&light_load_freq.attr,
 	&light_load_threshold.attr,
 	&sampling_down_factor.attr,
+	&boost_exit_extend.attr,
 	&bias_load_threshold.attr,
 	&kcpustat_window_us.attr,
 	&kcpustat_filter_shift.attr,
@@ -3108,6 +3185,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->light_load_freq	= ZENITH_DEFAULT_LIGHT_LOAD_FREQ;
 	tunables->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
 	tunables->sampling_down_factor	= ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR;
+	tunables->boost_exit_extend	= ZENITH_DEFAULT_BOOST_EXIT_EXTEND;
 	tunables->bias_load_threshold	= ZENITH_DEFAULT_BIAS_LOAD_THRESHOLD;
 	tunables->kcpustat_window_us	= ZENITH_DEFAULT_KCPUSTAT_WINDOW_US;
 	tunables->kcpustat_filter_shift	= ZENITH_DEFAULT_KCPUSTAT_FILTER_SHIFT;
