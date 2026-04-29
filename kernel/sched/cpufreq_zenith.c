@@ -249,6 +249,49 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_GAME_HISPEED_BOOST_PCT		110
 #define ZENITH_GAME_BOOST_DECAY_PCT		130
 
+/* psi_aware (default 0, off) + psi_mem_thresh (default 50):
+ *
+ * When psi_aware=1, zenith_get_next_freq() reads the system-wide
+ * memory-pressure 10s average from psi_system.avg[PSI_MEM_SOME][0].
+ * If the integer percentage is at or above psi_mem_thresh, the final
+ * freq is *capped* at the effective hispeed floor.  Rationale: under
+ * heavy memory stall, pushing the CPU above hispeed wastes energy on
+ * cycles that mostly stall waiting for memory; the workload is
+ * memory-bound, not compute-bound.  When the hispeed tier is disabled
+ * (eff_hispeed == 0) the cap is policy->max -- i.e. a no-op fallback.
+ *
+ * The reader is RCU-free and lock-free: psi_system.avg[][] is updated
+ * by the avgs_work delayed work and a single READ_ONCE is sufficient
+ * to get a coherent fixed-point value.  When CONFIG_PSI is off or
+ * psi_disabled is set, the helper returns 0 and the cap never fires.
+ *
+ * 0..100 range; values >100 rejected by sysfs.  0 disables the cap
+ * even with psi_aware=1 (useful for tracing without changing freq).
+ */
+#define ZENITH_DEFAULT_PSI_AWARE		0
+#define ZENITH_DEFAULT_PSI_MEM_THRESH		50
+
+/* boot_boost_ms (default 0, off):
+ *
+ * When non-zero, zenith pins the final freq to policy->max for the
+ * first boot_boost_ms milliseconds after system boot.  Gated by
+ * screen_state so it only applies after the screen comes on, and
+ * skipped on small clusters when input_boost_big_only=1 (the existing
+ * input-boost gate).  Intended to absorb the cold-cache, lots-of-zygote
+ * boot path without paying for low-freq sample windows that PELT then
+ * spends 200 ms catching up out of.
+ *
+ * boot_boost_ms is a one-shot: zenith_get_next_freq() compares
+ * ktime_get_boottime_ns() against boot_boost_ms * NSEC_PER_MSEC and
+ * disables the floor for everyone past that deadline.  Setting it to
+ * 0 disables the feature; values up to a few minutes are accepted
+ * but anything past 60_000 ms is wasteful.
+ *
+ * Recommended init.rc tune: 30000 (30 s).
+ */
+#define ZENITH_DEFAULT_BOOT_BOOST_MS		0
+#define ZENITH_BOOT_BOOST_MAX_MS		300000
+
 /* uclamp_max_respect (default 1): symmetric counterpart to
  * uclamp_min_respect.  When set, zenith_get_next_freq() applies an
  * explicit final-freq _cap_ derived from the RQ-aggregated uclamp_max
@@ -521,6 +564,13 @@ struct zenith_tunables {
 
 	/* See ZENITH_DEFAULT_GAME_MODE. 0/1, normalised on store. */
 	unsigned int		game_mode;
+
+	/* See ZENITH_DEFAULT_PSI_AWARE / ZENITH_DEFAULT_PSI_MEM_THRESH. */
+	unsigned int		psi_aware;
+	unsigned int		psi_mem_thresh;
+
+	/* See ZENITH_DEFAULT_BOOT_BOOST_MS. 0 disables the one-shot. */
+	unsigned int		boot_boost_ms;
 };
 
 /*
@@ -1325,6 +1375,28 @@ static inline unsigned int zenith_eff_hispeed_freq(struct zenith_policy *z_polic
 	return eff;
 }
 
+/* Read the system-wide memory pressure 10s average from PSI as an
+ * integer percentage (0..100).  Returns 0 when CONFIG_PSI is off, when
+ * psi_disabled is set, or when the value isn't yet populated (early
+ * boot).  Lock-free single READ_ONCE -- the avgs_work aggregator is
+ * what writes to psi_system.avg[][] and we tolerate up to 2 s of
+ * staleness on the read.
+ */
+static inline unsigned int zenith_psi_mem_some_pct(void)
+{
+#ifdef CONFIG_PSI
+	unsigned long avg;
+
+	if (static_branch_likely(&psi_disabled))
+		return 0;
+
+	avg = READ_ONCE(psi_system.avg[PSI_MEM_SOME][0]);
+	return (unsigned int)LOAD_INT(avg);
+#else
+	return 0;
+#endif
+}
+
 /* List of comm prefixes treated as render / display-pipeline threads.
  * Matched by strncmp() over the first N characters where N is the
  * length of the table entry, so the userspace task only needs to
@@ -1699,6 +1771,27 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		tp_path = "input_boost_decay";
 	}
 
+	/* 3c0. Boot-boost floor.  When boot_boost_ms != 0 and we are
+	 * still inside the boot_boost window (measured from
+	 * ktime_get_boottime_ns()), pin the freq to policy->max.  Gated
+	 * by screen_state and reuses the input_boost_big_only topology
+	 * gate so the small cluster does not wake to max during boot.
+	 */
+	if (z_policy->tunables->boot_boost_ms &&
+	    z_policy->tunables->screen_state &&
+	    (!z_policy->tunables->input_boost_big_only ||
+	     z_policy->is_big_cluster)) {
+		u64 deadline_ns = (u64)z_policy->tunables->boot_boost_ms *
+				  NSEC_PER_MSEC;
+
+		if (ktime_get_boottime_ns() < deadline_ns) {
+			if (freq < policy->max) {
+				freq = policy->max;
+				tp_path = "boot_boost";
+			}
+		}
+	}
+
 	/* 3c'. Render-thread / display-pipeline floor.  When
 	 * render_aware=1 and any CPU in this policy is currently running
 	 * a known render / display-pipeline thread (RenderThread,
@@ -1744,6 +1837,31 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		if (freq > uclamp_cap) {
 			freq = uclamp_cap;
 			tp_path = "uclamp_max_cap";
+		}
+	}
+
+	/* 3e. PSI memory-pressure cap.  When psi_aware=1 and the system
+	 * is over the configured 10s memory-pressure threshold, cap the
+	 * final freq at the effective hispeed floor (or policy->max as
+	 * fallback when the hispeed tier is disabled).  Rationale: under
+	 * heavy memstall, going above hispeed mostly burns energy on
+	 * cycles that stall waiting for memory.  Boot-boost (3c0) sits
+	 * higher in the chain so the boot window is preserved even with
+	 * psi_aware=1.
+	 */
+	if (z_policy->tunables->psi_aware &&
+	    z_policy->tunables->psi_mem_thresh) {
+		unsigned int mem_some = zenith_psi_mem_some_pct();
+
+		if (mem_some >= z_policy->tunables->psi_mem_thresh) {
+			unsigned int psi_cap = zenith_eff_hispeed_freq(z_policy);
+
+			if (!psi_cap)
+				psi_cap = policy->max;
+			if (freq > psi_cap) {
+				freq = psi_cap;
+				tp_path = "psi_mem_cap";
+			}
 		}
 	}
 
@@ -3309,6 +3427,80 @@ static ssize_t game_mode_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr game_mode = __ATTR_RW(game_mode);
 
+/* psi_aware sysfs knob.  Strict 0/1 boolean.  See ZENITH_DEFAULT_PSI_AWARE
+ * comment block for semantics.  No cache invalidation -- the value is
+ * consumed inline at zenith_get_next_freq() time.
+ */
+static ssize_t psi_aware_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->psi_aware);
+}
+
+static ssize_t psi_aware_store(struct gov_attr_set *attr_set,
+			       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->psi_aware = !!val;
+	return count;
+}
+static struct governor_attr psi_aware = __ATTR_RW(psi_aware);
+
+/* psi_mem_thresh sysfs knob.  Range 0..100 (integer percentage of
+ * the PSI 10s some-stall average).  0 disables the cap even with
+ * psi_aware=1, useful for tracing the helper without changing freq.
+ */
+static ssize_t psi_mem_thresh_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->psi_mem_thresh);
+}
+
+static ssize_t psi_mem_thresh_store(struct gov_attr_set *attr_set,
+				    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	t->psi_mem_thresh = val;
+	return count;
+}
+static struct governor_attr psi_mem_thresh = __ATTR_RW(psi_mem_thresh);
+
+/* boot_boost_ms sysfs knob.  See ZENITH_DEFAULT_BOOT_BOOST_MS comment
+ * block for semantics.  Range 0..ZENITH_BOOT_BOOST_MAX_MS;
+ * out-of-range values rejected with EINVAL so userspace gets a clear
+ * error rather than a silent clamp.  No cache invalidation: the value
+ * is consumed inline by the eval path on every tick.
+ */
+static ssize_t boot_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->boot_boost_ms);
+}
+
+static ssize_t boot_boost_ms_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > ZENITH_BOOT_BOOST_MAX_MS)
+		return -EINVAL;
+	t->boot_boost_ms = val;
+	return count;
+}
+static struct governor_attr boot_boost_ms = __ATTR_RW(boot_boost_ms);
+
 /*
  * uclamp_min_respect sysfs knob.  See the ZENITH_DEFAULT_UCLAMP_MIN_RESPECT
  * comment block at the top of this file for full semantics.  Normalised to
@@ -3407,6 +3599,9 @@ static struct attribute *zenith_attrs[] = {
 	&render_aware.attr,
 	&render_floor_pct.attr,
 	&game_mode.attr,
+	&psi_aware.attr,
+	&psi_mem_thresh.attr,
+	&boot_boost_ms.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -3553,6 +3748,9 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->render_aware		= ZENITH_DEFAULT_RENDER_AWARE;
 	tunables->render_floor_pct	= ZENITH_DEFAULT_RENDER_FLOOR_PCT;
 	tunables->game_mode		= ZENITH_DEFAULT_GAME_MODE;
+	tunables->psi_aware		= ZENITH_DEFAULT_PSI_AWARE;
+	tunables->psi_mem_thresh	= ZENITH_DEFAULT_PSI_MEM_THRESH;
+	tunables->boot_boost_ms		= ZENITH_DEFAULT_BOOT_BOOST_MS;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	/* If zenith.profile= was passed on the kernel cmdline, apply it
