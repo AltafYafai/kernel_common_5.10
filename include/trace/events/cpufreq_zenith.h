@@ -83,6 +83,92 @@ TRACE_EVENT(zenith_auto_tune,
 		  __entry->prev_profile, __entry->new_profile)
 );
 
+/* Predictive-util one-step-ahead extrapolation (predict_util_pct). One
+ * record per zenith_get_util() call when the predictor is enabled and
+ * the predicted value differs from the observed util. Useful for
+ * sanity-checking that the predictor isn't over-reaching during
+ * monotonic ramps.
+ */
+TRACE_EVENT(zenith_predict,
+
+	TP_PROTO(int cpu, unsigned int pct,
+		 unsigned long util_obs, unsigned long util_pred),
+
+	TP_ARGS(cpu, pct, util_obs, util_pred),
+
+	TP_STRUCT__entry(
+		__field(int,		cpu)
+		__field(unsigned int,	pct)
+		__field(unsigned long,	util_obs)
+		__field(unsigned long,	util_pred)
+	),
+
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->pct		= pct;
+		__entry->util_obs	= util_obs;
+		__entry->util_pred	= util_pred;
+	),
+
+	TP_printk("cpu=%d pct=%u util_obs=%lu util_pred=%lu",
+		  __entry->cpu, __entry->pct,
+		  __entry->util_obs, __entry->util_pred)
+);
+
+/* Render-thread / display-pipeline floor activation. Emitted at most
+ * once every ZENITH_RENDER_CACHE_TTL_NS per policy when render_aware=1
+ * and the comm walk decides whether a render thread is currently
+ * running on any of the policy's CPUs.
+ */
+TRACE_EVENT(zenith_render_floor,
+
+	TP_PROTO(int cpu, bool active, unsigned int floor_pct,
+		 unsigned int floor_freq),
+
+	TP_ARGS(cpu, active, floor_pct, floor_freq),
+
+	TP_STRUCT__entry(
+		__field(int,		cpu)
+		__field(bool,		active)
+		__field(unsigned int,	floor_pct)
+		__field(unsigned int,	floor_freq)
+	),
+
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->active		= active;
+		__entry->floor_pct	= floor_pct;
+		__entry->floor_freq	= floor_freq;
+	),
+
+	TP_printk("cpu=%d active=%d floor_pct=%u floor_freq=%u",
+		  __entry->cpu, __entry->active,
+		  __entry->floor_pct, __entry->floor_freq)
+);
+
+/* game_mode flip. Emitted whenever userspace writes a new value to
+ * the game_mode sysfs node; lets you correlate frame-pacing diffs in
+ * trace data with the moment the gameswitch helper armed/disarmed.
+ */
+TRACE_EVENT(zenith_game_mode,
+
+	TP_PROTO(int cpu, bool active),
+
+	TP_ARGS(cpu, active),
+
+	TP_STRUCT__entry(
+		__field(int,	cpu)
+		__field(bool,	active)
+	),
+
+	TP_fast_assign(
+		__entry->cpu	= cpu;
+		__entry->active	= active;
+	),
+
+	TP_printk("cpu=%d active=%d", __entry->cpu, __entry->active)
+);
+
 #endif /* _TRACE_CPUFREQ_ZENITH_H */
 
 /* This part must be outside protection */

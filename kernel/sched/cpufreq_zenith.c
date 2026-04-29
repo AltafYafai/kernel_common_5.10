@@ -175,6 +175,80 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
  */
 #define ZENITH_DEFAULT_UCLAMP_MIN_RESPECT	1
 
+/* predict_util_pct (default 0, off): when non-zero (1..100), zenith
+ * applies a lightweight one-step-ahead linear predictor to the
+ * util signal returned by zenith_get_util() before it is consumed by
+ * zenith_get_next_freq().  The predictor is
+ *
+ *    delta = util - prev_util
+ *    pred  = util + (delta * predict_util_pct / 100)   // clamped to max
+ *    util' = max(util, pred)                            // up-only
+ *
+ * The intent is to dampen the sawtooth pattern where the governor
+ * undershoots a transient ramp by one sample window and chases it
+ * across 3-4 windows before catching up.  Up-only ensures we never
+ * predict the load below what we actually observed -- ramp-down
+ * stays purely PELT-driven.  prev_util is held per zenith_cpu and
+ * tracks the *unpredicted* value to keep delta a true sample-to-
+ * sample derivative.
+ *
+ * 0 (default) disables the predictor; the 1..100 range covers the
+ * useful spectrum where 50 is half-step-ahead, 100 is one-step-
+ * ahead.  Values >100 are accepted but rarely helpful (the predictor
+ * gets noisy on small deltas).
+ */
+#define ZENITH_DEFAULT_PREDICT_UTIL_PCT		0
+#define ZENITH_PREDICT_UTIL_PCT_MAX		200
+
+/* render_aware (default 0, off) + render_floor_pct (default 70):
+ *
+ * When render_aware=1, zenith_get_next_freq() walks the policy's
+ * cpumask and checks each cpu_curr(cpu)->comm against a small list of
+ * known render / display-pipeline thread names.  If any matches and
+ * render_floor_pct > 0, the final freq is floored at
+ *
+ *     policy->max * render_floor_pct / 100
+ *
+ * before the rate-limit gate.  The intent is to keep frame-pacing
+ * threads on a frequency tier that delivers their next frame's
+ * deadline rather than ramping up only after PELT catches up.
+ *
+ * The comm check is cached per-policy with a short TTL
+ * (ZENITH_RENDER_CACHE_TTL_NS) so the strncmp loop runs at most once
+ * every few milliseconds, well above scroll-frame budgets but cheap
+ * enough that a hot scroll path doesn't spend any meaningful time on
+ * comm matching.
+ *
+ * Set render_aware=0 to fully disable the feature (no walks, no
+ * cache, no floor).  Set render_floor_pct=0 to leave the comm walk
+ * running (for tracepoints) but apply no floor.
+ */
+#define ZENITH_DEFAULT_RENDER_AWARE		0
+#define ZENITH_DEFAULT_RENDER_FLOOR_PCT		70
+#define ZENITH_RENDER_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
+
+/* game_mode (default 0, off):
+ *
+ * When game_mode=1, zenith applies two lightweight runtime overlays
+ * that together match the heuristics most game-detection daemons
+ * (Realme TouchBoost, OnePlus GameSpace, etc.) want:
+ *
+ *  (a) the effective hispeed_freq_pct used by zenith_eff_hispeed_freq()
+ *      is multiplied by ZENITH_GAME_HISPEED_BOOST_PCT/100 -- by
+ *      default a 10%% lift of the per-cluster auto-default floor;
+ *  (b) the effective input_boost_decay_ms is multiplied by
+ *      ZENITH_GAME_BOOST_DECAY_PCT/100 -- by default 130%%, so the
+ *      trailing decay window is ~30%% longer to keep frametime
+ *      stable across stick-flick / camera-pan inputs.
+ *
+ * The tunable itself is just a 0/1 flag; userspace (a small
+ * gameswitch helper, or a Realme `/proc/touchpanel/game_switch_enable`
+ * watcher) is expected to flip it.  Values >1 are normalised to 1.
+ */
+#define ZENITH_DEFAULT_GAME_MODE			0
+#define ZENITH_GAME_HISPEED_BOOST_PCT		110
+#define ZENITH_GAME_BOOST_DECAY_PCT		130
+
 /* uclamp_max_respect (default 1): symmetric counterpart to
  * uclamp_min_respect.  When set, zenith_get_next_freq() applies an
  * explicit final-freq _cap_ derived from the RQ-aggregated uclamp_max
@@ -437,6 +511,16 @@ struct zenith_tunables {
 	 */
 	unsigned int		uclamp_min_respect;
 	unsigned int		uclamp_max_respect;
+
+	/* See ZENITH_DEFAULT_PREDICT_UTIL_PCT comment block. 0 = off. */
+	unsigned int		predict_util_pct;
+
+	/* See ZENITH_DEFAULT_RENDER_AWARE / ZENITH_DEFAULT_RENDER_FLOOR_PCT. */
+	unsigned int		render_aware;
+	unsigned int		render_floor_pct;
+
+	/* See ZENITH_DEFAULT_GAME_MODE. 0/1, normalised on store. */
+	unsigned int		game_mode;
 };
 
 /*
@@ -551,6 +635,14 @@ struct zenith_policy {
 	 */
 	bool			is_big_cluster;
 
+	/* Cached per-policy result of the render-aware comm walk.  Valid
+	 * for ZENITH_RENDER_CACHE_TTL_NS after render_cache_stamp_ns.
+	 * Refreshed on the next zenith_get_next_freq() call past the TTL.
+	 * Zero stamp means "never sampled".
+	 */
+	bool			render_active;
+	u64			render_cache_stamp_ns;
+
 	/* Last seen zenith_input_boost_until_ns deadline observed inside
 	 * an active boost window for this policy.  Latched in the input
 	 * boost step (0) and consumed by the sampling-down step (7) to
@@ -579,6 +671,13 @@ struct zenith_cpu {
 	u64			prev_nice_time;
 	u64			prev_nice_wall;
 	unsigned long		max_capacity;
+
+	/* Previous *unpredicted* zenith_get_util() output for this CPU,
+	 * used as the second tap of the one-step-ahead predictor.  Only
+	 * read/written when tunables->predict_util_pct != 0.  Initialised
+	 * to zero by the kzalloc-style allocation in zenith_start().
+	 */
+	unsigned long		prev_util;
 
 	/* kcpustat hispeed-blend sampler state (consumed by
 	 * zenith_kcpustat_sample / zenith_kcpustat_blend). Two-phase
@@ -734,8 +833,9 @@ static inline void zenith_ignore_dl_rate_limit(struct zenith_cpu *z_cpu, struct 
 static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 {
 	struct rq *rq = cpu_rq(z_cpu->cpu);
-	unsigned long util;
+	unsigned long util, util_out;
 	unsigned long max = arch_scale_cpu_capacity(z_cpu->cpu);
+	unsigned int predict_pct;
 
 	z_cpu->max_capacity = max;
 	z_cpu->bw_dl = cpu_bw_dl(rq);
@@ -756,7 +856,42 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 		util = cpu_util_cfs(rq);
 	}
 
-	return schedutil_cpu_util(z_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
+	util_out = schedutil_cpu_util(z_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
+
+	/* One-step-ahead linear predictor (up-only). See the
+	 * ZENITH_DEFAULT_PREDICT_UTIL_PCT comment block at the top of
+	 * this file for semantics. predict_pct == 0 short-circuits the
+	 * whole block; non-zero loads the previous unpredicted value
+	 * and applies pred = util + delta * pct / 100, taking max with
+	 * the observed util so we never under-predict on a ramp-down.
+	 * prev_util is updated unconditionally inside the gated block
+	 * so disabling the predictor re-arms it cleanly on next enable.
+	 */
+	predict_pct = READ_ONCE(z_cpu->z_policy->tunables->predict_util_pct);
+	if (predict_pct) {
+		unsigned long prev = z_cpu->prev_util;
+
+		if (predict_pct > ZENITH_PREDICT_UTIL_PCT_MAX)
+			predict_pct = ZENITH_PREDICT_UTIL_PCT_MAX;
+
+		if (util_out > prev) {
+			unsigned long delta = util_out - prev;
+			unsigned long pred = util_out +
+					     (delta * predict_pct) / 100;
+
+			if (pred > max)
+				pred = max;
+			if (trace_zenith_predict_enabled())
+				trace_zenith_predict(z_cpu->cpu, predict_pct,
+						     util_out, pred);
+			z_cpu->prev_util = util_out;
+			util_out = pred;
+		} else {
+			z_cpu->prev_util = util_out;
+		}
+	}
+
+	return util_out;
 }
 
 /************************ kcpustat hispeed sampler *********************
@@ -1167,15 +1302,85 @@ static unsigned long zenith_policy_uclamp_max(struct zenith_policy *z_policy)
  * back to the per-cluster auto-default: (policy->max * hispeed_freq_pct / 100).
  * Returns 0 when the tier is disabled (both absolute and percentage values
  * are zero, or hispeed_freq_pct is zero while hispeed_freq is zero).
+ *
+ * When game_mode=1, the percentage path is multiplied by
+ * ZENITH_GAME_HISPEED_BOOST_PCT/100 so userspace game-detection
+ * daemons can lift the per-cluster auto-default floor without
+ * touching hispeed_freq_pct itself.  The absolute hispeed_freq path
+ * is left untouched: a userspace value written there is honoured
+ * verbatim even with game_mode=1.
  */
 static inline unsigned int zenith_eff_hispeed_freq(struct zenith_policy *z_policy)
 {
 	unsigned int eff = z_policy->tunables->hispeed_freq;
+	unsigned int pct = z_policy->tunables->hispeed_freq_pct;
 
-	if (!eff && z_policy->tunables->hispeed_freq_pct)
-		eff = (z_policy->policy->max *
-		       z_policy->tunables->hispeed_freq_pct) / 100;
+	if (!eff && pct) {
+		if (z_policy->tunables->game_mode)
+			pct = (pct * ZENITH_GAME_HISPEED_BOOST_PCT) / 100;
+		eff = (z_policy->policy->max * pct) / 100;
+		if (eff > z_policy->policy->max)
+			eff = z_policy->policy->max;
+	}
 	return eff;
+}
+
+/* List of comm prefixes treated as render / display-pipeline threads.
+ * Matched by strncmp() over the first N characters where N is the
+ * length of the table entry, so the userspace task only needs to
+ * have its first N chars match (Android's "RenderThread NNN" naming
+ * for libui's per-app render thread, for instance, matches the
+ * "RenderThread" prefix).  Order of entries is irrelevant for
+ * correctness; keep the most common first for cache-friendliness.
+ */
+static const char * const zenith_render_comms[] = {
+	"RenderThread",
+	"surfaceflinger",
+	"RenderEngine",
+	"mali-cmar-back",
+};
+
+/* Walk the policy's online cpumask and check each cpu_curr's comm
+ * against zenith_render_comms[].  Returns true on the first match.
+ * The result is cached for ZENITH_RENDER_CACHE_TTL_NS so a hot path
+ * (e.g. a 60 / 90 / 120 Hz scroll) only does the strncmp loop a few
+ * times per second.  Caller is expected to gate the call on
+ * tunables->render_aware != 0; this helper does not re-check that.
+ */
+static bool zenith_policy_has_render(struct zenith_policy *z_policy)
+{
+	u64 now = ktime_get_ns();
+	struct cpufreq_policy *policy = z_policy->policy;
+	unsigned int cpu;
+	bool match = false;
+
+	if (z_policy->render_cache_stamp_ns &&
+	    now - z_policy->render_cache_stamp_ns < ZENITH_RENDER_CACHE_TTL_NS)
+		return z_policy->render_active;
+
+	rcu_read_lock();
+	for_each_cpu(cpu, policy->cpus) {
+		struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+		int i;
+
+		if (!curr)
+			continue;
+		for (i = 0; i < ARRAY_SIZE(zenith_render_comms); i++) {
+			const char *needle = zenith_render_comms[i];
+
+			if (!strncmp(curr->comm, needle, strlen(needle))) {
+				match = true;
+				break;
+			}
+		}
+		if (match)
+			break;
+	}
+	rcu_read_unlock();
+
+	z_policy->render_active = match;
+	z_policy->render_cache_stamp_ns = now;
+	return match;
 }
 
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
@@ -1268,13 +1473,25 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		u64 until = (u64)atomic64_read(&zenith_input_boost_until_ns);
 
 		if (now < until) {
-			u64 decay_ns = (u64)z_policy->tunables->input_boost_decay_ms *
-				       NSEC_PER_MSEC;
+			unsigned int decay_ms =
+				z_policy->tunables->input_boost_decay_ms;
+			u64 decay_ns;
 			u64 remaining = until - now;
 			unsigned int cap_pct =
 				z_policy->tunables->input_boost_cap_pct;
 			unsigned int boost_ceiling = (cap_pct && cap_pct <= 100) ?
 				(policy->max / 100) * cap_pct : policy->max;
+
+			/* game_mode stretch: lengthen the trailing decay
+			 * window by ZENITH_GAME_BOOST_DECAY_PCT (default
+			 * 130%%, i.e. ~30%% longer) so input boosts hold
+			 * the freq floor longer across stick-flick / camera
+			 * pan inputs.  Pure no-op when game_mode=0.
+			 */
+			if (z_policy->tunables->game_mode && decay_ms)
+				decay_ms = (decay_ms *
+					    ZENITH_GAME_BOOST_DECAY_PCT) / 100;
+			decay_ns = (u64)decay_ms * NSEC_PER_MSEC;
 
 			/* Latch the deadline for the boost-exit hold-down
 			 * (step 7).  Refreshed on every active-boost tick so
@@ -1480,6 +1697,35 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	if (input_boost_floor && freq < input_boost_floor) {
 		freq = input_boost_floor;
 		tp_path = "input_boost_decay";
+	}
+
+	/* 3c'. Render-thread / display-pipeline floor.  When
+	 * render_aware=1 and any CPU in this policy is currently running
+	 * a known render / display-pipeline thread (RenderThread,
+	 * surfaceflinger, ...), apply a freq floor of
+	 * (policy->max * render_floor_pct / 100).  Caches the comm walk
+	 * for ZENITH_RENDER_CACHE_TTL_NS to keep the hot path cheap.
+	 * Floor is still capped by the uclamp_max tier below.
+	 */
+	if (z_policy->tunables->render_aware &&
+	    z_policy->tunables->render_floor_pct) {
+		bool has_render = zenith_policy_has_render(z_policy);
+		unsigned int rf = (policy->max *
+				   z_policy->tunables->render_floor_pct) /
+				  100;
+
+		if (rf > policy->max)
+			rf = policy->max;
+		if (trace_zenith_render_floor_enabled())
+			trace_zenith_render_floor(
+				cpumask_first(policy->cpus),
+				has_render,
+				z_policy->tunables->render_floor_pct,
+				has_render ? rf : 0);
+		if (has_render && freq < rf) {
+			freq = rf;
+			tp_path = "render_floor";
+		}
 	}
 
 	/* 3d. uclamp_max final-freq cap.  Applied after every other tier
@@ -2957,6 +3203,112 @@ static ssize_t util_math_v2_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr util_math_v2 = __ATTR_RW(util_math_v2);
 
+/* predict_util_pct sysfs knob.  See ZENITH_DEFAULT_PREDICT_UTIL_PCT
+ * comment block at the top of the file for semantics.  Range
+ * 0..ZENITH_PREDICT_UTIL_PCT_MAX; values above the cap are rejected
+ * outright rather than silently clamped, so userspace gets a clear
+ * EINVAL on out-of-range writes.  The freq cache is invalidated so
+ * a toggle takes effect on the very next zenith_update tick.
+ */
+static ssize_t predict_util_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->predict_util_pct);
+}
+
+static ssize_t predict_util_pct_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > ZENITH_PREDICT_UTIL_PCT_MAX)
+		return -EINVAL;
+	t->predict_util_pct = val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr predict_util_pct = __ATTR_RW(predict_util_pct);
+
+/* render_aware sysfs knob.  Strict 0/1 boolean; non-zero values are
+ * normalised to 1 on store so userspace can echo any truthy integer.
+ * No cache invalidation is required: tunables->render_aware is read
+ * fresh on every zenith_get_next_freq() call, so the next scheduler
+ * tick already sees the new value.
+ */
+static ssize_t render_aware_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->render_aware);
+}
+
+static ssize_t render_aware_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->render_aware = !!val;
+	return count;
+}
+static struct governor_attr render_aware = __ATTR_RW(render_aware);
+
+/* render_floor_pct sysfs knob.  Range 0..100; 0 leaves the comm
+ * walk running but applies no floor.  Out-of-range values rejected
+ * with EINVAL so userspace gets a clear error.
+ */
+static ssize_t render_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->render_floor_pct);
+}
+
+static ssize_t render_floor_pct_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	t->render_floor_pct = val;
+	return count;
+}
+static struct governor_attr render_floor_pct = __ATTR_RW(render_floor_pct);
+
+/* game_mode sysfs knob.  Strict 0/1 boolean.  See
+ * ZENITH_DEFAULT_GAME_MODE comment block for the per-tier overlays
+ * that flip behaviour when this is set.  No cache invalidation
+ * required: the value is consumed inline in the freq path.
+ */
+static ssize_t game_mode_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->game_mode);
+}
+
+static ssize_t game_mode_store(struct gov_attr_set *attr_set,
+			       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+	unsigned int prev;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	prev = t->game_mode;
+	t->game_mode = !!val;
+	if (prev != t->game_mode)
+		trace_zenith_game_mode(smp_processor_id(), !!t->game_mode);
+	return count;
+}
+static struct governor_attr game_mode = __ATTR_RW(game_mode);
+
 /*
  * uclamp_min_respect sysfs knob.  See the ZENITH_DEFAULT_UCLAMP_MIN_RESPECT
  * comment block at the top of this file for full semantics.  Normalised to
@@ -3051,6 +3403,10 @@ static struct attribute *zenith_attrs[] = {
 	&util_math_v2.attr,
 	&uclamp_min_respect.attr,
 	&uclamp_max_respect.attr,
+	&predict_util_pct.attr,
+	&render_aware.attr,
+	&render_floor_pct.attr,
+	&game_mode.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -3193,6 +3549,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->util_math_v2		= ZENITH_DEFAULT_UTIL_MATH_V2;
 	tunables->uclamp_min_respect	= ZENITH_DEFAULT_UCLAMP_MIN_RESPECT;
 	tunables->uclamp_max_respect	= ZENITH_DEFAULT_UCLAMP_MAX_RESPECT;
+	tunables->predict_util_pct	= ZENITH_DEFAULT_PREDICT_UTIL_PCT;
+	tunables->render_aware		= ZENITH_DEFAULT_RENDER_AWARE;
+	tunables->render_floor_pct	= ZENITH_DEFAULT_RENDER_FLOOR_PCT;
+	tunables->game_mode		= ZENITH_DEFAULT_GAME_MODE;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	/* If zenith.profile= was passed on the kernel cmdline, apply it
