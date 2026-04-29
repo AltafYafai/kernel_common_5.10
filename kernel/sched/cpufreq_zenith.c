@@ -1527,21 +1527,23 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 {
 	switch (prof) {
 	case ZENITH_PROFILE_PERFORMANCE:
-		t->up_rate_limit_us	= 200;
-		t->down_rate_limit_us	= 4000;
-		t->up_threshold		= 70;
-		t->down_threshold	= 50;
-		t->hispeed_load		= 80;
+		t->up_rate_limit_us	= 0;
+		t->down_rate_limit_us	= 8000;
+		t->up_threshold		= 65;
+		t->down_threshold	= 45;
+		t->hispeed_load		= 75;
 		t->climb_mode		= ZENITH_CLIMB_MODE_SNAP;
-		t->freq_step_pct	= 10;
+		t->freq_step_pct	= 15;
 		t->powersave_bias	= 0;
 		t->bias_load_threshold	= 50;
 		t->ignore_nice_load	= 0;
 		t->input_boost_ms	= 150;
-		t->light_load_threshold	= 20;
+		t->light_load_threshold	= 15;
 		t->sampling_down_factor	= 4;
 		t->thermal_auto		= 1;
 		t->screen_auto		= 1;
+		t->util_math_v2		= 1;
+		t->kcpustat_hispeed_enable = 1;
 		break;
 
 	case ZENITH_PROFILE_BALANCED:
@@ -1552,32 +1554,36 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
 		t->climb_mode		= ZENITH_CLIMB_MODE_SNAP;
 		t->freq_step_pct	= ZENITH_DEFAULT_FREQ_STEP_PCT;
-		t->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
-		t->bias_load_threshold	= ZENITH_DEFAULT_BIAS_LOAD_THRESHOLD;
-		t->ignore_nice_load	= 0;
+		t->powersave_bias	= 50;	/* 5% gentle bias */
+		t->bias_load_threshold	= 40;
+		t->ignore_nice_load	= 1;
 		t->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 		t->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
 		t->sampling_down_factor	= ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR;
-		t->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
-		t->screen_auto		= 0;
+		t->thermal_auto		= 1;
+		t->screen_auto		= 1;
+		t->util_math_v2		= 1;
+		t->kcpustat_hispeed_enable = 1;
 		break;
 
 	case ZENITH_PROFILE_BATTERY:
-		t->up_rate_limit_us	= 1000;
-		t->down_rate_limit_us	= 1000;
+		t->up_rate_limit_us	= 500;
+		t->down_rate_limit_us	= 2000;
 		t->up_threshold		= 85;
 		t->down_threshold	= 40;
 		t->hispeed_load		= 95;
 		t->climb_mode		= ZENITH_CLIMB_MODE_STEP;
-		t->freq_step_pct	= 10;
-		t->powersave_bias	= 100;	/* 10% */
-		t->bias_load_threshold	= 40;
+		t->freq_step_pct	= 8;
+		t->powersave_bias	= 150;	/* 15% */
+		t->bias_load_threshold	= 35;
 		t->ignore_nice_load	= 1;
-		t->input_boost_ms	= 60;
+		t->input_boost_ms	= 40;
 		t->light_load_threshold	= 30;
 		t->sampling_down_factor	= 1;
 		t->thermal_auto		= 1;
 		t->screen_auto		= 1;
+		t->util_math_v2		= 1;
+		t->kcpustat_hispeed_enable = 0;
 		break;
 
 	case ZENITH_PROFILE_LEGACY:
