@@ -61,6 +61,7 @@
 #define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
 #define ZENITH_DEFAULT_HISPEED_FREQ_PCT		55	/* fallback when hispeed_freq=0 */
 #define ZENITH_DEFAULT_HISPEED_LOAD		65
+#define ZENITH_DEFAULT_HISPEED_HYST_PCT		10	/* exit hysteresis margin */
 #define ZENITH_EFF_BINS_MAX			4
 #define ZENITH_CLIMB_MODE_SNAP			0	/* default */
 #define ZENITH_CLIMB_MODE_STEP			1
@@ -219,6 +220,15 @@ struct zenith_tunables {
 	unsigned int		hispeed_freq;
 	unsigned int		hispeed_freq_pct;
 	unsigned int		hispeed_load;
+
+	/* Hysteresis margin (percent of max_cap) applied to hispeed_load
+	 * on the _exit_ side of the tier.  Entering the tier still
+	 * triggers at load_pct >= hispeed_load; leaving it requires
+	 * load_pct < (hispeed_load - hispeed_hyst_pct).  Collapses to
+	 * the legacy no-hysteresis behaviour at 0.  See
+	 * ZENITH_DEFAULT_HISPEED_HYST_PCT.
+	 */
+	unsigned int		hispeed_hyst_pct;
 
 	/* Secondary up_threshold applied only when policy->cur has
 	 * already climbed to hispeed_freq or above. 0 disables the
@@ -433,6 +443,16 @@ struct zenith_policy {
 	 * down_threshold >= up_threshold.
 	 */
 	bool			brutal_active;
+
+	/* Hysteresis state for the hispeed tier (step 2b).  Sticky: goes
+	 * true when load_pct first crosses hispeed_load with freq below
+	 * the effective hispeed floor; stays true while load_pct stays
+	 * above (hispeed_load - hispeed_hyst_pct).  Drops back to false
+	 * only when the margin is crossed.  Prevents the tier from
+	 * flapping in/out on noisy load trajectories that dance around
+	 * hispeed_load, the same way brutal_active does for up_threshold.
+	 */
+	bool			hispeed_active;
 
 	/* Cached nice-load ratio for the policy (0..100). Sampled in
 	 * the update_util hook when ignore_nice_load=1 and read from
@@ -1255,11 +1275,25 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 
 		if (eff_hispeed && max_cap) {
 			unsigned int load_pct = (util * 100) / max_cap;
-			if (load_pct >= z_policy->tunables->hispeed_load &&
-			    freq < eff_hispeed) {
+			unsigned int entry = z_policy->tunables->hispeed_load;
+			unsigned int hyst  = z_policy->tunables->hispeed_hyst_pct;
+			unsigned int exit  = hyst < entry ? entry - hyst : 0;
+
+			/* Sticky enter-on-crossing, exit-on-margin transitions. */
+			if (!z_policy->hispeed_active && load_pct >= entry)
+				z_policy->hispeed_active = true;
+			else if (z_policy->hispeed_active && load_pct < exit)
+				z_policy->hispeed_active = false;
+
+			if (z_policy->hispeed_active && freq < eff_hispeed) {
 				freq = eff_hispeed;
 				tp_path = "hispeed";
 			}
+		} else {
+			/* Tier disabled or max_cap == 0: drop the sticky bit
+			 * so we don't carry it across a disable/enable cycle.
+			 */
+			z_policy->hispeed_active = false;
 		}
 	}
 
@@ -2479,6 +2513,25 @@ static ssize_t hispeed_load_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr hispeed_load = __ATTR_RW(hispeed_load);
 
+static ssize_t hispeed_hyst_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->hispeed_hyst_pct);
+}
+
+static ssize_t hispeed_hyst_pct_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->hispeed_hyst_pct = val;
+	return count;
+}
+static struct governor_attr hispeed_hyst_pct = __ATTR_RW(hispeed_hyst_pct);
+
 static ssize_t climb_mode_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->climb_mode);
@@ -2741,6 +2794,7 @@ static struct attribute *zenith_attrs[] = {
 	&hispeed_freq.attr,
 	&hispeed_freq_pct.attr,
 	&hispeed_load.attr,
+	&hispeed_hyst_pct.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
 	&profile.attr,
@@ -2879,6 +2933,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->hispeed_freq		= ZENITH_DEFAULT_HISPEED_FREQ;
 	tunables->hispeed_freq_pct	= ZENITH_DEFAULT_HISPEED_FREQ_PCT;
 	tunables->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
+	tunables->hispeed_hyst_pct	= ZENITH_DEFAULT_HISPEED_HYST_PCT;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->active_profile	= ZENITH_PROFILE_CUSTOM;
