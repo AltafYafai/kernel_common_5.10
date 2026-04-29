@@ -87,6 +87,7 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_IO_IS_BUSY		1
 #define ZENITH_DEFAULT_INPUT_BOOST_MS		80
 #define ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS	30
+#define ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY	1
 #define ZENITH_DEFAULT_EFFICIENT_FREQ		0
 #define ZENITH_DEFAULT_UP_DELAY_US		4000
 #define ZENITH_DEFAULT_LIGHT_LOAD_FREQ		0
@@ -294,6 +295,19 @@ struct zenith_tunables {
 	unsigned int		input_boost_ms;
 	unsigned int		input_boost_decay_ms;
 
+	/* When 1 (default), input boost is applied only to policies whose
+	 * top arch_scale_cpu_capacity equals SCHED_CAPACITY_SCALE -- i.e.
+	 * the system's highest-capacity cluster(s).  On a homogeneous SoC
+	 * every policy matches and behaviour is unchanged.  On big /
+	 * little, this stops every touch from dragging the little cluster
+	 * to policy->max, which rarely helps UI latency (UI / render run
+	 * on big) and wastes energy on a cluster that is almost always in
+	 * light-load territory at the moment of a tap.
+	 *
+	 * Set 0 to restore pre-patch behaviour (boost every policy).
+	 */
+	unsigned int		input_boost_big_only;
+
 	/* Efficient-frequency soft-cap ladder, up to ZENITH_EFF_BINS_MAX
 	 * entries. Sorted ascending by frequency. The up_delay_us array
 	 * is paired 1:1 with eff_freq; writing a single scalar to
@@ -442,6 +456,16 @@ struct zenith_policy {
 	atomic_t		at_samples_saturated;
 	u64			at_last_events;
 	struct delayed_work	at_work;
+
+	/* Cached topology bit: true when any CPU in the policy has
+	 * arch_scale_cpu_capacity == SCHED_CAPACITY_SCALE, i.e. the
+	 * policy belongs to (one of) the system's highest-capacity
+	 * cluster(s).  Computed once at zenith_start() time from the
+	 * policy's cpumask and kept for the lifetime of the policy.
+	 * Used by the input-boost gate (input_boost_big_only) to skip
+	 * boosting small-cluster policies on heterogeneous SoCs.
+	 */
+	bool			is_big_cluster;
 };
 
 struct zenith_cpu {
@@ -1101,10 +1125,13 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * down across the trailing input_boost_decay_ms so the gesture
 	 * tail doesn't cliff-drop back to the load-dependent target.
 	 * Gated by screen_state so we don't wake clusters while the
-	 * display is off.
+	 * display is off, and optionally gated by input_boost_big_only
+	 * so small-cluster policies skip the boost on heterogeneous SoCs.
 	 */
 	if (z_policy->tunables->input_boost_ms &&
-	    z_policy->tunables->screen_state) {
+	    z_policy->tunables->screen_state &&
+	    (!z_policy->tunables->input_boost_big_only ||
+	     z_policy->is_big_cluster)) {
 		u64 now = ktime_get_ns();
 		u64 until = (u64)atomic64_read(&zenith_input_boost_until_ns);
 
@@ -2073,6 +2100,26 @@ static ssize_t input_boost_decay_ms_store(struct gov_attr_set *attr_set,
 static struct governor_attr input_boost_decay_ms =
 	__ATTR_RW(input_boost_decay_ms);
 
+static ssize_t input_boost_big_only_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->input_boost_big_only);
+}
+
+static ssize_t input_boost_big_only_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->input_boost_big_only = !!val;
+	return count;
+}
+static struct governor_attr input_boost_big_only =
+	__ATTR_RW(input_boost_big_only);
+
 /* Parse up to ZENITH_EFF_BINS_MAX unsigned ints separated by whitespace
  * into out[], returning the number parsed. Extra tokens are ignored.
  * Returns -EINVAL if any token fails kstrtouint or if no tokens parse.
@@ -2713,6 +2760,7 @@ static struct attribute *zenith_attrs[] = {
 	&thermal_auto.attr,
 	&input_boost_ms.attr,
 	&input_boost_decay_ms.attr,
+	&input_boost_big_only.attr,
 	&efficient_freq.attr,
 	&up_delay_us.attr,
 	&light_load_freq.attr,
@@ -2850,6 +2898,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 	tunables->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
+	tunables->input_boost_big_only	= ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY;
 	tunables->efficient_freq	= ZENITH_DEFAULT_EFFICIENT_FREQ;
 	tunables->up_delay_us		= ZENITH_DEFAULT_UP_DELAY_US;
 	tunables->light_load_freq	= ZENITH_DEFAULT_LIGHT_LOAD_FREQ;
@@ -2955,6 +3004,19 @@ static int zenith_start(struct cpufreq_policy *policy)
 	z_policy->limits_changed = false;
 	z_policy->cached_raw_freq = 0;
 	z_policy->need_freq_update = cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS);
+
+	/* Cache the cluster-topology bit used by input_boost_big_only.
+	 * SCHED_CAPACITY_SCALE is the normalised top capacity; any CPU
+	 * in the policy hitting that value means this policy belongs
+	 * to the system's highest-capacity cluster(s).
+	 */
+	z_policy->is_big_cluster = false;
+	for_each_cpu(cpu, policy->cpus) {
+		if (arch_scale_cpu_capacity(cpu) >= SCHED_CAPACITY_SCALE) {
+			z_policy->is_big_cluster = true;
+			break;
+		}
+	}
 
 	for_each_cpu(cpu, policy->cpus) {
 		struct zenith_cpu *z_cpu = &per_cpu(zenith_cpu, cpu);
