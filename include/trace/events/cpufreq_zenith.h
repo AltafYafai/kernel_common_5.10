@@ -146,6 +146,38 @@ TRACE_EVENT(zenith_render_floor,
 		  __entry->floor_pct, __entry->floor_freq)
 );
 
+/* Adaptive frame-budget floor evaluation. Fires once per
+ * zenith_get_next_freq() call when frame_budget_us and
+ * frame_pace_floor_pct are both non-zero, regardless of whether the
+ * floor actually moved the freq.  Useful for sanity-checking that
+ * userspace is keeping the budget in sync with the panel's vrefresh.
+ */
+TRACE_EVENT(zenith_frame_pace,
+
+	TP_PROTO(int cpu, unsigned int budget_us,
+		 unsigned int eff_pct, unsigned int floor_freq),
+
+	TP_ARGS(cpu, budget_us, eff_pct, floor_freq),
+
+	TP_STRUCT__entry(
+		__field(int,		cpu)
+		__field(unsigned int,	budget_us)
+		__field(unsigned int,	eff_pct)
+		__field(unsigned int,	floor_freq)
+	),
+
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->budget_us	= budget_us;
+		__entry->eff_pct	= eff_pct;
+		__entry->floor_freq	= floor_freq;
+	),
+
+	TP_printk("cpu=%d budget_us=%u eff_pct=%u floor_freq=%u",
+		  __entry->cpu, __entry->budget_us,
+		  __entry->eff_pct, __entry->floor_freq)
+);
+
 /* game_mode flip. Emitted whenever userspace writes a new value to
  * the game_mode sysfs node; lets you correlate frame-pacing diffs in
  * trace data with the moment the gameswitch helper armed/disarmed.

@@ -249,6 +249,48 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_GAME_HISPEED_BOOST_PCT		110
 #define ZENITH_GAME_BOOST_DECAY_PCT		130
 
+/* frame_budget_us (default 0, off) + frame_pace_floor_pct (default 0):
+ *
+ * Userspace-driven, lock-free, KMI-clean alternative to a real DRM
+ * vblank hook.  The intent is the same as a frame-pacing governor:
+ * keep the freq high enough that the render pipeline is never the
+ * critical path of a frame's compute deadline.  The implementation
+ * differs from real frame pacing in that nothing in the kernel sees
+ * vblank events directly.  Instead, userspace (a small daemon that
+ * watches /sys/class/drm/card0-DSI-1/vrefresh, or SurfaceFlinger if
+ * patched, or the existing Realme display HAL) writes the current
+ * vblank period in microseconds to frame_budget_us whenever the
+ * panel switches refresh rate.
+ *
+ *   60 Hz   -> echo 16667 ...
+ *   90 Hz   -> echo 11111 ...
+ *  120 Hz   -> echo  8333 ...
+ *  144 Hz   -> echo  6944 ...
+ *  off      -> echo     0 ...
+ *
+ * The floor itself is computed adaptively: shorter budgets need a
+ * higher floor because the same compute must finish in less wall
+ * time.  The formula is
+ *
+ *   eff_pct = frame_pace_floor_pct * 16667 / frame_budget_us
+ *   floor   = policy->max * min(eff_pct, 100) / 100
+ *
+ * so frame_pace_floor_pct is the *60 Hz baseline*; it auto-scales
+ * upward at higher refresh rates without userspace re-tuning.
+ *
+ * frame_budget_us = 0 disables the feature regardless of
+ * frame_pace_floor_pct.  frame_pace_floor_pct = 0 disables the
+ * floor while keeping the budget set (useful for tracing the
+ * tracepoint without changing freq).
+ *
+ * Floor is capped by uclamp_max downstream so an explicit ADPF
+ * power-efficiency hint still wins.
+ */
+#define ZENITH_DEFAULT_FRAME_BUDGET_US		0
+#define ZENITH_FRAME_BUDGET_US_MAX		50000
+#define ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT	0
+#define ZENITH_FRAME_PACE_BASE_BUDGET_US	16667
+
 /* psi_aware (default 0, off) + psi_mem_thresh (default 50):
  *
  * When psi_aware=1, zenith_get_next_freq() reads the system-wide
@@ -571,6 +613,12 @@ struct zenith_tunables {
 
 	/* See ZENITH_DEFAULT_BOOT_BOOST_MS. 0 disables the one-shot. */
 	unsigned int		boot_boost_ms;
+
+	/* See ZENITH_DEFAULT_FRAME_BUDGET_US. Userspace writes the
+	 * current vblank period in microseconds.  0 disables.
+	 */
+	unsigned int		frame_budget_us;
+	unsigned int		frame_pace_floor_pct;
 };
 
 /*
@@ -1789,6 +1837,39 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				freq = policy->max;
 				tp_path = "boot_boost";
 			}
+		}
+	}
+
+	/* 3c''. Adaptive frame-budget floor.  Userspace-driven; sees
+	 * the current vblank period via tunables->frame_budget_us and
+	 * the calibrated 60 Hz baseline floor via
+	 * tunables->frame_pace_floor_pct.  The effective floor scales
+	 * inversely with the budget so 90 / 120 / 144 Hz refresh rates
+	 * automatically lift the floor.  See the comment block at the
+	 * top of the file for the formula.
+	 */
+	if (z_policy->tunables->frame_budget_us &&
+	    z_policy->tunables->frame_pace_floor_pct) {
+		unsigned int budget_us = z_policy->tunables->frame_budget_us;
+		unsigned int base_pct =
+			z_policy->tunables->frame_pace_floor_pct;
+		unsigned int eff_pct;
+		unsigned int fp_floor;
+
+		eff_pct = (base_pct * ZENITH_FRAME_PACE_BASE_BUDGET_US) /
+			  budget_us;
+		if (eff_pct > 100)
+			eff_pct = 100;
+		fp_floor = (policy->max * eff_pct) / 100;
+		if (fp_floor > policy->max)
+			fp_floor = policy->max;
+		if (trace_zenith_frame_pace_enabled())
+			trace_zenith_frame_pace(
+				cpumask_first(policy->cpus),
+				budget_us, eff_pct, fp_floor);
+		if (freq < fp_floor) {
+			freq = fp_floor;
+			tp_path = "frame_pace";
 		}
 	}
 
@@ -3501,6 +3582,63 @@ static ssize_t boot_boost_ms_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr boot_boost_ms = __ATTR_RW(boot_boost_ms);
 
+/* frame_budget_us sysfs knob.  Range 0..ZENITH_FRAME_BUDGET_US_MAX
+ * (50 ms).  Userspace writes the current vblank period in
+ * microseconds whenever the panel changes refresh rate.  0 disables
+ * the adaptive frame-budget floor outright.  See the
+ * ZENITH_DEFAULT_FRAME_BUDGET_US comment block at the top of the file
+ * for typical values per refresh rate.
+ */
+static ssize_t frame_budget_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->frame_budget_us);
+}
+
+static ssize_t frame_budget_us_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > ZENITH_FRAME_BUDGET_US_MAX)
+		return -EINVAL;
+	t->frame_budget_us = val;
+	return count;
+}
+static struct governor_attr frame_budget_us = __ATTR_RW(frame_budget_us);
+
+/* frame_pace_floor_pct sysfs knob.  Range 0..100; the value is the
+ * 60 Hz baseline floor as a percent of policy->max.  The kernel
+ * scales this inversely with frame_budget_us, so the same value
+ * gives a higher effective floor at higher refresh rates.  0
+ * disables the floor while leaving the tracepoint live.
+ */
+static ssize_t frame_pace_floor_pct_show(struct gov_attr_set *attr_set,
+					 char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->frame_pace_floor_pct);
+}
+
+static ssize_t frame_pace_floor_pct_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	t->frame_pace_floor_pct = val;
+	return count;
+}
+static struct governor_attr frame_pace_floor_pct =
+	__ATTR_RW(frame_pace_floor_pct);
+
 /*
  * uclamp_min_respect sysfs knob.  See the ZENITH_DEFAULT_UCLAMP_MIN_RESPECT
  * comment block at the top of this file for full semantics.  Normalised to
@@ -3602,6 +3740,8 @@ static struct attribute *zenith_attrs[] = {
 	&psi_aware.attr,
 	&psi_mem_thresh.attr,
 	&boot_boost_ms.attr,
+	&frame_budget_us.attr,
+	&frame_pace_floor_pct.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(zenith);
@@ -3751,6 +3891,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->psi_aware		= ZENITH_DEFAULT_PSI_AWARE;
 	tunables->psi_mem_thresh	= ZENITH_DEFAULT_PSI_MEM_THRESH;
 	tunables->boot_boost_ms		= ZENITH_DEFAULT_BOOT_BOOST_MS;
+	tunables->frame_budget_us	= ZENITH_DEFAULT_FRAME_BUDGET_US;
+	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
 	/* If zenith.profile= was passed on the kernel cmdline, apply it
