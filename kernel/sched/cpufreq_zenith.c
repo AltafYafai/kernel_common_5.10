@@ -1531,7 +1531,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->down_rate_limit_us	= 8000;
 		t->up_threshold		= 65;
 		t->down_threshold	= 45;
-		t->hispeed_load		= 75;
+		t->hispeed_load		= 55;	/* must stay < up_threshold */
 		t->climb_mode		= ZENITH_CLIMB_MODE_SNAP;
 		t->freq_step_pct	= 15;
 		t->powersave_bias	= 0;
@@ -1571,7 +1571,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->down_rate_limit_us	= 2000;
 		t->up_threshold		= 85;
 		t->down_threshold	= 40;
-		t->hispeed_load		= 95;
+		t->hispeed_load		= 75;	/* must stay < up_threshold */
 		t->climb_mode		= ZENITH_CLIMB_MODE_STEP;
 		t->freq_step_pct	= 8;
 		t->powersave_bias	= 150;	/* 15% */
