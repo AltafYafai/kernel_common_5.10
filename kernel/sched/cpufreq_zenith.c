@@ -856,12 +856,12 @@ static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned 
 /************************ Zenith Scaling Math ***********************/
 
 /* Spike detection threshold: when the requested frequency jump exceeds
- * this fraction of policy->max (in 1/4 units, i.e. 25%), bypass
- * the up_rate_limit entirely.  This gives instant response to big load
- * spikes (task wakeup, game frame start, UI touch) while still rate-
- * limiting small, noise-driven oscillations.
+ * policy->max >> ZENITH_SPIKE_SHIFT, bypass the up_rate_limit entirely.
+ * This gives instant response to load spikes (task wakeup, game frame
+ * start, UI touch) while still rate-limiting small, noise-driven
+ * oscillations.
  */
-#define ZENITH_SPIKE_SHIFT	2	/* 1 << 2 = divide by 4 = 25% */
+#define ZENITH_SPIKE_SHIFT	3	/* 1 << 3 = divide by 8 = 12.5% */
 
 static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, unsigned int next_freq)
 {
