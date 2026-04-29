@@ -2589,7 +2589,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->active_profile	= ZENITH_PROFILE_CUSTOM;
-	tunables->auto_tune		= 0;
+	tunables->auto_tune		= 1;
 	tunables->auto_tune_sat_load_pct = ZENITH_DEFAULT_AT_SAT_LOAD_PCT;
 	tunables->auto_tune_hi_sat_pct	= ZENITH_DEFAULT_AT_HI_SAT_PCT;
 	tunables->auto_tune_lo_sat_pct	= ZENITH_DEFAULT_AT_LO_SAT_PCT;
