@@ -163,7 +163,32 @@
  * walk from every freq eval down to once per millisecond.
  */
 #define ZENITH_UCLAMP_CACHE_TTL_NS		(1 * NSEC_PER_MSEC)
-#define ZENITH_EFF_BINS_MAX			4
+
+/* Maximum number of bins in the efficient_freq soft-cap ladder.
+ *
+ * The ladder is the array of (eff_freq, eff_delay_us) pairs the
+ * efficient_freq= / up_delay_us= sysfs nodes accept and that
+ * zenith_get_next_freq() walks once per evaluation.  This number
+ * bounds three things: the parser's parsed[] stack buffer, the
+ * static eff_freq[] / eff_delay_us[] tables on struct
+ * zenith_tunables, and the per-policy eff_unlock_at_ns[] deadline
+ * table on struct zenith_policy.  The runtime value of eff_nr
+ * (set by the parser, capped to this ceiling) decides how many of
+ * those slots the hot path actually walks; a CSV with fewer entries
+ * leaves the rest of the array unused but does not save any
+ * footprint.
+ *
+ * Was 4, raised to 8 to fit the more finely-binned freq tables
+ * found on Dimensity 9000+ / Snapdragon 8 Gen 3-class SoCs.  A bin
+ * count above 8 is hard to tune by hand and burns d-cache on the
+ * walk for diminishing return -- the cap is deliberate and not
+ * runtime-configurable.  Memory cost vs the old value: 8 - 4 = 4
+ * additional uints per array; tunables grows by 32 bytes (two
+ * arrays) and zenith_policy by 32 bytes (one u64 array), totals
+ * negligible against the rest of those structs.  Hot-path cost is
+ * unchanged: the loop bound is eff_nr, not the array ceiling.
+ */
+#define ZENITH_EFF_BINS_MAX			8
 #define ZENITH_CLIMB_MODE_SNAP			0	/* default */
 #define ZENITH_CLIMB_MODE_STEP			1
 #define ZENITH_PROFILE_CUSTOM			0	/* default */
