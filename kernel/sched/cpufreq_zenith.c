@@ -414,6 +414,40 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY	1
 #define ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT	80	/* 0 = no cap, pin to policy->max */
 #define ZENITH_DEFAULT_EFFICIENT_FREQ		0
+
+/* eff_bin_hyst_pct (default 0, off):
+ *
+ * The efficient_freq ladder releases a bin (and resets every higher
+ * bin's wait-deadline) the moment the requested target_freq drops
+ * to or below the bin's freq.  When userspace load sits right at a
+ * bin boundary -- a 6 Hz frame-pacing thread asking for almost
+ * exactly the bin freq -- this turns into ping-pong:
+ *
+ *   eval N   target = bin_freq + 1    arm bin, hold at bin_freq
+ *   eval N+1 target = bin_freq        clear deadline, break
+ *   eval N+2 target = bin_freq + 1    re-arm bin (full delay again)
+ *   ...
+ *
+ * The bin never actually unlocks because the deadline keeps getting
+ * reset.  The cluster sits one rung below where it should be.
+ *
+ * eff_bin_hyst_pct adds a release margin per bin: target must drop
+ * to bin_freq * (100 - eff_bin_hyst_pct) / 100 before the deadline
+ * is cleared.  Targets between that release threshold and bin_freq
+ * land in a hysteresis band: the bin is *not* released (deadline is
+ * preserved, so a re-cross doesn't have to re-arm) but the target
+ * is also *not* held at bin_freq (so the operator gets the slightly
+ * lower freq they asked for).  This breaks the ping-pong without
+ * pinning the cluster up to the bin.
+ *
+ * Range 0..20.  20% is a generous upper bound -- bin spacing in
+ * real freq tables tends to be larger than that, so a value of 20
+ * gives the full hysteresis band; values higher would just clip to
+ * the bin below.  0 disables the band entirely (legacy: any drop
+ * to-or-below bin_freq releases the deadline).
+ */
+#define ZENITH_DEFAULT_EFF_BIN_HYST_PCT		0
+#define ZENITH_EFF_BIN_HYST_PCT_MAX		20
 #define ZENITH_DEFAULT_UP_DELAY_US		4000
 #define ZENITH_DEFAULT_LIGHT_LOAD_FREQ		0
 #define ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD	20
@@ -1124,6 +1158,12 @@ struct zenith_tunables {
 	unsigned int		efficient_freq;
 	unsigned int		up_delay_us;
 	unsigned int		eff_nr;
+
+	/* See ZENITH_DEFAULT_EFF_BIN_HYST_PCT.  Per-bin release margin
+	 * for the efficient_freq ladder, in percent.  0..20.  0 keeps
+	 * the legacy "any drop releases" shape.
+	 */
+	unsigned int		eff_bin_hyst_pct;
 	unsigned int		eff_freq[ZENITH_EFF_BINS_MAX];
 	unsigned int		eff_delay_us[ZENITH_EFF_BINS_MAX];
 
@@ -3483,14 +3523,34 @@ apply_uclamp_max_cap:
 				bin_freq = policy->max;
 
 			if (target_freq <= bin_freq) {
-				/* Target is at or below this bin. Reset
-				 * its own and every higher bin's
-				 * deadline so a later climb has to earn
-				 * them again.
+				/* Target is at or below this bin.  With
+				 * hysteresis enabled, only release the
+				 * bin (clear its and every higher bin's
+				 * wait-deadline) if target dropped past
+				 * bin_freq * (100 - hyst_pct) / 100.
+				 * Otherwise the deadline is preserved
+				 * but target_freq is left as-is, so a
+				 * re-cross of bin_freq doesn't have to
+				 * re-arm the bin.  See ZENITH_DEFAULT_
+				 * EFF_BIN_HYST_PCT for the why.
 				 */
-				int j;
-				for (j = i; j < nr; j++)
-					z_policy->eff_unlock_at_ns[j] = 0;
+				unsigned int hyst = READ_ONCE(
+					z_policy->tunables->eff_bin_hyst_pct);
+
+				if (hyst) {
+					unsigned int margin =
+						(bin_freq * hyst) / 100;
+					unsigned int release = bin_freq -
+						margin;
+
+					if (target_freq > release)
+						break;
+				}
+				{
+					int j;
+					for (j = i; j < nr; j++)
+						z_policy->eff_unlock_at_ns[j] = 0;
+				}
 				break;
 			}
 
@@ -4883,6 +4943,26 @@ static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr efficient_freq = __ATTR_RW(efficient_freq);
 
+static ssize_t eff_bin_hyst_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->eff_bin_hyst_pct);
+}
+
+static ssize_t eff_bin_hyst_pct_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_EFF_BIN_HYST_PCT_MAX)
+		return -EINVAL;
+	t->eff_bin_hyst_pct = val;
+	return count;
+}
+static struct governor_attr eff_bin_hyst_pct = __ATTR_RW(eff_bin_hyst_pct);
+
 static ssize_t up_delay_us_show(struct gov_attr_set *attr_set, char *buf)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
@@ -6120,6 +6200,7 @@ static struct attribute *zenith_attrs[] = {
 	&input_boost_big_only.attr,
 	&input_boost_cap_pct.attr,
 	&efficient_freq.attr,
+	&eff_bin_hyst_pct.attr,
 	&up_delay_us.attr,
 	&light_load_freq.attr,
 	&light_load_threshold.attr,
@@ -6290,6 +6371,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->input_boost_big_only	= ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY;
 	tunables->input_boost_cap_pct	= ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT;
 	tunables->efficient_freq	= ZENITH_DEFAULT_EFFICIENT_FREQ;
+	tunables->eff_bin_hyst_pct	= ZENITH_DEFAULT_EFF_BIN_HYST_PCT;
 	tunables->up_delay_us		= ZENITH_DEFAULT_UP_DELAY_US;
 	tunables->light_load_freq	= ZENITH_DEFAULT_LIGHT_LOAD_FREQ;
 	tunables->light_load_threshold	= ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD;
