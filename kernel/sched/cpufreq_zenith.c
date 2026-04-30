@@ -5289,6 +5289,15 @@ static int __init zenith_gov_init(void)
 	if (ret)
 		pr_warn("Zenith: fb notifier register failed (%d), screen_auto disabled\n",
 			ret);
+#else
+	/* screen_auto stores still accept 0/1 (the field is plain
+	 * bookkeeping for userspace introspection) but no notifier
+	 * will ever flip screen_state.  Print once at init so an
+	 * operator wondering "why is screen_auto=1 not affecting the
+	 * frequency" can grep dmesg and find the answer immediately
+	 * rather than chasing the runtime path.
+	 */
+	pr_info("Zenith: CONFIG_FB_NOTIFY=n, screen_auto is bookkeeping-only (no panel events delivered)\n");
 #endif
 
 	return cpufreq_register_governor(&zenith_gov);
