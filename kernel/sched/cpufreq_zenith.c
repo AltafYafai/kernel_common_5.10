@@ -128,6 +128,24 @@
  */
 static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 
+/* Optional per-policy cmdline profile overrides parsed from
+ * zenith.policy_profile=N:prof,M:prof,...  Indexed by the "policy
+ * anchor cpu" (cpumask_first(policy->cpus) at init time -- what
+ * SurfaceFlinger and the cpufreq sysfs tree already print as
+ * policyN).  Each slot defaults to ZENITH_PROFILE_CUSTOM meaning
+ * "no per-policy override; fall through to zenith_cmdline_profile".
+ *
+ * Using a fixed-size array indexed by CPU is intentional: the
+ * parser runs at early_param time when per-cpu structures aren't
+ * fully populated, and an NR_CPUS-sized u8 table costs one byte
+ * per possible CPU on the kernel image (256 bytes on a common
+ * aarch64 defconfig) -- cheaper than any dynamic allocation would
+ * save, and lookup is a single load at init time.
+ */
+static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
+	[0 ... NR_CPUS - 1] = ZENITH_PROFILE_CUSTOM,
+};
+
 /* Static-branch fold for zero-default feature tunables.
  *
  * audio_aware, camera_aware, render_aware and psi_aware all default
@@ -3616,6 +3634,79 @@ static int __init zenith_setup_profile(char *s)
 }
 early_param("zenith.profile", zenith_setup_profile);
 
+/* Parse a single "performance|balanced|battery|legacy|custom" name
+ * into a profile id.  Returns ZENITH_PROFILE_CUSTOM on unknown
+ * input so callers can use the result as a tri-state ("apply" /
+ * "explicit-custom" / "ignore") without another strcmp pass.
+ */
+static unsigned int __init zenith_parse_profile_name(const char *s)
+{
+	if (!strcmp(s, "performance"))
+		return ZENITH_PROFILE_PERFORMANCE;
+	if (!strcmp(s, "balanced"))
+		return ZENITH_PROFILE_BALANCED;
+	if (!strcmp(s, "battery"))
+		return ZENITH_PROFILE_BATTERY;
+	if (!strcmp(s, "legacy"))
+		return ZENITH_PROFILE_LEGACY;
+	if (!strcmp(s, "custom"))
+		return ZENITH_PROFILE_CUSTOM;
+	return ZENITH_PROFILE_CUSTOM;
+}
+
+/* early_param("zenith.policy_profile", ...) -- asymmetric preset
+ * list.  Accepts a comma-separated list of "CPU:name" pairs where
+ * CPU is the anchor-cpu of a cpufreq policy (cpumask_first) and
+ * name is any of the canonical profile names accepted by
+ * zenith.profile.  Example on a 4+3+1 big.LITTLE:
+ *
+ *   zenith.policy_profile=0:battery,4:balanced,7:performance
+ *
+ * Silently skips pairs with an out-of-range CPU index or an
+ * unknown name.  Tokenising is done in-place against a stable
+ * early_param scratch buffer (the cmdline is already copied by
+ * the boot allocator).  Any slot not mentioned stays at CUSTOM
+ * and therefore falls through to the global zenith.profile= (or
+ * to the unprofiled default when that too is CUSTOM).
+ */
+static int __init zenith_setup_policy_profile(char *s)
+{
+	char *p, *next;
+
+	if (!s)
+		return 1;
+
+	for (p = s; p && *p; p = next) {
+		unsigned int cpu, prof;
+		char *colon;
+
+		next = strchr(p, ',');
+		if (next)
+			*next++ = '\0';
+
+		colon = strchr(p, ':');
+		if (!colon)
+			continue;
+		*colon++ = '\0';
+
+		if (kstrtouint(p, 10, &cpu) || cpu >= NR_CPUS)
+			continue;
+
+		prof = zenith_parse_profile_name(colon);
+		/* CUSTOM from the parser means either "user wrote
+		 * custom" (explicit) or "unknown name" (skipped).  In
+		 * both cases leaving the slot at its CUSTOM default
+		 * is correct: CUSTOM means "no override".  Distinguish
+		 * the explicit case only if we later want to force a
+		 * CUSTOM override over the global profile; today we
+		 * don't, so both collapse to the same behaviour.
+		 */
+		zenith_cmdline_policy_profile[cpu] = (u8)prof;
+	}
+	return 1;
+}
+early_param("zenith.policy_profile", zenith_setup_policy_profile);
+
 /************************ Auto-tune observer *****************************/
 
 /* Classify the workload seen since the last pass and pick a profile.
@@ -5493,15 +5584,33 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
-	/* If zenith.profile= was passed on the kernel cmdline, apply it
-	 * now (once, on the first policy that triggers global_tunables
-	 * creation). This happens before the sysfs attr set is published
-	 * by kobject_init_and_add() below, so userspace sees the
-	 * cmdline-picked preset as the initial state of the profile node.
+	/* Apply a cmdline-picked preset before the sysfs attr set is
+	 * published, so userspace sees the cmdline-picked preset as the
+	 * initial state of the profile node.
+	 *
+	 * Precedence:
+	 *   1. zenith.policy_profile=N:prof wins for the matching
+	 *      anchor cpu (cpumask_first(policy->cpus)) -- asymmetric
+	 *      big.LITTLE presets, one policy at a time.
+	 *   2. zenith.profile= applies to every unmatched policy
+	 *      (the historical global behaviour).
+	 *   3. No cmdline override -> CUSTOM (historical default).
 	 */
-	if (zenith_cmdline_profile != ZENITH_PROFILE_CUSTOM) {
-		zenith_apply_profile(tunables, zenith_cmdline_profile);
-		tunables->active_profile = zenith_cmdline_profile;
+	{
+		unsigned int anchor = cpumask_first(policy->cpus);
+		unsigned int chosen = ZENITH_PROFILE_CUSTOM;
+
+		if (anchor < NR_CPUS &&
+		    zenith_cmdline_policy_profile[anchor] !=
+		    ZENITH_PROFILE_CUSTOM)
+			chosen = zenith_cmdline_policy_profile[anchor];
+		else if (zenith_cmdline_profile != ZENITH_PROFILE_CUSTOM)
+			chosen = zenith_cmdline_profile;
+
+		if (chosen != ZENITH_PROFILE_CUSTOM) {
+			zenith_apply_profile(tunables, chosen);
+			tunables->active_profile = chosen;
+		}
 	}
 
 	ret = kobject_init_and_add(&tunables->attr_set.kobj,
