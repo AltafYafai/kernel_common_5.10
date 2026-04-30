@@ -1124,6 +1124,32 @@ static unsigned int zenith_input_boost_active_ms = ZENITH_DEFAULT_INPUT_BOOST_MS
 static atomic64_t zenith_auto_input_events = ATOMIC64_INIT(0);
 #define ZENITH_AUTO_TUNE_PERIOD_MS	10000	/* classify every 10s  */
 
+/* Per-policy decision-stat buckets exposed via the readonly
+ * `zenith_stats` sysfs node.  See struct zenith_policy::stats[] for
+ * the storage and zenith_path_to_bucket() for the tp_path -> bucket
+ * mapping.  ZENITH_STAT_OTHER is a catch-all so a future tier added
+ * without a bucket mapping still gets counted (against decisions,
+ * but not against any specific tier).
+ */
+enum zenith_stat_idx {
+	ZENITH_STAT_DECISIONS,		/* total get_next_freq() calls */
+	ZENITH_STAT_CACHE_HITS,		/* cached_raw_freq early-return */
+	ZENITH_STAT_INPUT_BOOST,	/* input_boost / input_boost_decay */
+	ZENITH_STAT_BRUTAL,		/* snap_max / brutal_hold / climb_step */
+	ZENITH_STAT_HISPEED,		/* hispeed */
+	ZENITH_STAT_FRAME_PACE,		/* frame_pace */
+	ZENITH_STAT_AUDIO,		/* audio_floor / audio_cap */
+	ZENITH_STAT_RENDER_CAMERA,	/* render_floor / camera_floor */
+	ZENITH_STAT_UCLAMP,		/* uclamp_min_floor / uclamp_max_cap */
+	ZENITH_STAT_PSI,		/* psi_*_cap */
+	ZENITH_STAT_BOOT_BOOST,		/* boot_boost */
+	ZENITH_STAT_LIGHT_CAP,		/* light_cap */
+	ZENITH_STAT_EM_CAP,		/* em_cap */
+	ZENITH_STAT_EAS,		/* fall-through, no override */
+	ZENITH_STAT_OTHER,		/* unmapped tp_path */
+	ZENITH_STAT_NR
+};
+
 struct zenith_policy {
 	struct cpufreq_policy	*policy;
 	struct zenith_tunables	*tunables;
@@ -1278,6 +1304,18 @@ struct zenith_policy {
 	 * recent boost to extend".
 	 */
 	u64			boost_active_until_ns;
+
+	/* Per-policy decision stats.  Bumped from zenith_get_next_freq()
+	 * once per evaluation; total decisions and cache_hits are
+	 * always counted, the tier buckets are mapped from the final
+	 * tp_path string by zenith_path_to_bucket().  Reset to zero on
+	 * zenith_start() so the values reflect the current attach
+	 * cycle.  No locking: zenith_get_next_freq() is serialised
+	 * per-policy by the cpufreq core (the leader cpu in a shared
+	 * policy, the only cpu in a single policy), so a plain
+	 * unsigned long ++ is race-free.
+	 */
+	unsigned long		stats[ZENITH_STAT_NR];
 };
 
 struct zenith_cpu {
@@ -2316,6 +2354,47 @@ static bool zenith_ladder_pending(struct zenith_policy *z_policy)
 	return false;
 }
 
+/* Map a tp_path string to a stats bucket.  Called once per
+ * zenith_get_next_freq() evaluation right before return, so the
+ * cost is one O(few-strcmp) chain per decision -- negligible vs.
+ * the rest of the eval pass.  Order is by frequency-of-hit so the
+ * common case (eas / hispeed) short-circuits early.  Catches
+ * everything; unknown tags fall through to ZENITH_STAT_OTHER.
+ */
+static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
+{
+	if (unlikely(!path))
+		return ZENITH_STAT_EAS;
+	if (!strcmp(path, "eas"))
+		return ZENITH_STAT_EAS;
+	if (!strcmp(path, "hispeed"))
+		return ZENITH_STAT_HISPEED;
+	if (!strncmp(path, "input_boost", 11))	/* input_boost / _decay */
+		return ZENITH_STAT_INPUT_BOOST;
+	if (!strcmp(path, "snap_max") ||
+	    !strcmp(path, "brutal_hold") ||
+	    !strcmp(path, "climb_step"))
+		return ZENITH_STAT_BRUTAL;
+	if (!strcmp(path, "frame_pace"))
+		return ZENITH_STAT_FRAME_PACE;
+	if (!strcmp(path, "audio_floor") || !strcmp(path, "audio_cap"))
+		return ZENITH_STAT_AUDIO;
+	if (!strcmp(path, "render_floor") || !strcmp(path, "camera_floor"))
+		return ZENITH_STAT_RENDER_CAMERA;
+	if (!strcmp(path, "uclamp_min_floor") ||
+	    !strcmp(path, "uclamp_max_cap"))
+		return ZENITH_STAT_UCLAMP;
+	if (!strncmp(path, "psi_", 4))		/* psi_mem_cap / _cpu / _io */
+		return ZENITH_STAT_PSI;
+	if (!strcmp(path, "boot_boost"))
+		return ZENITH_STAT_BOOT_BOOST;
+	if (!strcmp(path, "light_cap"))
+		return ZENITH_STAT_LIGHT_CAP;
+	if (!strcmp(path, "em_cap"))
+		return ZENITH_STAT_EM_CAP;
+	return ZENITH_STAT_OTHER;
+}
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
@@ -3065,6 +3144,8 @@ apply_uclamp_max_cap:
 	 */
 	if (freq == z_policy->cached_raw_freq && !z_policy->need_freq_update &&
 	    !zenith_ladder_pending(z_policy)) {
+		z_policy->stats[ZENITH_STAT_DECISIONS]++;
+		z_policy->stats[ZENITH_STAT_CACHE_HITS]++;
 		/* Emit the same summary tracepoint on cache-hit so a
 		 * trace consumer sees a continuous record of decisions
 		 * rather than gaps every time the cache shortcut wins.
@@ -3237,6 +3318,9 @@ apply_uclamp_max_cap:
 				      z_policy->cached_uclamp_max,
 				      false);
 	}
+
+	z_policy->stats[ZENITH_STAT_DECISIONS]++;
+	z_policy->stats[zenith_path_to_bucket(tp_path)]++;
 
 	return target_freq;
 }
@@ -4141,6 +4225,58 @@ static ssize_t profile_values_show(struct gov_attr_set *attr_set, char *buf)
 	return len;
 }
 static struct governor_attr profile_values = __ATTR_RO(profile_values);
+
+/* zenith_stats: readonly per-policy decision-stat dump.  One line
+ * per bucket, "name=count", emitted in enum order so userspace
+ * scrapers can read field-by-name without depending on a fixed
+ * column count.  Counters reset on zenith_start() so values reflect
+ * the current attach cycle.  See enum zenith_stat_idx for what each
+ * bucket includes.
+ *
+ * Each policy carries its own gov_attr_set, so this attribute is
+ * per-policy automatically; we walk attr_set->policy_list for the
+ * (currently always one) z_policy that owns the values.  The first
+ * entry's stats are reported; if multiple policies were ever to
+ * share a tunables instance, later entries are summed in.
+ */
+static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
+{
+	static const char * const zenith_stat_names[] = {
+		[ZENITH_STAT_DECISIONS]		= "decisions",
+		[ZENITH_STAT_CACHE_HITS]	= "cache_hits",
+		[ZENITH_STAT_INPUT_BOOST]	= "input_boost",
+		[ZENITH_STAT_BRUTAL]		= "brutal",
+		[ZENITH_STAT_HISPEED]		= "hispeed",
+		[ZENITH_STAT_FRAME_PACE]	= "frame_pace",
+		[ZENITH_STAT_AUDIO]		= "audio",
+		[ZENITH_STAT_RENDER_CAMERA]	= "render_camera",
+		[ZENITH_STAT_UCLAMP]		= "uclamp",
+		[ZENITH_STAT_PSI]		= "psi",
+		[ZENITH_STAT_BOOT_BOOST]	= "boot_boost",
+		[ZENITH_STAT_LIGHT_CAP]		= "light_cap",
+		[ZENITH_STAT_EM_CAP]		= "em_cap",
+		[ZENITH_STAT_EAS]		= "eas",
+		[ZENITH_STAT_OTHER]		= "other",
+	};
+	unsigned long sum[ZENITH_STAT_NR] = { 0 };
+	struct zenith_policy *z_pol;
+	ssize_t len = 0;
+	unsigned int i;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
+		for (i = 0; i < ZENITH_STAT_NR; i++)
+			sum[i] += z_pol->stats[i];
+	}
+
+	for (i = 0; i < ZENITH_STAT_NR; i++) {
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s=%lu\n",
+				 zenith_stat_names[i], sum[i]);
+		if (len >= PAGE_SIZE)
+			break;
+	}
+	return len;
+}
+static struct governor_attr zenith_stats = __ATTR_RO(zenith_stats);
 
 ZENITH_TUNABLE_UINT_INVAL(screen_state);
 
@@ -5512,6 +5648,7 @@ static struct attribute *zenith_attrs[] = {
 	&freq_step_adaptive.attr,
 	&profile.attr,
 	&profile_values.attr,
+	&zenith_stats.attr,
 	&auto_tune.attr,
 	&auto_tune_sat_load_pct.attr,
 	&auto_tune_hi_sat_pct.attr,
@@ -5865,6 +6002,8 @@ static int zenith_start(struct cpufreq_policy *policy)
 	z_policy->cached_uclamp_min = 0;
 	z_policy->cached_uclamp_max = SCHED_CAPACITY_SCALE;
 	z_policy->uclamp_cache_stamp_ns = 0;
+
+	memset(z_policy->stats, 0, sizeof(z_policy->stats));
 
 	for_each_cpu(cpu, policy->cpus) {
 		struct zenith_cpu *z_cpu = &per_cpu(zenith_cpu, cpu);
