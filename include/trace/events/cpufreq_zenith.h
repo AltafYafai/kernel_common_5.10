@@ -126,6 +126,38 @@ TRACE_EVENT(zenith_auto_tune_scenario,
 		  __entry->prev_target, __entry->scenario_target)
 );
 
+/* Thermal-pressure-aware util derate.  Emitted from zenith_get_util()
+ * each time arch_scale_thermal_pressure() reports a meaningful
+ * fraction of capacity eaten by SoC thermal throttling and util_out
+ * was scaled down accordingly.  before / after are the pre- and
+ * post-derate util values; pressure_pct is (pressure * 100 / max).
+ */
+TRACE_EVENT(zenith_thermal_derate,
+
+	TP_PROTO(int cpu, unsigned long before, unsigned long after,
+		 unsigned int pressure_pct),
+
+	TP_ARGS(cpu, before, after, pressure_pct),
+
+	TP_STRUCT__entry(
+		__field(int,		cpu)
+		__field(unsigned long,	before)
+		__field(unsigned long,	after)
+		__field(unsigned int,	pressure_pct)
+	),
+
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->before		= before;
+		__entry->after		= after;
+		__entry->pressure_pct	= pressure_pct;
+	),
+
+	TP_printk("cpu=%d util_before=%lu util_after=%lu pressure_pct=%u",
+		  __entry->cpu, __entry->before, __entry->after,
+		  __entry->pressure_pct)
+);
+
 /* Predictive-util one-step-ahead extrapolation (predict_util_pct). One
  * record per zenith_get_util() call when the predictor is enabled and
  * the predicted value differs from the observed util. Useful for

@@ -92,6 +92,38 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_FREQ_STEP_PCT		5
 #define ZENITH_DEFAULT_THERMAL_AUTO		1
 #define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
+
+/* thermal_util_derate (default 1, on):
+ *
+ * When set, zenith_get_util() scales down its output by the
+ * fraction of capacity currently being eaten by SoC thermal
+ * pressure (arch_scale_thermal_pressure(cpu) / arch_scale_cpu_capacity(cpu)).
+ *
+ * Without this, util keeps demanding 100% of the *thermal-throttled*
+ * max, which causes the governor to pin policy->max while the
+ * thermal framework drops the cap.  The result is a continuous
+ * yo-yo: thermal lowers max -> we still pin max -> SoC stays hot ->
+ * thermal lowers further.  Derating util smooths this loop because
+ * we ask for less than the throttled max, giving the SoC a chance
+ * to cool.
+ *
+ * Concretely, with 25% of capacity thermal-pressured, util is
+ * scaled by (cap - pressure) / cap = 0.75.  A util of 800/1024
+ * becomes 600/1024.  Frequency selection then targets the
+ * derated demand instead of clamping to the (already throttled)
+ * max.
+ *
+ * Only applies the scale when at least
+ * ZENITH_THERMAL_DERATE_FLOOR_PCT of the capacity is pressured;
+ * for sub-threshold pressure the cost of the multiply isn't
+ * worth the precision.
+ *
+ * Tunable-gated 0/1.  Default 1 (on) -- the existing thermal_auto
+ * tier already handles the "throttle hard" case, but it doesn't
+ * smooth the dance.  This tier adds the smoothing.
+ */
+#define ZENITH_DEFAULT_THERMAL_UTIL_DERATE	1
+#define ZENITH_THERMAL_DERATE_FLOOR_PCT		5
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		100
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	4000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
@@ -607,6 +639,14 @@ struct zenith_tunables {
 	 */
 	unsigned int		thermal_auto;
 
+	/* See ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block.  When
+	 * set, zenith_get_util() scales util_out by the (cap - pressure)
+	 * / cap fraction whenever pressure exceeds
+	 * ZENITH_THERMAL_DERATE_FLOOR_PCT.  Smooths the thermal dance
+	 * by asking for less than the throttled max.
+	 */
+	unsigned int		thermal_util_derate;
+
 	/* Input boost duration (ms). 0 = disabled. */
 	unsigned int		input_boost_ms;
 	unsigned int		input_boost_decay_ms;
@@ -1116,6 +1156,34 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 	}
 
 	util_out = schedutil_cpu_util(z_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
+
+	/* Thermal-pressure-aware util derate.  When the SoC thermal
+	 * framework has eaten a meaningful fraction of capacity, scale
+	 * util_out by (max - pressure) / max so the freq decision
+	 * targets what we can actually deliver instead of pinning to
+	 * the (already throttled) policy->max.  See the
+	 * ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block.
+	 *
+	 * Sub-floor pressure is ignored to avoid the multiply cost on
+	 * the noise.  trace_zenith_thermal_derate fires only when the
+	 * derate actually changes util.
+	 */
+	if (READ_ONCE(z_cpu->z_policy->tunables->thermal_util_derate) && max) {
+		unsigned long pressure = arch_scale_thermal_pressure(z_cpu->cpu);
+		unsigned long pressure_pct = (pressure * 100) / max;
+
+		if (pressure_pct >= ZENITH_THERMAL_DERATE_FLOOR_PCT &&
+		    pressure < max) {
+			unsigned long avail = max - pressure;
+			unsigned long derated = (util_out * avail) / max;
+
+			if (trace_zenith_thermal_derate_enabled())
+				trace_zenith_thermal_derate(z_cpu->cpu,
+							    util_out, derated,
+							    (unsigned int)pressure_pct);
+			util_out = derated;
+		}
+	}
 
 	/* One-step-ahead linear predictor (up-only). See the
 	 * ZENITH_DEFAULT_PREDICT_UTIL_PCT comment block at the top of
@@ -3199,6 +3267,29 @@ static ssize_t thermal_auto_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr thermal_auto = __ATTR_RW(thermal_auto);
 
+/* thermal_util_derate sysfs knob.  Strict 0/1 boolean.  See the
+ * ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block for semantics.
+ */
+static ssize_t thermal_util_derate_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->thermal_util_derate);
+}
+
+static ssize_t thermal_util_derate_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->thermal_util_derate = val;
+	return count;
+}
+static struct governor_attr thermal_util_derate =
+	__ATTR_RW(thermal_util_derate);
+
 static ssize_t input_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->input_boost_ms);
@@ -4347,6 +4438,7 @@ static struct attribute *zenith_attrs[] = {
 	&screen_auto.attr,
 	&thermal_state.attr,
 	&thermal_auto.attr,
+	&thermal_util_derate.attr,
 	&input_boost_ms.attr,
 	&input_boost_decay_ms.attr,
 	&input_boost_big_only.attr,
@@ -4505,6 +4597,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->screen_auto		= 1;
 	tunables->thermal_state		= 0;
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
+	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 	tunables->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
 	tunables->input_boost_big_only	= ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY;
