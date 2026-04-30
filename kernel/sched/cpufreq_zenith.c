@@ -1591,10 +1591,18 @@ static bool zenith_should_update_freq(struct zenith_policy *z_policy, u64 time)
 	if (!cpufreq_this_cpu_can_update(z_policy->policy))
 		return false;
 
-	if (unlikely(READ_ONCE(z_policy->limits_changed))) {
+	/* Pair the smp_store_release() in zenith_limits() with an
+	 * smp_load_acquire() here so the new policy->{min,max} written
+	 * by cpufreq_policy_apply_limits() is observed by the
+	 * subsequent eval on this CPU.  The previous smp_wmb()/smp_mb()
+	 * pair only ordered prior stores; it did not guarantee that the
+	 * load of policy->{min,max} below the flag check was observed
+	 * after the store of those fields above the flag store on the
+	 * writer side.
+	 */
+	if (unlikely(smp_load_acquire(&z_policy->limits_changed))) {
 		WRITE_ONCE(z_policy->limits_changed, false);
 		z_policy->need_freq_update = true;
-		smp_mb();
 		return true;
 	}
 
@@ -5024,8 +5032,14 @@ static void zenith_limits(struct cpufreq_policy *policy)
 		cpufreq_policy_apply_limits(policy);
 		mutex_unlock(&z_policy->work_lock);
 	}
-	smp_wmb();
-	WRITE_ONCE(z_policy->limits_changed, true);
+	/* Release-store the flag so the subsequent acquire-load in
+	 * zenith_should_update_freq() observes every write to
+	 * policy->{min,max} that cpufreq_policy_apply_limits() made
+	 * above.  smp_wmb() previously used here is a write-write
+	 * barrier that does NOT establish a happens-before edge with
+	 * the read side; release/acquire is the documented idiom.
+	 */
+	smp_store_release(&z_policy->limits_changed, true);
 }
 
 static struct cpufreq_governor zenith_gov = {
