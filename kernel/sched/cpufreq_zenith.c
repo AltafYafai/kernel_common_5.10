@@ -1352,10 +1352,18 @@ static void zenith_kcpustat_sample(struct zenith_cpu *z_cpu,
 				   unsigned int filter_shift, u64 time)
 {
 	u64 cur_idle, cur_wall;
-	unsigned int wall_delta, idle_delta;
+	u64 wall_delta, idle_delta;
 
 	cur_idle = get_cpu_idle_time(z_cpu->cpu, &cur_wall, 1);
-	wall_delta = (unsigned int)(cur_wall - z_cpu->kc_prev_wall_time);
+	/* kc_prev_wall_time and cur_wall are u64 microseconds; the
+	 * delta can exceed UINT_MAX on long-idle CPUs (~71 minutes).
+	 * Truncating to unsigned int there made wall_delta wrap to a
+	 * tiny value and immediately falsely satisfy the
+	 * wall_delta >= window_us phase-1 condition, so the sampler
+	 * silently re-armed instead of producing a real busy_pct.
+	 * Keep everything u64 through the divide.
+	 */
+	wall_delta = cur_wall - z_cpu->kc_prev_wall_time;
 
 	if (wall_delta >= window_us) {
 		/*
@@ -1379,10 +1387,11 @@ static void zenith_kcpustat_sample(struct zenith_cpu *z_cpu,
 	z_cpu->kc_hispeed_active = false;
 
 	idle_delta = (cur_idle > z_cpu->kc_prev_idle_time) ?
-		     (unsigned int)(cur_idle - z_cpu->kc_prev_idle_time) : 0;
+		     (cur_idle - z_cpu->kc_prev_idle_time) : 0;
 
 	z_cpu->kc_busy_pct = (wall_delta > idle_delta) ?
-		((100u * (wall_delta - idle_delta)) / wall_delta) : 0;
+		(unsigned int)div64_u64(100ULL * (wall_delta - idle_delta),
+					wall_delta) : 0;
 
 	z_cpu->kc_prev_idle_time = cur_idle;
 	z_cpu->kc_prev_wall_time = cur_wall;
