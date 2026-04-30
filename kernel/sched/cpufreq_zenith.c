@@ -332,6 +332,45 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  */
 #define ZENITH_DEFAULT_THERMAL_UTIL_DERATE	1
 #define ZENITH_THERMAL_DERATE_FLOOR_PCT		5
+
+/* thermal_derate_rate_pct (default 0, off):
+ *
+ * The static thermal_util_derate scales util by the *current*
+ * pressure level, which lags the actual thermal event: by the time
+ * pressure has risen to the level where the derate bites, the
+ * cluster has already spent the rising slope at full demand.  On
+ * SoCs with fast pressure tracking (e.g. tsensor-driven thermal
+ * frameworks) this is visible as an overshoot before the derate
+ * catches up.
+ *
+ * thermal_derate_rate_pct adds a derivative term: when pressure
+ * is rising sample-to-sample on a cpu, additionally scale util by
+ * up to thermal_derate_rate_pct percent based on how big the
+ * single-step rise was relative to capacity.  Same shape as the
+ * level derate -- just on the slope instead of the value.  Caps
+ * the additional reduction at thermal_derate_rate_pct so a single
+ * pressure spike can never zero util.
+ *
+ *   rise_pct = ((pressure - prev_pressure) * 100) / max  // 0..100
+ *   if (rise_pct > thermal_derate_rate_pct)
+ *           rise_pct = thermal_derate_rate_pct;
+ *   util_out = util_out * (100 - rise_pct) / 100;
+ *
+ * Only applied when the static thermal_util_derate also fires
+ * (pressure >= ZENITH_THERMAL_DERATE_FLOOR_PCT and pressure < max),
+ * so the rate term piggybacks on the existing gating and adds no
+ * cost when the level derate is silent.  prev_pressure is per-cpu
+ * and zero-initialised by zenith_start()'s memset, so the first
+ * sample after attach sees rise_pct == 0 (no derivative kick on
+ * cold start).
+ *
+ * 0 disables the derivative term entirely; the level derate is
+ * unaffected.  Range 0..100; values >100 rejected by sysfs.  No
+ * upper cap on the rate of rise itself -- the rate_pct clamp at
+ * thermal_derate_rate_pct is the only bound that matters for the
+ * output.
+ */
+#define ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT	0
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		100
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	4000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
@@ -1026,6 +1065,13 @@ struct zenith_tunables {
 	 */
 	unsigned int		thermal_util_derate;
 
+	/* See ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT.  Magnitude of the
+	 * derivative-term scaling applied on top of thermal_util_derate
+	 * when pressure is rising sample-to-sample, in percent.  0..100,
+	 * 0 disables.  Read lock-free in the derate site.
+	 */
+	unsigned int		thermal_derate_rate_pct;
+
 	/* Input boost duration (ms). 0 = disabled. */
 	unsigned int		input_boost_ms;
 	unsigned int		input_boost_decay_ms;
@@ -1468,6 +1514,15 @@ struct zenith_cpu {
 	 */
 	unsigned long		prev_util;
 
+	/* Previous arch_scale_thermal_pressure() observation, used by
+	 * the thermal_derate_rate_pct derivative term to compute a
+	 * sample-to-sample rise.  Zero-initialised by zenith_start()'s
+	 * memset; updated unconditionally whenever the static derate
+	 * runs, so toggling the rate tunable doesn't see a stale
+	 * prev_pressure for the first sample.
+	 */
+	unsigned long		prev_thermal_pressure;
+
 	/* Tap from two samples ago, used only when
 	 * tunables->predict_util_smooth is set and predict_util_pct != 0.
 	 * Maintained in lockstep with prev_util (push the old prev_util
@@ -1701,6 +1756,31 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 		    pressure < max) {
 			unsigned long avail = max - pressure;
 			unsigned long derated = (util_out * avail) / max;
+			unsigned int rate_pct = READ_ONCE(
+				z_cpu->z_policy->tunables->
+					thermal_derate_rate_pct);
+
+			/* Derivative term: when pressure is rising,
+			 * scale derated further by the single-step rise
+			 * relative to capacity, capped to rate_pct.  See
+			 * ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT for the
+			 * why.  rate_pct == 0 keeps the legacy level-only
+			 * shape; the rate-of-change term piggybacks on
+			 * the existing gate so it adds no cost when off.
+			 */
+			if (rate_pct &&
+			    pressure > z_cpu->prev_thermal_pressure) {
+				unsigned long rise =
+					pressure - z_cpu->prev_thermal_pressure;
+				unsigned long rise_pct =
+					(rise * 100) / max;
+
+				if (rate_pct > 100)
+					rate_pct = 100;
+				if (rise_pct > rate_pct)
+					rise_pct = rate_pct;
+				derated = (derated * (100 - rise_pct)) / 100;
+			}
 
 			if (trace_zenith_thermal_derate_enabled())
 				trace_zenith_thermal_derate(z_cpu->cpu,
@@ -1708,6 +1788,7 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 							    (unsigned int)pressure_pct);
 			util_out = derated;
 		}
+		z_cpu->prev_thermal_pressure = pressure;
 	}
 
 	/* One-step-ahead linear predictor (up-only). See the
@@ -4575,6 +4656,27 @@ static ssize_t thermal_util_derate_store(struct gov_attr_set *attr_set,
 static struct governor_attr thermal_util_derate =
 	__ATTR_RW(thermal_util_derate);
 
+static ssize_t thermal_derate_rate_pct_show(struct gov_attr_set *attr_set,
+					    char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->thermal_derate_rate_pct);
+}
+
+static ssize_t thermal_derate_rate_pct_store(struct gov_attr_set *attr_set,
+					     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->thermal_derate_rate_pct = val;
+	return count;
+}
+static struct governor_attr thermal_derate_rate_pct =
+	__ATTR_RW(thermal_derate_rate_pct);
+
 static ssize_t input_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->input_boost_ms);
@@ -6011,6 +6113,7 @@ static struct attribute *zenith_attrs[] = {
 	&thermal_state.attr,
 	&thermal_auto.attr,
 	&thermal_util_derate.attr,
+	&thermal_derate_rate_pct.attr,
 	&input_boost_ms.attr,
 	&input_boost_decay_ms.attr,
 	&input_boost_decay_curve.attr,
@@ -6180,6 +6283,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->thermal_state		= 0;
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
 	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
+	tunables->thermal_derate_rate_pct = ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 	tunables->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
 	tunables->input_boost_decay_curve = ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE;
