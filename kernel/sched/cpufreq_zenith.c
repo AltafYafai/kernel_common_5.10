@@ -131,6 +131,46 @@ DEFINE_STATIC_KEY_FALSE(zenith_camera_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_render_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_psi_aware_key);
 
+/* Transition invariant for the four feature static keys above:
+ *
+ *   tunables->X (sysfs-visible scalar)  ==  static-key state of zenith_X_key
+ *
+ * is established by every *_store callback below using
+ *
+ *   t->X = val;
+ *   zenith_set_static_key(&zenith_X_key, val);
+ *
+ * in that order — store the scalar first, then sync the key.  All
+ * stores run under attr_set->update_lock (held by the gov_attr
+ * dispatcher), so the two writes are serialised against each other
+ * and against any other store on the same attr_set.
+ *
+ * The hot path reads the static key (single never-taken jump while
+ * the feature is off), not the scalar, so a momentary tear between
+ * the two writes can at worst cause one tick of the get_next_freq()
+ * fast path to take the wrong branch.  Acceptable: feature flips are
+ * rare (sysfs writes from system_server / init shell only), the wrong
+ * branch is itself benign (returns or skips a tier), and the next
+ * tick will see the consistent state.
+ *
+ * Implications for anyone adding a new feature key here:
+ *   - The init state of every DEFINE_STATIC_KEY_FALSE is FALSE; do
+ *     not flip the key in zenith_init() unless the matching scalar
+ *     also defaults nonzero.  No init-time enable is needed for the
+ *     four current keys (all four scalars default to 0 in
+ *     zenith_tunables_init()).
+ *   - Profile presets in zenith_apply_profile() must not silently
+ *     toggle a feature scalar without also calling
+ *     zenith_set_static_key(); doing so violates the invariant.  The
+ *     four current presets (perf/balanced/battery/legacy) deliberately
+ *     leave audio_aware / camera_aware / render_aware / psi_aware
+ *     untouched for exactly this reason — they are user-managed
+ *     opt-ins, not preset state.
+ *   - static_branch_enable / static_branch_disable both sleep
+ *     acquiring cpus_read_lock() but are safe from sysfs store
+ *     context.  Do not call zenith_set_static_key() from the hot path
+ *     or from any context that holds a spinlock; both will deadlock.
+ */
 static inline void zenith_set_static_key(struct static_key_false *key,
 					 bool enable)
 {
