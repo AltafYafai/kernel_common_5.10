@@ -2089,7 +2089,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				freq = boost_ceiling;
 				tp_path = "input_boost";
 				pin_to_target = true;
-				goto resolve;
+				goto apply_uclamp_max_cap;
 			} else if (decay_ns) {
 				/* Decay phase: linearly ramp a floor from
 				 * boost_ceiling down toward policy->min over
@@ -2110,7 +2110,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				freq = boost_ceiling;
 				tp_path = "input_boost";
 				pin_to_target = true;
-				goto resolve;
+				goto apply_uclamp_max_cap;
 			}
 		}
 	}
@@ -2159,13 +2159,13 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				z_policy->brutal_active = false;
 				tp_path = "climb_step";
 				pin_to_target = true;
-				goto resolve;
+				goto apply_uclamp_max_cap;
 			}
 			z_policy->brutal_active = true;
 			freq = policy->max;
 			tp_path = "snap_max";
 			pin_to_target = true;
-			goto resolve;
+			goto apply_uclamp_max_cap;
 		}
 
 		if (z_policy->tunables->climb_mode == ZENITH_CLIMB_MODE_SNAP &&
@@ -2174,7 +2174,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			freq = policy->max;
 			tp_path = "brutal_hold";
 			pin_to_target = true;
-			goto resolve;
+			goto apply_uclamp_max_cap;
 		}
 
 		z_policy->brutal_active = false;
@@ -2501,6 +2501,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		}
 	}
 
+apply_uclamp_max_cap:
 	/* 3d. uclamp_max final-freq cap.  Applied after every other tier
 	 * so that brutality snap, hispeed floor, input boost, and the
 	 * uclamp_min / input_boost_decay floors can't walk over an
@@ -2509,6 +2510,13 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * first, cap would clamp it down below uclamp_min only when the
 	 * two hints disagree, and per-task uclamp validation already
 	 * prevents that at the scheduler layer).
+	 *
+	 * Reachable both from the natural fall-through path AND from
+	 * the input_boost / brutality "goto" sites, so an ADPF
+	 * uclamp_max hint can walk down even an explicitly-pinned
+	 * boost target (the user's "save power on this thread"
+	 * intent should beat the governor's "this is interactive"
+	 * heuristic).
 	 */
 	if (uclamp_max < SCHED_CAPACITY_SCALE && max_cap) {
 		unsigned int uclamp_cap = map_util_freq(uclamp_max,
@@ -2527,9 +2535,12 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * heavy memstall, going above hispeed mostly burns energy on
 	 * cycles that stall waiting for memory.  Boot-boost (3c0) sits
 	 * higher in the chain so the boot window is preserved even with
-	 * psi_aware=1.
+	 * psi_aware=1.  pin_to_target=true (input_boost / brutality)
+	 * skips the PSI cap so a touch-driven boost wins even under
+	 * memstall; the uclamp_max cap above is still authoritative.
 	 */
-	if (ZENITH_FEATURE_ENABLED(psi_aware) &&
+	if (!pin_to_target &&
+	    ZENITH_FEATURE_ENABLED(psi_aware) &&
 	    z_policy->tunables->psi_mem_thresh) {
 		unsigned int mem_some = zenith_psi_mem_some_pct();
 
@@ -2545,7 +2556,6 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		}
 	}
 
-resolve:
 	if (freq == z_policy->cached_raw_freq && !z_policy->need_freq_update)
 		return z_policy->next_freq;
 
