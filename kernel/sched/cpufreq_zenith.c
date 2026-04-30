@@ -3430,9 +3430,9 @@ static ssize_t auto_tune_scenario_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->auto_tune_scenario = !!val;
+	t->auto_tune_scenario = val;
 	return count;
 }
 static struct governor_attr auto_tune_scenario =
@@ -3599,9 +3599,9 @@ static ssize_t input_boost_big_only_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->input_boost_big_only = !!val;
+	t->input_boost_big_only = val;
 	return count;
 }
 static struct governor_attr input_boost_big_only =
@@ -3855,9 +3855,9 @@ static ssize_t boost_exit_extend_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->boost_exit_extend = !!val;
+	t->boost_exit_extend = val;
 	return count;
 }
 static struct governor_attr boost_exit_extend = __ATTR_RW(boost_exit_extend);
@@ -4221,9 +4221,9 @@ static ssize_t kcpustat_hispeed_enable_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->kcpustat_hispeed_enable = !!val;
+	t->kcpustat_hispeed_enable = val;
 	zenith_invalidate_cache(attr_set);
 	return count;
 }
@@ -4247,9 +4247,9 @@ static ssize_t util_math_v2_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->util_math_v2 = !!val;
+	t->util_math_v2 = val;
 	zenith_invalidate_cache(attr_set);
 	return count;
 }
@@ -4302,10 +4302,10 @@ static ssize_t render_aware_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->render_aware = !!val;
-	zenith_set_static_key(&zenith_render_aware_key, !!val);
+	t->render_aware = val;
+	zenith_set_static_key(&zenith_render_aware_key, val);
 	return count;
 }
 static struct governor_attr render_aware = __ATTR_RW(render_aware);
@@ -4354,10 +4354,10 @@ static ssize_t audio_aware_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->audio_aware = !!val;
-	zenith_set_static_key(&zenith_audio_aware_key, !!val);
+	t->audio_aware = val;
+	zenith_set_static_key(&zenith_audio_aware_key, val);
 	return count;
 }
 static struct governor_attr audio_aware = __ATTR_RW(audio_aware);
@@ -4429,10 +4429,10 @@ static ssize_t camera_aware_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->camera_aware = !!val;
-	zenith_set_static_key(&zenith_camera_aware_key, !!val);
+	t->camera_aware = val;
+	zenith_set_static_key(&zenith_camera_aware_key, val);
 	return count;
 }
 static struct governor_attr camera_aware = __ATTR_RW(camera_aware);
@@ -4505,12 +4505,12 @@ static ssize_t game_mode_store(struct gov_attr_set *attr_set,
 	unsigned int val;
 	unsigned int prev;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
 	prev = t->game_mode;
-	t->game_mode = !!val;
+	t->game_mode = val;
 	if (prev != t->game_mode)
-		trace_zenith_game_mode(smp_processor_id(), !!t->game_mode);
+		trace_zenith_game_mode(smp_processor_id(), t->game_mode);
 	return count;
 }
 static struct governor_attr game_mode = __ATTR_RW(game_mode);
@@ -4530,10 +4530,10 @@ static ssize_t psi_aware_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->psi_aware = !!val;
-	zenith_set_static_key(&zenith_psi_aware_key, !!val);
+	t->psi_aware = val;
+	zenith_set_static_key(&zenith_psi_aware_key, val);
 	return count;
 }
 static struct governor_attr psi_aware = __ATTR_RW(psi_aware);
@@ -4665,9 +4665,9 @@ static ssize_t uclamp_min_respect_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->uclamp_min_respect = !!val;
+	t->uclamp_min_respect = val;
 	return count;
 }
 static struct governor_attr uclamp_min_respect = __ATTR_RW(uclamp_min_respect);
@@ -4689,9 +4689,9 @@ static ssize_t uclamp_max_respect_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
-	t->uclamp_max_respect = !!val;
+	t->uclamp_max_respect = val;
 	return count;
 }
 static struct governor_attr uclamp_max_respect = __ATTR_RW(uclamp_max_respect);
