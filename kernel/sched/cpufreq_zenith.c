@@ -25,6 +25,7 @@
 #include <linux/mutex.h>
 #include <linux/energy_model.h>
 #include <linux/input.h>
+#include <linux/jump_label.h>
 #include <linux/atomic.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
@@ -104,6 +105,44 @@
  * node. Defaults to CUSTOM, which means "no cmdline override".
  */
 static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
+
+/* Static-branch fold for zero-default feature tunables.
+ *
+ * audio_aware, camera_aware, render_aware and psi_aware all default
+ * to 0 (off) and are checked on every zenith_get_next_freq() call.
+ * Folding them through a DEFINE_STATIC_KEY_FALSE turns the hot-path
+ * "if (z_policy->tunables->X)" load-cmp-branch sequence into a
+ * single never-taken jump while the feature is disabled, with the
+ * cold path moved out of line for better i-cache density.
+ *
+ * The keys are governor-global (one zenith_tunables instance is
+ * shared across all policies, see global_tunables_lock), so there
+ * is no per-policy synchronisation question.  Each *_store callback
+ * synchronises its key with the new tunable value via
+ * static_branch_enable / static_branch_disable, which both sleep
+ * acquiring cpus_read_lock() but are safe from sysfs store context.
+ *
+ * No init-time enable is needed: all four tunables default to 0 in
+ * zenith_tunables_init() and zenith_set_profile_defaults() never
+ * touches them, so the keys correctly start in the FALSE state.
+ */
+DEFINE_STATIC_KEY_FALSE(zenith_audio_aware_key);
+DEFINE_STATIC_KEY_FALSE(zenith_camera_aware_key);
+DEFINE_STATIC_KEY_FALSE(zenith_render_aware_key);
+DEFINE_STATIC_KEY_FALSE(zenith_psi_aware_key);
+
+static inline void zenith_set_static_key(struct static_key_false *key,
+					 bool enable)
+{
+	if (enable)
+		static_branch_enable(key);
+	else
+		static_branch_disable(key);
+}
+
+#define ZENITH_FEATURE_ENABLED(name)	\
+	static_branch_unlikely(&zenith_##name##_key)
+
 #define ZENITH_DEFAULT_CLIMB_MODE		ZENITH_CLIMB_MODE_SNAP
 #define ZENITH_DEFAULT_FREQ_STEP_PCT		5
 #define ZENITH_DEFAULT_THERMAL_AUTO		1
@@ -2314,7 +2353,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * walk running (for tracepoint visibility) but applies no
 	 * floor.
 	 */
-	if (z_policy->tunables->audio_aware) {
+	if (ZENITH_FEATURE_ENABLED(audio_aware)) {
 		bool has_audio = zenith_policy_has_audio(z_policy);
 		unsigned int af_pct = z_policy->tunables->audio_floor_pct;
 		unsigned int ac_pct = z_policy->tunables->audio_cap_pct;
@@ -2345,7 +2384,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * for ZENITH_RENDER_CACHE_TTL_NS to keep the hot path cheap.
 	 * Floor is still capped by the uclamp_max tier below.
 	 */
-	if (z_policy->tunables->render_aware &&
+	if (ZENITH_FEATURE_ENABLED(render_aware) &&
 	    z_policy->tunables->render_floor_pct) {
 		bool has_render = zenith_policy_has_render(z_policy);
 		unsigned int rf = (policy->max *
@@ -2380,7 +2419,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * The override exists because vendor camera HALs sometimes
 	 * use thread names that don't match the table.
 	 */
-	if (z_policy->tunables->camera_aware) {
+	if (ZENITH_FEATURE_ENABLED(camera_aware)) {
 		unsigned int override = z_policy->tunables->camera_active;
 		bool auto_match = false;
 		bool active;
@@ -2424,7 +2463,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * precedence (the floor block ran earlier; this block then
 	 * pulls back).
 	 */
-	if (z_policy->tunables->audio_aware &&
+	if (ZENITH_FEATURE_ENABLED(audio_aware) &&
 	    z_policy->tunables->audio_cap_pct) {
 		unsigned int ac = (policy->max *
 				   z_policy->tunables->audio_cap_pct) / 100;
@@ -2465,7 +2504,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * higher in the chain so the boot window is preserved even with
 	 * psi_aware=1.
 	 */
-	if (z_policy->tunables->psi_aware &&
+	if (ZENITH_FEATURE_ENABLED(psi_aware) &&
 	    z_policy->tunables->psi_mem_thresh) {
 		unsigned int mem_some = zenith_psi_mem_some_pct();
 
@@ -4103,6 +4142,7 @@ static ssize_t render_aware_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val))
 		return -EINVAL;
 	t->render_aware = !!val;
+	zenith_set_static_key(&zenith_render_aware_key, !!val);
 	return count;
 }
 static struct governor_attr render_aware = __ATTR_RW(render_aware);
@@ -4154,6 +4194,7 @@ static ssize_t audio_aware_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val))
 		return -EINVAL;
 	t->audio_aware = !!val;
+	zenith_set_static_key(&zenith_audio_aware_key, !!val);
 	return count;
 }
 static struct governor_attr audio_aware = __ATTR_RW(audio_aware);
@@ -4228,6 +4269,7 @@ static ssize_t camera_aware_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val))
 		return -EINVAL;
 	t->camera_aware = !!val;
+	zenith_set_static_key(&zenith_camera_aware_key, !!val);
 	return count;
 }
 static struct governor_attr camera_aware = __ATTR_RW(camera_aware);
@@ -4328,6 +4370,7 @@ static ssize_t psi_aware_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val))
 		return -EINVAL;
 	t->psi_aware = !!val;
+	zenith_set_static_key(&zenith_psi_aware_key, !!val);
 	return count;
 }
 static struct governor_attr psi_aware = __ATTR_RW(psi_aware);
