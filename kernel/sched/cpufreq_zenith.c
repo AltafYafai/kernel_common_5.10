@@ -1566,7 +1566,14 @@ static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned 
 static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, unsigned int next_freq)
 {
 	s64 delta_ns = time - z_policy->last_freq_update_time;
-	s64 down_delay = z_policy->down_rate_delay_ns *
+	/* Snapshot the cached delays once.  Concurrent writers are
+	 * profile_store / auto_tune / up_rate_limit_us_store; readers
+	 * are this hot path and zenith_should_update_freq().  Without
+	 * READ_ONCE the compiler may reload between the comparison and
+	 * the down_delay multiply, yielding inconsistent decisions.
+	 */
+	s64 up_delay = READ_ONCE(z_policy->up_rate_delay_ns);
+	s64 down_delay = READ_ONCE(z_policy->down_rate_delay_ns) *
 			 (s64)max(z_policy->down_rate_mult, 1U);
 
 	if (next_freq > z_policy->next_freq) {
@@ -1574,7 +1581,7 @@ static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, 
 
 		if (next_freq - z_policy->next_freq >= spike)
 			return false;
-		if (delta_ns < z_policy->up_rate_delay_ns)
+		if (delta_ns < up_delay)
 			return true;
 	}
 
@@ -1610,7 +1617,7 @@ static bool zenith_should_update_freq(struct zenith_policy *z_policy, u64 time)
 		return true;
 
 	delta_ns = time - z_policy->last_freq_update_time;
-	return delta_ns >= z_policy->min_rate_limit_ns;
+	return delta_ns >= READ_ONCE(z_policy->min_rate_limit_ns);
 }
 
 /*
@@ -2860,18 +2867,29 @@ static void zenith_irq_work(struct irq_work *irq_work)
 
 static struct zenith_tunables *global_tunables;
 static DEFINE_MUTEX(global_tunables_lock);
-static DEFINE_MUTEX(min_rate_lock);
 
 static inline struct zenith_tunables *to_zenith_tunables(struct gov_attr_set *attr_set)
 {
 	return container_of(attr_set, struct zenith_tunables, attr_set);
 }
 
+/* Recompute z_policy->min_rate_limit_ns from the current cached
+ * up/down delays.  Reads use READ_ONCE so concurrent updaters of
+ * either delay (sysfs writers, profile switches, auto_tune) cannot
+ * tear our snapshot, and the result is published with WRITE_ONCE
+ * so the hot-path reader (zenith_should_update_freq) observes a
+ * coherent value.  The min_rate_lock mutex previously used here is
+ * gone: readers and writers are all single-instruction loads/stores
+ * of a 64-bit aligned scalar, and the worst-case stale read costs
+ * exactly one rate-limit tick of latency (already bounded by the
+ * hot path anyway).
+ */
 static void update_min_rate_limit_ns(struct zenith_policy *z_policy)
 {
-	mutex_lock(&min_rate_lock);
-	z_policy->min_rate_limit_ns = min(z_policy->up_rate_delay_ns, z_policy->down_rate_delay_ns);
-	mutex_unlock(&min_rate_lock);
+	s64 up_ns = READ_ONCE(z_policy->up_rate_delay_ns);
+	s64 down_ns = READ_ONCE(z_policy->down_rate_delay_ns);
+
+	WRITE_ONCE(z_policy->min_rate_limit_ns, min(up_ns, down_ns));
 }
 
 /* Force the next zenith_get_next_freq() call on every policy sharing
@@ -2904,10 +2922,10 @@ static void zenith_refresh_rate_delays(struct gov_attr_set *attr_set)
 	struct zenith_policy *z_pol;
 
 	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
-		z_pol->up_rate_delay_ns =
-			(u64)t->up_rate_limit_us * NSEC_PER_USEC;
-		z_pol->down_rate_delay_ns =
-			(u64)t->down_rate_limit_us * NSEC_PER_USEC;
+		WRITE_ONCE(z_pol->up_rate_delay_ns,
+			   (u64)t->up_rate_limit_us * NSEC_PER_USEC);
+		WRITE_ONCE(z_pol->down_rate_delay_ns,
+			   (u64)t->down_rate_limit_us * NSEC_PER_USEC);
 		update_min_rate_limit_ns(z_pol);
 	}
 }
@@ -2925,10 +2943,10 @@ static void zenith_refresh_rate_delays_one(struct zenith_policy *z_policy)
 {
 	struct zenith_tunables *t = z_policy->tunables;
 
-	z_policy->up_rate_delay_ns =
-		(u64)t->up_rate_limit_us * NSEC_PER_USEC;
-	z_policy->down_rate_delay_ns =
-		(u64)t->down_rate_limit_us * NSEC_PER_USEC;
+	WRITE_ONCE(z_policy->up_rate_delay_ns,
+		   (u64)t->up_rate_limit_us * NSEC_PER_USEC);
+	WRITE_ONCE(z_policy->down_rate_delay_ns,
+		   (u64)t->down_rate_limit_us * NSEC_PER_USEC);
 	update_min_rate_limit_ns(z_policy);
 }
 
@@ -4068,7 +4086,8 @@ static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set, const char 
 	t->up_rate_limit_us = val;
 
 	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
-		z_pol->up_rate_delay_ns = (u64)val * NSEC_PER_USEC;
+		WRITE_ONCE(z_pol->up_rate_delay_ns,
+			   (u64)val * NSEC_PER_USEC);
 		update_min_rate_limit_ns(z_pol);
 	}
 	return count;
@@ -4090,7 +4109,8 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set, const cha
 	t->down_rate_limit_us = val;
 
 	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
-		z_pol->down_rate_delay_ns = (u64)val * NSEC_PER_USEC;
+		WRITE_ONCE(z_pol->down_rate_delay_ns,
+			   (u64)val * NSEC_PER_USEC);
 		update_min_rate_limit_ns(z_pol);
 	}
 	return count;
@@ -4946,8 +4966,10 @@ static int zenith_start(struct cpufreq_policy *policy)
 	struct zenith_policy *z_policy = policy->governor_data;
 	unsigned int cpu;
 
-	z_policy->up_rate_delay_ns = (u64)z_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
-	z_policy->down_rate_delay_ns = (u64)z_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;
+	WRITE_ONCE(z_policy->up_rate_delay_ns,
+		   (u64)z_policy->tunables->up_rate_limit_us * NSEC_PER_USEC);
+	WRITE_ONCE(z_policy->down_rate_delay_ns,
+		   (u64)z_policy->tunables->down_rate_limit_us * NSEC_PER_USEC);
 	update_min_rate_limit_ns(z_policy);
 
 	z_policy->last_freq_update_time = 0;
