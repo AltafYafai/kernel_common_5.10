@@ -603,27 +603,49 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT	0
 #define ZENITH_FRAME_PACE_BASE_BUDGET_US	16667
 
-/* psi_aware (default 0, off) + psi_mem_thresh (default 50):
+/* psi_aware (default 0, off) + psi_mem_thresh (default 50)
+ * + psi_cpu_thresh (default 0, off) + psi_io_thresh (default 0, off):
  *
  * When psi_aware=1, zenith_get_next_freq() reads the system-wide
- * memory-pressure 10s average from psi_system.avg[PSI_MEM_SOME][0].
- * If the integer percentage is at or above psi_mem_thresh, the final
- * freq is *capped* at the effective hispeed floor.  Rationale: under
- * heavy memory stall, pushing the CPU above hispeed wastes energy on
- * cycles that mostly stall waiting for memory; the workload is
- * memory-bound, not compute-bound.  When the hispeed tier is disabled
- * (eff_hispeed == 0) the cap is policy->max -- i.e. a no-op fallback.
+ * pressure 10s averages from psi_system.avg[PSI_*_SOME][0].  Each
+ * dimension has its own integer-percentage threshold; if the live
+ * average is at or above the threshold for that dimension, the final
+ * freq is *capped* at the effective hispeed floor.  Rationale:
+ *
+ *  - PSI_MEM_SOME: heavy memory stall.  Pushing above hispeed wastes
+ *    energy on cycles that mostly stall waiting for memory; the
+ *    workload is memory-bound, not compute-bound.
+ *
+ *  - PSI_CPU_SOME: oversubscribed runqueue.  More than one task is
+ *    waiting on the cpu; ramping the freq above hispeed doesn't make
+ *    runnable tasks run, it just burns power on the one that *is*
+ *    running.  Useful on big.LITTLE where a small cluster gets piled
+ *    on by a wakeup storm before the load balancer migrates anything.
+ *
+ *  - PSI_IO_SOME: I/O-bound stall.  The cpu is waiting on storage or
+ *    block I/O; freq ramps don't reduce wait time.  Symmetric with
+ *    PSI_MEM_SOME.
+ *
+ * When the hispeed tier is disabled (eff_hispeed == 0) the cap is
+ * policy->max -- i.e. a no-op fallback.  The three caps stack: any
+ * dimension over-threshold lowers the freq to the hispeed floor (we
+ * don't subtract three times; the cap is at most one floor down).
  *
  * The reader is RCU-free and lock-free: psi_system.avg[][] is updated
  * by the avgs_work delayed work and a single READ_ONCE is sufficient
  * to get a coherent fixed-point value.  When CONFIG_PSI is off or
- * psi_disabled is set, the helper returns 0 and the cap never fires.
+ * psi_disabled is set, the helper returns 0 and the caps never fire.
  *
  * 0..100 range; values >100 rejected by sysfs.  0 disables the cap
- * even with psi_aware=1 (useful for tracing without changing freq).
+ * for that dimension even with psi_aware=1 (useful for tracing the
+ * helpers without changing freq).  psi_cpu_thresh / psi_io_thresh
+ * default to 0 so out-of-box behaviour matches pre-N1: only the mem
+ * cap fires when psi_aware=1.
  */
 #define ZENITH_DEFAULT_PSI_AWARE		0
 #define ZENITH_DEFAULT_PSI_MEM_THRESH		50
+#define ZENITH_DEFAULT_PSI_CPU_THRESH		0
+#define ZENITH_DEFAULT_PSI_IO_THRESH		0
 
 /* audio_aware (default 0, off) + audio_floor_pct (default 0) +
  * audio_cap_pct (default 0):
@@ -1051,9 +1073,15 @@ struct zenith_tunables {
 	/* See ZENITH_DEFAULT_GAME_MODE. 0/1, normalised on store. */
 	unsigned int		game_mode;
 
-	/* See ZENITH_DEFAULT_PSI_AWARE / ZENITH_DEFAULT_PSI_MEM_THRESH. */
+	/* See ZENITH_DEFAULT_PSI_AWARE / ZENITH_DEFAULT_PSI_MEM_THRESH /
+	 * ZENITH_DEFAULT_PSI_CPU_THRESH / ZENITH_DEFAULT_PSI_IO_THRESH.
+	 * All thresholds are 0..100 integer percent of the 10s SOME
+	 * average.  0 disables that dimension's cap.
+	 */
 	unsigned int		psi_aware;
 	unsigned int		psi_mem_thresh;
+	unsigned int		psi_cpu_thresh;
+	unsigned int		psi_io_thresh;
 
 	/* See ZENITH_DEFAULT_AUDIO_AWARE / ZENITH_DEFAULT_AUDIO_FLOOR_PCT
 	 * / ZENITH_DEFAULT_AUDIO_CAP_PCT.  Both *_pct fields range 0..100;
@@ -2028,6 +2056,41 @@ static inline unsigned int zenith_psi_mem_some_pct(void)
 #endif
 }
 
+/* Same shape as zenith_psi_mem_some_pct() for the PSI_CPU_SOME and
+ * PSI_IO_SOME dimensions.  See the psi_aware / psi_*_thresh comment
+ * block for what each pressure source means.  Both helpers are
+ * RCU-free, lock-free, and tolerate CONFIG_PSI=n at compile time.
+ */
+static inline unsigned int zenith_psi_cpu_some_pct(void)
+{
+#ifdef CONFIG_PSI
+	unsigned long avg;
+
+	if (static_branch_likely(&psi_disabled))
+		return 0;
+
+	avg = READ_ONCE(psi_system.avg[PSI_CPU_SOME][0]);
+	return (unsigned int)LOAD_INT(avg);
+#else
+	return 0;
+#endif
+}
+
+static inline unsigned int zenith_psi_io_some_pct(void)
+{
+#ifdef CONFIG_PSI
+	unsigned long avg;
+
+	if (static_branch_likely(&psi_disabled))
+		return 0;
+
+	avg = READ_ONCE(psi_system.avg[PSI_IO_SOME][0]);
+	return (unsigned int)LOAD_INT(avg);
+#else
+	return 0;
+#endif
+}
+
 /* List of comm prefixes treated as render / display-pipeline threads.
  * Matched by strncmp() over the first N characters where N is the
  * length of the table entry, so the userspace task only needs to
@@ -2956,17 +3019,33 @@ apply_uclamp_max_cap:
 	 */
 	if (!pin_to_target &&
 	    ZENITH_FEATURE_ENABLED(psi_aware) &&
-	    z_policy->tunables->psi_mem_thresh) {
-		unsigned int mem_some = zenith_psi_mem_some_pct();
+	    (z_policy->tunables->psi_mem_thresh ||
+	     z_policy->tunables->psi_cpu_thresh ||
+	     z_policy->tunables->psi_io_thresh)) {
+		const char *psi_tag = NULL;
 
-		if (mem_some >= z_policy->tunables->psi_mem_thresh) {
-			unsigned int psi_cap = zenith_eff_hispeed_freq(z_policy);
+		if (z_policy->tunables->psi_mem_thresh &&
+		    zenith_psi_mem_some_pct() >=
+		    z_policy->tunables->psi_mem_thresh)
+			psi_tag = "psi_mem_cap";
+		else if (z_policy->tunables->psi_cpu_thresh &&
+			 zenith_psi_cpu_some_pct() >=
+			 z_policy->tunables->psi_cpu_thresh)
+			psi_tag = "psi_cpu_cap";
+		else if (z_policy->tunables->psi_io_thresh &&
+			 zenith_psi_io_some_pct() >=
+			 z_policy->tunables->psi_io_thresh)
+			psi_tag = "psi_io_cap";
+
+		if (psi_tag) {
+			unsigned int psi_cap =
+				zenith_eff_hispeed_freq(z_policy);
 
 			if (!psi_cap)
 				psi_cap = policy->max;
 			if (freq > psi_cap) {
 				freq = psi_cap;
-				tp_path = "psi_mem_cap";
+				tp_path = psi_tag;
 			}
 		}
 	}
@@ -5217,6 +5296,52 @@ static ssize_t psi_mem_thresh_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr psi_mem_thresh = __ATTR_RW(psi_mem_thresh);
 
+/* psi_cpu_thresh / psi_io_thresh sysfs knobs.  Same shape as
+ * psi_mem_thresh: 0..100 integer percent, 0 disables that dimension's
+ * cap.  See ZENITH_DEFAULT_PSI_AWARE comment block for semantics.
+ */
+static ssize_t psi_cpu_thresh_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->psi_cpu_thresh);
+}
+
+static ssize_t psi_cpu_thresh_store(struct gov_attr_set *attr_set,
+				    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	t->psi_cpu_thresh = val;
+	return count;
+}
+static struct governor_attr psi_cpu_thresh = __ATTR_RW(psi_cpu_thresh);
+
+static ssize_t psi_io_thresh_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->psi_io_thresh);
+}
+
+static ssize_t psi_io_thresh_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	t->psi_io_thresh = val;
+	return count;
+}
+static struct governor_attr psi_io_thresh = __ATTR_RW(psi_io_thresh);
+
 /* boot_boost_ms sysfs knob.  See ZENITH_DEFAULT_BOOT_BOOST_MS comment
  * block for semantics.  Range 0..ZENITH_BOOT_BOOST_MAX_MS;
  * out-of-range values rejected with EINVAL so userspace gets a clear
@@ -5415,6 +5540,8 @@ static struct attribute *zenith_attrs[] = {
 	&game_mode.attr,
 	&psi_aware.attr,
 	&psi_mem_thresh.attr,
+	&psi_cpu_thresh.attr,
+	&psi_io_thresh.attr,
 	&boot_boost_ms.attr,
 	&frame_budget_us.attr,
 	&frame_pace_floor_pct.attr,
@@ -5579,6 +5706,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->game_mode		= ZENITH_DEFAULT_GAME_MODE;
 	tunables->psi_aware		= ZENITH_DEFAULT_PSI_AWARE;
 	tunables->psi_mem_thresh	= ZENITH_DEFAULT_PSI_MEM_THRESH;
+	tunables->psi_cpu_thresh	= ZENITH_DEFAULT_PSI_CPU_THRESH;
+	tunables->psi_io_thresh		= ZENITH_DEFAULT_PSI_IO_THRESH;
 	tunables->boot_boost_ms		= ZENITH_DEFAULT_BOOT_BOOST_MS;
 	tunables->frame_budget_us	= ZENITH_DEFAULT_FRAME_BUDGET_US;
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
