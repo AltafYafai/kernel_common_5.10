@@ -4880,6 +4880,24 @@ static int zenith_start(struct cpufreq_policy *policy)
 		cpufreq_add_update_util_hook(cpu, &z_cpu->update_util, 
 			policy_is_shared(policy) ? zenith_update_shared : zenith_update_single);
 	}
+
+	/* Arm the auto-tune classifier when the tunable is enabled.  The
+	 * default tunables_init() sets auto_tune=1, but the only place
+	 * that schedules at_work is auto_tune_store() on a 0->1
+	 * transition.  Without this hook, the classifier silently never
+	 * runs on stock defaults; userspace has to write 0 then 1 to
+	 * arm it.  Mirror the body of the val=1 branch in
+	 * auto_tune_store() so start-time and runtime behaviour agree.
+	 */
+	if (z_policy->tunables->auto_tune) {
+		z_policy->at_last_events =
+			atomic64_read(&zenith_auto_input_events);
+		atomic_set(&z_policy->at_samples_total, 0);
+		atomic_set(&z_policy->at_samples_saturated, 0);
+		schedule_delayed_work(&z_policy->at_work,
+			msecs_to_jiffies(ZENITH_AUTO_TUNE_PERIOD_MS));
+	}
+
 	return 0;
 }
 
