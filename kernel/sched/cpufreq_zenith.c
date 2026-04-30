@@ -3830,6 +3830,77 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr profile = __ATTR_RW(profile);
+
+/* profile_values: readonly dump of the hardcoded preset tables.
+ *
+ * Invokes zenith_apply_profile() against a stack-scratch tunables
+ * struct for each preset (performance, balanced, battery, legacy)
+ * and prints the resulting knob values in "name=value" form,
+ * one line per profile.  The CUSTOM profile is intentionally
+ * skipped: it is a marker ("no preset has been applied") and has
+ * no canonical values.
+ *
+ * zenith_apply_profile() has one side effect -- it stamps
+ * zenith_input_boost_active_ms with the preset's input_boost_ms.
+ * Save / restore that mirror around the loop so reading this node
+ * never perturbs the running boost window.  The scratch struct
+ * itself is stack-local so there is no tunables-race window.
+ */
+static ssize_t profile_values_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct zenith_tunables scratch;
+	u32 saved_active_ms = READ_ONCE(zenith_input_boost_active_ms);
+	ssize_t len = 0;
+	int i;
+	static const struct {
+		unsigned int id;
+		const char *name;
+	} profs[] = {
+		{ ZENITH_PROFILE_PERFORMANCE, "performance" },
+		{ ZENITH_PROFILE_BALANCED,    "balanced" },
+		{ ZENITH_PROFILE_BATTERY,     "battery" },
+		{ ZENITH_PROFILE_LEGACY,      "legacy" },
+	};
+
+	for (i = 0; i < ARRAY_SIZE(profs); i++) {
+		memset(&scratch, 0, sizeof(scratch));
+		zenith_apply_profile(&scratch, profs[i].id);
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+			"%s: up_rate_limit_us=%u down_rate_limit_us=%u "
+			"up_threshold=%u down_threshold=%u "
+			"hispeed_freq_pct=%u hispeed_load=%u "
+			"climb_mode=%u freq_step_pct=%u "
+			"powersave_bias=%u bias_load_threshold=%u "
+			"ignore_nice_load=%u input_boost_ms=%u "
+			"input_boost_decay_ms=%u input_boost_cap_pct=%u "
+			"light_load_threshold=%u sampling_down_factor=%u "
+			"thermal_auto=%u screen_auto=%u util_math_v2=%u "
+			"kcpustat_hispeed_enable=%u\n",
+			profs[i].name,
+			scratch.up_rate_limit_us, scratch.down_rate_limit_us,
+			scratch.up_threshold, scratch.down_threshold,
+			scratch.hispeed_freq_pct, scratch.hispeed_load,
+			scratch.climb_mode, scratch.freq_step_pct,
+			scratch.powersave_bias, scratch.bias_load_threshold,
+			scratch.ignore_nice_load, scratch.input_boost_ms,
+			scratch.input_boost_decay_ms,
+			scratch.input_boost_cap_pct,
+			scratch.light_load_threshold,
+			scratch.sampling_down_factor,
+			scratch.thermal_auto, scratch.screen_auto,
+			scratch.util_math_v2,
+			scratch.kcpustat_hispeed_enable);
+	}
+
+	/* Restore the boost-active mirror that zenith_apply_profile()
+	 * stamps on every call.  Use WRITE_ONCE to match the writer
+	 * semantics elsewhere in the file.
+	 */
+	WRITE_ONCE(zenith_input_boost_active_ms, saved_active_ms);
+	return len;
+}
+static struct governor_attr profile_values = __ATTR_RO(profile_values);
+
 ZENITH_TUNABLE_UINT_INVAL(screen_state);
 
 static ssize_t screen_auto_show(struct gov_attr_set *attr_set, char *buf)
@@ -5153,6 +5224,7 @@ static struct attribute *zenith_attrs[] = {
 	&freq_step_pct.attr,
 	&freq_step_adaptive.attr,
 	&profile.attr,
+	&profile_values.attr,
 	&auto_tune.attr,
 	&auto_tune_sat_load_pct.attr,
 	&auto_tune_hi_sat_pct.attr,
