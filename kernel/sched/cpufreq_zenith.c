@@ -81,6 +81,28 @@
 #define ZENITH_DEFAULT_HISPEED_ENTRY_STREAK	0
 #define ZENITH_HISPEED_ENTRY_STREAK_MAX		16
 
+/* brutal_entry_streak (default 0, off):
+ *
+ * Symmetric to hispeed_entry_streak, but for the brutality
+ * snap-to-max tier.  Today the brutality path flips
+ * brutal_active=true and pins policy->max on the very first
+ * sample where load_pct >= up_threshold, leaving the tier
+ * vulnerable to single-sample spikes (scheduler wake-up
+ * bursts, sampler quantisation noise) that pin the cluster
+ * to max for the whole down_threshold hysteresis window.
+ *
+ * When set to N (>0), require load_pct >= up_threshold to
+ * hold for N+1 consecutive samples before flipping
+ * brutal_active to true.  0 preserves the historical
+ * immediate-flip behaviour.  Only gates SNAP mode; STEP
+ * climb mode is already gentle by design and is unaffected.
+ * Exit hysteresis via down_threshold / brutal_active hold is
+ * unchanged.  Capped to ZENITH_BRUTAL_ENTRY_STREAK_MAX so
+ * the per-policy u8 counter never overflows.
+ */
+#define ZENITH_DEFAULT_BRUTAL_ENTRY_STREAK	0
+#define ZENITH_BRUTAL_ENTRY_STREAK_MAX		16
+
 /* Time-based cache TTL for the uclamp_{min,max} per-policy walks.  The
  * per-rq UCLAMP values are maintained by the scheduler on every
  * enqueue / dequeue, so a 1 ms staleness bound on the cached
@@ -656,6 +678,14 @@ struct zenith_tunables {
 	 */
 	unsigned int		hispeed_entry_streak;
 
+	/* Symmetric entry-side hysteresis for the brutality tier.  See
+	 * ZENITH_DEFAULT_BRUTAL_ENTRY_STREAK.  Only gates SNAP climb
+	 * mode; STEP mode is unaffected.  Capped on store to
+	 * ZENITH_BRUTAL_ENTRY_STREAK_MAX so the per-policy u8 counter
+	 * cannot overflow.
+	 */
+	unsigned int		brutal_entry_streak;
+
 	/* Secondary up_threshold applied only when policy->cur has
 	 * already climbed to hispeed_freq or above. 0 disables the
 	 * substitution and falls back to up_threshold at every bin.
@@ -983,6 +1013,19 @@ struct zenith_policy {
 	 * avoid wraparound on long sustained-load runs.
 	 */
 	u8			hispeed_entry_count;
+
+	/* Entry-side streak counter for brutality activation.  Mirror of
+	 * hispeed_entry_count: increments on every sample where
+	 * load_pct >= up_threshold while brutal_active is false, resets
+	 * when load_pct drops below up_threshold OR when brutal_active
+	 * flips true (past entry, no more entry credit to accumulate).
+	 * Gates the SNAP snap-to-max path only when
+	 * tunables->brutal_entry_streak > 0.  Capped to a small u8 to
+	 * avoid wraparound on sustained-above-threshold runs that never
+	 * quite reach the streak cap (shouldn't happen with the default
+	 * cap of 16 but defensive against future cap bumps).
+	 */
+	u8			brutal_entry_count;
 
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
@@ -2228,11 +2271,17 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			load_pct = load_pct * (100 - z_policy->nice_pct) / 100;
 
 		if (load_pct >= dynamic_up_thresh) {
+			unsigned int b_streak =
+				z_policy->tunables->brutal_entry_streak;
+
 			if (z_policy->tunables->climb_mode ==
 			    ZENITH_CLIMB_MODE_STEP) {
 				/* Gentle climb: step by freq_step_pct of
 				 * policy->max from the current bin.
-				 * Bypasses hysteresis entirely.
+				 * Bypasses hysteresis entirely, including
+				 * brutal_entry_streak -- STEP mode is
+				 * already gentle by design so there is
+				 * nothing to debounce.
 				 */
 				unsigned int step =
 				    (policy->max *
@@ -2243,17 +2292,51 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				if (freq > policy->max)
 					freq = policy->max;
 				z_policy->brutal_active = false;
+				z_policy->brutal_entry_count = 0;
 				tp_path = "climb_step";
 				pin_to_target = true;
 				goto apply_uclamp_max_cap;
 			}
+
+			/* Entry-side streak hysteresis for the brutality
+			 * snap-to-max path.  Mirror of the hispeed tier:
+			 * increment the entry counter each qualifying
+			 * sample (saturate at the cap to avoid overflow),
+			 * and only flip brutal_active once the counter
+			 * exceeds tunables->brutal_entry_streak.
+			 * b_streak == 0 collapses to the historical
+			 * immediate-flip behaviour because the fresh
+			 * counter crosses 1 > 0 on the very first sample.
+			 * Counter reset sites: the STEP path above, the
+			 * below-threshold fall-through, and the brutal_hold
+			 * exit (all three mean "not in entry territory
+			 * anymore").
+			 */
+			if (!z_policy->brutal_active) {
+				if (z_policy->brutal_entry_count <
+				    ZENITH_BRUTAL_ENTRY_STREAK_MAX)
+					z_policy->brutal_entry_count++;
+				if (z_policy->brutal_entry_count <= b_streak) {
+					/* Streak not satisfied yet -- fall
+					 * through to the hispeed / EAS path
+					 * below without flipping brutal_active.
+					 * No goto: the hispeed tier gets a
+					 * chance to apply its own floor.
+					 */
+					goto brutal_entry_deferred;
+				}
+			}
+
 			z_policy->brutal_active = true;
+			z_policy->brutal_entry_count = 0;
 			freq = policy->max;
 			tp_path = "snap_max";
 			pin_to_target = true;
 			goto apply_uclamp_max_cap;
 		}
+		z_policy->brutal_entry_count = 0;
 
+brutal_entry_deferred:
 		if (z_policy->tunables->climb_mode == ZENITH_CLIMB_MODE_SNAP &&
 		    z_policy->brutal_active &&
 		    load_pct >= z_policy->tunables->down_threshold) {
@@ -4135,6 +4218,31 @@ static ssize_t hispeed_entry_streak_store(struct gov_attr_set *attr_set,
 static struct governor_attr hispeed_entry_streak =
 	__ATTR_RW(hispeed_entry_streak);
 
+/* brutal_entry_streak sysfs knob.  See ZENITH_DEFAULT_BRUTAL_ENTRY_STREAK
+ * for semantics.  Capped to ZENITH_BRUTAL_ENTRY_STREAK_MAX on store
+ * so the per-policy u8 streak counter cannot overflow.
+ */
+static ssize_t brutal_entry_streak_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->brutal_entry_streak);
+}
+
+static ssize_t brutal_entry_streak_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_BRUTAL_ENTRY_STREAK_MAX)
+		return -EINVAL;
+	t->brutal_entry_streak = val;
+	return count;
+}
+static struct governor_attr brutal_entry_streak =
+	__ATTR_RW(brutal_entry_streak);
+
 static ssize_t climb_mode_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->climb_mode);
@@ -4793,6 +4901,7 @@ static struct attribute *zenith_attrs[] = {
 	&hispeed_load.attr,
 	&hispeed_hyst_pct.attr,
 	&hispeed_entry_streak.attr,
+	&brutal_entry_streak.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
 	&profile.attr,
@@ -4953,6 +5062,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
 	tunables->hispeed_hyst_pct	= ZENITH_DEFAULT_HISPEED_HYST_PCT;
 	tunables->hispeed_entry_streak	= ZENITH_DEFAULT_HISPEED_ENTRY_STREAK;
+	tunables->brutal_entry_streak	= ZENITH_DEFAULT_BRUTAL_ENTRY_STREAK;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->active_profile	= ZENITH_PROFILE_CUSTOM;
