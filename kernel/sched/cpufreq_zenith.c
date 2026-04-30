@@ -5276,6 +5276,10 @@ static struct notifier_block zenith_fb_notifier = {
 static int __init zenith_gov_init(void)
 {
 	int ret;
+	bool input_registered = false;
+#ifdef CONFIG_FB_NOTIFY
+	bool fb_registered = false;
+#endif
 
 	pr_info("Zenith: V2 Dreadnought (EAS/EM/Display/Thermal) Initialized. By ENI for LO.\n");
 
@@ -5283,12 +5287,16 @@ static int __init zenith_gov_init(void)
 	if (ret)
 		pr_warn("Zenith: input handler register failed (%d), boost disabled\n",
 			ret);
+	else
+		input_registered = true;
 
 #ifdef CONFIG_FB_NOTIFY
 	ret = fb_register_client(&zenith_fb_notifier);
 	if (ret)
 		pr_warn("Zenith: fb notifier register failed (%d), screen_auto disabled\n",
 			ret);
+	else
+		fb_registered = true;
 #else
 	/* screen_auto stores still accept 0/1 (the field is plain
 	 * bookkeeping for userspace introspection) but no notifier
@@ -5300,6 +5308,25 @@ static int __init zenith_gov_init(void)
 	pr_info("Zenith: CONFIG_FB_NOTIFY=n, screen_auto is bookkeeping-only (no panel events delivered)\n");
 #endif
 
-	return cpufreq_register_governor(&zenith_gov);
+	ret = cpufreq_register_governor(&zenith_gov);
+	if (ret) {
+		/* Roll back the input + fb hooks we successfully
+		 * registered above so that a probe failure here
+		 * leaves no dangling notifier / handler bound to a
+		 * governor that does not exist.  Previously the
+		 * function returned the error and silently leaked
+		 * both registrations; subsequent module-style
+		 * insmod/rmmod cycles would double-register.
+		 */
+#ifdef CONFIG_FB_NOTIFY
+		if (fb_registered)
+			fb_unregister_client(&zenith_fb_notifier);
+#endif
+		if (input_registered)
+			input_unregister_handler(&zenith_input_handler);
+		pr_err("Zenith: cpufreq_register_governor failed (%d)\n", ret);
+		return ret;
+	}
+	return 0;
 }
 fs_initcall(zenith_gov_init);
