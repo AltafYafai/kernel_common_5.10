@@ -652,6 +652,35 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  */
 #define ZENITH_DEFAULT_FRAME_BUDGET_US		0
 #define ZENITH_FRAME_BUDGET_US_MAX		50000
+
+/* frame_budget_us_per_policy (default empty, off):
+ *
+ * frame_budget_us is global -- one vblank period applied to every
+ * policy.  On big.LITTLE / 3-cluster SoCs the right value usually
+ * differs per cluster: little wants 0 (no adaptive floor at all,
+ * the cluster idles between frames), big wants the full 16667 /
+ * 8333 / 6944 us depending on display refresh rate, prime in the
+ * middle.  A single global value forces userspace to either over-
+ * or under-floor at least one cluster.
+ *
+ * frame_budget_us_per_policy is a CSV override read as
+ *
+ *   anchor_cpu:budget_us[,anchor_cpu:budget_us]...
+ *
+ * where anchor_cpu is cpumask_first(policy->cpus) -- the same
+ * "policyN" identifier the cpufreq sysfs tree already uses.  Stored
+ * as a fixed-size array indexed by cpu, parsed once on store and
+ * read lock-free in zenith_get_next_freq().  A non-zero entry for
+ * the policy's anchor cpu overrides the global frame_budget_us
+ * for that policy; a zero entry (the default) falls through to
+ * the global value, preserving today's shape on every policy that
+ * isn't called out in the CSV.
+ *
+ * Empty string clears all overrides.  Bounds: anchor_cpu < NR_CPUS,
+ * budget_us <= ZENITH_FRAME_BUDGET_US_MAX.  Same disable semantics
+ * as frame_budget_us itself: 0 means "no adaptive floor" for that
+ * policy.
+ */
 #define ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT	0
 #define ZENITH_FRAME_PACE_BASE_BUDGET_US	16667
 
@@ -1172,6 +1201,16 @@ struct zenith_tunables {
 	 * current vblank period in microseconds.  0 disables.
 	 */
 	unsigned int		frame_budget_us;
+
+	/* See ZENITH_DEFAULT_FRAME_BUDGET_US/ frame_budget_us_per_policy
+	 * comment block.  Indexed by cpumask_first(policy->cpus).  A
+	 * non-zero entry overrides frame_budget_us for that policy;
+	 * zero falls through to the global value.  All entries default
+	 * to 0 (no override) at tunables_init() time.  Read lock-free
+	 * in zenith_get_next_freq() under READ_ONCE; written under
+	 * global_tunables_lock by the sysfs store path.
+	 */
+	unsigned int		frame_budget_us_per_policy[NR_CPUS];
 	unsigned int		frame_pace_floor_pct;
 };
 
@@ -3037,10 +3076,20 @@ brutal_entry_deferred:
 	 * upper bound check could yield eff_pct overflow).
 	 */
 	{
-		unsigned int budget_us =
-			READ_ONCE(z_policy->tunables->frame_budget_us);
+		unsigned int anchor = cpumask_first(policy->cpus);
+		unsigned int budget_us = (anchor < NR_CPUS) ?
+			READ_ONCE(z_policy->tunables->
+				frame_budget_us_per_policy[anchor]) : 0;
 		unsigned int base_pct =
 			READ_ONCE(z_policy->tunables->frame_pace_floor_pct);
+
+		/* Per-policy override of zero falls through to the
+		 * global frame_budget_us.  See ZENITH_DEFAULT_FRAME_
+		 * BUDGET_US per-policy comment block.
+		 */
+		if (!budget_us)
+			budget_us =
+			  READ_ONCE(z_policy->tunables->frame_budget_us);
 
 		if (budget_us && base_pct) {
 			unsigned int eff_pct;
@@ -5761,6 +5810,92 @@ static ssize_t frame_budget_us_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr frame_budget_us = __ATTR_RW(frame_budget_us);
 
+/* frame_budget_us_per_policy sysfs knob.  CSV "cpu:budget_us[,...]"
+ * with the per-policy override semantics described in the comment
+ * block at the top of the file.  Empty write clears all overrides.
+ */
+static ssize_t frame_budget_us_per_policy_show(struct gov_attr_set *attr_set,
+					       char *buf)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	ssize_t len = 0;
+	unsigned int cpu;
+	bool first = true;
+
+	for (cpu = 0; cpu < NR_CPUS; cpu++) {
+		unsigned int v = t->frame_budget_us_per_policy[cpu];
+
+		if (!v)
+			continue;
+		len += sprintf(buf + len, "%s%u:%u",
+			       first ? "" : ",", cpu, v);
+		first = false;
+	}
+	len += sprintf(buf + len, "\n");
+	return len;
+}
+
+static ssize_t frame_budget_us_per_policy_store(struct gov_attr_set *attr_set,
+						const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int parsed[NR_CPUS] = { 0 };
+	const char *p = buf;
+	const char *end = buf + count;
+	unsigned int cpu;
+
+	/* Empty write (just "\n" or "") clears all overrides. */
+	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n'))
+		p++;
+	if (p == end)
+		goto commit;
+
+	while (p < end) {
+		unsigned int anchor;
+		unsigned int val;
+		char *colon;
+		char *comma;
+		char token[32];
+		size_t tlen;
+
+		comma = strnchr(p, end - p, ',');
+		tlen = comma ? (size_t)(comma - p) : (size_t)(end - p);
+		if (tlen >= sizeof(token))
+			return -EINVAL;
+		memcpy(token, p, tlen);
+		token[tlen] = '\0';
+		/* Strip trailing whitespace / newline. */
+		while (tlen && (token[tlen - 1] == ' ' ||
+				token[tlen - 1] == '\t' ||
+				token[tlen - 1] == '\n'))
+			token[--tlen] = '\0';
+		if (!tlen) {
+			p = comma ? comma + 1 : end;
+			continue;
+		}
+
+		colon = strchr(token, ':');
+		if (!colon)
+			return -EINVAL;
+		*colon = '\0';
+		if (kstrtouint(token, 10, &anchor))
+			return -EINVAL;
+		if (kstrtouint(colon + 1, 10, &val))
+			return -EINVAL;
+		if (anchor >= NR_CPUS || val > ZENITH_FRAME_BUDGET_US_MAX)
+			return -EINVAL;
+		parsed[anchor] = val;
+		p = comma ? comma + 1 : end;
+	}
+
+commit:
+	for (cpu = 0; cpu < NR_CPUS; cpu++)
+		WRITE_ONCE(t->frame_budget_us_per_policy[cpu], parsed[cpu]);
+	return count;
+}
+static struct governor_attr frame_budget_us_per_policy =
+	__ATTR_RW(frame_budget_us_per_policy);
+
 /* frame_pace_floor_pct sysfs knob.  Range 0..100; the value is the
  * 60 Hz baseline floor as a percent of policy->max.  The kernel
  * scales this inversely with frame_budget_us, so the same value
@@ -5911,6 +6046,7 @@ static struct attribute *zenith_attrs[] = {
 	&psi_io_thresh.attr,
 	&boot_boost_ms.attr,
 	&frame_budget_us.attr,
+	&frame_budget_us_per_policy.attr,
 	&frame_pace_floor_pct.attr,
 	NULL
 };
