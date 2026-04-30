@@ -313,6 +313,45 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_PSI_AWARE		0
 #define ZENITH_DEFAULT_PSI_MEM_THRESH		50
 
+/* audio_aware (default 0, off) + audio_floor_pct (default 0) +
+ * audio_cap_pct (default 0):
+ *
+ * When audio_aware=1, zenith_get_next_freq() walks the policy's
+ * cpumask and checks each cpu_curr(cpu)->comm against a small list
+ * of known Android audio-thread names (AudioOut_*, audioserver,
+ * MediaCodec_*, OMX*, SoundPool, ...).  If any matches, the final
+ * freq is clamped into a configurable band:
+ *
+ *     floor = policy->max * audio_floor_pct / 100   (0 = no floor)
+ *     cap   = policy->max * audio_cap_pct   / 100   (0 = no cap)
+ *
+ * The point is to keep the freq an audio thread is running on as
+ * stable as possible.  Audio buffers underrun when freq drops
+ * mid-buffer; transient ramps to policy->max waste energy and
+ * incur a freq-transition stall that itself can blow a frame.  A
+ * modest floor (e.g. 40) prevents the underrun half; a modest cap
+ * (e.g. 60) prevents the burst-to-max half.  Either alone is
+ * useful; together they form a stable band.
+ *
+ * The cap is applied *before* the uclamp_max final cap so an
+ * explicit ADPF power-efficiency hint can still walk it down
+ * further.  The floor is applied alongside the render_floor /
+ * frame_pace_floor tier and is subject to the same uclamp_max
+ * downstream cap.
+ *
+ * The comm check is cached per-policy with TTL
+ * ZENITH_AUDIO_CACHE_TTL_NS so a hot path (e.g. a 60 / 90 / 120 Hz
+ * scroll) only does the strncmp loop a few times per second.
+ *
+ * Set audio_aware=0 to fully disable the feature (no walks, no
+ * cache, no clamp).  Set audio_floor_pct=audio_cap_pct=0 to leave
+ * the comm walk running (for tracepoints) but apply no clamp.
+ */
+#define ZENITH_DEFAULT_AUDIO_AWARE		0
+#define ZENITH_DEFAULT_AUDIO_FLOOR_PCT		0
+#define ZENITH_DEFAULT_AUDIO_CAP_PCT		0
+#define ZENITH_AUDIO_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
+
 /* boot_boost_ms (default 0, off):
  *
  * When non-zero, zenith pins the final freq to policy->max for the
@@ -611,6 +650,14 @@ struct zenith_tunables {
 	unsigned int		psi_aware;
 	unsigned int		psi_mem_thresh;
 
+	/* See ZENITH_DEFAULT_AUDIO_AWARE / ZENITH_DEFAULT_AUDIO_FLOOR_PCT
+	 * / ZENITH_DEFAULT_AUDIO_CAP_PCT.  Both *_pct fields range 0..100;
+	 * 0 in either disables that side of the band.
+	 */
+	unsigned int		audio_aware;
+	unsigned int		audio_floor_pct;
+	unsigned int		audio_cap_pct;
+
 	/* See ZENITH_DEFAULT_BOOT_BOOST_MS. 0 disables the one-shot. */
 	unsigned int		boot_boost_ms;
 
@@ -740,6 +787,13 @@ struct zenith_policy {
 	 */
 	bool			render_active;
 	u64			render_cache_stamp_ns;
+
+	/* Cached per-policy result of the audio-aware comm walk.  Same
+	 * shape as the render cache above; TTL is
+	 * ZENITH_AUDIO_CACHE_TTL_NS.  Zero stamp means "never sampled".
+	 */
+	bool			audio_active;
+	u64			audio_cache_stamp_ns;
 
 	/* Last seen zenith_input_boost_until_ns deadline observed inside
 	 * an active boost window for this policy.  Latched in the input
@@ -1503,6 +1557,79 @@ static bool zenith_policy_has_render(struct zenith_policy *z_policy)
 	return match;
 }
 
+/* Audio low-jitter comm match.  Same shape as zenith_render_comms[]:
+ * a NUL-terminated table of comm prefixes; strncmp() walks each
+ * cpu_curr->comm against each entry up to the table prefix length.
+ *
+ * Entries are picked from the standard Android audio thread names:
+ *   - AudioOut_*       per-AudioFlinger fast/normal mixer threads
+ *   - AudioMixer       AudioFlinger mixer threads (older naming)
+ *   - audioserver      AudioFlinger main thread
+ *   - audio_server     vendor variant of the same
+ *   - MediaCodec_*     framework media codec callback threads
+ *   - OMX*             OpenMAX vendor codec threads
+ *   - SoundPool        framework SoundPool worker
+ *   - PlaybackThread   AudioFlinger playback thread
+ *   - RecordThread     AudioFlinger record thread
+ *
+ * Order is tuned for cache-friendliness on phone workloads (the most
+ * common per-frame matches first).
+ */
+static const char * const zenith_audio_comms[] = {
+	"AudioOut_",
+	"AudioMixer",
+	"audioserver",
+	"audio_server",
+	"MediaCodec_",
+	"OMX",
+	"SoundPool",
+	"PlaybackThread",
+	"RecordThread",
+};
+
+/* Walk the policy's online cpumask and check each cpu_curr's comm
+ * against zenith_audio_comms[].  Returns true on the first match.
+ * Cached for ZENITH_AUDIO_CACHE_TTL_NS so the strncmp loop runs
+ * once every few milliseconds at most.  Caller is expected to gate
+ * the call on tunables->audio_aware != 0; this helper does not
+ * re-check that.
+ */
+static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
+{
+	u64 now = ktime_get_ns();
+	struct cpufreq_policy *policy = z_policy->policy;
+	unsigned int cpu;
+	bool match = false;
+
+	if (z_policy->audio_cache_stamp_ns &&
+	    now - z_policy->audio_cache_stamp_ns < ZENITH_AUDIO_CACHE_TTL_NS)
+		return z_policy->audio_active;
+
+	rcu_read_lock();
+	for_each_cpu(cpu, policy->cpus) {
+		struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+		int i;
+
+		if (!curr)
+			continue;
+		for (i = 0; i < ARRAY_SIZE(zenith_audio_comms); i++) {
+			const char *needle = zenith_audio_comms[i];
+
+			if (!strncmp(curr->comm, needle, strlen(needle))) {
+				match = true;
+				break;
+			}
+		}
+		if (match)
+			break;
+	}
+	rcu_read_unlock();
+
+	z_policy->audio_active = match;
+	z_policy->audio_cache_stamp_ns = now;
+	return match;
+}
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
@@ -1873,6 +2000,40 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		}
 	}
 
+	/* 3c''. Audio low-jitter floor.  When audio_aware=1 and any CPU
+	 * in this policy is currently running a known audio thread
+	 * (AudioOut_*, audioserver, MediaCodec_*, ...), apply a freq
+	 * floor of (policy->max * audio_floor_pct / 100).  Caches the
+	 * comm walk for ZENITH_AUDIO_CACHE_TTL_NS.  The audio cap_pct
+	 * companion is applied separately below, just before the
+	 * uclamp_max final cap, so an explicit ADPF hint can still
+	 * walk it down further.  audio_floor_pct=0 leaves the comm
+	 * walk running (for tracepoint visibility) but applies no
+	 * floor.
+	 */
+	if (z_policy->tunables->audio_aware) {
+		bool has_audio = zenith_policy_has_audio(z_policy);
+		unsigned int af_pct = z_policy->tunables->audio_floor_pct;
+		unsigned int ac_pct = z_policy->tunables->audio_cap_pct;
+		unsigned int af = af_pct ? (policy->max * af_pct) / 100 : 0;
+		unsigned int ac = ac_pct ? (policy->max * ac_pct) / 100 : 0;
+
+		if (af > policy->max)
+			af = policy->max;
+		if (ac > policy->max)
+			ac = policy->max;
+		if (trace_zenith_audio_band_enabled())
+			trace_zenith_audio_band(
+				cpumask_first(policy->cpus),
+				has_audio, af_pct, ac_pct,
+				has_audio ? af : 0,
+				has_audio ? ac : 0);
+		if (has_audio && af && freq < af) {
+			freq = af;
+			tp_path = "audio_floor";
+		}
+	}
+
 	/* 3c'. Render-thread / display-pipeline floor.  When
 	 * render_aware=1 and any CPU in this policy is currently running
 	 * a known render / display-pipeline thread (RenderThread,
@@ -1899,6 +2060,31 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		if (has_render && freq < rf) {
 			freq = rf;
 			tp_path = "render_floor";
+		}
+	}
+
+	/* 3c'''. Audio low-jitter cap.  Companion to the audio floor
+	 * tier above: when audio_aware=1, an audio thread is enqueued
+	 * on the policy, and audio_cap_pct > 0, cap freq at
+	 * (policy->max * audio_cap_pct / 100).  Applied after every
+	 * floor tier so it can pull the freq down even when render_floor
+	 * / boot_boost / input_boost would otherwise hold it higher.
+	 * Applied *before* the uclamp_max final cap so an explicit ADPF
+	 * power-efficiency hint can still walk it down further.  When
+	 * the user sets audio_cap_pct < audio_floor_pct, the cap takes
+	 * precedence (the floor block ran earlier; this block then
+	 * pulls back).
+	 */
+	if (z_policy->tunables->audio_aware &&
+	    z_policy->tunables->audio_cap_pct) {
+		unsigned int ac = (policy->max *
+				   z_policy->tunables->audio_cap_pct) / 100;
+
+		if (ac > policy->max)
+			ac = policy->max;
+		if (z_policy->audio_active && freq > ac) {
+			freq = ac;
+			tp_path = "audio_cap";
 		}
 	}
 
@@ -3481,6 +3667,84 @@ static ssize_t render_floor_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr render_floor_pct = __ATTR_RW(render_floor_pct);
 
+/* audio_aware sysfs knob.  Strict 0/1 boolean; non-zero values are
+ * normalised to 1 on store.  No cache invalidation: tunables->audio_aware
+ * is read fresh on every zenith_get_next_freq() call.  Toggling from 1
+ * to 0 leaves the per-policy audio_active cache stale, but its TTL
+ * (ZENITH_AUDIO_CACHE_TTL_NS) is short and the cap/floor are gated on
+ * tunables->audio_aware first so the stale state is unreachable.
+ */
+static ssize_t audio_aware_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->audio_aware);
+}
+
+static ssize_t audio_aware_store(struct gov_attr_set *attr_set,
+				 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->audio_aware = !!val;
+	return count;
+}
+static struct governor_attr audio_aware = __ATTR_RW(audio_aware);
+
+/* audio_floor_pct sysfs knob.  Range 0..100; 0 leaves the comm walk
+ * running (when audio_aware=1) but applies no floor.  Out-of-range
+ * values rejected with EINVAL.  audio_floor_pct does NOT have to be
+ * <= audio_cap_pct: if the user inverts them, the cap still wins
+ * because it runs after the floor in zenith_get_next_freq().
+ */
+static ssize_t audio_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->audio_floor_pct);
+}
+
+static ssize_t audio_floor_pct_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	t->audio_floor_pct = val;
+	return count;
+}
+static struct governor_attr audio_floor_pct = __ATTR_RW(audio_floor_pct);
+
+/* audio_cap_pct sysfs knob.  Range 0..100; 0 disables the cap (the
+ * floor side of the band can still apply alone).  Applied before the
+ * uclamp_max final cap so ADPF power-efficiency hints still win.
+ */
+static ssize_t audio_cap_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->audio_cap_pct);
+}
+
+static ssize_t audio_cap_pct_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	t->audio_cap_pct = val;
+	return count;
+}
+static struct governor_attr audio_cap_pct = __ATTR_RW(audio_cap_pct);
+
 /* game_mode sysfs knob.  Strict 0/1 boolean.  See
  * ZENITH_DEFAULT_GAME_MODE comment block for the per-tier overlays
  * that flip behaviour when this is set.  No cache invalidation
@@ -3736,6 +4000,9 @@ static struct attribute *zenith_attrs[] = {
 	&predict_util_pct.attr,
 	&render_aware.attr,
 	&render_floor_pct.attr,
+	&audio_aware.attr,
+	&audio_floor_pct.attr,
+	&audio_cap_pct.attr,
 	&game_mode.attr,
 	&psi_aware.attr,
 	&psi_mem_thresh.attr,
@@ -3887,6 +4154,9 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->predict_util_pct	= ZENITH_DEFAULT_PREDICT_UTIL_PCT;
 	tunables->render_aware		= ZENITH_DEFAULT_RENDER_AWARE;
 	tunables->render_floor_pct	= ZENITH_DEFAULT_RENDER_FLOOR_PCT;
+	tunables->audio_aware		= ZENITH_DEFAULT_AUDIO_AWARE;
+	tunables->audio_floor_pct	= ZENITH_DEFAULT_AUDIO_FLOOR_PCT;
+	tunables->audio_cap_pct		= ZENITH_DEFAULT_AUDIO_CAP_PCT;
 	tunables->game_mode		= ZENITH_DEFAULT_GAME_MODE;
 	tunables->psi_aware		= ZENITH_DEFAULT_PSI_AWARE;
 	tunables->psi_mem_thresh	= ZENITH_DEFAULT_PSI_MEM_THRESH;

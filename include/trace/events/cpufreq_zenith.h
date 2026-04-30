@@ -178,6 +178,44 @@ TRACE_EVENT(zenith_frame_pace,
 		  __entry->eff_pct, __entry->floor_freq)
 );
 
+/* Audio low-jitter floor/cap activation. Emitted at most once every
+ * ZENITH_AUDIO_CACHE_TTL_NS per policy when audio_aware=1 and the
+ * comm walk decides whether an audio thread is currently running on
+ * any of the policy's CPUs. floor_freq / cap_freq are the resolved
+ * absolute frequencies (kHz); 0 means "tier disabled".
+ */
+TRACE_EVENT(zenith_audio_band,
+
+	TP_PROTO(int cpu, bool active, unsigned int floor_pct,
+		 unsigned int cap_pct, unsigned int floor_freq,
+		 unsigned int cap_freq),
+
+	TP_ARGS(cpu, active, floor_pct, cap_pct, floor_freq, cap_freq),
+
+	TP_STRUCT__entry(
+		__field(int,		cpu)
+		__field(bool,		active)
+		__field(unsigned int,	floor_pct)
+		__field(unsigned int,	cap_pct)
+		__field(unsigned int,	floor_freq)
+		__field(unsigned int,	cap_freq)
+	),
+
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->active		= active;
+		__entry->floor_pct	= floor_pct;
+		__entry->cap_pct	= cap_pct;
+		__entry->floor_freq	= floor_freq;
+		__entry->cap_freq	= cap_freq;
+	),
+
+	TP_printk("cpu=%d active=%d floor_pct=%u cap_pct=%u floor_freq=%u cap_freq=%u",
+		  __entry->cpu, __entry->active,
+		  __entry->floor_pct, __entry->cap_pct,
+		  __entry->floor_freq, __entry->cap_freq)
+);
+
 /* game_mode flip. Emitted whenever userspace writes a new value to
  * the game_mode sysfs node; lets you correlate frame-pacing diffs in
  * trace data with the moment the gameswitch helper armed/disarmed.
