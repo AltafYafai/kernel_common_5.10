@@ -3224,8 +3224,19 @@ static int __init zenith_setup_profile(char *s)
 		zenith_cmdline_profile = ZENITH_PROFILE_LEGACY;
 	else if (!strcmp(s, "custom"))
 		zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
-	else
+	else {
+		/* Unknown preset.  Reset explicitly to CUSTOM so a
+		 * subsequent zenith.profile= on the cmdline (or a
+		 * future caller chaining into this routine) cannot
+		 * leak a previously-parsed value.  Belt and braces:
+		 * the variable is already file-static and starts at
+		 * CUSTOM, but pinning the reset on every unknown-input
+		 * branch removes the entire class of "is this still
+		 * the default?" questions.
+		 */
+		zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 		pr_warn("zenith.profile=%s: unknown preset, ignored\n", s);
+	}
 	return 1;
 }
 early_param("zenith.profile", zenith_setup_profile);
