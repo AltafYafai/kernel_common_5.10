@@ -2317,28 +2317,39 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * automatically lift the floor.  See the comment block at the
 	 * top of the file for the formula.
 	 */
-	if (z_policy->tunables->frame_budget_us &&
-	    z_policy->tunables->frame_pace_floor_pct) {
-		unsigned int budget_us = z_policy->tunables->frame_budget_us;
+	/* Read both tunables exactly once.  Without READ_ONCE the
+	 * compiler is free to re-fetch frame_budget_us between the
+	 * gating check and the divide below; if userspace writes 0 in
+	 * that window the divide oopses.  Same reasoning for base_pct
+	 * (a 0 here just skips the floor, but a torn read past the
+	 * upper bound check could yield eff_pct overflow).
+	 */
+	{
+		unsigned int budget_us =
+			READ_ONCE(z_policy->tunables->frame_budget_us);
 		unsigned int base_pct =
-			z_policy->tunables->frame_pace_floor_pct;
-		unsigned int eff_pct;
-		unsigned int fp_floor;
+			READ_ONCE(z_policy->tunables->frame_pace_floor_pct);
 
-		eff_pct = (base_pct * ZENITH_FRAME_PACE_BASE_BUDGET_US) /
-			  budget_us;
-		if (eff_pct > 100)
-			eff_pct = 100;
-		fp_floor = (policy->max * eff_pct) / 100;
-		if (fp_floor > policy->max)
-			fp_floor = policy->max;
-		if (trace_zenith_frame_pace_enabled())
-			trace_zenith_frame_pace(
-				cpumask_first(policy->cpus),
-				budget_us, eff_pct, fp_floor);
-		if (freq < fp_floor) {
-			freq = fp_floor;
-			tp_path = "frame_pace";
+		if (budget_us && base_pct) {
+			unsigned int eff_pct;
+			unsigned int fp_floor;
+
+			eff_pct = (base_pct *
+				   ZENITH_FRAME_PACE_BASE_BUDGET_US) /
+				  budget_us;
+			if (eff_pct > 100)
+				eff_pct = 100;
+			fp_floor = (policy->max * eff_pct) / 100;
+			if (fp_floor > policy->max)
+				fp_floor = policy->max;
+			if (trace_zenith_frame_pace_enabled())
+				trace_zenith_frame_pace(
+					cpumask_first(policy->cpus),
+					budget_us, eff_pct, fp_floor);
+			if (freq < fp_floor) {
+				freq = fp_floor;
+				tp_path = "frame_pace";
+			}
 		}
 	}
 
@@ -4509,7 +4520,7 @@ static ssize_t frame_budget_us_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 	if (val > ZENITH_FRAME_BUDGET_US_MAX)
 		return -EINVAL;
-	t->frame_budget_us = val;
+	WRITE_ONCE(t->frame_budget_us, val);
 	return count;
 }
 static struct governor_attr frame_budget_us = __ATTR_RW(frame_budget_us);
@@ -4537,7 +4548,7 @@ static ssize_t frame_pace_floor_pct_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 	if (val > 100)
 		return -EINVAL;
-	t->frame_pace_floor_pct = val;
+	WRITE_ONCE(t->frame_pace_floor_pct, val);
 	return count;
 }
 static struct governor_attr frame_pace_floor_pct =
