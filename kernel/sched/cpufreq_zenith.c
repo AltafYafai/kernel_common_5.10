@@ -119,6 +119,45 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_AT_HI_EVENTS_X2		4
 #define ZENITH_DEFAULT_AT_LO_EVENTS_X2		1
 
+/* auto_tune_scenario (default 0, off):
+ *
+ * When auto_tune=1 (the existing classifier worker is running) and
+ * auto_tune_scenario=1, zenith_auto_tune_work() also samples the
+ * detected scenario at classification time -- audio-thread enqueued,
+ * camera HAL active (via the camera_active override or the comm
+ * walk), render-thread active, and PSI memory-stall above
+ * psi_mem_thresh -- and lets that scenario *override* the
+ * load-saturation + input-rate target the vanilla classifier picks:
+ *
+ *   camera | render -> ZENITH_PROFILE_PERFORMANCE
+ *   memstall (and not camera/render) -> ZENITH_PROFILE_BATTERY
+ *   audio (and not camera/render/memstall) -> ZENITH_PROFILE_BALANCED
+ *   no scenario -> classifier output unchanged
+ *
+ * The intent is the obvious one: when the device is actively
+ * filming or driving a render pipeline, the user almost certainly
+ * wants PERFORMANCE regardless of what the input-rate classifier
+ * thinks; when it's purely playing audio in the background, BALANCED
+ * is the natural floor (BATTERY would risk underrun); when memory
+ * pressure is high the cycles wasted on stalls aren't worth the
+ * energy.  The scenarios have a strict precedence (camera/render
+ * beats memstall beats audio) to keep behaviour deterministic.
+ *
+ * Detection at classification time is a snapshot, not a window
+ * average -- the comm walk caches (4 ms TTL each) reflect what's
+ * running at the auto_tune sample point.  In practice that catches
+ * the common case of "user opened the camera 8 seconds ago" cleanly
+ * because the cameraserver / mtkcam-* processes stay enqueued.  For
+ * scenarios that have already wound down by the moment we sample,
+ * the classifier still picks via load and input-rate.
+ *
+ * Requires auto_tune=1.  Independent of audio_aware / camera_aware /
+ * render_aware: the comm walks fire even when those gating flags
+ * are 0, because here we're using them as detection signals, not as
+ * floor/cap policy.  No KMI exposure.
+ */
+#define ZENITH_DEFAULT_AUTO_TUNE_SCENARIO	0
+
 /* kcpustat-derived hispeed-floor blend (see cpufreq_zenith.c "kcpustat
  * hispeed blend" section for the algorithm). The feature ships OFF;
  * userspace flips kcpustat_hispeed_enable=1 once trace data shows the
@@ -650,6 +689,13 @@ struct zenith_tunables {
 	unsigned int		auto_tune_lo_sat_pct;
 	unsigned int		auto_tune_hi_events_x2;
 	unsigned int		auto_tune_lo_events_x2;
+
+	/* See ZENITH_DEFAULT_AUTO_TUNE_SCENARIO comment block.  Master
+	 * gate for the scenario overlay applied on top of the vanilla
+	 * load + input-rate classifier in zenith_auto_tune_work().
+	 * Requires auto_tune=1; ignored otherwise.
+	 */
+	unsigned int		auto_tune_scenario;
 
 	/* kcpustat hispeed blend tunables (see ZENITH_DEFAULT_KCPUSTAT_*
 	 * comments for semantics). All three default to safe values:
@@ -2928,6 +2974,49 @@ static void zenith_auto_tune_work(struct work_struct *w)
 				       events_rate_x2, t->active_profile,
 				       target);
 
+	/* Scenario overlay (auto_tune_scenario=1).  Sample the four
+	 * scenarios at classification time and let strict precedence
+	 * pick a target that overrides the load + input-rate result.
+	 * Each comm walk caches its result for a few ms in the per-policy
+	 * cache, so calling them here is cheap (one walk per scenario at
+	 * the 10s classifier tick) and never re-walks if the hot path
+	 * just ran them.
+	 */
+	if (t->auto_tune_scenario) {
+		bool audio = zenith_policy_has_audio(z_policy);
+		unsigned int cam_override = t->camera_active;
+		bool camera;
+		bool render = zenith_policy_has_render(z_policy);
+		bool memstall = false;
+		unsigned int prev = target;
+
+		if (cam_override == ZENITH_CAMERA_OVERRIDE_FORCE_ON)
+			camera = true;
+		else if (cam_override == ZENITH_CAMERA_OVERRIDE_FORCE_OFF)
+			camera = false;
+		else
+			camera = zenith_policy_has_camera(z_policy);
+
+		if (t->psi_mem_thresh) {
+			unsigned int mem_some = zenith_psi_mem_some_pct();
+
+			memstall = (mem_some >= t->psi_mem_thresh);
+		}
+
+		if (camera || render)
+			target = ZENITH_PROFILE_PERFORMANCE;
+		else if (memstall)
+			target = ZENITH_PROFILE_BATTERY;
+		else if (audio)
+			target = ZENITH_PROFILE_BALANCED;
+		/* else: leave target as the classifier's pick */
+
+		if (trace_zenith_auto_tune_scenario_enabled())
+			trace_zenith_auto_tune_scenario(
+				z_policy->policy->cpu, audio, camera,
+				render, memstall, prev, target);
+	}
+
 	if (target != t->active_profile) {
 		zenith_apply_profile(t, target);
 		t->active_profile = target;
@@ -3007,6 +3096,31 @@ ZENITH_AT_PCT_TUNABLE(auto_tune_lo_sat_pct);
 
 ZENITH_TUNABLE_UINT(auto_tune_hi_events_x2);
 ZENITH_TUNABLE_UINT(auto_tune_lo_events_x2);
+
+/* auto_tune_scenario sysfs knob.  Strict 0/1 boolean; non-zero
+ * values normalised to 1 on store.  Effective only when auto_tune=1.
+ * See ZENITH_DEFAULT_AUTO_TUNE_SCENARIO comment block for the
+ * detection logic and scenario precedence.
+ */
+static ssize_t auto_tune_scenario_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_tune_scenario);
+}
+
+static ssize_t auto_tune_scenario_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->auto_tune_scenario = !!val;
+	return count;
+}
+static struct governor_attr auto_tune_scenario =
+	__ATTR_RW(auto_tune_scenario);
 
 static ssize_t profile_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -4223,6 +4337,7 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_lo_sat_pct.attr,
 	&auto_tune_hi_events_x2.attr,
 	&auto_tune_lo_events_x2.attr,
+	&auto_tune_scenario.attr,
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&iowait_boost_min.attr,
@@ -4380,6 +4495,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->auto_tune_lo_sat_pct	= ZENITH_DEFAULT_AT_LO_SAT_PCT;
 	tunables->auto_tune_hi_events_x2 = ZENITH_DEFAULT_AT_HI_EVENTS_X2;
 	tunables->auto_tune_lo_events_x2 = ZENITH_DEFAULT_AT_LO_EVENTS_X2;
+	tunables->auto_tune_scenario	= ZENITH_DEFAULT_AUTO_TUNE_SCENARIO;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->iowait_boost_min	= ZENITH_DEFAULT_IOWAIT_BOOST_MIN;

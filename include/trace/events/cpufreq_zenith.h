@@ -83,6 +83,49 @@ TRACE_EVENT(zenith_auto_tune,
 		  __entry->prev_profile, __entry->new_profile)
 );
 
+/* Scenario-aware auto_tune classifier override.  Emitted from
+ * zenith_auto_tune_work() when auto_tune_scenario=1 and a detected
+ * scenario (audio / camera / render / mem-stall) overrides the
+ * load-saturation + input-rate classifier.  prev_target is what the
+ * vanilla classifier would have picked; scenario_target is what the
+ * scenario bias substitutes.  When the two are equal, the overlay
+ * was a no-op for this window (still emitted for tracing parity).
+ */
+TRACE_EVENT(zenith_auto_tune_scenario,
+
+	TP_PROTO(int cpu, bool audio, bool camera, bool render,
+		 bool memstall, unsigned int prev_target,
+		 unsigned int scenario_target),
+
+	TP_ARGS(cpu, audio, camera, render, memstall, prev_target,
+		scenario_target),
+
+	TP_STRUCT__entry(
+		__field(int,		cpu)
+		__field(bool,		audio)
+		__field(bool,		camera)
+		__field(bool,		render)
+		__field(bool,		memstall)
+		__field(unsigned int,	prev_target)
+		__field(unsigned int,	scenario_target)
+	),
+
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->audio		= audio;
+		__entry->camera		= camera;
+		__entry->render		= render;
+		__entry->memstall	= memstall;
+		__entry->prev_target	= prev_target;
+		__entry->scenario_target = scenario_target;
+	),
+
+	TP_printk("cpu=%d audio=%d camera=%d render=%d memstall=%d prev=%u scenario=%u",
+		  __entry->cpu, __entry->audio, __entry->camera,
+		  __entry->render, __entry->memstall,
+		  __entry->prev_target, __entry->scenario_target)
+);
+
 /* Predictive-util one-step-ahead extrapolation (predict_util_pct). One
  * record per zenith_get_util() call when the predictor is enabled and
  * the predicted value differs from the observed util. Useful for
