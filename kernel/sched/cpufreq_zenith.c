@@ -268,6 +268,40 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_IO_IS_BUSY		1
 #define ZENITH_DEFAULT_INPUT_BOOST_MS		80
 #define ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS	30
+
+/* input_boost_decay_curve (default 0, linear):
+ *
+ * The input-boost decay path lowers a synthetic floor from the full
+ * boost ceiling down to policy->min across input_boost_decay_ms.
+ * Until now that ramp was strictly linear:
+ *
+ *   floor = ceiling - span * elapsed / decay_ns        (LINEAR)
+ *
+ * which drops fast at the start of the tail and slows near the
+ * end -- the opposite of what a gesture actually wants.  The hand
+ * leaves the screen, the compositor has already committed one or
+ * two post-gesture frames at high freq, and we want the floor to
+ * hold high for a short moment (keeping the render thread on a
+ * comfortable bin for the settle frames) and then drop off
+ * quickly at the end of the decay window.
+ *
+ * When set to 1 (CUBIC), the normalised elapsed time is cubed
+ * before being consumed:
+ *
+ *   t256  = elapsed * 256 / decay_ns                   (0..256)
+ *   cubic = t256^3 / 65536                             (0..256)
+ *   floor = ceiling - span * cubic / 256               (CUBIC)
+ *
+ * At elapsed == 0 both curves give floor == ceiling; at
+ * elapsed == decay_ns both give floor == policy->min.  The
+ * midpoint differs sharply: LINEAR has dropped 50 %% at the
+ * halfway mark, CUBIC has dropped ~12.5 %%.  The full-boost phase
+ * (while remaining > decay_ns) is unaffected.
+ *
+ * All arithmetic is u32-bounded by design: t256 is capped at 256,
+ * its cube at 16,777,216, the final per-step divisor fits a u32.
+ */
+#define ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE	0
 #define ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY	1
 #define ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT	80	/* 0 = no cap, pin to policy->max */
 #define ZENITH_DEFAULT_EFFICIENT_FREQ		0
@@ -839,6 +873,13 @@ struct zenith_tunables {
 	/* Input boost duration (ms). 0 = disabled. */
 	unsigned int		input_boost_ms;
 	unsigned int		input_boost_decay_ms;
+
+	/* Shape of the input_boost decay-phase floor.  0 = linear
+	 * (legacy), 1 = cubic ease-in (floor holds high, drops fast at
+	 * the tail).  See ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE for
+	 * semantics.  Range-checked 0..1 on store.
+	 */
+	unsigned int		input_boost_decay_curve;
 
 	/* When 1 (default), input boost is applied only to policies whose
 	 * top arch_scale_cpu_capacity equals SCHED_CAPACITY_SCALE -- i.e.
@@ -2311,9 +2352,13 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				pin_to_target = true;
 				goto apply_uclamp_max_cap;
 			} else if (decay_ns) {
-				/* Decay phase: linearly ramp a floor from
-				 * boost_ceiling down toward policy->min over
-				 * the trailing decay_ns.  Normal eval runs
+				/* Decay phase: ramp a floor from boost_ceiling
+				 * down toward policy->min over the trailing
+				 * decay_ns.  Shape is picked by
+				 * input_boost_decay_curve: 0 = linear (the
+				 * historical behaviour), 1 = cubic ease-in
+				 * (floor holds high for most of the window,
+				 * drops fast at the tail).  Normal eval runs
 				 * after this point and may pick a higher freq;
 				 * the floor only kicks in if the load has
 				 * already dropped so far that eval undershoots
@@ -2321,10 +2366,27 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				 */
 				u64 elapsed = decay_ns - remaining;
 				u64 span = boost_ceiling - policy->min;
+				unsigned int dropped;
 
-				input_boost_floor = boost_ceiling -
-					(unsigned int)div64_u64(span * elapsed,
-								decay_ns);
+				if (z_policy->tunables->input_boost_decay_curve) {
+					u32 t256 = (u32)div64_u64(elapsed * 256,
+									  decay_ns);
+					u32 cubic;
+
+					if (t256 > 256)
+						t256 = 256;
+					cubic = (t256 * t256 * t256) >> 16;
+					if (cubic > 256)
+						cubic = 256;
+					dropped = (unsigned int)
+						((span * cubic) >> 8);
+				} else {
+					dropped = (unsigned int)
+						div64_u64(span * elapsed,
+							  decay_ns);
+				}
+
+				input_boost_floor = boost_ceiling - dropped;
 			} else {
 				/* Decay window not configured: original cliff. */
 				freq = boost_ceiling;
@@ -3871,6 +3933,30 @@ static ssize_t input_boost_decay_ms_store(struct gov_attr_set *attr_set,
 static struct governor_attr input_boost_decay_ms =
 	__ATTR_RW(input_boost_decay_ms);
 
+/* input_boost_decay_curve sysfs knob.  0 = linear (legacy),
+ * 1 = cubic ease-in.  See ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE.
+ */
+static ssize_t input_boost_decay_curve_show(struct gov_attr_set *attr_set,
+					    char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->input_boost_decay_curve);
+}
+
+static ssize_t input_boost_decay_curve_store(struct gov_attr_set *attr_set,
+					     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->input_boost_decay_curve = val;
+	return count;
+}
+static struct governor_attr input_boost_decay_curve =
+	__ATTR_RW(input_boost_decay_curve);
+
 static ssize_t input_boost_big_only_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n",
@@ -5086,6 +5172,7 @@ static struct attribute *zenith_attrs[] = {
 	&thermal_util_derate.attr,
 	&input_boost_ms.attr,
 	&input_boost_decay_ms.attr,
+	&input_boost_decay_curve.attr,
 	&input_boost_big_only.attr,
 	&input_boost_cap_pct.attr,
 	&efficient_freq.attr,
@@ -5249,6 +5336,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 	tunables->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
+	tunables->input_boost_decay_curve = ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE;
 	tunables->input_boost_big_only	= ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY;
 	tunables->input_boost_cap_pct	= ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT;
 	tunables->efficient_freq	= ZENITH_DEFAULT_EFFICIENT_FREQ;
