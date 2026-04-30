@@ -513,13 +513,35 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  *      trailing decay window is ~30%% longer to keep frametime
  *      stable across stick-flick / camera-pan inputs.
  *
- * The tunable itself is just a 0/1 flag; userspace (a small
- * gameswitch helper, or a Realme `/proc/touchpanel/game_switch_enable`
- * watcher) is expected to flip it.  Values >1 are normalised to 1.
+ * The tunable accepts 0/1/2; userspace (a small gameswitch helper,
+ * or a Realme `/proc/touchpanel/game_switch_enable` watcher) is
+ * expected to flip it.  Level 2 ("turbo") stacks additional
+ * runtime overrides on top of level 1 -- see the comment block
+ * attached to ZENITH_GAME_L2_HISPEED_BOOST_PCT for the full list.
+ * Values >2 are rejected by sysfs with -EINVAL.
  */
 #define ZENITH_DEFAULT_GAME_MODE			0
 #define ZENITH_GAME_HISPEED_BOOST_PCT		110
 #define ZENITH_GAME_BOOST_DECAY_PCT		130
+
+/* game_mode=2 ("turbo") stacks the game_mode=1 overlays on top of:
+ *
+ *   - a stronger hispeed boost multiplier (default 120%% vs 110%%),
+ *   - a longer input_boost decay window (default 160%% vs 130%%),
+ *   - effective input_boost_cap_pct treated as 0 (pin to policy->max
+ *     during the full-boost phase regardless of the user-set cap),
+ *   - effective climb_mode treated as SNAP for the brutality tier
+ *     regardless of the user-set climb_mode.
+ *
+ * The stacked overrides are applied inline in the hot path and do
+ * not mutate the underlying tunables, so switching back to 0 or 1
+ * restores the user's original climb_mode / input_boost_cap_pct
+ * bit-exactly.  Only the level 1 overlays (ZENITH_GAME_*_PCT above)
+ * apply at game_mode=1; level 2 is a strict superset.
+ */
+#define ZENITH_GAME_L2_HISPEED_BOOST_PCT	120
+#define ZENITH_GAME_L2_BOOST_DECAY_PCT		160
+#define ZENITH_GAME_MODE_MAX			2
 
 /* frame_budget_us (default 0, off) + frame_pace_floor_pct (default 0):
  *
@@ -1953,7 +1975,11 @@ static inline unsigned int zenith_eff_hispeed_freq(struct zenith_policy *z_polic
 	unsigned int pct = z_policy->tunables->hispeed_freq_pct;
 
 	if (!eff && pct) {
-		if (z_policy->tunables->game_mode)
+		unsigned int gm = z_policy->tunables->game_mode;
+
+		if (gm >= 2)
+			pct = (pct * ZENITH_GAME_L2_HISPEED_BOOST_PCT) / 100;
+		else if (gm == 1)
 			pct = (pct * ZENITH_GAME_HISPEED_BOOST_PCT) / 100;
 		eff = (z_policy->policy->max * pct) / 100;
 		if (eff > z_policy->policy->max)
@@ -2314,16 +2340,31 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			u64 remaining = until - now;
 			unsigned int cap_pct =
 				z_policy->tunables->input_boost_cap_pct;
-			unsigned int boost_ceiling = (cap_pct && cap_pct <= 100) ?
+			unsigned int gm = z_policy->tunables->game_mode;
+			unsigned int boost_ceiling;
+
+			/* game_mode=2 (turbo) overrides the user-set cap and
+			 * pins the full-boost phase to policy->max regardless
+			 * of input_boost_cap_pct.  Runtime-only; the stored
+			 * tunable is left untouched.
+			 */
+			if (gm >= 2)
+				cap_pct = 0;
+			boost_ceiling = (cap_pct && cap_pct <= 100) ?
 				(policy->max / 100) * cap_pct : policy->max;
 
-			/* game_mode stretch: lengthen the trailing decay
-			 * window by ZENITH_GAME_BOOST_DECAY_PCT (default
-			 * 130%%, i.e. ~30%% longer) so input boosts hold
-			 * the freq floor longer across stick-flick / camera
-			 * pan inputs.  Pure no-op when game_mode=0.
+			/* game_mode decay stretch: lengthen the trailing decay
+			 * window.  Level 1 uses ZENITH_GAME_BOOST_DECAY_PCT
+			 * (default 130%%, ~30%% longer); level 2 uses
+			 * ZENITH_GAME_L2_BOOST_DECAY_PCT (default 160%%,
+			 * ~60%% longer) so input boosts hold the floor even
+			 * longer across stick-flick / camera pan inputs.
+			 * Pure no-op when game_mode=0.
 			 */
-			if (z_policy->tunables->game_mode && decay_ms)
+			if (gm >= 2 && decay_ms)
+				decay_ms = (decay_ms *
+					    ZENITH_GAME_L2_BOOST_DECAY_PCT) / 100;
+			else if (gm == 1 && decay_ms)
 				decay_ms = (decay_ms *
 					    ZENITH_GAME_BOOST_DECAY_PCT) / 100;
 			decay_ns = (u64)decay_ms * NSEC_PER_MSEC;
@@ -2426,9 +2467,18 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		if (load_pct >= dynamic_up_thresh) {
 			unsigned int b_streak =
 				z_policy->tunables->brutal_entry_streak;
+			unsigned int climb_mode =
+				z_policy->tunables->climb_mode;
 
-			if (z_policy->tunables->climb_mode ==
-			    ZENITH_CLIMB_MODE_STEP) {
+			/* game_mode=2 (turbo) forces SNAP climb regardless of
+			 * the user-set climb_mode, so the brutality path
+			 * always pins policy->max on threshold crossing.
+			 * Runtime-only; the stored tunable is left untouched.
+			 */
+			if (z_policy->tunables->game_mode >= 2)
+				climb_mode = ZENITH_CLIMB_MODE_SNAP;
+
+			if (climb_mode == ZENITH_CLIMB_MODE_STEP) {
 				/* Gentle climb: step by freq_step_pct of
 				 * policy->max from the current bin.
 				 * Bypasses hysteresis entirely, including
@@ -2514,7 +2564,8 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		z_policy->brutal_entry_count = 0;
 
 brutal_entry_deferred:
-		if (z_policy->tunables->climb_mode == ZENITH_CLIMB_MODE_SNAP &&
+		if ((z_policy->tunables->climb_mode == ZENITH_CLIMB_MODE_SNAP ||
+		     z_policy->tunables->game_mode >= 2) &&
 		    z_policy->brutal_active &&
 		    load_pct >= z_policy->tunables->down_threshold) {
 			freq = policy->max;
@@ -5017,7 +5068,7 @@ static ssize_t game_mode_store(struct gov_attr_set *attr_set,
 	unsigned int val;
 	unsigned int prev;
 
-	if (kstrtouint(buf, 10, &val) || val > 1)
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_GAME_MODE_MAX)
 		return -EINVAL;
 	prev = t->game_mode;
 	t->game_mode = val;
