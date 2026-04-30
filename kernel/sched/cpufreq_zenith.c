@@ -127,6 +127,34 @@
 #define ZENITH_DEFAULT_BRUTAL_ENTRY_STREAK	0
 #define ZENITH_BRUTAL_ENTRY_STREAK_MAX		16
 
+/* up_threshold_adaptive (default 0, off):
+ *
+ * Variance-adaptive shaping of the brutality entry threshold.  The
+ * static up_threshold is a single number that has to fit two
+ * different workloads: bursty / interactive (UI scrolling, gestures,
+ * frame pacing) where a low up_threshold is desirable so the cluster
+ * climbs fast on a single hot sample, and sustained / steady
+ * (transcoding, long compute) where a higher up_threshold avoids
+ * pinning the cluster at max for the whole run.
+ *
+ * When set to N (1..30), zenith_get_next_freq() lowers the effective
+ * up_threshold by up to N percent when the recent load signal is
+ * bursty, leaving it unchanged on a steady signal.  The bursty/
+ * steady signal is a rolling EWMA of |load_pct - prev_load_pct|;
+ * high mean-absolute-change == bursty.  The adjustment is applied
+ * only on the regular up_threshold path -- the screen-off (95),
+ * thermal (90), and up_threshold_hispeed overrides are absolute
+ * pinning values and stay verbatim.
+ *
+ * 0 disables the adjustment entirely (legacy: dynamic_up_thresh ==
+ * tunables->up_threshold whenever no override fires).  Cap at 30 so
+ * a runaway tunable can never lower up_threshold by more than 30%
+ * of its value, which would be indistinguishable from "force snap"
+ * behaviour.
+ */
+#define ZENITH_DEFAULT_UP_THRESHOLD_ADAPTIVE	0
+#define ZENITH_UP_THRESHOLD_ADAPTIVE_MAX	30
+
 /* Time-based cache TTL for the uclamp_{min,max} per-policy walks.  The
  * per-rq UCLAMP values are maintained by the scheduler on every
  * enqueue / dequeue, so a 1 ms staleness bound on the cached
@@ -814,6 +842,13 @@ struct zenith_tunables {
 	unsigned int		up_rate_limit_us;
 	unsigned int		down_rate_limit_us;
 	unsigned int		up_threshold;
+
+	/* See ZENITH_DEFAULT_UP_THRESHOLD_ADAPTIVE.  Magnitude of the
+	 * variance-adaptive lowering applied to dynamic_up_thresh on
+	 * bursty workloads, in percent of the static up_threshold.
+	 * Range 0..ZENITH_UP_THRESHOLD_ADAPTIVE_MAX.  0 disables.
+	 */
+	unsigned int		up_threshold_adaptive;
 	unsigned int		down_threshold;	/* hysteresis lower bound */
 
 	/* Hispeed floor tier: when load >= hispeed_load (% of max_cap),
@@ -1334,6 +1369,18 @@ struct zenith_policy {
 	 * recent boost to extend".
 	 */
 	u64			boost_active_until_ns;
+
+	/* Variance-adaptive up_threshold state (see
+	 * ZENITH_DEFAULT_UP_THRESHOLD_ADAPTIVE).  load_var_ewma_x256 is
+	 * an EWMA (alpha=1/8) of |load_pct - prev| in fixed-point
+	 * 1/256ths -- so a value of 256 == 1.0 percentage-point of
+	 * average sample-to-sample swing.  Read at the top of
+	 * zenith_get_next_freq() to bias dynamic_up_thresh, updated at
+	 * the bottom with the current sample's tp_load_pct.  Both fields
+	 * zero-initialised by zenith_start()'s memset.
+	 */
+	unsigned int		load_var_ewma_x256;
+	unsigned int		last_load_pct;
 
 	/* Per-policy decision stats.  Bumped from zenith_get_next_freq()
 	 * once per evaluation; total decisions and cache_hits are
@@ -2538,6 +2585,35 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		 * higher value.
 		 */
 		dynamic_up_thresh = z_policy->tunables->up_threshold_hispeed;
+	} else if (z_policy->tunables->up_threshold_adaptive &&
+		   dynamic_up_thresh == z_policy->tunables->up_threshold) {
+		/* Variance-adaptive shaping: lower dynamic_up_thresh by
+		 * up to up_threshold_adaptive percent of its value when
+		 * the recent load signal is bursty.  See
+		 * ZENITH_DEFAULT_UP_THRESHOLD_ADAPTIVE for semantics.
+		 * Skipped when any of the harder overrides above is in
+		 * effect (those are absolute pinning values and must not
+		 * be softened).  load_var_ewma_x256 is in 1/256ths of a
+		 * percentage-point of mean abs change; 30*256 == fully
+		 * saturated bursty signal.
+		 */
+		unsigned int adaptive =
+			z_policy->tunables->up_threshold_adaptive;
+		unsigned int var = z_policy->load_var_ewma_x256 / 256;
+		unsigned int swing;
+
+		if (adaptive > ZENITH_UP_THRESHOLD_ADAPTIVE_MAX)
+			adaptive = ZENITH_UP_THRESHOLD_ADAPTIVE_MAX;
+		if (var > ZENITH_UP_THRESHOLD_ADAPTIVE_MAX)
+			var = ZENITH_UP_THRESHOLD_ADAPTIVE_MAX;
+		/* swing = up_threshold * adaptive% * (var/30)
+		 *       = up_threshold * adaptive * var
+		 *         / (100 * ZENITH_UP_THRESHOLD_ADAPTIVE_MAX)
+		 */
+		swing = ((unsigned int)dynamic_up_thresh * adaptive * var) /
+			(100u * ZENITH_UP_THRESHOLD_ADAPTIVE_MAX);
+		if (swing < dynamic_up_thresh)
+			dynamic_up_thresh -= swing;
 	}
 
 	if (max_cap)
@@ -3386,6 +3462,23 @@ apply_uclamp_max_cap:
 
 	z_policy->stats[ZENITH_STAT_DECISIONS]++;
 	z_policy->stats[zenith_path_to_bucket(tp_path)]++;
+
+	/* Update the variance EWMA used by the up_threshold_adaptive
+	 * shaping at the top of the next eval.  Uses tp_load_pct as the
+	 * input signal (computed earlier in this function).  Cheap: one
+	 * abs-diff, one shift, one add.  See ZENITH_DEFAULT_UP_THRESHOLD_
+	 * ADAPTIVE for what consumes load_var_ewma_x256.  Updated even
+	 * when up_threshold_adaptive is 0 so flipping the tunable on
+	 * doesn't see a stale-zero variance for the first 8 samples.
+	 */
+	{
+		unsigned int prev = z_policy->last_load_pct;
+		unsigned int delta = tp_load_pct > prev ?
+				tp_load_pct - prev : prev - tp_load_pct;
+		z_policy->load_var_ewma_x256 =
+			(z_policy->load_var_ewma_x256 * 7 + delta * 256) / 8;
+		z_policy->last_load_pct = tp_load_pct;
+	}
 
 	return target_freq;
 }
@@ -4812,6 +4905,28 @@ static ssize_t up_threshold_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr up_threshold = __ATTR_RW(up_threshold);
 
+static ssize_t up_threshold_adaptive_show(struct gov_attr_set *attr_set,
+					  char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->up_threshold_adaptive);
+}
+
+static ssize_t up_threshold_adaptive_store(struct gov_attr_set *attr_set,
+					   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_UP_THRESHOLD_ADAPTIVE_MAX)
+		return -EINVAL;
+	t->up_threshold_adaptive = val;
+	return count;
+}
+static struct governor_attr up_threshold_adaptive =
+	__ATTR_RW(up_threshold_adaptive);
+
 static ssize_t up_threshold_hispeed_show(struct gov_attr_set *attr_set,
 					 char *buf)
 {
@@ -5728,6 +5843,7 @@ static struct attribute *zenith_attrs[] = {
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
 	&up_threshold.attr,
+	&up_threshold_adaptive.attr,
 	&up_threshold_hispeed.attr,
 	&down_threshold.attr,
 	&hispeed_freq.attr,
@@ -5897,6 +6013,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->up_rate_limit_us	= ZENITH_DEFAULT_UP_RATE_LIMIT_US;
 	tunables->down_rate_limit_us	= ZENITH_DEFAULT_DOWN_RATE_LIMIT_US;
 	tunables->up_threshold		= ZENITH_DEFAULT_UP_THRESHOLD;
+	tunables->up_threshold_adaptive	= ZENITH_DEFAULT_UP_THRESHOLD_ADAPTIVE;
 	tunables->up_threshold_hispeed	= ZENITH_DEFAULT_UP_THRESHOLD_HISPEED;
 	tunables->down_threshold	= ZENITH_DEFAULT_DOWN_THRESHOLD;
 	tunables->hispeed_freq		= ZENITH_DEFAULT_HISPEED_FREQ;
