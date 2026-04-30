@@ -216,6 +216,43 @@ TRACE_EVENT(zenith_audio_band,
 		  __entry->floor_freq, __entry->cap_freq)
 );
 
+/* Camera capture-pipeline floor activation. Emitted at most once
+ * every ZENITH_CAMERA_CACHE_TTL_NS per policy when camera_aware=1.
+ * 'active' is the resolved decision after applying the userspace
+ * override (camera_active=auto/force-on/force-off); 'auto_match' is
+ * the raw comm-walk result before override.
+ */
+TRACE_EVENT(zenith_camera_floor,
+
+	TP_PROTO(int cpu, bool active, bool auto_match,
+		 unsigned int override, unsigned int floor_pct,
+		 unsigned int floor_freq),
+
+	TP_ARGS(cpu, active, auto_match, override, floor_pct, floor_freq),
+
+	TP_STRUCT__entry(
+		__field(int,		cpu)
+		__field(bool,		active)
+		__field(bool,		auto_match)
+		__field(unsigned int,	override)
+		__field(unsigned int,	floor_pct)
+		__field(unsigned int,	floor_freq)
+	),
+
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->active		= active;
+		__entry->auto_match	= auto_match;
+		__entry->override	= override;
+		__entry->floor_pct	= floor_pct;
+		__entry->floor_freq	= floor_freq;
+	),
+
+	TP_printk("cpu=%d active=%d auto_match=%d override=%u floor_pct=%u floor_freq=%u",
+		  __entry->cpu, __entry->active, __entry->auto_match,
+		  __entry->override, __entry->floor_pct, __entry->floor_freq)
+);
+
 /* game_mode flip. Emitted whenever userspace writes a new value to
  * the game_mode sysfs node; lets you correlate frame-pacing diffs in
  * trace data with the moment the gameswitch helper armed/disarmed.

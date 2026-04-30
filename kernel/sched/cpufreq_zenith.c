@@ -352,6 +352,49 @@ static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 #define ZENITH_DEFAULT_AUDIO_CAP_PCT		0
 #define ZENITH_AUDIO_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
 
+/* camera_aware (default 0, off) + camera_active (default 0, auto)
+ * + camera_floor_pct (default 0):
+ *
+ * When camera_aware=1, zenith_get_next_freq() walks the policy's
+ * cpumask and checks each cpu_curr(cpu)->comm against a small list
+ * of known Android camera HAL / framework thread names
+ * (cameraserver, provider@N.M-se, provider.MTK*, mtkcam-*,
+ * Camera2-*, CamX_*, ...).  If any matches, the final freq is
+ * floored at (policy->max * camera_floor_pct / 100), mirroring
+ * the render_aware tier.
+ *
+ * Camera workloads benefit from a stable high freq -- the capture
+ * pipeline stalls when the freq dips below what its ISP/codec
+ * pipeline needs.  No companion cap is provided (unlike audio):
+ * camera bursts are short and infrequent, and capping freq there
+ * costs frame-rate.
+ *
+ * The userspace override knob (camera_active) is provided because
+ * vendor camera HALs sometimes use thread names that don't match
+ * the comm table on every device.  Values:
+ *
+ *   0 (auto, default)  -- consult comm table
+ *   1 (force-on)       -- floor always applied (skip comm walk)
+ *   2 (force-off)      -- floor never applied (skip comm walk)
+ *
+ * The HAL or a Magisk module can write 1 on capture-start /
+ * preview-start and 2 (or 0) on capture-stop, giving deterministic
+ * behaviour without the kernel having to know every vendor name.
+ *
+ * The comm check is cached per-policy with TTL
+ * ZENITH_CAMERA_CACHE_TTL_NS (mirrored from render).  Set
+ * camera_aware=0 to fully disable; set camera_floor_pct=0 to leave
+ * comm-walk + tracepoint visibility on but apply no floor.
+ */
+#define ZENITH_DEFAULT_CAMERA_AWARE		0
+#define ZENITH_DEFAULT_CAMERA_ACTIVE		0
+#define ZENITH_DEFAULT_CAMERA_FLOOR_PCT		0
+#define ZENITH_CAMERA_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
+
+#define ZENITH_CAMERA_OVERRIDE_AUTO		0
+#define ZENITH_CAMERA_OVERRIDE_FORCE_ON		1
+#define ZENITH_CAMERA_OVERRIDE_FORCE_OFF	2
+
 /* boot_boost_ms (default 0, off):
  *
  * When non-zero, zenith pins the final freq to policy->max for the
@@ -658,6 +701,15 @@ struct zenith_tunables {
 	unsigned int		audio_floor_pct;
 	unsigned int		audio_cap_pct;
 
+	/* See ZENITH_DEFAULT_CAMERA_AWARE / ZENITH_DEFAULT_CAMERA_ACTIVE
+	 * / ZENITH_DEFAULT_CAMERA_FLOOR_PCT.  camera_active is the
+	 * userspace override (0 auto, 1 force-on, 2 force-off);
+	 * camera_floor_pct ranges 0..100.
+	 */
+	unsigned int		camera_aware;
+	unsigned int		camera_active;
+	unsigned int		camera_floor_pct;
+
 	/* See ZENITH_DEFAULT_BOOT_BOOST_MS. 0 disables the one-shot. */
 	unsigned int		boot_boost_ms;
 
@@ -794,6 +846,15 @@ struct zenith_policy {
 	 */
 	bool			audio_active;
 	u64			audio_cache_stamp_ns;
+
+	/* Cached per-policy result of the camera-aware comm walk.
+	 * Holds the *raw* comm-match result, before the userspace
+	 * override (camera_active=auto/force-on/force-off) is applied.
+	 * TTL is ZENITH_CAMERA_CACHE_TTL_NS.  Zero stamp means "never
+	 * sampled".
+	 */
+	bool			camera_auto_match;
+	u64			camera_cache_stamp_ns;
 
 	/* Last seen zenith_input_boost_until_ns deadline observed inside
 	 * an active boost window for this policy.  Latched in the input
@@ -1630,6 +1691,78 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
 	return match;
 }
 
+/* Camera capture-pipeline comm match.  Picks names commonly used by
+ * Android camera framework / HAL processes:
+ *   - cameraserver       framework cameraserver process
+ *   - cameraprovider     newer Treble cameraprovider
+ *   - provider@          HIDL camera HAL service threads
+ *                        ("provider@2.4-se", "provider@2.5-se", ...)
+ *   - provider.MTK       MediaTek vendor variant
+ *   - mtkcam-            MediaTek ISP/camera daemon threads
+ *   - mtkcamutil         MediaTek camera utility threads
+ *   - Camera2-           framework Camera2 internal threads
+ *   - CamX_              Qualcomm CamX HAL threads
+ *   - CamX-              CamX subsystem threads (alt naming)
+ *   - vendor.qti.camera  Qualcomm vendor camera service
+ *
+ * Order is tuned for cache-friendliness: most common matches first.
+ */
+static const char * const zenith_camera_comms[] = {
+	"cameraserver",
+	"cameraprovider",
+	"provider@",
+	"provider.MTK",
+	"mtkcam-",
+	"mtkcamutil",
+	"Camera2-",
+	"CamX_",
+	"CamX-",
+	"vendor.qti.camera",
+};
+
+/* Walk the policy's online cpumask and check each cpu_curr's comm
+ * against zenith_camera_comms[].  Returns true on the first match.
+ * Cached for ZENITH_CAMERA_CACHE_TTL_NS.  Caller is expected to
+ * gate on tunables->camera_aware != 0; this helper does not
+ * re-check that.  The returned value is the *raw* comm-match
+ * decision; the caller applies the camera_active override on top.
+ */
+static bool zenith_policy_has_camera(struct zenith_policy *z_policy)
+{
+	u64 now = ktime_get_ns();
+	struct cpufreq_policy *policy = z_policy->policy;
+	unsigned int cpu;
+	bool match = false;
+
+	if (z_policy->camera_cache_stamp_ns &&
+	    now - z_policy->camera_cache_stamp_ns < ZENITH_CAMERA_CACHE_TTL_NS)
+		return z_policy->camera_auto_match;
+
+	rcu_read_lock();
+	for_each_cpu(cpu, policy->cpus) {
+		struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+		int i;
+
+		if (!curr)
+			continue;
+		for (i = 0; i < ARRAY_SIZE(zenith_camera_comms); i++) {
+			const char *needle = zenith_camera_comms[i];
+
+			if (!strncmp(curr->comm, needle, strlen(needle))) {
+				match = true;
+				break;
+			}
+		}
+		if (match)
+			break;
+	}
+	rcu_read_unlock();
+
+	z_policy->camera_auto_match = match;
+	z_policy->camera_cache_stamp_ns = now;
+	return match;
+}
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
@@ -2060,6 +2193,52 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		if (has_render && freq < rf) {
 			freq = rf;
 			tp_path = "render_floor";
+		}
+	}
+
+	/* 3c''''. Camera capture-pipeline floor.  When camera_aware=1
+	 * and either (camera_active=force-on) or (camera_active=auto
+	 * && comm walk finds a known camera HAL/framework thread on
+	 * the policy), apply a freq floor of
+	 * (policy->max * camera_floor_pct / 100).  No companion cap:
+	 * camera bursts benefit from full freq headroom; capping
+	 * costs frame-rate.  Floor is still subject to the uclamp_max
+	 * downstream cap.
+	 *
+	 * When camera_active=force-off, the comm walk is skipped and
+	 * no floor is applied even if the table would have matched.
+	 * The override exists because vendor camera HALs sometimes
+	 * use thread names that don't match the table.
+	 */
+	if (z_policy->tunables->camera_aware) {
+		unsigned int override = z_policy->tunables->camera_active;
+		bool auto_match = false;
+		bool active;
+		unsigned int cf_pct = z_policy->tunables->camera_floor_pct;
+		unsigned int cf;
+
+		if (override == ZENITH_CAMERA_OVERRIDE_FORCE_OFF) {
+			active = false;
+		} else if (override == ZENITH_CAMERA_OVERRIDE_FORCE_ON) {
+			active = true;
+		} else {
+			auto_match = zenith_policy_has_camera(z_policy);
+			active = auto_match;
+		}
+
+		cf = cf_pct ? (policy->max * cf_pct) / 100 : 0;
+		if (cf > policy->max)
+			cf = policy->max;
+
+		if (trace_zenith_camera_floor_enabled())
+			trace_zenith_camera_floor(
+				cpumask_first(policy->cpus),
+				active, auto_match, override, cf_pct,
+				active ? cf : 0);
+
+		if (active && cf && freq < cf) {
+			freq = cf;
+			tp_path = "camera_floor";
 		}
 	}
 
@@ -3745,6 +3924,79 @@ static ssize_t audio_cap_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr audio_cap_pct = __ATTR_RW(audio_cap_pct);
 
+/* camera_aware sysfs knob.  Strict 0/1 boolean; non-zero values
+ * normalised to 1 on store.
+ */
+static ssize_t camera_aware_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->camera_aware);
+}
+
+static ssize_t camera_aware_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	t->camera_aware = !!val;
+	return count;
+}
+static struct governor_attr camera_aware = __ATTR_RW(camera_aware);
+
+/* camera_active sysfs knob.  Tri-state override:
+ *   0  ZENITH_CAMERA_OVERRIDE_AUTO        consult comm table
+ *   1  ZENITH_CAMERA_OVERRIDE_FORCE_ON    floor always applied
+ *   2  ZENITH_CAMERA_OVERRIDE_FORCE_OFF   floor never applied
+ * Out-of-range values (>=3) rejected with EINVAL.
+ */
+static ssize_t camera_active_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->camera_active);
+}
+
+static ssize_t camera_active_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > ZENITH_CAMERA_OVERRIDE_FORCE_OFF)
+		return -EINVAL;
+	t->camera_active = val;
+	return count;
+}
+static struct governor_attr camera_active = __ATTR_RW(camera_active);
+
+/* camera_floor_pct sysfs knob.  Range 0..100; 0 leaves the comm
+ * walk running (when camera_aware=1) but applies no floor.
+ */
+static ssize_t camera_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->camera_floor_pct);
+}
+
+static ssize_t camera_floor_pct_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	t->camera_floor_pct = val;
+	return count;
+}
+static struct governor_attr camera_floor_pct = __ATTR_RW(camera_floor_pct);
+
 /* game_mode sysfs knob.  Strict 0/1 boolean.  See
  * ZENITH_DEFAULT_GAME_MODE comment block for the per-tier overlays
  * that flip behaviour when this is set.  No cache invalidation
@@ -4003,6 +4255,9 @@ static struct attribute *zenith_attrs[] = {
 	&audio_aware.attr,
 	&audio_floor_pct.attr,
 	&audio_cap_pct.attr,
+	&camera_aware.attr,
+	&camera_active.attr,
+	&camera_floor_pct.attr,
 	&game_mode.attr,
 	&psi_aware.attr,
 	&psi_mem_thresh.attr,
@@ -4157,6 +4412,9 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->audio_aware		= ZENITH_DEFAULT_AUDIO_AWARE;
 	tunables->audio_floor_pct	= ZENITH_DEFAULT_AUDIO_FLOOR_PCT;
 	tunables->audio_cap_pct		= ZENITH_DEFAULT_AUDIO_CAP_PCT;
+	tunables->camera_aware		= ZENITH_DEFAULT_CAMERA_AWARE;
+	tunables->camera_active		= ZENITH_DEFAULT_CAMERA_ACTIVE;
+	tunables->camera_floor_pct	= ZENITH_DEFAULT_CAMERA_FLOOR_PCT;
 	tunables->game_mode		= ZENITH_DEFAULT_GAME_MODE;
 	tunables->psi_aware		= ZENITH_DEFAULT_PSI_AWARE;
 	tunables->psi_mem_thresh	= ZENITH_DEFAULT_PSI_MEM_THRESH;
