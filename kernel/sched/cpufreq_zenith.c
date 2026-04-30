@@ -207,6 +207,27 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 
 #define ZENITH_DEFAULT_CLIMB_MODE		ZENITH_CLIMB_MODE_SNAP
 #define ZENITH_DEFAULT_FREQ_STEP_PCT		5
+
+/* freq_step_adaptive (default 0, off):
+ *
+ * When STEP climb mode is selected, the per-sample step is a fixed
+ * fraction of policy->max (freq_step_pct) regardless of how far
+ * load_pct has overshot up_threshold.  A sample at load_pct = 76%
+ * with up_threshold = 75% produces the same step as a sample at
+ * load_pct = 99% -- the latter clearly wants to converge faster.
+ *
+ * When set to 1, the base step is scaled by (100 + overshoot)% where
+ * overshoot is 100 * (load_pct - up_threshold) / (100 - up_threshold),
+ * so:
+ *   - At load_pct == up_threshold: 1.0x base step (no change)
+ *   - At load_pct == 100:           2.0x base step (double)
+ *   - Linearly interpolated in between.
+ *
+ * Only affects STEP climb mode; SNAP mode is load-independent by
+ * design and unchanged.  Preserves a minimum step of 1 (same guard
+ * as the base path) so a zero freq_step_pct cannot stall the climb.
+ */
+#define ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE	0
 #define ZENITH_DEFAULT_THERMAL_AUTO		1
 #define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
 
@@ -706,6 +727,13 @@ struct zenith_tunables {
 	 */
 	unsigned int		climb_mode;
 	unsigned int		freq_step_pct;
+
+	/* Load-proportional scaling for the STEP climb step.  See
+	 * ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE.  0 = off (fixed step);
+	 * 1 = on (step scales 1.0x .. 2.0x with overshoot).  Only
+	 * meaningful when climb_mode == STEP.
+	 */
+	unsigned int		freq_step_adaptive;
 
 	/* Last-applied preset, or CUSTOM if one was never written. The
 	 * tunable does NOT auto-revert to CUSTOM when individual fields
@@ -2286,6 +2314,30 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				unsigned int step =
 				    (policy->max *
 				     z_policy->tunables->freq_step_pct) / 100;
+
+				/* Load-proportional scaling (I4).  When
+				 * freq_step_adaptive is set, widen the step
+				 * linearly with overshoot above the active
+				 * up_threshold so genuinely heavy load
+				 * converges faster without changing the
+				 * light-overshoot behaviour at the boundary.
+				 * dynamic_up_thresh already reflects the
+				 * screen-off / thermal / hispeed overrides
+				 * above, so the span denominator is always
+				 * the effective ceiling for this sample.
+				 */
+				if (z_policy->tunables->freq_step_adaptive &&
+				    dynamic_up_thresh < 100) {
+					unsigned int span =
+						100 - dynamic_up_thresh;
+					unsigned int overshoot =
+						load_pct > dynamic_up_thresh ?
+						load_pct - dynamic_up_thresh : 0;
+					if (overshoot > span)
+						overshoot = span;
+					step += (step * overshoot) / span;
+				}
+
 				if (!step)
 					step = 1;
 				freq = policy->cur + step;
@@ -4281,6 +4333,29 @@ static ssize_t freq_step_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr freq_step_pct = __ATTR_RW(freq_step_pct);
 
+/* freq_step_adaptive sysfs knob.  0/1 only.  See
+ * ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE for semantics.
+ */
+static ssize_t freq_step_adaptive_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->freq_step_adaptive);
+}
+
+static ssize_t freq_step_adaptive_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->freq_step_adaptive = val;
+	return count;
+}
+static struct governor_attr freq_step_adaptive =
+	__ATTR_RW(freq_step_adaptive);
+
 static ssize_t powersave_bias_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n",
@@ -4904,6 +4979,7 @@ static struct attribute *zenith_attrs[] = {
 	&brutal_entry_streak.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
+	&freq_step_adaptive.attr,
 	&profile.attr,
 	&auto_tune.attr,
 	&auto_tune_sat_load_pct.attr,
@@ -5065,6 +5141,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->brutal_entry_streak	= ZENITH_DEFAULT_BRUTAL_ENTRY_STREAK;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
+	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
 	tunables->active_profile	= ZENITH_PROFILE_CUSTOM;
 	tunables->auto_tune		= 1;
 	tunables->auto_tune_sat_load_pct = ZENITH_DEFAULT_AT_SAT_LOAD_PCT;
