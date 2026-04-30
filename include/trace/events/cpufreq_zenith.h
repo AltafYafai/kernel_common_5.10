@@ -20,10 +20,12 @@ TRACE_EVENT(zenith_decision,
 	TP_PROTO(int cpu, const char *path, unsigned long util,
 		 unsigned long max_cap, unsigned int load_pct,
 		 unsigned int freq_in, unsigned int freq_out,
-		 unsigned int kcpustat_pct),
+		 unsigned int kcpustat_pct,
+		 unsigned long uclamp_min, unsigned long uclamp_max,
+		 bool cached_hit),
 
 	TP_ARGS(cpu, path, util, max_cap, load_pct, freq_in, freq_out,
-		kcpustat_pct),
+		kcpustat_pct, uclamp_min, uclamp_max, cached_hit),
 
 	TP_STRUCT__entry(
 		__field(int,		cpu)
@@ -34,6 +36,9 @@ TRACE_EVENT(zenith_decision,
 		__field(unsigned int,	freq_in)
 		__field(unsigned int,	freq_out)
 		__field(unsigned int,	kcpustat_pct)
+		__field(unsigned long,	uclamp_min)
+		__field(unsigned long,	uclamp_max)
+		__field(bool,		cached_hit)
 	),
 
 	TP_fast_assign(
@@ -45,13 +50,18 @@ TRACE_EVENT(zenith_decision,
 		__entry->freq_in	= freq_in;
 		__entry->freq_out	= freq_out;
 		__entry->kcpustat_pct	= kcpustat_pct;
+		__entry->uclamp_min	= uclamp_min;
+		__entry->uclamp_max	= uclamp_max;
+		__entry->cached_hit	= cached_hit;
 	),
 
-	TP_printk("cpu=%d path=%s util=%lu max=%lu load=%u%% in=%u out=%u kcpustat=%u%%",
+	TP_printk("cpu=%d path=%s util=%lu max=%lu load=%u%% in=%u out=%u kcpustat=%u%% umin=%lu umax=%lu cached=%d",
 		  __entry->cpu, __get_str(path), __entry->util,
 		  __entry->max_cap, __entry->load_pct,
 		  __entry->freq_in, __entry->freq_out,
-		  __entry->kcpustat_pct)
+		  __entry->kcpustat_pct,
+		  __entry->uclamp_min, __entry->uclamp_max,
+		  __entry->cached_hit)
 );
 
 /* Auto-tune classifier decision emitted once per ZENITH_AUTO_TUNE_PERIOD_MS. */

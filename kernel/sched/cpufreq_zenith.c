@@ -3064,8 +3064,25 @@ apply_uclamp_max_cap:
 	 * cache hit short-circuits past the loop that consumes them.
 	 */
 	if (freq == z_policy->cached_raw_freq && !z_policy->need_freq_update &&
-	    !zenith_ladder_pending(z_policy))
+	    !zenith_ladder_pending(z_policy)) {
+		/* Emit the same summary tracepoint on cache-hit so a
+		 * trace consumer sees a continuous record of decisions
+		 * rather than gaps every time the cache shortcut wins.
+		 * Gated on trace_zenith_decision_enabled() so the cache
+		 * hot path stays free when tracing is off.
+		 */
+		if (trace_zenith_decision_enabled()) {
+			unsigned int kc_pct = per_cpu(zenith_cpu, policy->cpu)
+						.kc_filtered_busy_pct;
+			trace_zenith_decision(policy->cpu, tp_path, util,
+					      max_cap, tp_load_pct, freq,
+					      z_policy->next_freq, kc_pct,
+					      z_policy->cached_uclamp_min,
+					      z_policy->cached_uclamp_max,
+					      true);
+		}
 		return z_policy->next_freq;
+	}
 
 	z_policy->cached_raw_freq = freq;
 	target_freq = cpufreq_driver_resolve_freq(policy, freq);
@@ -3215,7 +3232,10 @@ apply_uclamp_max_cap:
 			per_cpu(zenith_cpu, policy->cpu).kc_filtered_busy_pct;
 
 		trace_zenith_decision(policy->cpu, tp_path, util, max_cap,
-				      tp_load_pct, freq, target_freq, kc_pct);
+				      tp_load_pct, freq, target_freq, kc_pct,
+				      z_policy->cached_uclamp_min,
+				      z_policy->cached_uclamp_max,
+				      false);
 	}
 
 	return target_freq;
