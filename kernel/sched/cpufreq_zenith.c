@@ -1958,6 +1958,15 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 */
 	const char *tp_path = "eas";
 	unsigned int tp_load_pct = 0;
+	/* Set when freq is pinned by an explicit user-experience tier
+	 * (input_boost full-pin, brutality snap_max / brutal_hold,
+	 * climb_step).  Suppresses the post-resolve efficient-freq
+	 * ladder and light-load hard cap so those tiers can't clip a
+	 * boost back down to a lower bin.  EM validation and the
+	 * sampling-down multiplier still run; both are correctness
+	 * tiers, not user-experience clips.
+	 */
+	bool pin_to_target = false;
 
 	/* Dynamic Environment Overrides */
 	unsigned int dynamic_up_thresh = z_policy->tunables->up_threshold;
@@ -2079,6 +2088,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				 */
 				freq = boost_ceiling;
 				tp_path = "input_boost";
+				pin_to_target = true;
 				goto resolve;
 			} else if (decay_ns) {
 				/* Decay phase: linearly ramp a floor from
@@ -2099,6 +2109,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				/* Decay window not configured: original cliff. */
 				freq = boost_ceiling;
 				tp_path = "input_boost";
+				pin_to_target = true;
 				goto resolve;
 			}
 		}
@@ -2147,11 +2158,13 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 					freq = policy->max;
 				z_policy->brutal_active = false;
 				tp_path = "climb_step";
+				pin_to_target = true;
 				goto resolve;
 			}
 			z_policy->brutal_active = true;
 			freq = policy->max;
 			tp_path = "snap_max";
+			pin_to_target = true;
 			goto resolve;
 		}
 
@@ -2160,6 +2173,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		    load_pct >= z_policy->tunables->down_threshold) {
 			freq = policy->max;
 			tp_path = "brutal_hold";
+			pin_to_target = true;
 			goto resolve;
 		}
 
@@ -2549,9 +2563,11 @@ resolve:
 	 * climbing progress.
 	 *
 	 * eff_nr == 0 disables the ladder (identical to pre-ladder
-	 * efficient_freq=0).
+	 * efficient_freq=0).  pin_to_target=true (input_boost full-pin,
+	 * brutality snap_max / brutal_hold, climb_step) skips the
+	 * ladder so the user-experience tier wins.
 	 */
-	if (z_policy->tunables->eff_nr) {
+	if (!pin_to_target && z_policy->tunables->eff_nr) {
 		unsigned int nr = z_policy->tunables->eff_nr;
 		u64 now = ktime_get_ns();
 		int i;
@@ -2600,8 +2616,11 @@ resolve:
 	 * resolved target_freq down to light_load_freq. Saves power on
 	 * idle-ish workloads (background sync, screen-on hold) where PELT
 	 * jitter would otherwise push us into a mid bin we do not need.
+	 * pin_to_target=true skips this cap for the same reason as the
+	 * efficient-freq ladder above.
 	 */
-	if (z_policy->tunables->light_load_freq && max_cap &&
+	if (!pin_to_target &&
+	    z_policy->tunables->light_load_freq && max_cap &&
 	    (util * 100) / max_cap < z_policy->tunables->light_load_threshold &&
 	    target_freq > z_policy->tunables->light_load_freq) {
 		target_freq = z_policy->tunables->light_load_freq;
