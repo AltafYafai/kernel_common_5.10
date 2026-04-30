@@ -409,6 +409,35 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_PREDICT_UTIL_PCT		0
 #define ZENITH_PREDICT_UTIL_PCT_MAX		200
 
+/* predict_util_smooth (default 0, off):
+ *
+ * The base predictor at ZENITH_DEFAULT_PREDICT_UTIL_PCT uses a
+ * single-tap slope:
+ *
+ *   slope = util - prev_util
+ *   pred  = util + slope * pct / 100
+ *
+ * A single-tap slope is jumpy: a one-sample outlier in util
+ * produces a full-strength prediction on the very next tick.
+ *
+ * When set to 1, average the slope across the two most recent
+ * taps:
+ *
+ *   slope1 = util       - prev_util
+ *   slope2 = prev_util  - prev_util_2
+ *   pred   = util + ((slope1 + slope2) / 2) * pct / 100
+ *
+ * Both slopes are computed only when strictly positive, so the
+ * "up-only" invariant of the base predictor is preserved (a
+ * ramp-down is never amplified).  prev_util_2 is maintained as
+ * long as predict_util_pct > 0; toggling smooth on/off is free.
+ *
+ * Same cap / clamp / trace / prev_util update semantics as the
+ * base predictor, so reverting to 0 returns to the historical
+ * single-tap math with no lingering state.
+ */
+#define ZENITH_DEFAULT_PREDICT_UTIL_SMOOTH	0
+
 /* render_aware (default 0, off) + render_floor_pct (default 70):
  *
  * When render_aware=1, zenith_get_next_freq() walks the policy's
@@ -928,6 +957,12 @@ struct zenith_tunables {
 	/* See ZENITH_DEFAULT_PREDICT_UTIL_PCT comment block. 0 = off. */
 	unsigned int		predict_util_pct;
 
+	/* See ZENITH_DEFAULT_PREDICT_UTIL_SMOOTH comment block.  0 = off
+	 * (single-tap), 1 = on (two-tap averaged slope).  Ignored when
+	 * predict_util_pct == 0.
+	 */
+	unsigned int		predict_util_smooth;
+
 	/* See ZENITH_DEFAULT_RENDER_AWARE / ZENITH_DEFAULT_RENDER_FLOOR_PCT. */
 	unsigned int		render_aware;
 	unsigned int		render_floor_pct;
@@ -1160,6 +1195,16 @@ struct zenith_cpu {
 	 */
 	unsigned long		prev_util;
 
+	/* Tap from two samples ago, used only when
+	 * tunables->predict_util_smooth is set and predict_util_pct != 0.
+	 * Maintained in lockstep with prev_util (push the old prev_util
+	 * into prev_util_2 before overwriting prev_util) so toggling the
+	 * smooth tunable does not require any per-cpu init handshake.
+	 * Initialised to zero by the kzalloc-style allocation in
+	 * zenith_start().
+	 */
+	unsigned long		prev_util_2;
+
 	/* kcpustat hispeed-blend sampler state (consumed by
 	 * zenith_kcpustat_sample / zenith_kcpustat_blend). Two-phase
 	 * windowed measurement: phase 1 clears at window expiry and
@@ -1379,23 +1424,41 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 	predict_pct = READ_ONCE(z_cpu->z_policy->tunables->predict_util_pct);
 	if (predict_pct) {
 		unsigned long prev = z_cpu->prev_util;
+		unsigned int smooth = READ_ONCE(
+			z_cpu->z_policy->tunables->predict_util_smooth);
 
 		if (predict_pct > ZENITH_PREDICT_UTIL_PCT_MAX)
 			predict_pct = ZENITH_PREDICT_UTIL_PCT_MAX;
 
 		if (util_out > prev) {
-			unsigned long delta = util_out - prev;
-			unsigned long pred = util_out +
-					     (delta * predict_pct) / 100;
+			unsigned long slope1 = util_out - prev;
+			unsigned long eff_slope = slope1;
+			unsigned long pred;
 
+			/* Two-tap smoothing (I7).  Average slope1 with
+			 * the previous observed slope only when it was
+			 * also positive -- preserves the base predictor's
+			 * up-only invariant (we never smooth in a
+			 * negative-slope memory).  Cheap: one add, one
+			 * shift, no divide.
+			 */
+			if (smooth && prev > z_cpu->prev_util_2) {
+				unsigned long slope2 =
+					prev - z_cpu->prev_util_2;
+				eff_slope = (slope1 + slope2) >> 1;
+			}
+
+			pred = util_out + (eff_slope * predict_pct) / 100;
 			if (pred > max)
 				pred = max;
 			if (trace_zenith_predict_enabled())
 				trace_zenith_predict(z_cpu->cpu, predict_pct,
 						     util_out, pred);
+			z_cpu->prev_util_2 = prev;
 			z_cpu->prev_util = util_out;
 			util_out = pred;
 		} else {
+			z_cpu->prev_util_2 = prev;
 			z_cpu->prev_util = util_out;
 		}
 	}
@@ -4553,6 +4616,29 @@ static ssize_t predict_util_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr predict_util_pct = __ATTR_RW(predict_util_pct);
 
+/* predict_util_smooth sysfs knob.  0/1 only.  See
+ * ZENITH_DEFAULT_PREDICT_UTIL_SMOOTH for semantics.
+ */
+static ssize_t predict_util_smooth_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->predict_util_smooth);
+}
+
+static ssize_t predict_util_smooth_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->predict_util_smooth = val;
+	return count;
+}
+static struct governor_attr predict_util_smooth =
+	__ATTR_RW(predict_util_smooth);
+
 /* render_aware sysfs knob.  Strict 0/1 boolean; non-zero values are
  * normalised to 1 on store so userspace can echo any truthy integer.
  * No cache invalidation is required: tunables->render_aware is read
@@ -5016,6 +5102,7 @@ static struct attribute *zenith_attrs[] = {
 	&uclamp_min_respect.attr,
 	&uclamp_max_respect.attr,
 	&predict_util_pct.attr,
+	&predict_util_smooth.attr,
 	&render_aware.attr,
 	&render_floor_pct.attr,
 	&audio_aware.attr,
@@ -5178,6 +5265,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->uclamp_min_respect	= ZENITH_DEFAULT_UCLAMP_MIN_RESPECT;
 	tunables->uclamp_max_respect	= ZENITH_DEFAULT_UCLAMP_MAX_RESPECT;
 	tunables->predict_util_pct	= ZENITH_DEFAULT_PREDICT_UTIL_PCT;
+	tunables->predict_util_smooth	= ZENITH_DEFAULT_PREDICT_UTIL_SMOOTH;
 	tunables->render_aware		= ZENITH_DEFAULT_RENDER_AWARE;
 	tunables->render_floor_pct	= ZENITH_DEFAULT_RENDER_FLOOR_PCT;
 	tunables->audio_aware		= ZENITH_DEFAULT_AUDIO_AWARE;
