@@ -1963,6 +1963,28 @@ static bool zenith_policy_has_camera(struct zenith_policy *z_policy)
 	return match;
 }
 
+/* Predicate used by the cached_raw_freq shortcut in
+ * zenith_get_next_freq().  Returns true when the efficient_freq
+ * ladder has any armed bin deadline; in that case the cache hit
+ * cannot be used because the ladder loop must run to drain
+ * deadlines on schedule.  Walking ZENITH_EFF_BINS_MAX (small) once
+ * per tick is cheap and avoids the latch hazard.
+ */
+static bool zenith_ladder_pending(struct zenith_policy *z_policy)
+{
+	unsigned int nr = z_policy->tunables->eff_nr;
+	int i;
+
+	if (!nr)
+		return false;
+	if (nr > ZENITH_EFF_BINS_MAX)
+		nr = ZENITH_EFF_BINS_MAX;
+	for (i = 0; i < nr; i++)
+		if (z_policy->eff_unlock_at_ns[i])
+			return true;
+	return false;
+}
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
@@ -2571,7 +2593,21 @@ apply_uclamp_max_cap:
 		}
 	}
 
-	if (freq == z_policy->cached_raw_freq && !z_policy->need_freq_update)
+	/* cached_raw_freq shortcut: when the pre-resolve freq matches
+	 * the value we cached on the previous tick AND nothing has
+	 * marked need_freq_update, the post-resolve tiers (ladder,
+	 * light_cap, EM, sampling-down) all produced the same answer
+	 * last tick, so we can return the cached final value.
+	 *
+	 * EXCEPTION: if the efficient_freq ladder has any armed bin
+	 * deadline (eff_unlock_at_ns[i] != 0), we MUST run the ladder
+	 * loop again so deadlines can release on schedule.  Otherwise a
+	 * sustained sub-up_threshold load that holds freq steady would
+	 * latch the ladder at its current bin forever, because the
+	 * cache hit short-circuits past the loop that consumes them.
+	 */
+	if (freq == z_policy->cached_raw_freq && !z_policy->need_freq_update &&
+	    !zenith_ladder_pending(z_policy))
 		return z_policy->next_freq;
 
 	z_policy->cached_raw_freq = freq;
