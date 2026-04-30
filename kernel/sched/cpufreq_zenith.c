@@ -2650,6 +2650,21 @@ apply_uclamp_max_cap:
 			u64 delay_ns = (u64)z_policy->tunables->eff_delay_us[i] *
 				       NSEC_PER_USEC;
 
+			/* Clamp the bin to this policy's max.  The
+			 * efficient_freq table is set on the global
+			 * tunables and may serve multiple policies with
+			 * different policy->max values.  Bins above
+			 * policy->max would otherwise be permanently
+			 * unreachable (target_freq is already bounded
+			 * by policy->max upstream), silently disabling
+			 * the upper rungs of the ladder for the smaller
+			 * cluster.  Collapsing to policy->max gives the
+			 * operator the intuitive behaviour: "the table
+			 * extends through this cluster's max".
+			 */
+			if (bin_freq > policy->max)
+				bin_freq = policy->max;
+
 			if (target_freq <= bin_freq) {
 				/* Target is at or below this bin. Reset
 				 * its own and every higher bin's
