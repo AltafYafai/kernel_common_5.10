@@ -57,6 +57,30 @@
  */
 #define ZENITH_DEFAULT_IOWAIT_BOOST_MIN		125
 #define ZENITH_DEFAULT_IOWAIT_STACK_PCT		50	/* 0 = legacy max(util, boost) */
+
+/* iowait_backoff_after_ms (default 0, off):
+ *
+ * The doubling-on-each-iowait-flag climb in zenith_iowait_boost()
+ * has no upper bound other than SCHED_CAPACITY_SCALE.  On long
+ * sustained-iowait workloads (level loads, app installs, big-file
+ * syncs) the boost saturates near max for the duration, with
+ * diminishing return: by the time the boost has doubled past the
+ * point where extra freq materially reduces I/O wait, the cpu is
+ * burning power on cycles that gain almost nothing.
+ *
+ * When set, this tunable starts shrinking the boost stack once a
+ * single iowait episode has been live for N milliseconds.  The
+ * doubling step in zenith_iowait_boost() flips to a halving step
+ * once the timer elapses, so the boost decays toward the floor at
+ * the same rate the apply path would decay it during quiet ticks.
+ * iowait flag observations no longer keep extending the boost; the
+ * episode dies on its own and the next fresh iowait re-arms from
+ * the floor with a clean timer.
+ *
+ * 0 disables the backoff entirely (legacy behaviour: doubling
+ * climbs to SCHED_CAPACITY_SCALE without an upper time bound).
+ */
+#define ZENITH_DEFAULT_IOWAIT_BACKOFF_AFTER_MS	0
 #define ZENITH_DEFAULT_UP_THRESHOLD		75
 #define ZENITH_DEFAULT_UP_THRESHOLD_HISPEED	0	/* disabled */
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
@@ -891,6 +915,12 @@ struct zenith_tunables {
 	 */
 	unsigned int		iowait_stack_pct;
 
+	/* See ZENITH_DEFAULT_IOWAIT_BACKOFF_AFTER_MS.  Time in ms after
+	 * the start of a single iowait episode before the doubling-on-
+	 * arm climb flips to a halving step.  0 disables the backoff.
+	 */
+	unsigned int		iowait_backoff_after_ms;
+
 	/* When 1, a per-policy delayed_work periodically classifies the
 	 * recent workload from load-saturation rate and input-event
 	 * rate, and auto-selects performance / balanced / battery via
@@ -1325,6 +1355,16 @@ struct zenith_cpu {
 
 	bool			iowait_boost_pending;
 	unsigned int		iowait_boost;
+
+	/* Wall-time the current iowait boost episode first armed; zero
+	 * means "no episode in progress".  Stamped in zenith_iowait_boost()
+	 * on the 0->floor transition, cleared whenever iowait_boost
+	 * itself is cleared (zenith_iowait_reset / zenith_iowait_apply).
+	 * Read by zenith_iowait_boost() to decide whether the
+	 * iowait_backoff_after_ms timer has elapsed and the doubling
+	 * step should flip to a halving step.
+	 */
+	u64			iowait_boost_first_ns;
 	u64			last_update;
 	unsigned long		bw_dl;
 
@@ -1399,6 +1439,7 @@ static bool zenith_iowait_reset(struct zenith_cpu *z_cpu, u64 time, bool set_iow
 
 	z_cpu->iowait_boost = set_iowait_boost ? zenith_iowait_floor(z_cpu) : 0;
 	z_cpu->iowait_boost_pending = set_iowait_boost;
+	z_cpu->iowait_boost_first_ns = set_iowait_boost ? time : 0;
 	return true;
 }
 
@@ -1416,10 +1457,33 @@ static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time, unsigned int
 	z_cpu->iowait_boost_pending = true;
 
 	if (z_cpu->iowait_boost) {
-		z_cpu->iowait_boost = min_t(unsigned int, z_cpu->iowait_boost << 1, SCHED_CAPACITY_SCALE);
+		unsigned int after_ms =
+			z_cpu->z_policy->tunables->iowait_backoff_after_ms;
+		u64 first = z_cpu->iowait_boost_first_ns;
+
+		/* Sustained-iowait backoff: once the episode has been
+		 * live for after_ms milliseconds, halve instead of
+		 * doubling so the boost decays toward the floor and
+		 * eventually clears.  See ZENITH_DEFAULT_IOWAIT_BACKOFF_
+		 * AFTER_MS for the why.  after_ms=0 keeps the legacy
+		 * unbounded-doubling behaviour.
+		 */
+		if (after_ms && first &&
+		    (time - first) > (u64)after_ms * NSEC_PER_MSEC) {
+			z_cpu->iowait_boost >>= 1;
+			if (z_cpu->iowait_boost <
+			    zenith_iowait_floor(z_cpu)) {
+				z_cpu->iowait_boost = 0;
+				z_cpu->iowait_boost_first_ns = 0;
+			}
+		} else {
+			z_cpu->iowait_boost = min_t(unsigned int,
+				z_cpu->iowait_boost << 1, SCHED_CAPACITY_SCALE);
+		}
 		return;
 	}
 	z_cpu->iowait_boost = zenith_iowait_floor(z_cpu);
+	z_cpu->iowait_boost_first_ns = time;
 }
 
 static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, unsigned long util, unsigned long max_cap)
@@ -1436,6 +1500,7 @@ static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, uns
 		z_cpu->iowait_boost >>= 1;
 		if (z_cpu->iowait_boost < floor) {
 			z_cpu->iowait_boost = 0;
+			z_cpu->iowait_boost_first_ns = 0;
 			return util;
 		}
 	}
@@ -3644,6 +3709,34 @@ static ssize_t iowait_stack_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr iowait_stack_pct = __ATTR_RW(iowait_stack_pct);
 
+static ssize_t iowait_backoff_after_ms_show(struct gov_attr_set *attr_set,
+					    char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->iowait_backoff_after_ms);
+}
+
+static ssize_t iowait_backoff_after_ms_store(struct gov_attr_set *attr_set,
+					     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	/* 0 disables the backoff.  Cap at 60_000 ms (1 minute): an
+	 * iowait episode lasting that long without a single quiet tick
+	 * is exotic enough that the user almost certainly wants the
+	 * backoff to kick in well before then; values above the cap
+	 * are rejected so a typo doesn't silently disable the feature
+	 * for hours.
+	 */
+	if (kstrtouint(buf, 10, &val) || val > 60000)
+		return -EINVAL;
+	t->iowait_backoff_after_ms = val;
+	return count;
+}
+static struct governor_attr iowait_backoff_after_ms =
+	__ATTR_RW(iowait_backoff_after_ms);
+
 static ssize_t ignore_nice_load_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n",
@@ -5660,6 +5753,7 @@ static struct attribute *zenith_attrs[] = {
 	&io_is_busy.attr,
 	&iowait_boost_min.attr,
 	&iowait_stack_pct.attr,
+	&iowait_backoff_after_ms.attr,
 	&ignore_nice_load.attr,
 	&screen_state.attr,
 	&screen_auto.attr,
@@ -5826,6 +5920,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->iowait_boost_min	= ZENITH_DEFAULT_IOWAIT_BOOST_MIN;
 	tunables->iowait_stack_pct	= ZENITH_DEFAULT_IOWAIT_STACK_PCT;
+	tunables->iowait_backoff_after_ms = ZENITH_DEFAULT_IOWAIT_BACKOFF_AFTER_MS;
 	tunables->ignore_nice_load	= 0;
 	tunables->screen_state		= 1;
 	tunables->screen_auto		= 1;
