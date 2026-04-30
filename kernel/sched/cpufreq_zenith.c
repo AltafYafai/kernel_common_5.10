@@ -64,6 +64,22 @@
 #define ZENITH_DEFAULT_HISPEED_LOAD		65
 #define ZENITH_DEFAULT_HISPEED_HYST_PCT		10	/* exit hysteresis margin */
 
+/* hispeed_entry_streak (default 0, off):
+ *
+ * Symmetric entry-side hysteresis for the hispeed tier.  Today the
+ * tier has only exit hysteresis (hispeed_hyst_pct): once load_pct
+ * crosses hispeed_load it activates immediately, leaving the tier
+ * vulnerable to single-sample noise spikes near the boundary.
+ *
+ * When set to N (>0), require load_pct >= hispeed_load to hold for
+ * N+1 consecutive samples before flipping hispeed_active to true.
+ * 0 preserves the historical immediate-flip behaviour.  Capped to
+ * ZENITH_HISPEED_ENTRY_STREAK_MAX so the per-policy u8 counter
+ * never overflows.
+ */
+#define ZENITH_DEFAULT_HISPEED_ENTRY_STREAK	0
+#define ZENITH_HISPEED_ENTRY_STREAK_MAX		16
+
 /* Time-based cache TTL for the uclamp_{min,max} per-policy walks.  The
  * per-rq UCLAMP values are maintained by the scheduler on every
  * enqueue / dequeue, so a 1 ms staleness bound on the cached
@@ -554,6 +570,13 @@ struct zenith_tunables {
 	 */
 	unsigned int		hispeed_hyst_pct;
 
+	/* Symmetric entry-side hysteresis for the hispeed tier.  See
+	 * ZENITH_DEFAULT_HISPEED_ENTRY_STREAK.  Capped on store to
+	 * ZENITH_HISPEED_ENTRY_STREAK_MAX so the per-policy u8 counter
+	 * cannot overflow.
+	 */
+	unsigned int		hispeed_entry_streak;
+
 	/* Secondary up_threshold applied only when policy->cur has
 	 * already climbed to hispeed_freq or above. 0 disables the
 	 * substitution and falls back to up_threshold at every bin.
@@ -872,6 +895,15 @@ struct zenith_policy {
 	 * hispeed_load, the same way brutal_active does for up_threshold.
 	 */
 	bool			hispeed_active;
+
+	/* Entry-side streak counter for hispeed activation.  Increments
+	 * on every sample where load_pct >= hispeed_load, resets when
+	 * load_pct < hispeed_load.  hispeed_active flips to true only
+	 * when streak > tunables->hispeed_entry_streak, providing
+	 * symmetric entry/exit hysteresis.  Capped to a small u8 to
+	 * avoid wraparound on long sustained-load runs.
+	 */
+	u8			hispeed_entry_count;
 
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
@@ -2123,9 +2155,30 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			unsigned int entry = z_policy->tunables->hispeed_load;
 			unsigned int hyst  = z_policy->tunables->hispeed_hyst_pct;
 			unsigned int exit  = hyst < entry ? entry - hyst : 0;
+			unsigned int streak =
+				z_policy->tunables->hispeed_entry_streak;
 
-			/* Sticky enter-on-crossing, exit-on-margin transitions. */
-			if (!z_policy->hispeed_active && load_pct >= entry)
+			/* Entry-side streak hysteresis.  When streak == 0
+			 * the historical immediate-flip behaviour is
+			 * preserved (hispeed_entry_count crosses 1 > 0 on
+			 * the very first qualifying sample).  When
+			 * streak == N>0, require load_pct >= entry to
+			 * hold for N+1 consecutive ticks before flipping.
+			 * Counter is reset whenever load_pct drops below
+			 * entry, and saturates at the streak cap so it
+			 * cannot wrap.
+			 */
+			if (load_pct >= entry) {
+				if (z_policy->hispeed_entry_count <
+				    ZENITH_HISPEED_ENTRY_STREAK_MAX)
+					z_policy->hispeed_entry_count++;
+			} else {
+				z_policy->hispeed_entry_count = 0;
+			}
+
+			if (!z_policy->hispeed_active &&
+			    load_pct >= entry &&
+			    z_policy->hispeed_entry_count > streak)
 				z_policy->hispeed_active = true;
 			else if (z_policy->hispeed_active && load_pct < exit)
 				z_policy->hispeed_active = false;
@@ -2137,8 +2190,11 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		} else {
 			/* Tier disabled or max_cap == 0: drop the sticky bit
 			 * so we don't carry it across a disable/enable cycle.
+			 * Reset the streak counter too so we don't carry
+			 * partial entry credit across a disable.
 			 */
 			z_policy->hispeed_active = false;
+			z_policy->hispeed_entry_count = 0;
 		}
 	}
 
@@ -3768,6 +3824,31 @@ static ssize_t hispeed_hyst_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr hispeed_hyst_pct = __ATTR_RW(hispeed_hyst_pct);
 
+/* hispeed_entry_streak sysfs knob.  See ZENITH_DEFAULT_HISPEED_ENTRY_STREAK
+ * for semantics.  Capped to ZENITH_HISPEED_ENTRY_STREAK_MAX on store
+ * so the per-policy u8 streak counter cannot overflow.
+ */
+static ssize_t hispeed_entry_streak_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->hispeed_entry_streak);
+}
+
+static ssize_t hispeed_entry_streak_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_HISPEED_ENTRY_STREAK_MAX)
+		return -EINVAL;
+	t->hispeed_entry_streak = val;
+	return count;
+}
+static struct governor_attr hispeed_entry_streak =
+	__ATTR_RW(hispeed_entry_streak);
+
 static ssize_t climb_mode_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->climb_mode);
@@ -4419,6 +4500,7 @@ static struct attribute *zenith_attrs[] = {
 	&hispeed_freq_pct.attr,
 	&hispeed_load.attr,
 	&hispeed_hyst_pct.attr,
+	&hispeed_entry_streak.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
 	&profile.attr,
@@ -4578,6 +4660,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->hispeed_freq_pct	= ZENITH_DEFAULT_HISPEED_FREQ_PCT;
 	tunables->hispeed_load		= ZENITH_DEFAULT_HISPEED_LOAD;
 	tunables->hispeed_hyst_pct	= ZENITH_DEFAULT_HISPEED_HYST_PCT;
+	tunables->hispeed_entry_streak	= ZENITH_DEFAULT_HISPEED_ENTRY_STREAK;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->active_profile	= ZENITH_PROFILE_CUSTOM;
