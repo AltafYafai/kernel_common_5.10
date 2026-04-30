@@ -3505,6 +3505,17 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 	else
 		return -EINVAL;
 
+	/* Idempotent early-return: writing the currently-active
+	 * profile is a no-op.  Skipping zenith_apply_profile() avoids
+	 * re-stomping the tunables (which would lose any per-knob
+	 * userspace tweaks the operator layered on top of the
+	 * preset), and skipping zenith_refresh_rate_delays() avoids a
+	 * tunables-list walk under attr_set->update_lock for nothing.
+	 * The active_profile field is already correct by definition.
+	 */
+	if (t->active_profile == prof)
+		return count;
+
 	zenith_apply_profile(t, prof);
 	t->active_profile = prof;
 	/* Profile may have mutated tunables->{up,down}_rate_limit_us;
