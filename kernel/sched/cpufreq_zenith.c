@@ -2426,13 +2426,191 @@ static inline unsigned int zenith_psi_io_some_pct(void)
 #endif
 }
 
+/* RCU-protected, sysfs-configurable comm-prefix lists.
+ *
+ * The render / audio / camera comm tables used to be three plain
+ * `static const char * const X[]` arrays compiled into the kernel.
+ * Vendors using non-AOSP userspace -- MTK skins, Qualcomm OEM
+ * builds, OEM-rebrand audio servers -- needed kernel rebuilds just
+ * to add their thread names.  This block reworks the storage as a
+ * trio of RCU-protected tables, populated at init from the original
+ * arrays (so out-of-box behaviour is unchanged) and replaceable
+ * lock-free via three new sysfs nodes (render_comms / audio_comms
+ * / camera_comms, comma-separated).
+ *
+ * The reader (each of the three zenith_policy_has_X helpers) does:
+ *   rcu_read_lock();
+ *   table = rcu_dereference(zenith_<X>_table);
+ *   for (i = 0; i < table->nr; i++) strncmp(curr->comm, table->entries[i], ...);
+ *   rcu_read_unlock();
+ *
+ * The writer (each of the three sysfs_store helpers) builds an
+ * entirely new struct zenith_comm_table from the CSV, RCU-swaps the
+ * pointer, then kfree_rcu()'s the old one.  No hot-path allocation,
+ * no lock contention with the readers, no synchronize_rcu() at
+ * commit time -- the readers walk a stable snapshot until their
+ * grace period closes, the kfree_rcu callback drops the old table
+ * once everyone has moved on.
+ *
+ * Storage layout: each table is a single allocation containing the
+ * pointer array plus the raw NUL-separated buffer the entries[]
+ * pointers index into, sized to ZENITH_COMM_LIST_MAX entries and
+ * ZENITH_COMM_BUF_MAX raw bytes.  Empty CSV (just "\n" or "")
+ * resets to defaults; a parse error fails the entire write so
+ * userspace doesn't see a half-applied table.
+ */
+#define ZENITH_COMM_LIST_MAX		32
+#define ZENITH_COMM_BUF_MAX		1024
+
+struct zenith_comm_table {
+	struct rcu_head	rcu;
+	unsigned int	nr;
+	const char	*entries[ZENITH_COMM_LIST_MAX];
+	char		raw[ZENITH_COMM_BUF_MAX];
+};
+
+static struct zenith_comm_table __rcu *zenith_render_table;
+static struct zenith_comm_table __rcu *zenith_audio_table;
+static struct zenith_comm_table __rcu *zenith_camera_table;
+static DEFINE_MUTEX(zenith_comm_table_lock);
+
+static struct zenith_comm_table *
+zenith_alloc_comm_table_from_defaults(const char * const *defaults,
+				      size_t nr_defaults)
+{
+	struct zenith_comm_table *t;
+	size_t off = 0;
+	unsigned int i;
+
+	t = kzalloc(sizeof(*t), GFP_KERNEL);
+	if (!t)
+		return NULL;
+
+	for (i = 0; i < nr_defaults && i < ZENITH_COMM_LIST_MAX; i++) {
+		size_t len = strlen(defaults[i]) + 1;
+
+		if (off + len > ZENITH_COMM_BUF_MAX)
+			break;
+		memcpy(t->raw + off, defaults[i], len);
+		t->entries[i] = t->raw + off;
+		off += len;
+		t->nr = i + 1;
+	}
+	return t;
+}
+
+/* Parse a CSV (entries separated by ',' or whitespace) into a fresh
+ * zenith_comm_table.  Returns NULL on alloc failure, ERR_PTR on
+ * parse error.  Caller owns the table and must rcu_assign_pointer
+ * + kfree_rcu the old one to publish.
+ */
+static struct zenith_comm_table *
+zenith_alloc_comm_table_from_csv(const char *buf, size_t count)
+{
+	struct zenith_comm_table *t;
+	size_t off = 0;
+	const char *p = buf;
+	const char *end = buf + count;
+
+	t = kzalloc(sizeof(*t), GFP_KERNEL);
+	if (!t)
+		return NULL;
+
+	while (p < end && t->nr < ZENITH_COMM_LIST_MAX) {
+		const char *tok_start;
+		size_t len;
+
+		while (p < end && (*p == ',' || *p == ' ' ||
+				   *p == '\t' || *p == '\n'))
+			p++;
+		if (p == end)
+			break;
+
+		tok_start = p;
+		while (p < end && *p != ',' && *p != ' ' &&
+		       *p != '\t' && *p != '\n')
+			p++;
+		len = p - tok_start;
+		if (!len)
+			continue;
+		if (off + len + 1 > ZENITH_COMM_BUF_MAX) {
+			kfree(t);
+			return ERR_PTR(-ENOSPC);
+		}
+		memcpy(t->raw + off, tok_start, len);
+		t->raw[off + len] = '\0';
+		t->entries[t->nr++] = t->raw + off;
+		off += len + 1;
+	}
+	return t;
+}
+
+static ssize_t zenith_show_comm_table(struct zenith_comm_table __rcu **slot,
+				      char *buf)
+{
+	struct zenith_comm_table *t;
+	ssize_t len = 0;
+	unsigned int i;
+	bool first = true;
+
+	rcu_read_lock();
+	t = rcu_dereference(*slot);
+	if (t) {
+		for (i = 0; i < t->nr; i++) {
+			len += scnprintf(buf + len, PAGE_SIZE - len - 1,
+					 "%s%s", first ? "" : ",",
+					 t->entries[i]);
+			first = false;
+		}
+	}
+	rcu_read_unlock();
+	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	return len;
+}
+
+static ssize_t
+zenith_store_comm_table(struct zenith_comm_table __rcu **slot,
+			const char *const *defaults, size_t nr_defaults,
+			const char *buf, size_t count)
+{
+	struct zenith_comm_table *new_t;
+	struct zenith_comm_table *old_t;
+	const char *p = buf;
+	const char *end = buf + count;
+
+	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n'))
+		p++;
+	if (p == end)
+		new_t = zenith_alloc_comm_table_from_defaults(defaults,
+							      nr_defaults);
+	else
+		new_t = zenith_alloc_comm_table_from_csv(buf, count);
+
+	if (!new_t)
+		return -ENOMEM;
+	if (IS_ERR(new_t))
+		return PTR_ERR(new_t);
+
+	mutex_lock(&zenith_comm_table_lock);
+	old_t = rcu_dereference_protected(*slot,
+			lockdep_is_held(&zenith_comm_table_lock));
+	rcu_assign_pointer(*slot, new_t);
+	mutex_unlock(&zenith_comm_table_lock);
+
+	if (old_t)
+		kfree_rcu(old_t, rcu);
+	return count;
+}
+
 /* List of comm prefixes treated as render / display-pipeline threads.
  * Matched by strncmp() over the first N characters where N is the
  * length of the table entry, so the userspace task only needs to
  * have its first N chars match (Android's "RenderThread NNN" naming
  * for libui's per-app render thread, for instance, matches the
- * "RenderThread" prefix).  Order of entries is irrelevant for
- * correctness; keep the most common first for cache-friendliness.
+ * "RenderThread" prefix).  Used as the seed values for the RCU
+ * zenith_render_table at zenith_gov_init() time and as the reset
+ * target when the render_comms sysfs node is written empty; live
+ * matching always reads the RCU table.
  */
 static const char * const zenith_render_comms[] = {
 	"RenderThread",
@@ -2460,22 +2638,28 @@ static bool zenith_policy_has_render(struct zenith_policy *z_policy)
 		return z_policy->render_active;
 
 	rcu_read_lock();
-	for_each_cpu(cpu, policy->cpus) {
-		struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
-		int i;
+	{
+		struct zenith_comm_table *t =
+			rcu_dereference(zenith_render_table);
 
-		if (!curr)
-			continue;
-		for (i = 0; i < ARRAY_SIZE(zenith_render_comms); i++) {
-			const char *needle = zenith_render_comms[i];
+		for_each_cpu(cpu, policy->cpus) {
+			struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+			unsigned int i;
 
-			if (!strncmp(curr->comm, needle, strlen(needle))) {
-				match = true;
-				break;
+			if (!curr || !t)
+				continue;
+			for (i = 0; i < t->nr; i++) {
+				const char *needle = t->entries[i];
+
+				if (!strncmp(curr->comm, needle,
+					     strlen(needle))) {
+					match = true;
+					break;
+				}
 			}
+			if (match)
+				break;
 		}
-		if (match)
-			break;
 	}
 	rcu_read_unlock();
 
@@ -2533,22 +2717,28 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
 		return z_policy->audio_active;
 
 	rcu_read_lock();
-	for_each_cpu(cpu, policy->cpus) {
-		struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
-		int i;
+	{
+		struct zenith_comm_table *t =
+			rcu_dereference(zenith_audio_table);
 
-		if (!curr)
-			continue;
-		for (i = 0; i < ARRAY_SIZE(zenith_audio_comms); i++) {
-			const char *needle = zenith_audio_comms[i];
+		for_each_cpu(cpu, policy->cpus) {
+			struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+			unsigned int i;
 
-			if (!strncmp(curr->comm, needle, strlen(needle))) {
-				match = true;
-				break;
+			if (!curr || !t)
+				continue;
+			for (i = 0; i < t->nr; i++) {
+				const char *needle = t->entries[i];
+
+				if (!strncmp(curr->comm, needle,
+					     strlen(needle))) {
+					match = true;
+					break;
+				}
 			}
+			if (match)
+				break;
 		}
-		if (match)
-			break;
 	}
 	rcu_read_unlock();
 
@@ -2611,12 +2801,20 @@ static bool zenith_policy_has_camera(struct zenith_policy *z_policy)
 
 		if (!curr)
 			continue;
-		for (i = 0; i < ARRAY_SIZE(zenith_camera_comms); i++) {
-			const char *needle = zenith_camera_comms[i];
+		{
+			struct zenith_comm_table *t =
+				rcu_dereference(zenith_camera_table);
 
-			if (!strncmp(curr->comm, needle, strlen(needle))) {
-				match = true;
-				break;
+			if (!t)
+				continue;
+			for (i = 0; i < t->nr; i++) {
+				const char *needle = t->entries[i];
+
+				if (!strncmp(curr->comm, needle,
+					     strlen(needle))) {
+					match = true;
+					break;
+				}
 			}
 		}
 		if (match)
@@ -5790,6 +5988,56 @@ static ssize_t camera_aware_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr camera_aware = __ATTR_RW(camera_aware);
 
+/* render_comms / audio_comms / camera_comms sysfs knobs.  CSV of
+ * comma-separated comm prefixes.  See the zenith_comm_table comment
+ * block above zenith_render_comms[] for the RCU semantics and
+ * defaults.  Empty write resets to the in-tree default list.
+ */
+static ssize_t render_comms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return zenith_show_comm_table(&zenith_render_table, buf);
+}
+
+static ssize_t render_comms_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	return zenith_store_comm_table(&zenith_render_table,
+				       zenith_render_comms,
+				       ARRAY_SIZE(zenith_render_comms),
+				       buf, count);
+}
+static struct governor_attr render_comms = __ATTR_RW(render_comms);
+
+static ssize_t audio_comms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return zenith_show_comm_table(&zenith_audio_table, buf);
+}
+
+static ssize_t audio_comms_store(struct gov_attr_set *attr_set,
+				 const char *buf, size_t count)
+{
+	return zenith_store_comm_table(&zenith_audio_table,
+				       zenith_audio_comms,
+				       ARRAY_SIZE(zenith_audio_comms),
+				       buf, count);
+}
+static struct governor_attr audio_comms = __ATTR_RW(audio_comms);
+
+static ssize_t camera_comms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return zenith_show_comm_table(&zenith_camera_table, buf);
+}
+
+static ssize_t camera_comms_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	return zenith_store_comm_table(&zenith_camera_table,
+				       zenith_camera_comms,
+				       ARRAY_SIZE(zenith_camera_comms),
+				       buf, count);
+}
+static struct governor_attr camera_comms = __ATTR_RW(camera_comms);
+
 /* camera_active sysfs knob.  Tri-state override:
  *   0  ZENITH_CAMERA_OVERRIDE_AUTO        consult comm table
  *   1  ZENITH_CAMERA_OVERRIDE_FORCE_ON    floor always applied
@@ -6241,11 +6489,14 @@ static struct attribute *zenith_attrs[] = {
 	&predict_util_pct.attr,
 	&predict_util_smooth.attr,
 	&render_aware.attr,
+	&render_comms.attr,
 	&render_floor_pct.attr,
 	&audio_aware.attr,
+	&audio_comms.attr,
 	&audio_floor_pct.attr,
 	&audio_cap_pct.attr,
 	&camera_aware.attr,
+	&camera_comms.attr,
 	&camera_active.attr,
 	&camera_floor_pct.attr,
 	&game_mode.attr,
@@ -6790,6 +7041,23 @@ static int __init zenith_gov_init(void)
 #endif
 
 	pr_info("Zenith: V2 Dreadnought (EAS/EM/Display/Thermal) Initialized. By ENI for LO.\n");
+
+	/* Allocate the initial RCU comm tables from the in-tree default
+	 * arrays.  Failure here is non-fatal: zenith_policy_has_X()
+	 * checks for a NULL table on the read side, so the awareness
+	 * features simply skip the comm walk and fall through to the
+	 * existing override paths (camera_active, render override, etc.)
+	 * until userspace populates the tables via the sysfs nodes.
+	 */
+	rcu_assign_pointer(zenith_render_table,
+		zenith_alloc_comm_table_from_defaults(zenith_render_comms,
+			ARRAY_SIZE(zenith_render_comms)));
+	rcu_assign_pointer(zenith_audio_table,
+		zenith_alloc_comm_table_from_defaults(zenith_audio_comms,
+			ARRAY_SIZE(zenith_audio_comms)));
+	rcu_assign_pointer(zenith_camera_table,
+		zenith_alloc_comm_table_from_defaults(zenith_camera_comms,
+			ARRAY_SIZE(zenith_camera_comms)));
 
 	ret = input_register_handler(&zenith_input_handler);
 	if (ret)
