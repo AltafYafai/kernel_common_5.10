@@ -2842,6 +2842,48 @@ static void zenith_invalidate_cache(struct gov_attr_set *attr_set)
 		z_pol->need_freq_update = true;
 }
 
+/* Refresh the per-policy {up,down}_rate_delay_ns caches on every
+ * policy sharing this tunables set after a profile change has
+ * mutated the {up,down}_rate_limit_us fields.  Without this, the
+ * hot path keeps reading the previous profile's cached delays
+ * (zenith_up_down_rate_limit() reads z_policy->up_rate_delay_ns,
+ * not tunables->up_rate_limit_us).  Caller must hold the
+ * attr_set->update_lock; sysfs profile_store always does.
+ */
+static void zenith_refresh_rate_delays(struct gov_attr_set *attr_set)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	struct zenith_policy *z_pol;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
+		z_pol->up_rate_delay_ns =
+			(u64)t->up_rate_limit_us * NSEC_PER_USEC;
+		z_pol->down_rate_delay_ns =
+			(u64)t->down_rate_limit_us * NSEC_PER_USEC;
+		update_min_rate_limit_ns(z_pol);
+	}
+}
+
+/* Single-policy variant of zenith_refresh_rate_delays() for the
+ * auto_tune classifier worker.  The worker runs from delayed_work
+ * context and does NOT hold attr_set->update_lock, so iterating
+ * policy_list there would race with concurrent gov_attr_set_get/put.
+ * The per-policy z_policy that owns the worker is guaranteed live
+ * (zenith_exit() cancels the worker before unlinking).  Other
+ * policies sharing the same tunables pick up the new delays on
+ * their own next auto_tune tick.
+ */
+static void zenith_refresh_rate_delays_one(struct zenith_policy *z_policy)
+{
+	struct zenith_tunables *t = z_policy->tunables;
+
+	z_policy->up_rate_delay_ns =
+		(u64)t->up_rate_limit_us * NSEC_PER_USEC;
+	z_policy->down_rate_delay_ns =
+		(u64)t->down_rate_limit_us * NSEC_PER_USEC;
+	update_min_rate_limit_ns(z_policy);
+}
+
 #define ZENITH_TUNABLE_UINT(_name) \
 static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
@@ -3183,6 +3225,15 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	if (target != t->active_profile) {
 		zenith_apply_profile(t, target);
 		t->active_profile = target;
+		/* Profile mutated tunables->{up,down}_rate_limit_us;
+		 * refresh the per-policy rate-delay cache for *this*
+		 * policy so the new limits take effect on the next tick.
+		 * Other policies sharing the same tunables pick up the
+		 * change on their own next auto_tune tick.  We cannot
+		 * iterate attr_set->policy_list from this context
+		 * (no lock held) without racing gov_attr_set_get/put.
+		 */
+		zenith_refresh_rate_delays_one(z_policy);
 	}
 
 	/* Re-arm for the next classification window. */
@@ -3319,6 +3370,14 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 
 	zenith_apply_profile(t, prof);
 	t->active_profile = prof;
+	/* Profile may have mutated tunables->{up,down}_rate_limit_us;
+	 * refresh the per-policy rate-delay cache on every policy
+	 * sharing this tunables set so the new limits take effect on
+	 * the next tick rather than persisting the previous profile's
+	 * cached delays.  attr_set->update_lock is held by the
+	 * governor_store wrapper, so iterating policy_list is safe.
+	 */
+	zenith_refresh_rate_delays(attr_set);
 	zenith_invalidate_cache(attr_set);
 	return count;
 }
