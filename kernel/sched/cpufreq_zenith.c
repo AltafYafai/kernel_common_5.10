@@ -619,6 +619,15 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_HYSTERESIS_WINDOWS_MAX	8
 #define ZENITH_AT_COOLDOWN_WINDOWS_MAX		8
 
+#define ZENITH_DEFAULT_AT_CLUSTER_AWARE		1
+#define ZENITH_DEFAULT_AT_V2_SIGNALS		1
+#define ZENITH_DEFAULT_AT_THERMAL_SLOPE		1
+#define ZENITH_DEFAULT_AT_THERMAL_PRESSURE_PCT	18
+#define ZENITH_DEFAULT_AT_THERMAL_SLOPE_PCT	4
+#define ZENITH_DEFAULT_AT_FRAME_PACING		1
+#define ZENITH_DEFAULT_AT_SUSTAINED_GAMING	1
+#define ZENITH_AT_THERMAL_PCT_MAX		100
+
 #define ZENITH_AT_STATE_EFFICIENCY		0
 #define ZENITH_AT_STATE_BALANCED		1
 #define ZENITH_AT_STATE_LATENCY			2
@@ -633,12 +642,24 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_REASON_THERMAL		5
 #define ZENITH_AT_REASON_COOLDOWN		6
 #define ZENITH_AT_REASON_HYSTERESIS		7
+#define ZENITH_AT_REASON_SCREEN			8
+#define ZENITH_AT_REASON_PSI			9
+#define ZENITH_AT_REASON_FRAME			10
+#define ZENITH_AT_REASON_GAME			11
+#define ZENITH_AT_REASON_THERMAL_SLOPE		12
 
 #define ZENITH_AT_FLAG_AUDIO			(1U << 0)
 #define ZENITH_AT_FLAG_CAMERA			(1U << 1)
 #define ZENITH_AT_FLAG_RENDER			(1U << 2)
 #define ZENITH_AT_FLAG_MEMSTALL			(1U << 3)
 #define ZENITH_AT_FLAG_THERMAL			(1U << 4)
+#define ZENITH_AT_FLAG_SCREEN_OFF		(1U << 5)
+#define ZENITH_AT_FLAG_PSI_CPU			(1U << 6)
+#define ZENITH_AT_FLAG_PSI_IO			(1U << 7)
+#define ZENITH_AT_FLAG_FRAME			(1U << 8)
+#define ZENITH_AT_FLAG_GAME			(1U << 9)
+#define ZENITH_AT_FLAG_THERMAL_SLOPE		(1U << 10)
+#define ZENITH_AT_FLAG_LOCAL_ACTIONS		(1U << 11)
 
 #define ZENITH_AT_OVERRIDE_UP_RATE		(1UL << 0)
 #define ZENITH_AT_OVERRIDE_DOWN_RATE		(1UL << 1)
@@ -648,6 +669,12 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_OVERRIDE_INPUT_BOOST_CAP	(1UL << 5)
 #define ZENITH_AT_OVERRIDE_DOWN_ADAPTIVE	(1UL << 6)
 #define ZENITH_AT_OVERRIDE_DOWN_THRESH_ADAPTIVE	(1UL << 7)
+#define ZENITH_AT_OVERRIDE_FRAME_PACE		(1UL << 8)
+#define ZENITH_AT_OVERRIDE_GAME_MODE		(1UL << 9)
+
+#define ZENITH_CLUSTER_LITTLE			0
+#define ZENITH_CLUSTER_BIG			1
+#define ZENITH_CLUSTER_PRIME			2
 
 /* kcpustat-derived hispeed-floor blend (see cpufreq_zenith.c "kcpustat
  * hispeed blend" section for the algorithm). The feature ships OFF;
@@ -1379,6 +1406,13 @@ struct zenith_tunables {
 	unsigned int		auto_tune_hysteresis_windows;
 	unsigned int		auto_tune_cooldown_windows;
 	unsigned long		auto_tune_override_mask;
+	unsigned int		auto_tune_cluster_aware;
+	unsigned int		auto_tune_v2_signals;
+	unsigned int		auto_tune_thermal_slope;
+	unsigned int		auto_tune_thermal_pressure_pct;
+	unsigned int		auto_tune_thermal_slope_pct;
+	unsigned int		auto_tune_frame_pacing;
+	unsigned int		auto_tune_sustained_gaming;
 
 	/* See ZENITH_DEFAULT_AUTO_TUNE_SCENARIO comment block.  Master
 	 * gate for the scenario overlay applied on top of the vanilla
@@ -1638,6 +1672,23 @@ struct zenith_policy {
 	unsigned int		at_last_reason;
 	unsigned int		at_last_flags;
 	unsigned int		at_last_var_x256;
+	unsigned int		at_last_psi_cpu;
+	unsigned int		at_last_psi_io;
+	unsigned int		at_last_psi_mem;
+	unsigned int		at_last_thermal_pressure;
+	unsigned int		at_last_thermal_slope;
+	unsigned int		at_last_frame_budget_us;
+	unsigned int		at_effective_up_rate_limit_us;
+	unsigned int		at_effective_down_rate_limit_us;
+	unsigned int		at_effective_up_threshold;
+	unsigned int		at_effective_down_threshold;
+	unsigned int		at_effective_input_boost_ms;
+	unsigned int		at_effective_input_boost_cap_pct;
+	unsigned int		at_effective_down_rate_adaptive;
+	unsigned int		at_effective_down_threshold_adaptive;
+	unsigned int		at_effective_frame_pace_floor_pct;
+	unsigned int		at_effective_game_mode;
+	bool			at_local_actions;
 	struct delayed_work	at_work;
 
 	/* Cached topology bit: true when any CPU in the policy has
@@ -1657,6 +1708,7 @@ struct zenith_policy {
 	 */
 	unsigned int		up_rate_scale;
 	unsigned int		down_rate_scale_shift;
+	unsigned int		cluster_class;
 
 	/* Cached per-policy result of the render-aware comm walk.  Valid
 	 * for ZENITH_RENDER_CACHE_TTL_NS after render_cache_stamp_ns.
@@ -1805,6 +1857,10 @@ struct zenith_cpu {
 };
 
 static DEFINE_PER_CPU(struct zenith_cpu, zenith_cpu);
+
+static unsigned int zenith_tunable_or_local(struct zenith_policy *z_policy,
+					    unsigned int tunable,
+					    unsigned int local);
 
 /************************ Schedutil: I/O Wait & DL Logic ***********************/
 
@@ -2329,6 +2385,25 @@ static bool zenith_thermal_active(struct zenith_policy *z_policy)
 
 	pressure = arch_scale_thermal_pressure(cpu);
 	return (pressure * 100 / cap) >= ZENITH_THERMAL_AUTO_PRESSURE_PCT;
+}
+
+static unsigned int zenith_policy_thermal_pressure_pct(struct zenith_policy *z_policy)
+{
+	struct cpufreq_policy *policy = z_policy->policy;
+	unsigned long pressure;
+	unsigned long cap;
+	int cpu;
+
+	cpu = cpumask_first(policy->cpus);
+	if (cpu >= nr_cpu_ids)
+		return 0;
+
+	cap = arch_scale_cpu_capacity(cpu);
+	if (!cap)
+		return 0;
+
+	pressure = arch_scale_thermal_pressure(cpu);
+	return min_t(unsigned int, (pressure * 100) / cap, 100);
 }
 
 /************************ Energy Model (EM) Evaluation ***********************/
@@ -3112,7 +3187,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	bool pin_to_target = false;
 
 	/* Dynamic Environment Overrides */
-	unsigned int dynamic_up_thresh = z_policy->tunables->up_threshold;
+	unsigned int dynamic_up_thresh = zenith_tunable_or_local(z_policy,
+		z_policy->tunables->up_threshold,
+		z_policy->at_effective_up_threshold);
 	unsigned int dynamic_bias = z_policy->tunables->powersave_bias;
 
 	/* ADPF / uclamp_min floor.  Sampled once here so every decision
@@ -3170,7 +3247,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		 */
 		dynamic_up_thresh = z_policy->tunables->up_threshold_hispeed;
 	} else if (z_policy->tunables->up_threshold_adaptive &&
-		   dynamic_up_thresh == z_policy->tunables->up_threshold) {
+		   dynamic_up_thresh == zenith_tunable_or_local(z_policy,
+				z_policy->tunables->up_threshold,
+				z_policy->at_effective_up_threshold)) {
 		/* Variance-adaptive shaping: lower dynamic_up_thresh by
 		 * up to up_threshold_adaptive percent of its value when
 		 * the recent load signal is bursty.  See
@@ -3211,7 +3290,8 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * display is off, and optionally gated by input_boost_big_only
 	 * so small-cluster policies skip the boost on heterogeneous SoCs.
 	 */
-	if (z_policy->tunables->input_boost_ms &&
+	if (zenith_tunable_or_local(z_policy, z_policy->tunables->input_boost_ms,
+				    z_policy->at_effective_input_boost_ms) &&
 	    z_policy->tunables->screen_state &&
 	    (!z_policy->tunables->input_boost_big_only ||
 	     z_policy->is_big_cluster)) {
@@ -3223,9 +3303,12 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				z_policy->tunables->input_boost_decay_ms;
 			u64 decay_ns;
 			u64 remaining = until - now;
-			unsigned int cap_pct =
-				z_policy->tunables->input_boost_cap_pct;
-			unsigned int gm = z_policy->tunables->game_mode;
+			unsigned int cap_pct = zenith_tunable_or_local(
+				z_policy, z_policy->tunables->input_boost_cap_pct,
+				z_policy->at_effective_input_boost_cap_pct);
+			unsigned int gm = zenith_tunable_or_local(
+				z_policy, z_policy->tunables->game_mode,
+				z_policy->at_effective_game_mode);
 			unsigned int boost_ceiling;
 
 			/* game_mode=2 (turbo) overrides the user-set cap and
@@ -3360,7 +3443,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			 * always pins policy->max on threshold crossing.
 			 * Runtime-only; the stored tunable is left untouched.
 			 */
-			if (z_policy->tunables->game_mode >= 2)
+			if (zenith_tunable_or_local(z_policy,
+					z_policy->tunables->game_mode,
+					z_policy->at_effective_game_mode) >= 2)
 				climb_mode = ZENITH_CLIMB_MODE_SNAP;
 
 			if (climb_mode == ZENITH_CLIMB_MODE_STEP) {
@@ -3450,12 +3535,17 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 
 brutal_entry_deferred:
 		if ((z_policy->tunables->climb_mode == ZENITH_CLIMB_MODE_SNAP ||
-		     z_policy->tunables->game_mode >= 2) &&
+		     zenith_tunable_or_local(z_policy,
+				z_policy->tunables->game_mode,
+				z_policy->at_effective_game_mode) >= 2) &&
 		    z_policy->brutal_active) {
 			unsigned int eff_down =
-				READ_ONCE(z_policy->tunables->down_threshold);
-			unsigned int adaptive = READ_ONCE(
-				z_policy->tunables->down_threshold_adaptive);
+				zenith_tunable_or_local(z_policy,
+					READ_ONCE(z_policy->tunables->down_threshold),
+					z_policy->at_effective_down_threshold);
+			unsigned int adaptive = zenith_tunable_or_local(z_policy,
+				READ_ONCE(z_policy->tunables->down_threshold_adaptive),
+				z_policy->at_effective_down_threshold_adaptive);
 
 			if (adaptive) {
 				unsigned int var =
@@ -3647,7 +3737,9 @@ brutal_entry_deferred:
 			READ_ONCE(z_policy->tunables->
 				frame_budget_us_per_policy[anchor]) : 0;
 		unsigned int base_pct =
-			READ_ONCE(z_policy->tunables->frame_pace_floor_pct);
+			zenith_tunable_or_local(z_policy,
+				READ_ONCE(z_policy->tunables->frame_pace_floor_pct),
+				z_policy->at_effective_frame_pace_floor_pct);
 
 		/* Per-policy override of zero falls through to the
 		 * global frame_budget_us.  See ZENITH_DEFAULT_FRAME_
@@ -4342,6 +4434,7 @@ static void zenith_update_cluster_rate_scale(struct zenith_policy *z_policy)
 	unsigned int little_thresh =
 		(SCHED_CAPACITY_SCALE * ZENITH_CLUSTER_LITTLE_THRESH_PCT) / 100;
 	unsigned int cluster_cap = 0;
+	unsigned int big_cap = 0;
 	unsigned int cpu;
 
 	for_each_cpu(cpu, z_policy->policy->cpus) {
@@ -4350,6 +4443,18 @@ static void zenith_update_cluster_rate_scale(struct zenith_policy *z_policy)
 		if (cap > cluster_cap)
 			cluster_cap = cap;
 	}
+	for_each_possible_cpu(cpu) {
+		unsigned int cap = arch_scale_cpu_capacity(cpu);
+
+		if (cap > big_cap)
+			big_cap = cap;
+	}
+	if (cluster_cap < little_thresh)
+		z_policy->cluster_class = ZENITH_CLUSTER_LITTLE;
+	else if (big_cap && cluster_cap >= big_cap)
+		z_policy->cluster_class = ZENITH_CLUSTER_PRIME;
+	else
+		z_policy->cluster_class = ZENITH_CLUSTER_BIG;
 	if (z_policy->tunables->rate_limit_cluster_scale &&
 	    cluster_cap < little_thresh) {
 		z_policy->up_rate_scale = 2;
@@ -4363,8 +4468,11 @@ static void zenith_update_cluster_rate_scale(struct zenith_policy *z_policy)
 static void zenith_update_rate_delay_ns(struct zenith_policy *z_policy)
 {
 	struct zenith_tunables *t = z_policy->tunables;
-	unsigned int up_us = t->up_rate_limit_us;
-	unsigned int down_us = t->down_rate_limit_us;
+	unsigned int up_us = zenith_tunable_or_local(z_policy,
+		t->up_rate_limit_us, z_policy->at_effective_up_rate_limit_us);
+	unsigned int down_us = zenith_tunable_or_local(z_policy,
+		t->down_rate_limit_us,
+		z_policy->at_effective_down_rate_limit_us);
 	s64 up_ns = (u64)up_us * NSEC_PER_USEC;
 	s64 down_ns = (u64)down_us * NSEC_PER_USEC;
 
@@ -4407,6 +4515,29 @@ static void zenith_refresh_rate_delays(struct gov_attr_set *attr_set)
 		zenith_update_cluster_rate_scale(z_pol);
 		zenith_update_rate_delay_ns(z_pol);
 	}
+}
+
+static void zenith_reset_local_actions(struct zenith_policy *z_policy)
+{
+	z_policy->at_effective_up_rate_limit_us = z_policy->tunables->up_rate_limit_us;
+	z_policy->at_effective_down_rate_limit_us =
+		z_policy->tunables->down_rate_limit_us;
+	z_policy->at_effective_up_threshold = z_policy->tunables->up_threshold;
+	z_policy->at_effective_down_threshold =
+		z_policy->tunables->down_threshold;
+	z_policy->at_effective_input_boost_ms =
+		z_policy->tunables->input_boost_ms;
+	z_policy->at_effective_input_boost_cap_pct =
+		z_policy->tunables->input_boost_cap_pct;
+	z_policy->at_effective_down_rate_adaptive =
+		z_policy->tunables->down_rate_adaptive;
+	z_policy->at_effective_down_threshold_adaptive =
+		z_policy->tunables->down_threshold_adaptive;
+	z_policy->at_effective_frame_pace_floor_pct =
+		z_policy->tunables->frame_pace_floor_pct;
+	z_policy->at_effective_game_mode = z_policy->tunables->game_mode;
+	z_policy->at_local_actions = false;
+	zenith_update_rate_delay_ns(z_policy);
 }
 
 /* Single-policy variant of zenith_refresh_rate_delays() for the
@@ -4478,6 +4609,16 @@ static const char *zenith_at_reason_name(unsigned int reason)
 		return "cooldown";
 	case ZENITH_AT_REASON_HYSTERESIS:
 		return "hysteresis";
+	case ZENITH_AT_REASON_SCREEN:
+		return "screen";
+	case ZENITH_AT_REASON_PSI:
+		return "psi";
+	case ZENITH_AT_REASON_FRAME:
+		return "frame";
+	case ZENITH_AT_REASON_GAME:
+		return "game";
+	case ZENITH_AT_REASON_THERMAL_SLOPE:
+		return "thermal_slope";
 	default:
 		return "unknown";
 	}
@@ -4510,6 +4651,10 @@ struct zenith_at_guardrails {
 	unsigned int down_adaptive_max;
 	unsigned int down_thresh_adaptive_min;
 	unsigned int down_thresh_adaptive_max;
+	unsigned int frame_floor_min;
+	unsigned int frame_floor_max;
+	unsigned int game_mode_min;
+	unsigned int game_mode_max;
 };
 
 static void zenith_at_get_guardrails(unsigned int profile,
@@ -4527,6 +4672,8 @@ static void zenith_at_get_guardrails(unsigned int profile,
 			.down_adaptive_min = 1, .down_adaptive_max = 1,
 			.down_thresh_adaptive_min = 5,
 			.down_thresh_adaptive_max = 15,
+			.frame_floor_min = 25, .frame_floor_max = 70,
+			.game_mode_min = 0, .game_mode_max = 2,
 		};
 		break;
 	case ZENITH_PROFILE_BATTERY:
@@ -4540,6 +4687,8 @@ static void zenith_at_get_guardrails(unsigned int profile,
 			.down_adaptive_min = 0, .down_adaptive_max = 1,
 			.down_thresh_adaptive_min = 0,
 			.down_thresh_adaptive_max = 5,
+			.frame_floor_min = 0, .frame_floor_max = 35,
+			.game_mode_min = 0, .game_mode_max = 1,
 		};
 		break;
 	case ZENITH_PROFILE_LEGACY:
@@ -4553,6 +4702,8 @@ static void zenith_at_get_guardrails(unsigned int profile,
 			.down_adaptive_min = 0, .down_adaptive_max = 0,
 			.down_thresh_adaptive_min = 0,
 			.down_thresh_adaptive_max = 0,
+			.frame_floor_min = 0, .frame_floor_max = 0,
+			.game_mode_min = 0, .game_mode_max = 0,
 		};
 		break;
 	case ZENITH_PROFILE_CUSTOM:
@@ -4568,7 +4719,39 @@ static void zenith_at_get_guardrails(unsigned int profile,
 			.down_adaptive_min = 0, .down_adaptive_max = 1,
 			.down_thresh_adaptive_min = 0,
 			.down_thresh_adaptive_max = 10,
+			.frame_floor_min = 15, .frame_floor_max = 55,
+			.game_mode_min = 0, .game_mode_max = 2,
 		};
+		break;
+	}
+}
+
+static void zenith_at_get_policy_guardrails(struct zenith_policy *z_policy,
+					    unsigned int profile,
+					    struct zenith_at_guardrails *g)
+{
+	zenith_at_get_guardrails(profile, g);
+	if (!z_policy->tunables->auto_tune_cluster_aware)
+		return;
+
+	switch (z_policy->cluster_class) {
+	case ZENITH_CLUSTER_LITTLE:
+		g->up_rate_min = max(g->up_rate_min,
+				     (g->up_rate_min + g->up_rate_max) / 2);
+		g->input_boost_max = min(g->input_boost_max,
+					 (g->input_boost_min +
+					  g->input_boost_max) / 2);
+		g->frame_floor_max = min(g->frame_floor_max,
+					 (g->frame_floor_min +
+					  g->frame_floor_max) / 2);
+		g->game_mode_max = min(g->game_mode_max, 1U);
+		break;
+	case ZENITH_CLUSTER_PRIME:
+		g->up_rate_max = min(g->up_rate_max,
+				     (g->up_rate_min + g->up_rate_max) / 2);
+		break;
+	case ZENITH_CLUSTER_BIG:
+	default:
 		break;
 	}
 }
@@ -4603,6 +4786,42 @@ static unsigned int zenith_profile_to_at_state(unsigned int profile)
 	}
 }
 
+static const char *zenith_at_cluster_name(unsigned int cluster)
+{
+	switch (cluster) {
+	case ZENITH_CLUSTER_LITTLE:
+		return "little";
+	case ZENITH_CLUSTER_BIG:
+		return "big";
+	case ZENITH_CLUSTER_PRIME:
+		return "prime";
+	default:
+		return "unknown";
+	}
+}
+
+static unsigned int zenith_at_profile_for_state(struct zenith_policy *z_policy,
+						unsigned int state)
+{
+	if (!z_policy->tunables->auto_tune_cluster_aware)
+		return zenith_at_state_to_profile(state);
+
+	switch (z_policy->cluster_class) {
+	case ZENITH_CLUSTER_LITTLE:
+		if (state == ZENITH_AT_STATE_LATENCY ||
+		    state == ZENITH_AT_STATE_SUSTAINED_PERF)
+			return ZENITH_PROFILE_BALANCED;
+		return zenith_at_state_to_profile(state);
+	case ZENITH_CLUSTER_PRIME:
+		if (state == ZENITH_AT_STATE_BALANCED)
+			return ZENITH_PROFILE_PERFORMANCE;
+		return zenith_at_state_to_profile(state);
+	case ZENITH_CLUSTER_BIG:
+	default:
+		return zenith_at_state_to_profile(state);
+	}
+}
+
 static void zenith_at_mark_override(struct zenith_tunables *t,
 				    unsigned long bit)
 {
@@ -4622,6 +4841,84 @@ static bool zenith_at_set_uint(struct zenith_tunables *t, unsigned long bit,
 	return true;
 }
 
+static unsigned int zenith_tunable_or_local(struct zenith_policy *z_policy,
+					    unsigned int tunable,
+					    unsigned int local)
+{
+	return z_policy->at_local_actions ? local : tunable;
+}
+
+static void zenith_at_write_effective(struct zenith_policy *z_policy,
+				      struct zenith_at_guardrails *g,
+				      unsigned int up_rate,
+				      unsigned int down_rate,
+				      unsigned int up_th,
+				      unsigned int down_th,
+				      unsigned int boost_ms,
+				      unsigned int boost_cap,
+				      unsigned int down_adapt,
+				      unsigned int down_th_adapt,
+				      unsigned int frame_floor,
+				      unsigned int game_mode)
+{
+	struct zenith_tunables *t = z_policy->tunables;
+
+	z_policy->at_effective_up_rate_limit_us =
+		(t->auto_tune_override_mask & ZENITH_AT_OVERRIDE_UP_RATE) ?
+		t->up_rate_limit_us : zenith_at_clamp(up_rate,
+						      g->up_rate_min,
+						      g->up_rate_max);
+	z_policy->at_effective_down_rate_limit_us =
+		(t->auto_tune_override_mask & ZENITH_AT_OVERRIDE_DOWN_RATE) ?
+		t->down_rate_limit_us : zenith_at_clamp(down_rate,
+							g->down_rate_min,
+							g->down_rate_max);
+	z_policy->at_effective_up_threshold =
+		(t->auto_tune_override_mask & ZENITH_AT_OVERRIDE_UP_THRESHOLD) ?
+		t->up_threshold : zenith_at_clamp(up_th,
+						  g->up_threshold_min,
+						  g->up_threshold_max);
+	z_policy->at_effective_down_threshold =
+		(t->auto_tune_override_mask &
+		 ZENITH_AT_OVERRIDE_DOWN_THRESHOLD) ?
+		t->down_threshold : zenith_at_clamp(down_th,
+						    g->down_threshold_min,
+						    g->down_threshold_max);
+	z_policy->at_effective_input_boost_ms =
+		(t->auto_tune_override_mask & ZENITH_AT_OVERRIDE_INPUT_BOOST_MS) ?
+		t->input_boost_ms : zenith_at_clamp(boost_ms,
+						    g->input_boost_min,
+						    g->input_boost_max);
+	z_policy->at_effective_input_boost_cap_pct =
+		(t->auto_tune_override_mask & ZENITH_AT_OVERRIDE_INPUT_BOOST_CAP) ?
+		t->input_boost_cap_pct : zenith_at_clamp(boost_cap,
+							 g->input_cap_min,
+							 g->input_cap_max);
+	z_policy->at_effective_down_rate_adaptive =
+		(t->auto_tune_override_mask & ZENITH_AT_OVERRIDE_DOWN_ADAPTIVE) ?
+		t->down_rate_adaptive : zenith_at_clamp(down_adapt,
+							g->down_adaptive_min,
+							g->down_adaptive_max);
+	z_policy->at_effective_down_threshold_adaptive =
+		(t->auto_tune_override_mask &
+		 ZENITH_AT_OVERRIDE_DOWN_THRESH_ADAPTIVE) ?
+		t->down_threshold_adaptive :
+		zenith_at_clamp(down_th_adapt, g->down_thresh_adaptive_min,
+				g->down_thresh_adaptive_max);
+	z_policy->at_effective_frame_pace_floor_pct =
+		(t->auto_tune_override_mask & ZENITH_AT_OVERRIDE_FRAME_PACE) ?
+		t->frame_pace_floor_pct : zenith_at_clamp(frame_floor,
+							  g->frame_floor_min,
+							  g->frame_floor_max);
+	z_policy->at_effective_game_mode =
+		(t->auto_tune_override_mask & ZENITH_AT_OVERRIDE_GAME_MODE) ?
+		t->game_mode : zenith_at_clamp(game_mode, g->game_mode_min,
+					       g->game_mode_max);
+	z_policy->at_local_actions = true;
+	zenith_update_rate_delay_ns(z_policy);
+	z_policy->need_freq_update = true;
+}
+
 static bool zenith_at_apply_actions(struct zenith_policy *z_policy,
 				    unsigned int state)
 {
@@ -4629,10 +4926,15 @@ static bool zenith_at_apply_actions(struct zenith_policy *z_policy,
 	struct zenith_at_guardrails g;
 	unsigned int up_rate, down_rate, up_th, down_th;
 	unsigned int boost_ms, boost_cap, down_adapt, down_th_adapt;
+	unsigned int frame_floor = 0;
+	unsigned int game_mode = 0;
 	bool rate_changed = false;
 	bool changed = false;
 
-	zenith_at_get_guardrails(t->active_profile, &g);
+	zenith_at_get_policy_guardrails(z_policy, t->auto_tune_cluster_aware ?
+					zenith_at_profile_for_state(z_policy,
+								    state) :
+					t->active_profile, &g);
 	switch (state) {
 	case ZENITH_AT_STATE_EFFICIENCY:
 		up_rate = g.up_rate_max;
@@ -4643,6 +4945,8 @@ static bool zenith_at_apply_actions(struct zenith_policy *z_policy,
 		boost_cap = g.input_cap_min;
 		down_adapt = g.down_adaptive_min;
 		down_th_adapt = g.down_thresh_adaptive_min;
+		frame_floor = g.frame_floor_min;
+		game_mode = g.game_mode_min;
 		break;
 	case ZENITH_AT_STATE_LATENCY:
 		up_rate = g.up_rate_min;
@@ -4653,6 +4957,8 @@ static bool zenith_at_apply_actions(struct zenith_policy *z_policy,
 		boost_cap = g.input_cap_max;
 		down_adapt = g.down_adaptive_max;
 		down_th_adapt = g.down_thresh_adaptive_max;
+		frame_floor = (g.frame_floor_min + g.frame_floor_max) / 2;
+		game_mode = min_t(unsigned int, g.game_mode_max, 1);
 		break;
 	case ZENITH_AT_STATE_SUSTAINED_PERF:
 		up_rate = g.up_rate_min;
@@ -4663,6 +4969,8 @@ static bool zenith_at_apply_actions(struct zenith_policy *z_policy,
 		boost_cap = g.input_cap_max;
 		down_adapt = g.down_adaptive_max;
 		down_th_adapt = g.down_thresh_adaptive_max;
+		frame_floor = g.frame_floor_max;
+		game_mode = g.game_mode_max;
 		break;
 	case ZENITH_AT_STATE_THERMAL_RECOVERY:
 		up_rate = g.up_rate_max;
@@ -4673,6 +4981,8 @@ static bool zenith_at_apply_actions(struct zenith_policy *z_policy,
 		boost_cap = g.input_cap_min;
 		down_adapt = g.down_adaptive_min;
 		down_th_adapt = g.down_thresh_adaptive_min;
+		frame_floor = g.frame_floor_min;
+		game_mode = g.game_mode_min;
 		break;
 	case ZENITH_AT_STATE_BALANCED:
 	default:
@@ -4685,7 +4995,53 @@ static bool zenith_at_apply_actions(struct zenith_policy *z_policy,
 		down_adapt = g.down_adaptive_max;
 		down_th_adapt = (g.down_thresh_adaptive_min +
 				  g.down_thresh_adaptive_max) / 2;
+		frame_floor = (g.frame_floor_min + g.frame_floor_max) / 2;
+		game_mode = min_t(unsigned int, g.game_mode_max, 1);
 		break;
+	}
+
+	if (t->auto_tune_cluster_aware) {
+		if (z_policy->cluster_class == ZENITH_CLUSTER_LITTLE) {
+			up_rate = max(up_rate, (g.up_rate_min + g.up_rate_max) / 2);
+			down_rate = g.down_rate_min;
+			boost_ms = min(boost_ms,
+				       (g.input_boost_min + g.input_boost_max) / 2);
+			frame_floor = min(frame_floor,
+					  (g.frame_floor_min + g.frame_floor_max) / 2);
+			game_mode = min(game_mode, 1U);
+		} else if (z_policy->cluster_class == ZENITH_CLUSTER_PRIME) {
+			up_rate = g.up_rate_min;
+			if (state == ZENITH_AT_STATE_LATENCY ||
+			    state == ZENITH_AT_STATE_SUSTAINED_PERF) {
+				boost_ms = g.input_boost_max;
+				frame_floor = g.frame_floor_max;
+			}
+		}
+	}
+
+	if (t->auto_tune_frame_pacing && z_policy->at_last_frame_budget_us &&
+	    (state == ZENITH_AT_STATE_LATENCY ||
+	     state == ZENITH_AT_STATE_SUSTAINED_PERF))
+		frame_floor = g.frame_floor_max;
+	if (t->auto_tune_sustained_gaming &&
+	    state == ZENITH_AT_STATE_SUSTAINED_PERF)
+		game_mode = g.game_mode_max;
+	if (t->auto_tune_thermal_slope &&
+	    (z_policy->at_last_flags & ZENITH_AT_FLAG_THERMAL_SLOPE)) {
+		down_rate = g.down_rate_min;
+		down_th = g.down_threshold_min;
+		boost_ms = g.input_boost_min;
+		boost_cap = g.input_cap_min;
+		frame_floor = g.frame_floor_min;
+		game_mode = g.game_mode_min;
+	}
+
+	if (t->auto_tune_cluster_aware) {
+		zenith_at_write_effective(z_policy, &g, up_rate, down_rate,
+					  up_th, down_th, boost_ms, boost_cap,
+					  down_adapt, down_th_adapt,
+					  frame_floor, game_mode);
+		return true;
 	}
 
 	rate_changed |= zenith_at_set_uint(t, ZENITH_AT_OVERRIDE_UP_RATE,
@@ -4717,6 +5073,12 @@ static bool zenith_at_apply_actions(struct zenith_policy *z_policy,
 				      down_th_adapt,
 				      g.down_thresh_adaptive_min,
 				      g.down_thresh_adaptive_max);
+	changed |= zenith_at_set_uint(t, ZENITH_AT_OVERRIDE_FRAME_PACE,
+				      &t->frame_pace_floor_pct, frame_floor,
+				      g.frame_floor_min, g.frame_floor_max);
+	changed |= zenith_at_set_uint(t, ZENITH_AT_OVERRIDE_GAME_MODE,
+				      &t->game_mode, game_mode,
+				      g.game_mode_min, g.game_mode_max);
 	if (rate_changed)
 		zenith_refresh_rate_delays_one(z_policy);
 	if (changed || rate_changed) {
@@ -5180,7 +5542,18 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	bool camera = false;
 	bool render = false;
 	bool memstall = false;
+	bool psi_cpu = false;
+	bool psi_io = false;
+	bool frame_active = false;
+	bool screen_off = false;
+	bool thermal_slope = false;
 	bool thermal;
+	unsigned int psi_mem_pct = 0;
+	unsigned int psi_cpu_pct = 0;
+	unsigned int psi_io_pct = 0;
+	unsigned int thermal_pressure = 0;
+	unsigned int thermal_delta = 0;
+	unsigned int frame_budget_us = 0;
 
 	if (!t->auto_tune)
 		return;	/* tunable turned off; stop the chain */
@@ -5216,6 +5589,51 @@ static void zenith_auto_tune_work(struct work_struct *w)
 				       events_rate_x2, t->active_profile,
 				       target);
 
+	if (t->auto_tune_v2 && t->auto_tune_v2_signals) {
+		unsigned int anchor = cpumask_first(z_policy->policy->cpus);
+
+		screen_off = !READ_ONCE(t->screen_state);
+		if (screen_off)
+			flags |= ZENITH_AT_FLAG_SCREEN_OFF;
+
+		if (t->psi_mem_thresh) {
+			psi_mem_pct = zenith_psi_mem_some_pct();
+			memstall = psi_mem_pct >= t->psi_mem_thresh;
+		}
+		if (t->psi_cpu_thresh) {
+			psi_cpu_pct = zenith_psi_cpu_some_pct();
+			psi_cpu = psi_cpu_pct >= t->psi_cpu_thresh;
+		}
+		if (t->psi_io_thresh) {
+			psi_io_pct = zenith_psi_io_some_pct();
+			psi_io = psi_io_pct >= t->psi_io_thresh;
+		}
+		if (psi_cpu)
+			flags |= ZENITH_AT_FLAG_PSI_CPU;
+		if (psi_io)
+			flags |= ZENITH_AT_FLAG_PSI_IO;
+
+		if (t->auto_tune_frame_pacing) {
+			if (cpu_possible(anchor))
+				frame_budget_us = READ_ONCE(
+					t->frame_budget_us_per_policy[anchor]);
+			if (!frame_budget_us)
+				frame_budget_us = READ_ONCE(t->frame_budget_us);
+			frame_active = frame_budget_us &&
+				       READ_ONCE(t->frame_pace_floor_pct);
+			if (frame_active)
+				flags |= ZENITH_AT_FLAG_FRAME;
+		}
+
+		if (t->auto_tune_sustained_gaming && READ_ONCE(t->game_mode)) {
+			flags |= ZENITH_AT_FLAG_GAME;
+			if (state == ZENITH_AT_STATE_LATENCY) {
+				state = ZENITH_AT_STATE_SUSTAINED_PERF;
+				reason = ZENITH_AT_REASON_GAME;
+			}
+		}
+	}
+
 	/* Scenario overlay.  V2 samples the same signals even when the
 	 * legacy overlay gate is off, because diagnostics and state choice
 	 * both benefit from knowing why a policy was held back or boosted.
@@ -5233,11 +5651,10 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		else
 			camera = zenith_policy_has_camera(z_policy);
 
-		if (t->psi_mem_thresh) {
-			unsigned int mem_some = zenith_psi_mem_some_pct();
-
-			memstall = (mem_some >= t->psi_mem_thresh);
-		}
+		if (!psi_mem_pct && t->psi_mem_thresh)
+			psi_mem_pct = zenith_psi_mem_some_pct();
+		if (t->psi_mem_thresh)
+			memstall = psi_mem_pct >= t->psi_mem_thresh;
 
 		if (camera || render)
 			target = ZENITH_PROFILE_PERFORMANCE;
@@ -5261,7 +5678,9 @@ static void zenith_auto_tune_work(struct work_struct *w)
 			else if (audio)
 				reason = ZENITH_AT_REASON_AUDIO;
 		}
-		state = zenith_profile_to_at_state(target);
+		if (!(t->auto_tune_v2 && t->auto_tune_sustained_gaming &&
+		      state == ZENITH_AT_STATE_SUSTAINED_PERF))
+			state = zenith_profile_to_at_state(target);
 
 		if (trace_zenith_auto_tune_scenario_enabled())
 			trace_zenith_auto_tune_scenario(
@@ -5270,18 +5689,47 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	}
 
 	thermal = READ_ONCE(t->thermal_state);
+	if (t->auto_tune_v2 && t->auto_tune_thermal_slope) {
+		thermal_pressure = zenith_policy_thermal_pressure_pct(z_policy);
+		if (thermal_pressure > z_policy->at_last_thermal_pressure)
+			thermal_delta = thermal_pressure -
+				z_policy->at_last_thermal_pressure;
+		thermal_slope = thermal_pressure >=
+				t->auto_tune_thermal_pressure_pct ||
+			thermal_delta >= t->auto_tune_thermal_slope_pct;
+		if (thermal_slope)
+			flags |= ZENITH_AT_FLAG_THERMAL_SLOPE;
+	}
 	if (thermal) {
 		flags |= ZENITH_AT_FLAG_THERMAL;
 		if (t->auto_tune_v2) {
 			state = ZENITH_AT_STATE_THERMAL_RECOVERY;
-			target = zenith_at_state_to_profile(state);
+			target = zenith_at_profile_for_state(z_policy, state);
 			reason = ZENITH_AT_REASON_THERMAL;
 		}
+	} else if (t->auto_tune_v2 && thermal_slope) {
+		state = ZENITH_AT_STATE_THERMAL_RECOVERY;
+		target = zenith_at_profile_for_state(z_policy, state);
+		reason = ZENITH_AT_REASON_THERMAL_SLOPE;
+	} else if (t->auto_tune_v2 && screen_off) {
+		state = ZENITH_AT_STATE_EFFICIENCY;
+		target = zenith_at_profile_for_state(z_policy, state);
+		reason = ZENITH_AT_REASON_SCREEN;
+	} else if (t->auto_tune_v2 && (psi_cpu || psi_io)) {
+		state = psi_cpu ? ZENITH_AT_STATE_SUSTAINED_PERF :
+			ZENITH_AT_STATE_EFFICIENCY;
+		target = zenith_at_profile_for_state(z_policy, state);
+		reason = ZENITH_AT_REASON_PSI;
+	} else if (t->auto_tune_v2 && frame_active &&
+		   state == ZENITH_AT_STATE_LATENCY) {
+		state = ZENITH_AT_STATE_SUSTAINED_PERF;
+		target = zenith_at_profile_for_state(z_policy, state);
+		reason = ZENITH_AT_REASON_FRAME;
 	} else if (t->auto_tune_v2 &&
 		   z_policy->load_var_ewma_x256 >= 768 &&
 		   state == ZENITH_AT_STATE_LATENCY) {
 		state = ZENITH_AT_STATE_SUSTAINED_PERF;
-		target = zenith_at_state_to_profile(state);
+		target = zenith_at_profile_for_state(z_policy, state);
 		reason = ZENITH_AT_REASON_VARIANCE;
 	}
 
@@ -5292,6 +5740,12 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	z_policy->at_last_target = target;
 	z_policy->at_last_flags = flags;
 	z_policy->at_last_var_x256 = z_policy->load_var_ewma_x256;
+	z_policy->at_last_psi_cpu = psi_cpu_pct;
+	z_policy->at_last_psi_io = psi_io_pct;
+	z_policy->at_last_psi_mem = psi_mem_pct;
+	z_policy->at_last_thermal_slope = thermal_delta;
+	z_policy->at_last_frame_budget_us = frame_budget_us;
+	z_policy->at_last_thermal_pressure = thermal_pressure;
 
 	if (t->auto_tune_v2) {
 		unsigned int need = t->auto_tune_hysteresis_windows;
@@ -5316,16 +5770,24 @@ static void zenith_auto_tune_work(struct work_struct *w)
 			goto rearm;
 		}
 		if (state != z_policy->at_last_state) {
+			unsigned int old_state = z_policy->at_last_state;
+
 			z_policy->at_last_state = state;
 			z_policy->at_cooldown_left =
 				min_t(unsigned int,
 				      t->auto_tune_cooldown_windows,
 				      ZENITH_AT_COOLDOWN_WINDOWS_MAX);
-			if (target != t->active_profile) {
+			if (!t->auto_tune_cluster_aware &&
+			    target != t->active_profile) {
 				zenith_apply_profile(t, target);
 				t->active_profile = target;
 				zenith_refresh_rate_delays_one(z_policy);
 			}
+			if (trace_zenith_auto_tune_v2_enabled())
+				trace_zenith_auto_tune_v2(
+					z_policy->policy->cpu,
+					z_policy->cluster_class, old_state,
+					state, reason, flags, target);
 		}
 		z_policy->at_last_reason = reason;
 		zenith_at_apply_actions(z_policy, state);
@@ -5335,6 +5797,7 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	if (target != t->active_profile) {
 		zenith_apply_profile(t, target);
 		t->active_profile = target;
+		z_policy->at_local_actions = false;
 		/* Profile mutated tunables->{up,down}_rate_limit_us;
 		 * refresh the per-policy rate-delay cache for *this*
 		 * policy so the new limits take effect on the next tick.
@@ -5456,6 +5919,159 @@ static ssize_t auto_tune_cooldown_windows_store(struct gov_attr_set *attr_set,
 static struct governor_attr auto_tune_cooldown_windows =
 	__ATTR_RW(auto_tune_cooldown_windows);
 
+static ssize_t auto_tune_cluster_aware_show(struct gov_attr_set *attr_set,
+					    char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_tune_cluster_aware);
+}
+
+static ssize_t auto_tune_cluster_aware_store(struct gov_attr_set *attr_set,
+					     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	struct zenith_policy *z_pol;
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->auto_tune_cluster_aware = val;
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook)
+		zenith_reset_local_actions(z_pol);
+	zenith_refresh_rate_delays(attr_set);
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr auto_tune_cluster_aware =
+	__ATTR_RW(auto_tune_cluster_aware);
+
+static ssize_t auto_tune_v2_signals_show(struct gov_attr_set *attr_set,
+					 char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_tune_v2_signals);
+}
+
+static ssize_t auto_tune_v2_signals_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->auto_tune_v2_signals = val;
+	return count;
+}
+static struct governor_attr auto_tune_v2_signals =
+	__ATTR_RW(auto_tune_v2_signals);
+
+static ssize_t auto_tune_thermal_slope_show(struct gov_attr_set *attr_set,
+					    char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_tune_thermal_slope);
+}
+
+static ssize_t auto_tune_thermal_slope_store(struct gov_attr_set *attr_set,
+					     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->auto_tune_thermal_slope = val;
+	return count;
+}
+static struct governor_attr auto_tune_thermal_slope =
+	__ATTR_RW(auto_tune_thermal_slope);
+
+static ssize_t auto_tune_thermal_pressure_pct_show(struct gov_attr_set *attr_set,
+						   char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->
+		       auto_tune_thermal_pressure_pct);
+}
+
+static ssize_t auto_tune_thermal_pressure_pct_store(struct gov_attr_set *attr_set,
+						    const char *buf,
+						    size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_AT_THERMAL_PCT_MAX)
+		return -EINVAL;
+	t->auto_tune_thermal_pressure_pct = val;
+	return count;
+}
+static struct governor_attr auto_tune_thermal_pressure_pct =
+	__ATTR_RW(auto_tune_thermal_pressure_pct);
+
+static ssize_t auto_tune_thermal_slope_pct_show(struct gov_attr_set *attr_set,
+						char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->
+		       auto_tune_thermal_slope_pct);
+}
+
+static ssize_t auto_tune_thermal_slope_pct_store(struct gov_attr_set *attr_set,
+						 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_AT_THERMAL_PCT_MAX)
+		return -EINVAL;
+	t->auto_tune_thermal_slope_pct = val;
+	return count;
+}
+static struct governor_attr auto_tune_thermal_slope_pct =
+	__ATTR_RW(auto_tune_thermal_slope_pct);
+
+static ssize_t auto_tune_frame_pacing_show(struct gov_attr_set *attr_set,
+					   char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_tune_frame_pacing);
+}
+
+static ssize_t auto_tune_frame_pacing_store(struct gov_attr_set *attr_set,
+					    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->auto_tune_frame_pacing = val;
+	return count;
+}
+static struct governor_attr auto_tune_frame_pacing =
+	__ATTR_RW(auto_tune_frame_pacing);
+
+static ssize_t auto_tune_sustained_gaming_show(struct gov_attr_set *attr_set,
+					       char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->
+		       auto_tune_sustained_gaming);
+}
+
+static ssize_t auto_tune_sustained_gaming_store(struct gov_attr_set *attr_set,
+						const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->auto_tune_sustained_gaming = val;
+	return count;
+}
+static struct governor_attr auto_tune_sustained_gaming =
+	__ATTR_RW(auto_tune_sustained_gaming);
+
 /* auto_tune_* threshold tunables. The three *_pct fields are clamped to
  * the 0..100 range; the events_x2 fields accept any uint but only
  * values that can realistically occur in the 10 s observation window
@@ -5564,6 +6180,7 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 	t->active_profile = prof;
 	t->auto_tune_override_mask = 0;
 	list_for_each_entry(z_policy, &attr_set->policy_list, tunables_hook) {
+		zenith_reset_local_actions(z_policy);
 		z_policy->at_last_state = ZENITH_AT_STATE_BALANCED;
 		z_policy->at_pending_state = ZENITH_AT_STATE_BALANCED;
 		z_policy->at_pending_windows = 0;
@@ -5592,14 +6209,22 @@ static ssize_t auto_tune_status_show(struct gov_attr_set *attr_set, char *buf)
 			 "auto_tune=%u\n", t->auto_tune);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "auto_tune_v2=%u\n", t->auto_tune_v2);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "v2_knobs=cluster:%u signals:%u thermal_slope:%u frame:%u gaming:%u\n",
+			 t->auto_tune_cluster_aware,
+			 t->auto_tune_v2_signals,
+			 t->auto_tune_thermal_slope,
+			 t->auto_tune_frame_pacing,
+			 t->auto_tune_sustained_gaming);
 	len += scnprintf(buf + len, PAGE_SIZE - len, "profile=%s\n",
 			 zenith_profile_name(t->active_profile));
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "override_mask=0x%lx\n", t->auto_tune_override_mask);
 	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
 		len += scnprintf(buf + len, PAGE_SIZE - len,
-				 "policy%u: state=%s pending=%s pending_windows=%u cooldown=%u reason=%s target=%s samples=%u saturated=%u sat_pct=%u events_x2=%u flags=0x%x var_x256=%u\n",
+				 "policy%u(%s): state=%s pending=%s pending_windows=%u cooldown=%u reason=%s target=%s samples=%u saturated=%u sat_pct=%u events_x2=%u flags=0x%x var_x256=%u psi=%u/%u/%u thermal=%u+%u frame_us=%u local=%u eff_rate=%u/%u eff_thresh=%u/%u eff_boost=%u/%u eff_frame=%u eff_game=%u\n",
 				 z_pol->policy->cpu,
+				 zenith_at_cluster_name(z_pol->cluster_class),
 				 zenith_at_state_name(z_pol->at_last_state),
 				 zenith_at_state_name(z_pol->at_pending_state),
 				 z_pol->at_pending_windows,
@@ -5611,7 +6236,22 @@ static ssize_t auto_tune_status_show(struct gov_attr_set *attr_set, char *buf)
 				 z_pol->at_last_sat_pct,
 				 z_pol->at_last_events_rate_x2,
 				 z_pol->at_last_flags,
-				 z_pol->at_last_var_x256);
+				 z_pol->at_last_var_x256,
+				 z_pol->at_last_psi_cpu,
+				 z_pol->at_last_psi_io,
+				 z_pol->at_last_psi_mem,
+				 z_pol->at_last_thermal_pressure,
+				 z_pol->at_last_thermal_slope,
+				 z_pol->at_last_frame_budget_us,
+				 z_pol->at_local_actions,
+				 z_pol->at_effective_up_rate_limit_us,
+				 z_pol->at_effective_down_rate_limit_us,
+				 z_pol->at_effective_up_threshold,
+				 z_pol->at_effective_down_threshold,
+				 z_pol->at_effective_input_boost_ms,
+				 z_pol->at_effective_input_boost_cap_pct,
+				 z_pol->at_effective_frame_pace_floor_pct,
+				 z_pol->at_effective_game_mode);
 		if (len >= PAGE_SIZE)
 			break;
 	}
@@ -5623,12 +6263,15 @@ static ssize_t auto_tune_reset_overrides_store(struct gov_attr_set *attr_set,
 					       const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	struct zenith_policy *z_pol;
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
 	if (val)
 		t->auto_tune_override_mask = 0;
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook)
+		zenith_reset_local_actions(z_pol);
 	return count;
 }
 static struct governor_attr auto_tune_reset_overrides =
@@ -7112,6 +7755,7 @@ static ssize_t game_mode_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 	prev = t->game_mode;
 	t->game_mode = val;
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_GAME_MODE);
 	if (prev != t->game_mode)
 		trace_zenith_game_mode(smp_processor_id(), t->game_mode);
 	return count;
@@ -7377,6 +8021,7 @@ static ssize_t frame_pace_floor_pct_store(struct gov_attr_set *attr_set,
 	if (val > 100)
 		return -EINVAL;
 	WRITE_ONCE(t->frame_pace_floor_pct, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_FRAME_PACE);
 	return count;
 }
 static struct governor_attr frame_pace_floor_pct =
@@ -7456,6 +8101,13 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_v2.attr,
 	&auto_tune_hysteresis_windows.attr,
 	&auto_tune_cooldown_windows.attr,
+	&auto_tune_cluster_aware.attr,
+	&auto_tune_v2_signals.attr,
+	&auto_tune_thermal_slope.attr,
+	&auto_tune_thermal_pressure_pct.attr,
+	&auto_tune_thermal_slope_pct.attr,
+	&auto_tune_frame_pacing.attr,
+	&auto_tune_sustained_gaming.attr,
 	&auto_tune_sat_load_pct.attr,
 	&auto_tune_hi_sat_pct.attr,
 	&auto_tune_lo_sat_pct.attr,
@@ -7645,6 +8297,20 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_AT_HYSTERESIS_WINDOWS;
 	tunables->auto_tune_cooldown_windows =
 		ZENITH_DEFAULT_AT_COOLDOWN_WINDOWS;
+	tunables->auto_tune_cluster_aware =
+		ZENITH_DEFAULT_AT_CLUSTER_AWARE;
+	tunables->auto_tune_v2_signals =
+		ZENITH_DEFAULT_AT_V2_SIGNALS;
+	tunables->auto_tune_thermal_slope =
+		ZENITH_DEFAULT_AT_THERMAL_SLOPE;
+	tunables->auto_tune_thermal_pressure_pct =
+		ZENITH_DEFAULT_AT_THERMAL_PRESSURE_PCT;
+	tunables->auto_tune_thermal_slope_pct =
+		ZENITH_DEFAULT_AT_THERMAL_SLOPE_PCT;
+	tunables->auto_tune_frame_pacing =
+		ZENITH_DEFAULT_AT_FRAME_PACING;
+	tunables->auto_tune_sustained_gaming =
+		ZENITH_DEFAULT_AT_SUSTAINED_GAMING;
 	tunables->auto_tune_scenario	= ZENITH_DEFAULT_AUTO_TUNE_SCENARIO;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
@@ -7752,6 +8418,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 out:
 	mutex_unlock(&global_tunables_lock);
 	z_policy->tunables = tunables;
+	zenith_update_cluster_rate_scale(z_policy);
+	zenith_reset_local_actions(z_policy);
 	policy->governor_data = z_policy;
 	return 0;
 
@@ -7821,7 +8489,7 @@ static int zenith_start(struct cpufreq_policy *policy)
 		}
 	}
 	zenith_update_cluster_rate_scale(z_policy);
-	zenith_update_rate_delay_ns(z_policy);
+	zenith_reset_local_actions(z_policy);
 
 	/* Zero the uclamp cache so zenith_policy_uclamp_{min,max} refresh
 	 * on the first eval after start rather than returning stale

@@ -136,6 +136,41 @@ TRACE_EVENT(zenith_auto_tune_scenario,
 		  __entry->prev_target, __entry->scenario_target)
 );
 
+TRACE_EVENT(zenith_auto_tune_v2,
+
+	TP_PROTO(int cpu, unsigned int cluster, unsigned int old_state,
+		 unsigned int new_state, unsigned int reason,
+		 unsigned int flags, unsigned int target_profile),
+
+	TP_ARGS(cpu, cluster, old_state, new_state, reason, flags,
+		target_profile),
+
+	TP_STRUCT__entry(
+		__field(int,		cpu)
+		__field(unsigned int,	cluster)
+		__field(unsigned int,	old_state)
+		__field(unsigned int,	new_state)
+		__field(unsigned int,	reason)
+		__field(unsigned int,	flags)
+		__field(unsigned int,	target_profile)
+	),
+
+	TP_fast_assign(
+		__entry->cpu		= cpu;
+		__entry->cluster	= cluster;
+		__entry->old_state	= old_state;
+		__entry->new_state	= new_state;
+		__entry->reason		= reason;
+		__entry->flags		= flags;
+		__entry->target_profile	= target_profile;
+	),
+
+	TP_printk("cpu=%d cluster=%u old=%u new=%u reason=%u flags=0x%x target=%u",
+		  __entry->cpu, __entry->cluster, __entry->old_state,
+		  __entry->new_state, __entry->reason, __entry->flags,
+		  __entry->target_profile)
+);
+
 /* Thermal-pressure-aware util derate.  Emitted from zenith_get_util()
  * each time arch_scale_thermal_pressure() reports a meaningful
  * fraction of capacity eaten by SoC thermal throttling and util_out
