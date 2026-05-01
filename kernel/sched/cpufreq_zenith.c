@@ -396,6 +396,77 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * output.
  */
 #define ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT	0
+
+/* freq_stability_margin_pct (default 3):
+ *
+ * When the resolved target_freq is within margin percent of policy->max
+ * below the currently-requested frequency, keep the current request
+ * instead of issuing a tiny downward transition.  This removes
+ * bin-boundary oscillation where the target dances just below an OPP
+ * edge and pays regulator / PLL transition cost for no perceptible
+ * gain.  Upward transitions are never suppressed.
+ *
+ * 0 disables the margin entirely (legacy: every target != current
+ * request can switch subject only to the rate limiter).  Range 0..10;
+ * values above 10 are aggressive enough to feel sticky.
+ */
+#define ZENITH_DEFAULT_FREQ_STABILITY_MARGIN_PCT	3
+#define ZENITH_FREQ_STABILITY_MARGIN_PCT_MAX		10
+
+/* down_rate_adaptive (default 1, on):
+ *
+ * Scales the effective down_rate_delay_ns by the recent load variance
+ * EWMA.  Bursty workloads get up to 2x the base delay, keeping freq
+ * elevated between adjacent frame/render bursts; steady workloads use
+ * the configured delay unchanged.
+ *
+ *   eff_delay = base_delay * (256 + min(var, 256)) / 256
+ *
+ * 0 disables the scaling and restores the fixed down-rate delay.
+ */
+#define ZENITH_DEFAULT_DOWN_RATE_ADAPTIVE	1
+
+/* wakeup_boost (default 1, on):
+ *
+ * Detects idle-to-busy transitions where util jumps from below 10% to
+ * at least 40% of capacity in one scheduler callback.  On detection,
+ * the next two upward transitions bypass up_rate_limit so app launch,
+ * screen-on and notification wakeups avoid the cold-start sample lag.
+ *
+ * 0 disables the detector.  The thresholds are expressed as capacity
+ * percentages so they scale across ARM DynamIQ clusters.
+ */
+#define ZENITH_DEFAULT_WAKEUP_BOOST		1
+#define ZENITH_WAKEUP_IDLE_THRESH_PCT		10
+#define ZENITH_WAKEUP_BUSY_THRESH_PCT		40
+#define ZENITH_WAKEUP_BOOST_TICKS		2
+
+/* down_threshold_adaptive (default 0, off):
+ *
+ * Mirrors up_threshold_adaptive on the brutality exit side.  When set
+ * to N (1..20), the effective down_threshold is lowered by up to N
+ * percent under bursty load, widening the hysteresis band so max freq
+ * holds through frame bursts.  Steady load leaves the configured
+ * down_threshold unchanged.
+ *
+ * 0 disables the adjustment.
+ */
+#define ZENITH_DEFAULT_DOWN_THRESHOLD_ADAPTIVE	0
+#define ZENITH_DOWN_THRESHOLD_ADAPTIVE_MAX	20
+
+/* rate_limit_cluster_scale (default 1, on):
+ *
+ * Applies asymmetric cached rate limits to little-cluster policies on
+ * heterogeneous SoCs: up_rate_delay_ns is doubled and
+ * down_rate_delay_ns is halved.  Big / prime clusters keep the
+ * configured limits.  On homogeneous SoCs every policy is treated as a
+ * big cluster and this is a no-op.
+ *
+ * 0 disables the per-cluster scaling.
+ */
+#define ZENITH_DEFAULT_RATE_LIMIT_CLUSTER_SCALE	1
+#define ZENITH_CLUSTER_LITTLE_THRESH_PCT	60
+
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		100
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	4000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
@@ -1131,6 +1202,32 @@ struct zenith_tunables {
 	 */
 	unsigned int		thermal_derate_rate_pct;
 
+	/* See ZENITH_DEFAULT_FREQ_STABILITY_MARGIN_PCT.  Percent of
+	 * policy->max below which tiny downward transitions are held at
+	 * the current request.  0 disables; range 0..10.
+	 */
+	unsigned int		freq_stability_margin_pct;
+
+	/* See ZENITH_DEFAULT_DOWN_RATE_ADAPTIVE.  When set, bursty load
+	 * variance stretches the effective down-rate delay up to 2x.
+	 */
+	unsigned int		down_rate_adaptive;
+
+	/* See ZENITH_DEFAULT_WAKEUP_BOOST.  When set, idle-to-busy
+	 * transitions arm a short up-rate bypass countdown.
+	 */
+	unsigned int		wakeup_boost;
+
+	/* See ZENITH_DEFAULT_DOWN_THRESHOLD_ADAPTIVE.  Percent by which
+	 * bursty load can lower the brutality exit threshold.  0 disables.
+	 */
+	unsigned int		down_threshold_adaptive;
+
+	/* See ZENITH_DEFAULT_RATE_LIMIT_CLUSTER_SCALE.  When set, little
+	 * clusters use asymmetric cached up/down rate delays.
+	 */
+	unsigned int		rate_limit_cluster_scale;
+
 	/* Input boost duration (ms). 0 = disabled. */
 	unsigned int		input_boost_ms;
 	unsigned int		input_boost_decay_ms;
@@ -1485,6 +1582,14 @@ struct zenith_policy {
 	 */
 	bool			is_big_cluster;
 
+	/* Cached rate-limit scale factors applied when
+	 * rate_limit_cluster_scale is enabled.  1/0 means unscaled;
+	 * little clusters use 2/1 so upward ramps are less eager and
+	 * downward ramps save power sooner.
+	 */
+	unsigned int		up_rate_scale;
+	unsigned int		down_rate_scale_shift;
+
 	/* Cached per-policy result of the render-aware comm walk.  Valid
 	 * for ZENITH_RENDER_CACHE_TTL_NS after render_cache_stamp_ns.
 	 * Refreshed on the next zenith_get_next_freq() call past the TTL.
@@ -1597,6 +1702,14 @@ struct zenith_cpu {
 	 * zenith_start().
 	 */
 	unsigned long		prev_util_2;
+
+	/* Wakeup-boost state.  prev_util is independent from the predictor
+	 * taps above so the detector works even when predict_util_pct=0.
+	 * The countdown is decremented on upward transitions that bypass
+	 * up_rate_limit.
+	 */
+	unsigned long		wakeup_prev_util;
+	u8			wakeup_boost_ticks;
 
 	/* kcpustat hispeed-blend sampler state (consumed by
 	 * zenith_kcpustat_sample / zenith_kcpustat_blend). Two-phase
@@ -2193,6 +2306,8 @@ static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned 
 static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, unsigned int next_freq)
 {
 	s64 delta_ns = time - z_policy->last_freq_update_time;
+	struct zenith_tunables *tunables = z_policy->tunables;
+
 	/* Snapshot the cached delays once.  Concurrent writers are
 	 * profile_store / auto_tune / up_rate_limit_us_store; readers
 	 * are this hot path and zenith_should_update_freq().  Without
@@ -2203,9 +2318,27 @@ static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, 
 	s64 down_delay = READ_ONCE(z_policy->down_rate_delay_ns) *
 			 (s64)max(z_policy->down_rate_mult, 1U);
 
+	if (READ_ONCE(tunables->down_rate_adaptive)) {
+		unsigned int var = READ_ONCE(z_policy->load_var_ewma_x256);
+
+		if (var > 256)
+			var = 256;
+		down_delay = (down_delay * (256 + var)) / 256;
+	}
+
 	if (next_freq > z_policy->next_freq) {
 		unsigned int spike = z_policy->policy->max >> ZENITH_SPIKE_SHIFT;
+		unsigned int cpu;
+		struct zenith_cpu *z_cpu;
 
+		for_each_cpu(cpu, z_policy->policy->cpus) {
+			z_cpu = &per_cpu(zenith_cpu, cpu);
+
+			if (z_cpu->wakeup_boost_ticks) {
+				z_cpu->wakeup_boost_ticks--;
+				return false;
+			}
+		}
 		if (next_freq - z_policy->next_freq >= spike)
 			return false;
 		if (delta_ns < up_delay)
@@ -3250,12 +3383,33 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 brutal_entry_deferred:
 		if ((z_policy->tunables->climb_mode == ZENITH_CLIMB_MODE_SNAP ||
 		     z_policy->tunables->game_mode >= 2) &&
-		    z_policy->brutal_active &&
-		    load_pct >= z_policy->tunables->down_threshold) {
-			freq = policy->max;
-			tp_path = "brutal_hold";
-			pin_to_target = true;
-			goto apply_uclamp_max_cap;
+		    z_policy->brutal_active) {
+			unsigned int eff_down =
+				READ_ONCE(z_policy->tunables->down_threshold);
+			unsigned int adaptive = READ_ONCE(
+				z_policy->tunables->down_threshold_adaptive);
+
+			if (adaptive) {
+				unsigned int var =
+					z_policy->load_var_ewma_x256 / 256;
+				unsigned int swing;
+
+				if (adaptive > ZENITH_DOWN_THRESHOLD_ADAPTIVE_MAX)
+					adaptive = ZENITH_DOWN_THRESHOLD_ADAPTIVE_MAX;
+				if (var > ZENITH_DOWN_THRESHOLD_ADAPTIVE_MAX)
+					var = ZENITH_DOWN_THRESHOLD_ADAPTIVE_MAX;
+				swing = (eff_down * adaptive * var) /
+					(100u * ZENITH_DOWN_THRESHOLD_ADAPTIVE_MAX);
+				if (swing < eff_down)
+					eff_down -= swing;
+			}
+
+			if (load_pct >= eff_down) {
+				freq = policy->max;
+				tp_path = "brutal_hold";
+				pin_to_target = true;
+				goto apply_uclamp_max_cap;
+			}
 		}
 
 		z_policy->brutal_active = false;
@@ -3906,6 +4060,21 @@ static void zenith_execute_switch(struct zenith_policy *z_policy, u64 time, unsi
 		return;
 	}
 
+	if (next_freq < z_policy->next_freq) {
+		unsigned int margin_pct =
+			READ_ONCE(z_policy->tunables->freq_stability_margin_pct);
+
+		if (margin_pct) {
+			unsigned int margin;
+
+			if (margin_pct > ZENITH_FREQ_STABILITY_MARGIN_PCT_MAX)
+				margin_pct = ZENITH_FREQ_STABILITY_MARGIN_PCT_MAX;
+			margin = (z_policy->policy->max * margin_pct) / 100;
+			if (z_policy->next_freq - next_freq <= margin)
+				return;
+		}
+	}
+
 	if (zenith_up_down_rate_limit(z_policy, time, next_freq))
 		return;
 
@@ -3942,6 +4111,17 @@ static void zenith_update_single(struct update_util_data *hook, u64 time, unsign
 	max_cap = z_cpu->max_capacity;
 	
 	util = zenith_iowait_apply(z_cpu, time, util, max_cap);
+	if (READ_ONCE(tunables->wakeup_boost) && max_cap) {
+		unsigned int cur_pct = (unsigned int)((util * 100) / max_cap);
+		unsigned int prev_pct = z_cpu->wakeup_prev_util ?
+			(unsigned int)((z_cpu->wakeup_prev_util * 100) /
+				       max_cap) : 0;
+
+		if (prev_pct < ZENITH_WAKEUP_IDLE_THRESH_PCT &&
+		    cur_pct >= ZENITH_WAKEUP_BUSY_THRESH_PCT)
+			z_cpu->wakeup_boost_ticks = ZENITH_WAKEUP_BOOST_TICKS;
+	}
+	z_cpu->wakeup_prev_util = util;
 
 	if (tunables->kcpustat_hispeed_enable) {
 		zenith_kcpustat_sample(z_cpu,
@@ -3991,6 +4171,20 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 			j_util = zenith_get_util(j_z_cpu);
 			j_max = j_z_cpu->max_capacity;
 			j_util = zenith_iowait_apply(j_z_cpu, time, j_util, j_max);
+			if (READ_ONCE(tunables->wakeup_boost) && j_max) {
+				unsigned int cur_pct =
+					(unsigned int)((j_util * 100) / j_max);
+				unsigned int prev_pct =
+					j_z_cpu->wakeup_prev_util ?
+					(unsigned int)((j_z_cpu->wakeup_prev_util *
+							100) / j_max) : 0;
+
+				if (prev_pct < ZENITH_WAKEUP_IDLE_THRESH_PCT &&
+				    cur_pct >= ZENITH_WAKEUP_BUSY_THRESH_PCT)
+					j_z_cpu->wakeup_boost_ticks =
+						ZENITH_WAKEUP_BOOST_TICKS;
+			}
+			j_z_cpu->wakeup_prev_util = j_util;
 
 			if (tunables->kcpustat_hispeed_enable) {
 				zenith_kcpustat_sample(j_z_cpu,
@@ -4075,6 +4269,44 @@ static void update_min_rate_limit_ns(struct zenith_policy *z_policy)
 	WRITE_ONCE(z_policy->min_rate_limit_ns, min(up_ns, down_ns));
 }
 
+static void zenith_update_cluster_rate_scale(struct zenith_policy *z_policy)
+{
+	unsigned int little_thresh =
+		(SCHED_CAPACITY_SCALE * ZENITH_CLUSTER_LITTLE_THRESH_PCT) / 100;
+	unsigned int cluster_cap = 0;
+	unsigned int cpu;
+
+	for_each_cpu(cpu, z_policy->policy->cpus) {
+		unsigned int cap = arch_scale_cpu_capacity(cpu);
+
+		if (cap > cluster_cap)
+			cluster_cap = cap;
+	}
+	if (z_policy->tunables->rate_limit_cluster_scale &&
+	    cluster_cap < little_thresh) {
+		z_policy->up_rate_scale = 2;
+		z_policy->down_rate_scale_shift = 1;
+	} else {
+		z_policy->up_rate_scale = 1;
+		z_policy->down_rate_scale_shift = 0;
+	}
+}
+
+static void zenith_update_rate_delay_ns(struct zenith_policy *z_policy)
+{
+	struct zenith_tunables *t = z_policy->tunables;
+	unsigned int up_us = t->up_rate_limit_us;
+	unsigned int down_us = t->down_rate_limit_us;
+	s64 up_ns = (u64)up_us * NSEC_PER_USEC;
+	s64 down_ns = (u64)down_us * NSEC_PER_USEC;
+
+	up_ns *= max(z_policy->up_rate_scale, 1U);
+	down_ns >>= z_policy->down_rate_scale_shift;
+	WRITE_ONCE(z_policy->up_rate_delay_ns, up_ns);
+	WRITE_ONCE(z_policy->down_rate_delay_ns, down_ns);
+	update_min_rate_limit_ns(z_policy);
+}
+
 /* Force the next zenith_get_next_freq() call on every policy sharing
  * this tunables set to recompute from scratch, bypassing the
  * cached_raw_freq shortcut. Call this from any sysfs _store that
@@ -4101,15 +4333,11 @@ static void zenith_invalidate_cache(struct gov_attr_set *attr_set)
  */
 static void zenith_refresh_rate_delays(struct gov_attr_set *attr_set)
 {
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	struct zenith_policy *z_pol;
 
 	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
-		WRITE_ONCE(z_pol->up_rate_delay_ns,
-			   (u64)t->up_rate_limit_us * NSEC_PER_USEC);
-		WRITE_ONCE(z_pol->down_rate_delay_ns,
-			   (u64)t->down_rate_limit_us * NSEC_PER_USEC);
-		update_min_rate_limit_ns(z_pol);
+		zenith_update_cluster_rate_scale(z_pol);
+		zenith_update_rate_delay_ns(z_pol);
 	}
 }
 
@@ -4124,13 +4352,8 @@ static void zenith_refresh_rate_delays(struct gov_attr_set *attr_set)
  */
 static void zenith_refresh_rate_delays_one(struct zenith_policy *z_policy)
 {
-	struct zenith_tunables *t = z_policy->tunables;
-
-	WRITE_ONCE(z_policy->up_rate_delay_ns,
-		   (u64)t->up_rate_limit_us * NSEC_PER_USEC);
-	WRITE_ONCE(z_policy->down_rate_delay_ns,
-		   (u64)t->down_rate_limit_us * NSEC_PER_USEC);
-	update_min_rate_limit_ns(z_policy);
+	zenith_update_cluster_rate_scale(z_policy);
+	zenith_update_rate_delay_ns(z_policy);
 }
 
 #define ZENITH_TUNABLE_UINT(_name) \
@@ -4293,6 +4516,10 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->screen_auto		= 1;
 		t->util_math_v2		= 1;
 		t->kcpustat_hispeed_enable = 1;
+		t->down_rate_adaptive	= 1;
+		t->wakeup_boost		= 1;
+		t->down_threshold_adaptive = 10;
+		t->rate_limit_cluster_scale = 1;
 		break;
 
 	case ZENITH_PROFILE_BALANCED:
@@ -4316,6 +4543,10 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->screen_auto		= 1;
 		t->util_math_v2		= 1;
 		t->kcpustat_hispeed_enable = 1;
+		t->down_rate_adaptive	= 1;
+		t->wakeup_boost		= 1;
+		t->down_threshold_adaptive = 5;
+		t->rate_limit_cluster_scale = 1;
 		break;
 
 	case ZENITH_PROFILE_BATTERY:
@@ -4339,6 +4570,10 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->screen_auto		= 1;
 		t->util_math_v2		= 1;
 		t->kcpustat_hispeed_enable = 0;
+		t->down_rate_adaptive	= 0;
+		t->wakeup_boost		= 1;
+		t->down_threshold_adaptive = 0;
+		t->rate_limit_cluster_scale = 1;
 		break;
 
 	case ZENITH_PROFILE_LEGACY:
@@ -4363,6 +4598,12 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		t->sampling_down_factor	= 1;
 		t->thermal_auto		= 0;
 		t->screen_auto		= 0;
+		t->util_math_v2		= 0;
+		t->kcpustat_hispeed_enable = 0;
+		t->down_rate_adaptive	= 0;
+		t->wakeup_boost		= 1;
+		t->down_threshold_adaptive = 0;
+		t->rate_limit_cluster_scale = 1;
 		break;
 
 	case ZENITH_PROFILE_CUSTOM:
@@ -4814,6 +5055,19 @@ static ssize_t profile_values_show(struct gov_attr_set *attr_set, char *buf)
 			scratch.thermal_auto, scratch.screen_auto,
 			scratch.util_math_v2,
 			scratch.kcpustat_hispeed_enable);
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s-extra: ",
+				 profs[i].name);
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "down_rate_adaptive=%u ",
+				 scratch.down_rate_adaptive);
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "wakeup_boost=%u ", scratch.wakeup_boost);
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "down_threshold_adaptive=%u ",
+				 scratch.down_threshold_adaptive);
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "rate_limit_cluster_scale=%u\n",
+				 scratch.rate_limit_cluster_scale);
 	}
 
 	/* Restore the boost-active mirror that zenith_apply_profile()
@@ -4959,6 +5213,91 @@ static ssize_t thermal_derate_rate_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr thermal_derate_rate_pct =
 	__ATTR_RW(thermal_derate_rate_pct);
+
+static ssize_t freq_stability_margin_pct_show(struct gov_attr_set *attr_set,
+					      char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+				freq_stability_margin_pct);
+}
+
+static ssize_t freq_stability_margin_pct_store(struct gov_attr_set *attr_set,
+					       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_FREQ_STABILITY_MARGIN_PCT_MAX)
+		return -EINVAL;
+	t->freq_stability_margin_pct = val;
+	return count;
+}
+static struct governor_attr freq_stability_margin_pct =
+	__ATTR_RW(freq_stability_margin_pct);
+
+static ssize_t down_rate_adaptive_show(struct gov_attr_set *attr_set,
+				       char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->down_rate_adaptive);
+}
+
+static ssize_t down_rate_adaptive_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->down_rate_adaptive = val;
+	return count;
+}
+static struct governor_attr down_rate_adaptive =
+	__ATTR_RW(down_rate_adaptive);
+
+static ssize_t wakeup_boost_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->wakeup_boost);
+}
+
+static ssize_t wakeup_boost_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->wakeup_boost = val;
+	return count;
+}
+static struct governor_attr wakeup_boost = __ATTR_RW(wakeup_boost);
+
+static ssize_t rate_limit_cluster_scale_show(struct gov_attr_set *attr_set,
+					     char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->rate_limit_cluster_scale);
+}
+
+static ssize_t rate_limit_cluster_scale_store(struct gov_attr_set *attr_set,
+					     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->rate_limit_cluster_scale = val;
+	zenith_refresh_rate_delays(attr_set);
+	return count;
+}
+static struct governor_attr rate_limit_cluster_scale =
+	__ATTR_RW(rate_limit_cluster_scale);
 
 static ssize_t input_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -5428,6 +5767,29 @@ static ssize_t down_threshold_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr down_threshold = __ATTR_RW(down_threshold);
 
+static ssize_t down_threshold_adaptive_show(struct gov_attr_set *attr_set,
+					    char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->down_threshold_adaptive);
+}
+
+static ssize_t down_threshold_adaptive_store(struct gov_attr_set *attr_set,
+					     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_DOWN_THRESHOLD_ADAPTIVE_MAX)
+		return -EINVAL;
+	t->down_threshold_adaptive = val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr down_threshold_adaptive =
+	__ATTR_RW(down_threshold_adaptive);
+
 static ssize_t hispeed_freq_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->hispeed_freq);
@@ -5649,11 +6011,8 @@ static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set, const char 
 	if (kstrtouint(buf, 10, &val)) return -EINVAL;
 	t->up_rate_limit_us = val;
 
-	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
-		WRITE_ONCE(z_pol->up_rate_delay_ns,
-			   (u64)val * NSEC_PER_USEC);
-		update_min_rate_limit_ns(z_pol);
-	}
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook)
+		zenith_update_rate_delay_ns(z_pol);
 	return count;
 }
 static struct governor_attr up_rate_limit_us = __ATTR_RW(up_rate_limit_us);
@@ -5672,11 +6031,8 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set, const cha
 	if (kstrtouint(buf, 10, &val)) return -EINVAL;
 	t->down_rate_limit_us = val;
 
-	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
-		WRITE_ONCE(z_pol->down_rate_delay_ns,
-			   (u64)val * NSEC_PER_USEC);
-		update_min_rate_limit_ns(z_pol);
-	}
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook)
+		zenith_update_rate_delay_ns(z_pol);
 	return count;
 }
 static struct governor_attr down_rate_limit_us = __ATTR_RW(down_rate_limit_us);
@@ -6467,6 +6823,11 @@ static struct attribute *zenith_attrs[] = {
 	&thermal_auto.attr,
 	&thermal_util_derate.attr,
 	&thermal_derate_rate_pct.attr,
+	&freq_stability_margin_pct.attr,
+	&down_rate_adaptive.attr,
+	&wakeup_boost.attr,
+	&down_threshold_adaptive.attr,
+	&rate_limit_cluster_scale.attr,
 	&input_boost_ms.attr,
 	&input_boost_decay_ms.attr,
 	&input_boost_decay_curve.attr,
@@ -6641,6 +7002,11 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
 	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
 	tunables->thermal_derate_rate_pct = ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT;
+	tunables->freq_stability_margin_pct = ZENITH_DEFAULT_FREQ_STABILITY_MARGIN_PCT;
+	tunables->down_rate_adaptive	= ZENITH_DEFAULT_DOWN_RATE_ADAPTIVE;
+	tunables->wakeup_boost		= ZENITH_DEFAULT_WAKEUP_BOOST;
+	tunables->down_threshold_adaptive = ZENITH_DEFAULT_DOWN_THRESHOLD_ADAPTIVE;
+	tunables->rate_limit_cluster_scale = ZENITH_DEFAULT_RATE_LIMIT_CLUSTER_SCALE;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 	tunables->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
 	tunables->input_boost_decay_curve = ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE;
@@ -6779,12 +7145,6 @@ static int zenith_start(struct cpufreq_policy *policy)
 	struct zenith_policy *z_policy = policy->governor_data;
 	unsigned int cpu;
 
-	WRITE_ONCE(z_policy->up_rate_delay_ns,
-		   (u64)z_policy->tunables->up_rate_limit_us * NSEC_PER_USEC);
-	WRITE_ONCE(z_policy->down_rate_delay_ns,
-		   (u64)z_policy->tunables->down_rate_limit_us * NSEC_PER_USEC);
-	update_min_rate_limit_ns(z_policy);
-
 	z_policy->last_freq_update_time = 0;
 	z_policy->next_freq = 0;
 	z_policy->work_in_progress = false;
@@ -6804,6 +7164,8 @@ static int zenith_start(struct cpufreq_policy *policy)
 			break;
 		}
 	}
+	zenith_update_cluster_rate_scale(z_policy);
+	zenith_update_rate_delay_ns(z_policy);
 
 	/* Zero the uclamp cache so zenith_policy_uclamp_{min,max} refresh
 	 * on the first eval after start rather than returning stale
