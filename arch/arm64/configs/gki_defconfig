@@ -1,4 +1,4 @@
-CONFIG_LOCALVERSION="-GrayRavens-Zenithed-V2-KWS-Stellar"
+CONFIG_LOCALVERSION="-GrayRavens-Zenithed-V3-KWS-Ethereal"
 # CONFIG_LOCALVERSION_AUTO is not set
 CONFIG_AUDIT=y
 CONFIG_NO_HZ=y
