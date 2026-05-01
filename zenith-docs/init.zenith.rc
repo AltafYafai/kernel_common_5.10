@@ -1,154 +1,201 @@
-# SPDX-License-Identifier: GPL-2.0
+# init.zenith.rc — Zenith governor runtime tunables
 #
-# init.zenith.rc — Android init.rc example for activating zenith
+# Drop in /vendor/etc/init/init.zenith.rc on the device, then merge into
+# your existing init.mtxxxx.rc init scripts.  Path globs (`*`) require Android 10+ init.
+# On older init or stricter SELinux, replace each glob with explicit
+# policy paths (e.g. policy0, policy4, policy6) for your device.
 #
-# Copy this file to your vendor
-# /etc/init/init.zenith.rc, fix the on-trigger requirements for your
-# device, and import it from your top-level init.rc with
-# ex: in init.mt6789.rc > or any init.mtxxx.rc
-#    import /vendor/etc/init/init.zenith.rc
+# Ordering: triggered on `init` so the writes land before any userspace
+# workload starts.  Most knobs are hot-readable; the kernel applies the
+# new value on the next decision tick.
 #
-# All kernel-side phone-class defaults (mm/, net/ipv4/, net/core/) are
-# baked into the kernel image and need no userspace setup. This file
-# only handles knobs that can NOT be hard-coded into the kernel:
+# All knobs default to sensible per-cluster values inside the kernel.
+# This file only OVERRIDES where a phone-class default differs from the
+# generic default, and provides every other knob commented out as a
+# discoverable reference.
 #
-#   - Switching the active CPUFreq governor to zenith on every policy.
-#     (Switching governors is per-policy at runtime; it can't be done
-#     from the kernel itself once another governor is up.)
-#   - Picking a zenith profile preset.
-#   - Enabling KSM (kernel default is off by design).
-#   - Optional BORE tunables for users who want to deviate from
-#     defaults.
+# To find your device's policy indices:
+#   ls /sys/devices/system/cpu/cpufreq/
+# Typical Snapdragon 8-gen / Tensor split is policy0 (little) +
+# policy4 (big) +/- policy7 (prime).  MTK Dimensity is usually
+# policy0 + policy4 + policy7 too.
 #
-# Triggers used:
-#
-#   on early-boot           -- runs after `init` but before zygote.
-#                              Suitable for governor switch.
-#   on property:sys.boot_completed=1
-#                           -- runs after Android boot completion. Used
-#                              for KSM since it is genuinely opt-in
-#                              (we do not want it scanning during the
-#                              boot critical path).
-#
-# Author: ENI (exclusively for LO)
+# Path glob `policy*` covers all clusters with a single line.  Use
+# explicit paths if a knob should differ per cluster (e.g. profile=
+# performance on big, battery on little).
 
-# -------------------------------------------------------------------
-# CPUFreq governor switch
-# -------------------------------------------------------------------
-# Switch every cpufreq policy to zenith. The cpu0/cpu1/... globbing
-# pattern in init.rc is a single line per policy; on a 8-core SoC with
-# two clusters (Helio P65 / 6-2 split) you need cpu0 and cpu6, plus
-# the rest of cpu1..cpu5 / cpu7 are followers and inherit. We list
-# them all explicitly to be robust against the platform reporting
-# different policy ownership.
+on init
+    # ----- Profile -----
+    # 'performance' | 'balanced' | 'battery' | 'legacy' | 'custom'
+    # Picking a profile here resets the per-knob tunables to that
+    # profile's preset; subsequent writes below override individual
+    # knobs back to your taste.  Leave commented to keep cmdline /
+    # built-in CUSTOM defaults.
+    #
+    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/profile balanced
 
-on early-boot
-    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor zenith
-    write /sys/devices/system/cpu/cpu1/cpufreq/scaling_governor zenith
-    write /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor zenith
-    write /sys/devices/system/cpu/cpu3/cpufreq/scaling_governor zenith
-    write /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor zenith
-    write /sys/devices/system/cpu/cpu5/cpufreq/scaling_governor zenith
-    write /sys/devices/system/cpu/cpu6/cpufreq/scaling_governor zenith
-    write /sys/devices/system/cpu/cpu7/cpufreq/scaling_governor zenith
+    # ----- Boot boost (one-shot, decays past deadline) -----
+    # Pin freq to policy->max for this many ms after kernel boot.
+    # 0 disables.  Recommended 30000 (30s).  Gated by screen_state and
+    # input_boost_big_only — small clusters skip if big_only=1.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/boot_boost_ms 30000
 
-    # Pick a profile preset. See zenith.rst for full descriptions:
-    #   performance / balanced / battery / legacy / custom
-    write /sys/devices/system/cpu/cpufreq/zenith/profile balanced
+    # ----- Auto-tune -----
+    # Worker classifies workload every 10s and switches profiles based on
+    # input-event rate, saturation load %, and (if scenario=1) game/audio/
+    # camera/render flags.  Default ON.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune 1
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_scenario 1
 
-    # Enable the auto-tune classifier so up_threshold / down_threshold
-    # rebalance based on observed input rate and saturation.
-    write /sys/devices/system/cpu/cpufreq/zenith/auto_tune 1
+    # ----- Awareness flags (default OFF, opt-in) -----
+    # Each adds a per-tier floor or cap.  Userspace must signal the
+    # state via the `*_active` knobs.  Leave OFF unless you have an
+    # init script that toggles them based on running app.
+    #
+    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/render_aware 1
+    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/audio_aware 1
+    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/camera_aware 1
+    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/game_mode 0
+    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/psi_aware 1
 
-    # Auto-track display blank/unblank for screen_state, and thermal
-    # framework for thermal_state, instead of relying on userspace.
-    write /sys/devices/system/cpu/cpufreq/zenith/screen_auto 1
-    write /sys/devices/system/cpu/cpufreq/zenith/thermal_auto 1
+    # ----- Frame pace floor (adaptive 60/90/120/144 Hz) -----
+    # Userspace writes the current vblank period in microseconds whenever
+    # the panel changes refresh rate; 0 disables.  60Hz=16666, 90Hz=11111,
+    # 120Hz=8333, 144Hz=6944.  Pair with frame_pace_floor_pct (0..100,
+    # default 0 = disabled) — typical 50.
+    #
+    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/frame_budget_us 8333
+    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/frame_pace_floor_pct 50
 
-    # Reasonable input boost duration. Default is already 80, listed
-    # here for clarity.
-    write /sys/devices/system/cpu/cpufreq/zenith/input_boost_ms 80
+    # ----- Permissions for runtime userspace tweaks -----
+    # Open the knobs you want HALs / app-aware daemons to write to.
+    # The chown / chmod has to happen AFTER the governor is registered;
+    # zenith register from cpufreq_init() is well before init.rc runs,
+    # so these are safe at boot time.
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/profile
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/screen_state
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/thermal_state
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/render_aware
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/audio_aware
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/camera_active
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/game_mode
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/frame_budget_us
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/frame_pace_floor_pct
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/profile
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/screen_state
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/thermal_state
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/render_aware
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/audio_aware
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/camera_active
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/game_mode
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/frame_budget_us
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/frame_pace_floor_pct
+    # Repeat for policy4, policy6, policy7 as your device requires.
 
-# -------------------------------------------------------------------
-# Optional BORE retunes
-# -------------------------------------------------------------------
-# All BORE knobs are sane out of the box. Uncomment any of these
-# lines only if you have a measured reason to deviate from defaults
-# (see Documentation/admin-guide/pm/zenith-stack.rst).
-
-#on early-boot
-#    # Stronger latency-vs-burst penalty (default 1280; ~1.25× scale).
-#    write /proc/sys/kernel/sched_burst_penalty_scale 1536
-#
-#    # Slightly more lenient burst offset (default 22).
-#    write /proc/sys/kernel/sched_burst_penalty_offset 18
-#
-#    # Disable BORE entirely for an A/B test with stock CFS.
-#    write /proc/sys/kernel/sched_bore 0
-
-# -------------------------------------------------------------------
-# KSM (Kernel Samepage Merging)
-# -------------------------------------------------------------------
-# KSM is off by default in this kernel — deliberately, because it
-# adds CPU cost during the boot critical path. Enable after Android
-# boot completes so the dedup scan never delays an app launch.
-
+# Tighten down-rate & dial in profile once boot completes, so stock
+# Android UI feels snappy mid-session without paying for the boot-pin
+# energy cost any longer than necessary.
 on property:sys.boot_completed=1
-    # 0 = stop+unmerge, 1 = scan, 2 = unmerge+stop. Want 1.
-    write /sys/kernel/mm/ksm/run 1
+    # Optional: switch to balanced profile once boot finishes.  Boot
+    # boost above already auto-decays at deadline so this is mostly
+    # a tidy-up.
+    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/profile balanced
 
-    # Pages per ksmd wakeup. 100 is a good default; raise for higher
-    # dedup convergence at the cost of background CPU.
-    write /sys/kernel/mm/ksm/pages_to_scan 100
+    # Drop boot_boost early if we want it cleared (the kernel ignores
+    # writes-while-armed past the deadline anyway, but explicit clear
+    # frees any future userspace from worrying about residual state).
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/boot_boost_ms 0
 
-    # ksmd sleep duration between batches.
-    write /sys/kernel/mm/ksm/sleep_millisecs 200
-
-    # KSM Advisor (mainline 6.7+ backport): hands-off auto-tune of
-    # pages_to_scan based on observed full-scan duration.
-    # Setting advisor_mode=scan-time makes pages_to_scan a self-tuning
-    # variable; it converges so a full scan takes
-    # advisor_target_scan_time seconds, capped by advisor_max_cpu and
-    # advisor_max_pages_to_scan. Recommended for phones.
-    write /sys/kernel/mm/ksm/advisor_mode scan-time
-
-    # ----------------------------------------------------------------
-    # DAMON_RECLAIM activation
-    # ----------------------------------------------------------------
-    # Already CONFIG_DAMON_RECLAIM=y in this kernel; just activate it.
-    # The watermark gate keeps it dormant when the system has plenty
-    # of free memory, so this is safe to enable unconditionally.
-    write /sys/module/damon_reclaim/parameters/enabled Y
-
-    # Optionally tune for phone-class:
-    #   - lower min_age to 60s (default 120s) for snappier reclaim
-    #   - raise wmarks_high to 800 (=8% free) to activate earlier
-    # write /sys/module/damon_reclaim/parameters/min_age 60000000
-    # write /sys/module/damon_reclaim/parameters/wmarks_high 800
-
-# -------------------------------------------------------------------
-# Notes on what is NOT here
-# -------------------------------------------------------------------
-# The following are intentionally OMITTED because the kernel already
-# ships them as compile-time defaults (see zenith-stack.rst):
+# ----- Reference: every Zenith knob, defaults shown -----
+# (Listed for grep / discovery.  Do not uncomment unless you actually
+#  want to override that knob.)
 #
-#   /proc/sys/vm/swappiness            (=100, baked)
-#   /proc/sys/vm/dirty_ratio           (=10, baked)
-#   /proc/sys/vm/dirty_background_ratio(=5, baked)
-#   /proc/sys/vm/watermark_scale_factor(=100, baked)
-#   /proc/sys/vm/vfs_cache_pressure    (=200, baked)
-#   /proc/sys/net/core/rmem_max        (=16777216, baked)
-#   /proc/sys/net/core/wmem_max        (=16777216, baked)
-#   /proc/sys/net/core/netdev_max_backlog (=16384, baked)
-#   /proc/sys/net/core/default_qdisc   (=cake, baked)
-#   /proc/sys/net/ipv4/tcp_slow_start_after_idle (=0, baked)
-#   /proc/sys/net/ipv4/tcp_nometrics_save (=1, baked)
-#   /proc/sys/net/ipv4/tcp_fastopen    (=0x3, baked)
-#   /proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout (=0, baked)
-#   /proc/sys/net/ipv4/tcp_limit_output_bytes (=4194304, baked)
-#   /proc/sys/net/ipv4/tcp_congestion_control (=bbr, baked via defconfig)
+# Cluster cadence
+#   up_rate_limit_us           = 100
+#   down_rate_limit_us         = 4000
+#   up_threshold               = 75
+#   up_threshold_hispeed       = 0       (0=disabled)
+#   down_threshold             = 60
+#   sampling_down_factor       = 2
+#   up_delay_us                = 4000
 #
-# If you intentionally want different values from kernel defaults,
-# add `write` lines for them under `on early-boot` here. Do not edit
-# the kernel image to revert any of the above unless you genuinely
-# need device-specific values that diverge from phone-class baseline.
+# Hispeed tier
+#   hispeed_freq               = 0       (kHz; 0 -> use hispeed_freq_pct)
+#   hispeed_freq_pct           = 55      (% of policy->max when freq=0)
+#   hispeed_load               = 65
+#   hispeed_hyst_pct           = 10      (exit-side hysteresis margin)
+#   hispeed_entry_streak       = 0       (0=disabled, otherwise N samples)
+#
+# Climb / step
+#   climb_mode                 = 0       (0=SNAP, 1=STEP)
+#   freq_step_pct              = 5
+#
+# IO / iowait
+#   io_is_busy                 = 1
+#   iowait_boost_min           = 125
+#   iowait_stack_pct           = 50
+#   ignore_nice_load           = 0
+#
+# Power / bias
+#   powersave_bias             = 0
+#   bias_load_threshold        = 50
+#   light_load_freq            = 0       (kHz; 0=disabled)
+#   light_load_threshold       = 20
+#   efficient_freq             = 0       (kHz CSV ladder; 0=disabled)
+#   boost_exit_extend          = 1
+#
+# Display / thermal
+#   screen_state               = 1       (1=on, 0=off; FB notifier auto)
+#   screen_auto                = 1       (FB notifier wired)
+#   thermal_state              = 0       (1=throttled view, sysfs hint)
+#   thermal_auto               = 1
+#   thermal_util_derate        = 1
+#
+# Input boost
+#   input_boost_ms             = 80
+#   input_boost_decay_ms       = 30
+#   input_boost_big_only       = 1
+#   input_boost_cap_pct        = 80      (0=pin to max)
+#
+# kcpustat / util math
+#   kcpustat_window_us         = 4000
+#   kcpustat_filter_shift      = 1
+#   kcpustat_hispeed_enable    = 1
+#   util_math_v2               = 1
+#   predict_util_pct           = 0       (1-step linear util predictor)
+#
+# uclamp respect
+#   uclamp_min_respect         = 1
+#   uclamp_max_respect         = 1
+#
+# Auto-tune
+#   auto_tune                  = 1
+#   auto_tune_sat_load_pct     = 70
+#   auto_tune_hi_sat_pct       = 60
+#   auto_tune_lo_sat_pct       = 10
+#   auto_tune_hi_events_x2     = 4
+#   auto_tune_lo_events_x2     = 1
+#   auto_tune_scenario         = 0       (1=enable scenario flags)
+#
+# Profile
+#   profile                    = custom  (or performance/balanced/battery/legacy)
+#
+# Awareness floors
+#   render_aware               = 0
+#   render_floor_pct           = 70
+#   audio_aware                = 0
+#   audio_floor_pct            = 0
+#   audio_cap_pct              = 0
+#   camera_aware               = 0
+#   camera_active              = 0
+#   camera_floor_pct           = 0
+#   game_mode                  = 0
+#
+# PSI / memstall
+#   psi_aware                  = 0
+#   psi_mem_thresh             = 50
+#
+# Boot / frame pacing
+#   boot_boost_ms              = 0       (overridden to 30000 above)
+#   frame_budget_us            = 0       (vblank period; 0=disabled)
+#   frame_pace_floor_pct       = 0
