@@ -676,63 +676,6 @@ static inline void tlb_flush_p4d_range(struct mmu_gather *tlb,
 	} while (0)
 #endif
 
-#if defined(CONFIG_ARCH_WANT_HUGE_PMD_SHARE) && defined(CONFIG_HUGETLB_PAGE)
-static inline void tlb_unshare_pmd_ptdesc(struct mmu_gather *tlb, struct page *pt,
-					  unsigned long addr)
-{
-	/*
-	 * The caller must make sure that concurrent unsharing + exclusive
-	 * reuse is impossible until tlb_flush_unshared_tables() was called.
-	 */
-	VM_WARN_ON_ONCE(!atomic_read(&pt->pt_share_count));
-	atomic_dec(&pt->pt_share_count);
-
-	/* Clearing a PUD pointing at a PMD table with PMD leaves. */
-	tlb_flush_pmd_range(tlb, addr & PUD_MASK, PUD_SIZE);
-
-	/*
-	 * If the page table is now exclusively owned, we fully unshared
-	 * a page table.
-	 */
-	if (!atomic_read(&pt->pt_share_count))
-		tlb->fully_unshared_tables = true;
-	tlb->unshared_tables = true;
-}
-
-static inline void tlb_flush_unshared_tables(struct mmu_gather *tlb)
-{
-	/*
-	 * As soon as the caller drops locks to allow for reuse of
-	 * previously-shared tables, these tables could get modified and
-	 * even reused outside of hugetlb context, so we have to make sure that
-	 * any page table walkers (incl. TLB, GUP-fast) are aware of that
-	 * change.
-	 *
-	 * Even if we are not fully unsharing a PMD table, we must
-	 * flush the TLB for the unsharer now.
-	 */
-	if (tlb->unshared_tables)
-		tlb_flush_mmu_tlbonly(tlb);
-
-	/*
-	 * Similarly, we must make sure that concurrent GUP-fast will not
-	 * walk previously-shared page tables that are getting modified+reused
-	 * elsewhere. So broadcast an IPI to wait for any concurrent GUP-fast.
-	 *
-	 * We only perform this when we are the last sharer of a page table,
-	 * as the IPI will reach all CPUs: any GUP-fast.
-	 *
-	 * Note that on configs where tlb_remove_table_sync_one() is a NOP,
-	 * the expectation is that the tlb_flush_mmu_tlbonly() would have issued
-	 * required IPIs already for us.
-	 */
-	if (tlb->fully_unshared_tables) {
-		tlb_remove_table_sync_one();
-		tlb->fully_unshared_tables = false;
-	}
-}
-#endif
-
 #endif /* CONFIG_MMU */
 
 #endif /* _ASM_GENERIC__TLB_H */
