@@ -1,4 +1,4 @@
-# init.zenith.rc — Zenith governor runtime tunables
+# init.zenith.rc — Zenith governor runtime tunables (Zenithed-V3)
 #
 # Drop in /vendor/etc/init/init.zenith.rc on the device, then merge into
 # your existing init.mtxxxx.rc init scripts.  Path globs (`*`) require Android 10+ init.
@@ -47,6 +47,41 @@ on init
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune 1
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_scenario 1
 
+    # ----- Auto-tune V2 (smart scenario-driven tuning) -----
+    # V2 state machine: classifies into efficiency/balanced/latency/
+    # sustained_perf/thermal_recovery and adjusts knobs automatically
+    # within per-profile guardrails.  Default ON.
+    # Hysteresis: require this many consecutive 10s windows agreeing
+    # before committing a state change.  Prevents mode thrashing.
+    # Cooldown: quiet period (in windows) after a state change before
+    # another change is allowed.  Thermal/sustained_perf bypass this.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_v2 1
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_hysteresis_windows 2
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_cooldown_windows 1
+
+    # ----- Smoothness tunables (V3) -----
+    # Frequency stability margin: hold current freq when the new target
+    # is within this % of policy->max below current.  Prevents tiny
+    # oscillations at OPP boundaries.  0=disabled, max 10.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/freq_stability_margin_pct 3
+
+    # Adaptive down-rate: bursty workloads automatically get up to 2x
+    # the normal down-rate delay, keeping freq elevated between bursts.
+    # 0=fixed delay (legacy), 1=adaptive.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/down_rate_adaptive 1
+
+    # Wakeup boost: brief up-rate bypass on idle-to-busy transitions.
+    # 0=disabled, 1=enabled.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/wakeup_boost 1
+
+    # Adaptive down-threshold: bursty load variance widens the brutality
+    # exit threshold by up to this %.  0=disabled.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/down_threshold_adaptive 5
+
+    # Per-cluster asymmetric rate limits: little clusters use tighter
+    # up/down delays.  0=uniform, 1=asymmetric.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/rate_limit_cluster_scale 1
+
     # ----- Awareness flags (default OFF, opt-in) -----
     # Each adds a per-tier floor or cap.  Userspace must signal the
     # state via the `*_active` knobs.  Leave OFF unless you have an
@@ -81,6 +116,8 @@ on init
     chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/game_mode
     chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/frame_budget_us
     chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/frame_pace_floor_pct
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/auto_tune_v2
+    chown system system /sys/devices/system/cpu/cpufreq/policy0/zenith/auto_tune_reset_overrides
     chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/profile
     chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/screen_state
     chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/thermal_state
@@ -90,6 +127,8 @@ on init
     chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/game_mode
     chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/frame_budget_us
     chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/frame_pace_floor_pct
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/auto_tune_v2
+    chmod 0664 /sys/devices/system/cpu/cpufreq/policy0/zenith/auto_tune_reset_overrides
     # Repeat for policy4, policy6, policy7 as your device requires.
 
 # Tighten down-rate & dial in profile once boot completes, so stock
@@ -115,7 +154,9 @@ on property:sys.boot_completed=1
 #   down_rate_limit_us         = 4000
 #   up_threshold               = 75
 #   up_threshold_hispeed       = 0       (0=disabled)
+#   up_threshold_adaptive      = 0       (0=disabled; variance shaping)
 #   down_threshold             = 60
+#   down_threshold_adaptive    = 0       (0=disabled; bursty exit widening)
 #   sampling_down_factor       = 2
 #   up_delay_us                = 4000
 #
@@ -125,15 +166,24 @@ on property:sys.boot_completed=1
 #   hispeed_load               = 65
 #   hispeed_hyst_pct           = 10      (exit-side hysteresis margin)
 #   hispeed_entry_streak       = 0       (0=disabled, otherwise N samples)
+#   brutal_entry_streak        = 0       (0=disabled, N samples to confirm brutality)
 #
 # Climb / step
 #   climb_mode                 = 0       (0=SNAP, 1=STEP)
 #   freq_step_pct              = 5
+#   freq_step_adaptive         = 0       (0=disabled; load-proportional step)
+#
+# Smoothness (V3)
+#   freq_stability_margin_pct  = 3       (0=disabled; OPP boundary filter)
+#   down_rate_adaptive         = 1       (0=fixed delay, 1=variance-scaled)
+#   wakeup_boost               = 1       (0=disabled; idle→busy fast-ramp)
+#   rate_limit_cluster_scale   = 1       (0=uniform, 1=per-cluster asymmetric)
 #
 # IO / iowait
 #   io_is_busy                 = 1
 #   iowait_boost_min           = 125
 #   iowait_stack_pct           = 50
+#   iowait_backoff_after_ms    = 0       (0=disabled; sustained-iowait decay)
 #   ignore_nice_load           = 0
 #
 # Power / bias
@@ -142,6 +192,7 @@ on property:sys.boot_completed=1
 #   light_load_freq            = 0       (kHz; 0=disabled)
 #   light_load_threshold       = 20
 #   efficient_freq             = 0       (kHz CSV ladder; 0=disabled)
+#   eff_bin_hyst_pct           = 0       (0=disabled; ladder release margin)
 #   boost_exit_extend          = 1
 #
 # Display / thermal
@@ -150,10 +201,12 @@ on property:sys.boot_completed=1
 #   thermal_state              = 0       (1=throttled view, sysfs hint)
 #   thermal_auto               = 1
 #   thermal_util_derate        = 1
+#   thermal_derate_rate_pct    = 0       (0=disabled; derivative-term scaling)
 #
 # Input boost
 #   input_boost_ms             = 80
 #   input_boost_decay_ms       = 30
+#   input_boost_decay_curve    = 0       (0=linear, 1=cubic ease-in)
 #   input_boost_big_only       = 1
 #   input_boost_cap_pct        = 80      (0=pin to max)
 #
@@ -163,6 +216,7 @@ on property:sys.boot_completed=1
 #   kcpustat_hispeed_enable    = 1
 #   util_math_v2               = 1
 #   predict_util_pct           = 0       (1-step linear util predictor)
+#   predict_util_smooth        = 0       (0=raw predictor, 1=smoothed)
 #
 # uclamp respect
 #   uclamp_min_respect         = 1
@@ -176,6 +230,13 @@ on property:sys.boot_completed=1
 #   auto_tune_hi_events_x2     = 4
 #   auto_tune_lo_events_x2     = 1
 #   auto_tune_scenario         = 0       (1=enable scenario flags)
+#
+# Auto-tune V2 (V3, smart state machine)
+#   auto_tune_v2               = 1       (0=legacy classifier, 1=bounded V2)
+#   auto_tune_hysteresis_windows = 2     (windows before committing state)
+#   auto_tune_cooldown_windows = 1       (quiet windows after state change)
+#   auto_tune_reset_overrides  = WO      (write 1 to clear user-override mask)
+#   auto_tune_status           = RO      (diagnostic: state, reason, signals)
 #
 # Profile
 #   profile                    = custom  (or performance/balanced/battery/legacy)
@@ -194,8 +255,11 @@ on property:sys.boot_completed=1
 # PSI / memstall
 #   psi_aware                  = 0
 #   psi_mem_thresh             = 50
+#   psi_cpu_thresh             = 0
+#   psi_io_thresh              = 0
 #
 # Boot / frame pacing
 #   boot_boost_ms              = 0       (overridden to 30000 above)
 #   frame_budget_us            = 0       (vblank period; 0=disabled)
+#   frame_budget_us_per_policy = (none)  (CSV per-policy override)
 #   frame_pace_floor_pct       = 0
