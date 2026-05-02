@@ -309,6 +309,53 @@ guardrails.
     Bitmask of signals V2 may consult.  See ``ZENITH_AT_FLAG_*``
     in the source.  Default ``0`` (legacy: classifier only).
 
+``auto_tune_v2_glides``
+    Boolean (0/1, default **1**).  Master gate for V2-driven
+    population of the round-U-z10 glide / coordination knobs:
+
+      * ``brutal_decay_ms``
+      * ``wakeup_boost_ms``
+      * ``boot_boost_decay_ms``
+      * ``screen_off_glide_ms``
+      * ``thermal_pressure_continuous``
+      * ``prefer_silver_aware``
+      * ``frame_budget_us_auto``
+
+    All seven default to 0 (off / legacy hard cliff).  With this
+    knob at 1 (the default), the V2 worker maps the current state
+    + signal flags to per-policy effective values for these knobs
+    so consumers do not need to hand-tune any of them via sysfs.
+
+    Per-knob writes from userspace continue to win outright: any
+    non-zero value written to one of the seven knobs takes
+    precedence over the V2-derived value.  The V2 fall-through
+    only applies when the user value is 0 (the default).
+
+    Set ``auto_tune_v2_glides`` to 0 to lock all seven knobs back
+    to byte-identical legacy behaviour.
+
+    State -> value map (see ``zenith_at_apply_glides`` in the
+    source):
+
+      * ``latency``: ``brutal_decay_ms = 150``,
+        ``wakeup_boost_ms = 50``
+      * ``thermal_recovery`` *or* thermal pressure >= 25%:
+        ``thermal_pressure_continuous = 1``
+      * ``efficiency`` / ``balanced`` with prefer_silver hit-rate
+        at or above ``prefer_silver_hot_threshold_pct``:
+        ``prefer_silver_aware = 1``
+      * any state with ``ZENITH_AT_FLAG_FRAME`` or game_mode and a
+        non-zero ``zenith_drm_vblank_us`` cache:
+        ``frame_budget_us_auto = 1``,
+        ``wakeup_boost_ms = 50``
+      * always (state-independent, arm-time / one-shot knobs):
+        ``boot_boost_decay_ms = 5000``,
+        ``screen_off_glide_ms = 300``
+
+    Ignored unless ``auto_tune_v2`` is also 1; on V1-only or
+    auto-tune-off systems the knob is read but no effective values
+    are populated.
+
 ``auto_tune_thermal_slope``
     Boolean (0/1, default 0).  Enables the thermal-slope detector;
     when thermal pressure is rising fast, V2 jumps directly to

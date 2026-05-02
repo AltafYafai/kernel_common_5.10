@@ -699,6 +699,44 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_AT_SUSTAINED_GAMING	1
 #define ZENITH_AT_THERMAL_PCT_MAX		100
 
+/* auto_tune_v2_glides (default 1, on):
+ *
+ * Master gate for V2-driven population of the round-U-z10 "glide" /
+ * coordination knobs:
+ *
+ *   brutal_decay_ms, wakeup_boost_ms, boot_boost_decay_ms,
+ *   screen_off_glide_ms, thermal_pressure_continuous,
+ *   prefer_silver_aware, frame_budget_us_auto.
+ *
+ * On stock systems all seven knobs default to 0 (legacy hard
+ * cliffs / off).  Without auto_tune_v2_glides the consumer has to
+ * hand-tune each one via sysfs to opt into the new behaviour.
+ *
+ * When auto_tune_v2_glides is 1 (default), zenith_auto_tune_work()
+ * populates per-policy "effective" copies of these knobs based on
+ * the current V2 state and signal flags; consumers fall back to the
+ * effective copy whenever the user-set tunable is 0.  Writes a
+ * non-zero value to any of the seven tunables continue to win
+ * outright -- the V2-derived copy is only consulted on the 0
+ * (default) value.  Set auto_tune_v2_glides to 0 to lock all seven
+ * back to byte-identical legacy behaviour at the cost of having to
+ * hand-tune anything you want enabled.
+ *
+ * Costs nothing on auto_tune_v2=0 systems: zenith_at_apply_glides()
+ * is only called from the V2 worker path.
+ */
+#define ZENITH_DEFAULT_AUTO_TUNE_V2_GLIDES	1
+
+/* Effective values applied by zenith_at_apply_glides() per state.
+ * Picked to match the round-U-z10 doc recommendations and keep all
+ * seven knobs inside their documented sysfs ranges.
+ */
+#define ZENITH_AT_GLIDE_BRUTAL_DECAY_MS		150
+#define ZENITH_AT_GLIDE_WAKEUP_BOOST_MS		50
+#define ZENITH_AT_GLIDE_BOOT_BOOST_DECAY_MS	5000
+#define ZENITH_AT_GLIDE_SCREEN_OFF_MS		300
+#define ZENITH_AT_GLIDE_THERMAL_PRESSURE_PCT	25
+
 #define ZENITH_AT_STATE_EFFICIENCY		0
 #define ZENITH_AT_STATE_BALANCED		1
 #define ZENITH_AT_STATE_LATENCY			2
@@ -1600,6 +1638,18 @@ struct zenith_tunables {
 	unsigned int		auto_tune_frame_pacing;
 	unsigned int		auto_tune_sustained_gaming;
 
+	/* See ZENITH_DEFAULT_AUTO_TUNE_V2_GLIDES.  When 1 (default), the
+	 * V2 worker populates per-policy effective values for the
+	 * round-U-z10 glide / coordination knobs (brutal_decay_ms,
+	 * wakeup_boost_ms, boot_boost_decay_ms, screen_off_glide_ms,
+	 * thermal_pressure_continuous, prefer_silver_aware,
+	 * frame_budget_us_auto) based on V2 state.  Consumers use the
+	 * effective value only when the user-set tunable is 0.  0 here
+	 * locks all seven back to legacy behaviour exactly.  Ignored
+	 * unless auto_tune_v2 is also 1.
+	 */
+	unsigned int		auto_tune_v2_glides;
+
 	/* See ZENITH_DEFAULT_AUTO_TUNE_SCENARIO comment block.  Master
 	 * gate for the scenario overlay applied on top of the vanilla
 	 * load + input-rate classifier in zenith_auto_tune_work().
@@ -1954,6 +2004,23 @@ struct zenith_policy {
 	unsigned int		at_effective_frame_pace_floor_pct;
 	unsigned int		at_effective_game_mode;
 	bool			at_local_actions;
+
+	/* round-U-z10 glide / coordination knobs auto-driven by the V2
+	 * worker via zenith_at_apply_glides() when
+	 * tunables->auto_tune_v2_glides is on.  Consumers fall through
+	 * to these only when the user-set tunable is 0; otherwise the
+	 * user value wins outright.  at_local_glides_active gates the
+	 * fall-through; cleared on auto_tune_v2 disable so the next
+	 * unrelated freq tick stops consulting stale values.
+	 */
+	bool			at_local_glides_active;
+	unsigned int		at_local_brutal_decay_ms;
+	unsigned int		at_local_wakeup_boost_ms;
+	unsigned int		at_local_boot_boost_decay_ms;
+	unsigned int		at_local_screen_off_glide_ms;
+	unsigned int		at_local_thermal_pressure_continuous;
+	unsigned int		at_local_prefer_silver_aware;
+	unsigned int		at_local_frame_budget_us_auto;
 	struct delayed_work	at_work;
 
 	/* Auto-tune classifier ring buffer.  Single-writer (the
@@ -2181,6 +2248,9 @@ static DEFINE_PER_CPU(struct zenith_cpu, zenith_cpu);
 static unsigned int zenith_tunable_or_local(struct zenith_policy *z_policy,
 					    unsigned int tunable,
 					    unsigned int local);
+static unsigned int zenith_glide_value(struct zenith_policy *z_policy,
+				       unsigned int tunable,
+				       unsigned int local);
 
 /************************ Schedutil: I/O Wait & DL Logic ***********************/
 
@@ -3576,8 +3646,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	}
 
 	if (z_policy->tunables->screen_state == 0 && !uclamp_min_meaningful) {
-		unsigned int glide_ms =
-			z_policy->tunables->screen_off_glide_ms;
+		unsigned int glide_ms = zenith_glide_value(z_policy,
+				z_policy->tunables->screen_off_glide_ms,
+				z_policy->at_local_screen_off_glide_ms);
 		u64 now = z_policy->screen_off_arm_ns ? ktime_get_ns() : 0;
 		u64 elapsed_ns = (z_policy->screen_off_arm_ns &&
 				  now > z_policy->screen_off_arm_ns) ?
@@ -3645,7 +3716,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		 * audible / observable step that otherwise happens the
 		 * moment thermal_active flips on after a long burst.
 		 */
-		if (z_policy->tunables->thermal_pressure_continuous) {
+		if (zenith_glide_value(z_policy,
+				z_policy->tunables->thermal_pressure_continuous,
+				z_policy->at_local_thermal_pressure_continuous)) {
 			unsigned int floor = zenith_tunable_or_local(z_policy,
 				z_policy->tunables->up_threshold,
 				z_policy->at_effective_up_threshold);
@@ -3725,7 +3798,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * effect while restoring the climb resistance prefer_silver
 	 * was eroding by hiding light load from this cluster.
 	 */
-	if (z_policy->tunables->prefer_silver_aware &&
+	if (zenith_glide_value(z_policy,
+			z_policy->tunables->prefer_silver_aware,
+			z_policy->at_local_prefer_silver_aware) &&
 	    z_policy->cluster_class != ZENITH_CLUSTER_LITTLE &&
 	    z_policy->ps_hit_rate_pct >=
 		    z_policy->tunables->prefer_silver_hot_threshold_pct) {
@@ -4047,16 +4122,20 @@ brutal_entry_deferred:
 		 * implicitly clears it on the next exit).  No-op when
 		 * brutal_decay_ms == 0.
 		 */
-		if (z_policy->brutal_active &&
-		    z_policy->tunables->brutal_decay_ms) {
-			unsigned int decay_ms =
-				z_policy->tunables->brutal_decay_ms;
+		if (z_policy->brutal_active) {
+			unsigned int decay_ms = zenith_glide_value(z_policy,
+				z_policy->tunables->brutal_decay_ms,
+				z_policy->at_local_brutal_decay_ms);
 
-			if (decay_ms > ZENITH_BRUTAL_DECAY_MS_MAX)
-				decay_ms = ZENITH_BRUTAL_DECAY_MS_MAX;
-			z_policy->brutal_decay_arm_ms = decay_ms;
-			z_policy->brutal_decay_until_ns = ktime_get_ns() +
-				(u64)decay_ms * NSEC_PER_MSEC;
+			if (decay_ms) {
+				if (decay_ms > ZENITH_BRUTAL_DECAY_MS_MAX)
+					decay_ms =
+						ZENITH_BRUTAL_DECAY_MS_MAX;
+				z_policy->brutal_decay_arm_ms = decay_ms;
+				z_policy->brutal_decay_until_ns =
+					ktime_get_ns() +
+					(u64)decay_ms * NSEC_PER_MSEC;
+			}
 		}
 		z_policy->brutal_active = false;
 	}
@@ -4235,7 +4314,7 @@ brutal_entry_deferred:
 				freq = policy->max;
 				tp_path = "boot_boost";
 			}
-		} else if (z_policy->tunables->boot_boost_decay_ms) {
+		} else {
 			/* Boot-boost decay tail.  Mirror of input_boost's
 			 * decay phase but pinned to wall-clock boottime so
 			 * the ramp shape is independent of how often
@@ -4246,8 +4325,9 @@ brutal_entry_deferred:
 			 * dumps boot freq from policy->max to load-derived
 			 * the moment boot_boost_ms passes.
 			 */
-			unsigned int decay_ms =
-				z_policy->tunables->boot_boost_decay_ms;
+			unsigned int decay_ms = zenith_glide_value(z_policy,
+				z_policy->tunables->boot_boost_decay_ms,
+				z_policy->at_local_boot_boost_decay_ms);
 			u64 decay_ns = (u64)decay_ms * NSEC_PER_MSEC;
 			u64 elapsed_post = boot_now - deadline_ns;
 
@@ -4311,7 +4391,10 @@ brutal_entry_deferred:
 		 * its first commit), so the floor still works on
 		 * stock-tuned systems where userspace writes the rate.
 		 */
-		if (READ_ONCE(z_policy->tunables->frame_budget_us_auto)) {
+		if (zenith_glide_value(z_policy,
+				READ_ONCE(z_policy->tunables->
+					  frame_budget_us_auto),
+				z_policy->at_local_frame_budget_us_auto)) {
 			unsigned int auto_us = (unsigned int)
 				atomic_read(&zenith_drm_vblank_us);
 
@@ -4849,7 +4932,9 @@ static void zenith_update_single(struct update_util_data *hook, u64 time, unsign
 
 		if (prev_pct < ZENITH_WAKEUP_IDLE_THRESH_PCT &&
 		    cur_pct >= ZENITH_WAKEUP_BUSY_THRESH_PCT) {
-			unsigned int ms = READ_ONCE(tunables->wakeup_boost_ms);
+			unsigned int ms = zenith_glide_value(z_policy,
+				READ_ONCE(tunables->wakeup_boost_ms),
+				z_policy->at_local_wakeup_boost_ms);
 
 			z_cpu->wakeup_boost_ticks = ZENITH_WAKEUP_BOOST_TICKS;
 			if (ms) {
@@ -4921,8 +5006,12 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 
 				if (prev_pct < ZENITH_WAKEUP_IDLE_THRESH_PCT &&
 				    cur_pct >= ZENITH_WAKEUP_BUSY_THRESH_PCT) {
-					unsigned int ms = READ_ONCE(
-						tunables->wakeup_boost_ms);
+					unsigned int ms = zenith_glide_value(
+						z_policy,
+						READ_ONCE(
+						 tunables->wakeup_boost_ms),
+						z_policy->
+						 at_local_wakeup_boost_ms);
 
 					j_z_cpu->wakeup_boost_ticks =
 						ZENITH_WAKEUP_BOOST_TICKS;
@@ -5254,6 +5343,7 @@ static void zenith_reset_local_actions(struct zenith_policy *z_policy)
 		z_policy->tunables->frame_pace_floor_pct;
 	z_policy->at_effective_game_mode = z_policy->tunables->game_mode;
 	z_policy->at_local_actions = false;
+	z_policy->at_local_glides_active = false;
 	zenith_update_rate_delay_ns(z_policy);
 }
 
@@ -5565,6 +5655,34 @@ static unsigned int zenith_tunable_or_local(struct zenith_policy *z_policy,
 	return z_policy->at_local_actions ? local : tunable;
 }
 
+/* zenith_glide_value - auto_tune_v2_glides accessor for round-U-z10 knobs.
+ *
+ * Semantics (different from zenith_tunable_or_local!):
+ *   - If user wrote a non-zero tunable value, that wins outright --
+ *     always, regardless of whether glides are active.
+ *   - If the user value is 0 (the default for all seven glide knobs)
+ *     AND auto_tune_v2_glides is on AND the V2 worker has run at
+ *     least once (at_local_glides_active == true), return the
+ *     V2-derived value.
+ *   - Otherwise return 0 (== legacy behaviour: the consumer's
+ *     "feature off" path).
+ *
+ * Read in the freq-update hot path; the non-zero short-circuit
+ * keeps it one branch + one load on the common case (user has
+ * tuned the knob explicitly).
+ */
+static unsigned int zenith_glide_value(struct zenith_policy *z_policy,
+				       unsigned int tunable,
+				       unsigned int local)
+{
+	if (tunable)
+		return tunable;
+	if (READ_ONCE(z_policy->tunables->auto_tune_v2_glides) &&
+	    z_policy->at_local_glides_active)
+		return local;
+	return 0;
+}
+
 static void zenith_at_write_effective(struct zenith_policy *z_policy,
 				      struct zenith_at_guardrails *g,
 				      unsigned int up_rate,
@@ -5803,6 +5921,98 @@ static bool zenith_at_apply_actions(struct zenith_policy *z_policy,
 		z_policy->need_freq_update = true;
 	}
 	return changed || rate_changed;
+}
+
+/* zenith_at_apply_glides - V2 driver for the round-U-z10 glide knobs.
+ *
+ * Called from the V2 worker tail (just after zenith_at_apply_actions)
+ * when auto_tune_v2 && auto_tune_v2_glides.  Populates per-policy
+ * effective copies of the seven glide knobs from the current state +
+ * the at_last_flags bitmap so the freq-update hot path can fall
+ * through to them when the user-set tunable is 0.
+ *
+ * Mapping (state -> effective values):
+ *
+ *   ZENITH_AT_STATE_LATENCY:
+ *     brutal_decay_ms       = ZENITH_AT_GLIDE_BRUTAL_DECAY_MS
+ *     wakeup_boost_ms       = ZENITH_AT_GLIDE_WAKEUP_BOOST_MS
+ *
+ *   ZENITH_AT_STATE_THERMAL_RECOVERY:
+ *     thermal_pressure_continuous = 1
+ *
+ *   ZENITH_AT_STATE_EFFICIENCY / BALANCED:
+ *     prefer_silver_aware    = 1 (when ps hit-rate >= configured
+ *                                 threshold; gated by the existing
+ *                                 ps_hit_rate_pct snapshot)
+ *
+ *   any state with (flags & ZENITH_AT_FLAG_FRAME) || game_mode:
+ *     wakeup_boost_ms        = ZENITH_AT_GLIDE_WAKEUP_BOOST_MS
+ *     frame_budget_us_auto   = 1 (when zenith_drm_vblank_us != 0)
+ *
+ *   pressure_pct >= ZENITH_AT_GLIDE_THERMAL_PRESSURE_PCT:
+ *     thermal_pressure_continuous = 1
+ *
+ *   always (independent of state):
+ *     screen_off_glide_ms    = ZENITH_AT_GLIDE_SCREEN_OFF_MS
+ *     boot_boost_decay_ms    = ZENITH_AT_GLIDE_BOOT_BOOST_DECAY_MS
+ *     (these are arm-time / one-shot knobs, not state-dependent)
+ *
+ * Sets at_local_glides_active to gate consumer fall-through.
+ * Cheap: O(1) and writes scalar fields with no locking (single
+ * writer in the V2 worker, single readers in the consumer paths
+ * under update_lock; staleness cost is bounded by the V2 tick
+ * cadence).
+ */
+static void zenith_at_apply_glides(struct zenith_policy *z_policy,
+				   unsigned int state)
+{
+	unsigned int flags = z_policy->at_last_flags;
+	unsigned int pressure_pct = z_policy->at_last_thermal_pressure;
+	unsigned int brutal_ms = 0;
+	unsigned int wakeup_ms = 0;
+	unsigned int thermal_continuous = 0;
+	unsigned int prefer_silver_aware_v = 0;
+	unsigned int frame_auto_v = 0;
+
+	switch (state) {
+	case ZENITH_AT_STATE_LATENCY:
+		brutal_ms = ZENITH_AT_GLIDE_BRUTAL_DECAY_MS;
+		wakeup_ms = ZENITH_AT_GLIDE_WAKEUP_BOOST_MS;
+		break;
+	case ZENITH_AT_STATE_THERMAL_RECOVERY:
+		thermal_continuous = 1;
+		break;
+	case ZENITH_AT_STATE_EFFICIENCY:
+	case ZENITH_AT_STATE_BALANCED:
+		if (z_policy->ps_hit_rate_pct >=
+		    READ_ONCE(z_policy->tunables->
+			      prefer_silver_hot_threshold_pct))
+			prefer_silver_aware_v = 1;
+		break;
+	default:
+		break;
+	}
+
+	if ((flags & ZENITH_AT_FLAG_FRAME) || (flags & ZENITH_AT_FLAG_GAME)) {
+		if (!wakeup_ms)
+			wakeup_ms = ZENITH_AT_GLIDE_WAKEUP_BOOST_MS;
+		if (atomic_read(&zenith_drm_vblank_us))
+			frame_auto_v = 1;
+	}
+
+	if (pressure_pct >= ZENITH_AT_GLIDE_THERMAL_PRESSURE_PCT)
+		thermal_continuous = 1;
+
+	z_policy->at_local_brutal_decay_ms = brutal_ms;
+	z_policy->at_local_wakeup_boost_ms = wakeup_ms;
+	z_policy->at_local_boot_boost_decay_ms =
+		ZENITH_AT_GLIDE_BOOT_BOOST_DECAY_MS;
+	z_policy->at_local_screen_off_glide_ms =
+		ZENITH_AT_GLIDE_SCREEN_OFF_MS;
+	z_policy->at_local_thermal_pressure_continuous = thermal_continuous;
+	z_policy->at_local_prefer_silver_aware = prefer_silver_aware_v;
+	z_policy->at_local_frame_budget_us_auto = frame_auto_v;
+	z_policy->at_local_glides_active = true;
 }
 
 #define ZENITH_TUNABLE_UINT(_name) \
@@ -6345,7 +6555,9 @@ static void zenith_auto_tune_work(struct work_struct *w)
 			 * miss frame_active on auto setups whose userspace
 			 * frame_budget_us is left at 0.
 			 */
-			if (READ_ONCE(t->frame_budget_us_auto)) {
+			if (zenith_glide_value(z_policy,
+				READ_ONCE(t->frame_budget_us_auto),
+				z_policy->at_local_frame_budget_us_auto)) {
 				unsigned int auto_us = (unsigned int)
 					atomic_read(&zenith_drm_vblank_us);
 
@@ -6527,6 +6739,15 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		}
 		z_policy->at_last_reason = reason;
 		zenith_at_apply_actions(z_policy, state);
+		/* Populate the round-U-z10 glide knobs (brutal_decay_ms,
+		 * wakeup_boost_ms, ...) from the just-resolved V2 state
+		 * when auto_tune_v2_glides is on.  Cheap; gated so it
+		 * remains free on systems that opt out.
+		 */
+		if (READ_ONCE(t->auto_tune_v2_glides))
+			zenith_at_apply_glides(z_policy, state);
+		else
+			z_policy->at_local_glides_active = false;
 		goto rearm;
 	}
 
@@ -6534,6 +6755,7 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		zenith_apply_profile(t, target);
 		t->active_profile = target;
 		z_policy->at_local_actions = false;
+		z_policy->at_local_glides_active = false;
 		/* Profile mutated tunables->{up,down}_rate_limit_us;
 		 * refresh the per-policy rate-delay cache for *this*
 		 * policy so the new limits take effect on the next tick.
@@ -6610,6 +6832,34 @@ static ssize_t auto_tune_v2_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr auto_tune_v2 = __ATTR_RW(auto_tune_v2);
+
+/* auto_tune_v2_glides sysfs knob.  Boolean (0/1).  See
+ * ZENITH_DEFAULT_AUTO_TUNE_V2_GLIDES.  Master gate for V2-driven
+ * population of the round-U-z10 glide / coordination knobs;
+ * defaults to 1 so the new soft-glide behaviour is on out of the
+ * box without forcing operators to write seven separate sysfs
+ * entries.  Per-knob user writes still take precedence.
+ */
+static ssize_t auto_tune_v2_glides_show(struct gov_attr_set *attr_set,
+					char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_tune_v2_glides);
+}
+
+static ssize_t auto_tune_v2_glides_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->auto_tune_v2_glides = val;
+	return count;
+}
+static struct governor_attr auto_tune_v2_glides =
+	__ATTR_RW(auto_tune_v2_glides);
 
 static ssize_t auto_tune_hysteresis_windows_show(struct gov_attr_set *attr_set,
 						 char *buf)
@@ -6946,7 +7196,8 @@ static ssize_t auto_tune_status_show(struct gov_attr_set *attr_set, char *buf)
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "auto_tune=%u\n", t->auto_tune);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
-			 "auto_tune_v2=%u\n", t->auto_tune_v2);
+			 "auto_tune_v2=%u glides=%u\n",
+			 t->auto_tune_v2, t->auto_tune_v2_glides);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "v2_knobs=cluster:%u signals:%u thermal_slope:%u frame:%u gaming:%u\n",
 			 t->auto_tune_cluster_aware,
@@ -9180,6 +9431,7 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_reset_overrides.attr,
 	&auto_tune.attr,
 	&auto_tune_v2.attr,
+	&auto_tune_v2_glides.attr,
 	&auto_tune_hysteresis_windows.attr,
 	&auto_tune_cooldown_windows.attr,
 	&auto_tune_cluster_aware.attr,
@@ -9383,6 +9635,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->auto_tune_hi_events_x2 = ZENITH_DEFAULT_AT_HI_EVENTS_X2;
 	tunables->auto_tune_lo_events_x2 = ZENITH_DEFAULT_AT_LO_EVENTS_X2;
 	tunables->auto_tune_v2		= ZENITH_DEFAULT_AUTO_TUNE_V2;
+	tunables->auto_tune_v2_glides	= ZENITH_DEFAULT_AUTO_TUNE_V2_GLIDES;
 	tunables->auto_tune_hysteresis_windows =
 		ZENITH_DEFAULT_AT_HYSTERESIS_WINDOWS;
 	tunables->auto_tune_cooldown_windows =
