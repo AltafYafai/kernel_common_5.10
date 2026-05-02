@@ -862,13 +862,26 @@ Frame pacing
     floor (and the auto-tune V2 classifier's ``frame_active`` flag)
     use the drm-side cached vblank period instead of the
     userspace-set ``frame_budget_us`` whenever the cache is non-zero.
-    The cache is populated by display drivers via the exported
-    kernel API ``zenith_set_drm_vblank_us(unsigned int us)``;
-    drivers that own the active panel mode (drm-bridge, mipi-dsi
-    panel, vendor display HALs upstreaming via drm) call it on every
-    vblank-period change.  Falls back to ``frame_budget_us`` silently
-    when the cache is empty so existing userspace-driven tunings keep
-    working.
+
+    The cache is populated automatically by the drm core: every call
+    to ``drm_calc_timestamping_constants()`` (i.e. every panel mode
+    set, including refresh-rate switches) feeds the just-computed
+    ``framedur_ns`` into the exported kernel API
+    ``zenith_set_drm_vblank_us(unsigned int us)``.  Any drm-based
+    display path -- drm-bridge, mipi-dsi panel, vendor display HALs
+    upstreaming via drm, msm_drm, mtk_drm, etc. -- gets the auto
+    refresh-rate handoff for free; no per-driver hooks required.
+
+    Drivers may also call ``zenith_set_drm_vblank_us()`` directly
+    (e.g. before the timestamping constants are recomputed, for
+    cases where the panel period is known earlier).  Manual writes
+    win: each call simply overwrites the cache.
+
+    Falls back to ``frame_budget_us`` silently when the cache is
+    empty so existing userspace-driven tunings keep working.  The
+    drm hook does not publish a 0 cache on mode disable (dotclock
+    == 0) so a CRTC teardown does not clobber another CRTC's
+    still-active value.
 
 ``drm_vblank_us``
     Read-only.  Reports the most recent vblank period (in

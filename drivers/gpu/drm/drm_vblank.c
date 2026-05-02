@@ -24,6 +24,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include <linux/cpufreq_zenith.h>
 #include <linux/export.h>
 #include <linux/kthread.h>
 #include <linux/moduleparam.h>
@@ -646,6 +647,18 @@ void drm_calc_timestamping_constants(struct drm_crtc *crtc,
 		     mode->crtc_vtotal, mode->crtc_vdisplay);
 	drm_dbg_core(dev, "crtc %u: clock %d kHz framedur %d linedur %d\n",
 		     crtc->base.id, dotclock, framedur_ns, linedur_ns);
+
+	/* Publish the just-computed framedur to the zenith cpufreq
+	 * governor's adaptive frame-budget cache so frame_budget_us_auto
+	 * can drop the wall-clock guess and use the real panel period.
+	 * Stub-out via the linux/cpufreq_zenith.h header when zenith is
+	 * not built; otherwise the call is lock-free and safe from any
+	 * context (it is a single atomic_set).  Skip the publish when
+	 * framedur_ns is 0 (mode disable path: dotclock == 0) so a CRTC
+	 * teardown does not clobber another CRTC's still-active cache.
+	 */
+	if (framedur_ns > 0)
+		zenith_set_drm_vblank_us((unsigned int)(framedur_ns / 1000));
 }
 EXPORT_SYMBOL(drm_calc_timestamping_constants);
 
