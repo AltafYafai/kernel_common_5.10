@@ -383,6 +383,13 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_PREFER_SILVER_HOT_BUMP_PCT		5
 #define ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT			20
 
+/* brutal_decay_ms upper bound.  500ms is generous: a longer window
+ * is functionally indistinguishable from "no cliff exit" because
+ * the underlying EAS / load signal will move the floor anyway.
+ */
+#define ZENITH_DEFAULT_BRUTAL_DECAY_MS				0
+#define ZENITH_BRUTAL_DECAY_MS_MAX				500
+
 /* thermal_util_derate (default 1, on):
  *
  * When set, zenith_get_util() scales down its output by the
@@ -1230,6 +1237,20 @@ struct zenith_tunables {
 	 */
 	unsigned int		brutal_entry_streak;
 
+	/* Tail-decay window for the brutal-hold cliff exit, in
+	 * milliseconds.  0 (default) preserves the historical hard-exit
+	 * behaviour: the moment load_pct drops below the (possibly
+	 * adaptive-shaped) eff_down threshold, brutal_active is cleared
+	 * and the next sample's freq is whatever the EAS proportional
+	 * math returns.  Non-zero arms a linear glide: policy->max at
+	 * arm time, decaying toward the EAS-computed freq over
+	 * brutal_decay_ms.  Eliminates the audible / visible drop that
+	 * otherwise happens at the moment of cliff exit, especially on
+	 * loads with bursty PELT signals.  Capped at
+	 * ZENITH_BRUTAL_DECAY_MS_MAX in the sysfs store.
+	 */
+	unsigned int		brutal_decay_ms;
+
 	/* Secondary up_threshold applied only when policy->cur has
 	 * already climbed to hispeed_freq or above. 0 disables the
 	 * substitution and falls back to up_threshold at every bin.
@@ -1819,6 +1840,15 @@ struct zenith_policy {
 	struct zenith_at_log_entry at_log[ZENITH_AT_LOG_NR];
 	unsigned int		at_log_head;
 	unsigned int		at_log_count;
+
+	/* brutal_decay_ms tail-glide deadline.  0 means no decay is
+	 * armed and zenith_get_next_freq() takes the fast path; non-zero
+	 * is an absolute ktime_get_ns() value at which the decay floor
+	 * stops applying.  Single-writer (zenith_get_next_freq() under
+	 * the policy's update_lock), single-reader (same site).
+	 */
+	u64			brutal_decay_until_ns;
+	unsigned int		brutal_decay_arm_ms;
 
 	/* prefer_silver_aware coordination state.  Snapshot of the
 	 * global prefer_silver hit / miss counters at the previous V1
@@ -3779,6 +3809,27 @@ brutal_entry_deferred:
 			}
 		}
 
+		/* Brutal-hold cliff exit.  When tunables->brutal_decay_ms
+		 * is non-zero, arm a tail-glide deadline so the EAS
+		 * post-floor below tapers freq from policy->max down to
+		 * the load-dependent target across the configured window
+		 * instead of cliff-dropping in a single tick.  The
+		 * deadline is sticky: it survives until either expired
+		 * or replaced by a fresh brutal-hold re-entry (which
+		 * implicitly clears it on the next exit).  No-op when
+		 * brutal_decay_ms == 0.
+		 */
+		if (z_policy->brutal_active &&
+		    z_policy->tunables->brutal_decay_ms) {
+			unsigned int decay_ms =
+				z_policy->tunables->brutal_decay_ms;
+
+			if (decay_ms > ZENITH_BRUTAL_DECAY_MS_MAX)
+				decay_ms = ZENITH_BRUTAL_DECAY_MS_MAX;
+			z_policy->brutal_decay_arm_ms = decay_ms;
+			z_policy->brutal_decay_until_ns = ktime_get_ns() +
+				(u64)decay_ms * NSEC_PER_MSEC;
+		}
 		z_policy->brutal_active = false;
 	}
 
@@ -3789,6 +3840,39 @@ brutal_entry_deferred:
 		freq = policy->cur + (policy->cur >> 2); 
 
 	freq = map_util_freq(util, freq, max_cap);
+
+	/* 2a. Brutal-hold tail glide.  When the cliff exit above armed
+	 * a brutal_decay_ms deadline, linearly interpolate a floor
+	 * between policy->max (at arm time) and the EAS-computed freq
+	 * (at expiry).  Eliminates the audible / visible drop that the
+	 * legacy cliff produces on bursty workloads.  Self-disarms once
+	 * the deadline passes.  When the deadline is unarmed (the
+	 * common case), this whole block is a single zero-test branch.
+	 */
+	if (z_policy->brutal_decay_until_ns) {
+		u64 now = ktime_get_ns();
+
+		if (now >= z_policy->brutal_decay_until_ns) {
+			z_policy->brutal_decay_until_ns = 0;
+			z_policy->brutal_decay_arm_ms = 0;
+		} else if (z_policy->brutal_decay_arm_ms) {
+			u64 total_ns = (u64)z_policy->brutal_decay_arm_ms *
+				NSEC_PER_MSEC;
+			u64 remaining_ns =
+				z_policy->brutal_decay_until_ns - now;
+			unsigned int max_freq = policy->max;
+			u64 span;
+
+			if (max_freq > freq && total_ns) {
+				span = (u64)(max_freq - freq) * remaining_ns;
+				span = div64_u64(span, total_ns);
+				if ((u64)freq + span > max_freq)
+					freq = max_freq;
+				else
+					freq = freq + (unsigned int)span;
+			}
+		}
+	}
 
 	/* 2b. Hispeed floor — intermediate snap tier.
 	 *
@@ -7736,6 +7820,31 @@ static ssize_t brutal_entry_streak_store(struct gov_attr_set *attr_set,
 static struct governor_attr brutal_entry_streak =
 	__ATTR_RW(brutal_entry_streak);
 
+/* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
+ * 0 disables the tail-glide and restores the legacy hard cliff
+ * exit; non-zero arms a linear ramp from policy->max down to the
+ * EAS-computed freq across the configured window on every
+ * brutal-hold cliff exit.  See struct zenith_tunables for details.
+ */
+static ssize_t brutal_decay_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->brutal_decay_ms);
+}
+
+static ssize_t brutal_decay_ms_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_BRUTAL_DECAY_MS_MAX)
+		return -EINVAL;
+	t->brutal_decay_ms = val;
+	return count;
+}
+static struct governor_attr brutal_decay_ms = __ATTR_RW(brutal_decay_ms);
+
 static ssize_t climb_mode_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->climb_mode);
@@ -8622,6 +8731,7 @@ static struct attribute *zenith_attrs[] = {
 	&hispeed_hyst_pct.attr,
 	&hispeed_entry_streak.attr,
 	&brutal_entry_streak.attr,
+	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
 	&freq_step_adaptive.attr,
@@ -8868,6 +8978,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PREFER_SILVER_HOT_THRESHOLD_PCT;
 	tunables->prefer_silver_hot_bump_pct =
 		ZENITH_DEFAULT_PREFER_SILVER_HOT_BUMP_PCT;
+	tunables->brutal_decay_ms	= ZENITH_DEFAULT_BRUTAL_DECAY_MS;
 	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
 	tunables->thermal_derate_rate_pct = ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT;
 	tunables->freq_stability_margin_pct = ZENITH_DEFAULT_FREQ_STABILITY_MARGIN_PCT;

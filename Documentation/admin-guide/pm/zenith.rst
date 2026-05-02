@@ -191,6 +191,19 @@ Hispeed ladder
     for N+1 consecutive samples before activating.  Default 0 (off,
     legacy single-sample entry), range 0..ZENITH_HISPEED_ENTRY_STREAK_MAX.
 
+``brutal_decay_ms``
+    Tail-glide window in milliseconds (0..500, default 0).  When 0,
+    the brutal-hold cliff exit is the legacy hard cliff: the moment
+    ``load_pct`` drops below the (possibly adaptive-shaped) effective
+    down threshold, ``brutal_active`` is cleared and the next sample's
+    ``freq`` is whatever the EAS proportional math returns.  When
+    non-zero, the cliff exit instead arms a linear glide: ``policy->max``
+    at arm time, decaying toward the EAS-computed ``freq`` over
+    ``brutal_decay_ms``.  Eliminates the audible / visible drop that
+    the legacy cliff produces on bursty workloads.  The glide self-
+    disarms once the deadline passes; while disarmed (the common case)
+    the post-EAS check is a single zero-test branch.
+
 ``brutal_entry_streak``
     Same idea for the brutality tier (snap-to-max).  Only gates
     ``climb_mode = SNAP``; STEP mode is unaffected.  Default 0 (off).
