@@ -699,6 +699,26 @@ Frame pacing
     raises a brief floor on ``policy->max`` to recover.  60 Hz =
     16667, 90 Hz = 11111, 120 Hz = 8333.  Default 0 (off).
 
+``frame_budget_us_auto``
+    Boolean (0/1, default 0).  When 1, the adaptive frame-budget
+    floor (and the auto-tune V2 classifier's ``frame_active`` flag)
+    use the drm-side cached vblank period instead of the
+    userspace-set ``frame_budget_us`` whenever the cache is non-zero.
+    The cache is populated by display drivers via the exported
+    kernel API ``zenith_set_drm_vblank_us(unsigned int us)``;
+    drivers that own the active panel mode (drm-bridge, mipi-dsi
+    panel, vendor display HALs upstreaming via drm) call it on every
+    vblank-period change.  Falls back to ``frame_budget_us`` silently
+    when the cache is empty so existing userspace-driven tunings keep
+    working.
+
+``drm_vblank_us``
+    Read-only.  Reports the most recent vblank period (in
+    microseconds) published by drm via
+    ``zenith_set_drm_vblank_us()``.  0 means no driver has reported
+    yet; useful as a sanity check when ``frame_budget_us_auto`` is
+    enabled.
+
 ``frame_budget_us_per_policy``
     CSV override of ``frame_budget_us`` per policy (e.g.
     ``policy0=16667,policy4=8333``).  Empty = use the global

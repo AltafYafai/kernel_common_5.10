@@ -977,6 +977,26 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_FRAME_BUDGET_US		0
 #define ZENITH_FRAME_BUDGET_US_MAX		50000
 
+/* frame_budget_us_auto (default 0, off):
+ *
+ * When 1, the adaptive frame-budget floor in zenith_get_next_freq()
+ * uses the cached refresh-rate value at zenith_drm_vblank_us in
+ * preference to tunables->frame_budget_us / the per-policy override.
+ * The cached value is the most recent vblank period (in us) reported
+ * by the display driver via the exported zenith_set_drm_vblank_us()
+ * kernel API; when zero (driver hasn't reported yet) the auto path
+ * falls back to the userspace-set frame_budget_us so existing
+ * tunings keep working.
+ *
+ * The "_drm" naming reflects the source of truth: any driver that
+ * owns the active panel mode (drm-bridge, mipi-dsi panel, or vendor
+ * display HAL upstreaming via drm) calls zenith_set_drm_vblank_us()
+ * on every vblank-period change.  Eliminates the userspace
+ * round-trip that otherwise loses 90 / 120 / 144 Hz bumps until the
+ * HAL relays them to /sys/devices/.../zenith/frame_budget_us.
+ */
+#define ZENITH_DEFAULT_FRAME_BUDGET_US_AUTO	0
+
 /* frame_budget_us_per_policy (default empty, off):
  *
  * frame_budget_us is global -- one vblank period applied to every
@@ -1678,6 +1698,16 @@ struct zenith_tunables {
 	 */
 	unsigned int		frame_budget_us;
 
+	/* See ZENITH_DEFAULT_FRAME_BUDGET_US_AUTO.  When 1, the adaptive
+	 * frame-budget floor uses the cached drm-side vblank period
+	 * (zenith_drm_vblank_us) instead of frame_budget_us /
+	 * frame_budget_us_per_policy whenever the cached value is
+	 * non-zero.  Lets a drm panel driver populate the rate without
+	 * a userspace round-trip.  0 (default) preserves the legacy
+	 * userspace-driven behaviour exactly.
+	 */
+	unsigned int		frame_budget_us_auto;
+
 	/* See ZENITH_DEFAULT_FRAME_BUDGET_US/ frame_budget_us_per_policy
 	 * comment block.  Indexed by cpumask_first(policy->cpus).  A
 	 * non-zero entry overrides frame_budget_us for that policy;
@@ -1695,6 +1725,41 @@ struct zenith_tunables {
  * with atomic64_read so no governor lock is needed in the producer.
  */
 static atomic64_t zenith_input_boost_until_ns = ATOMIC64_INIT(0);
+
+/*
+ * Cached drm-panel vblank period, in microseconds.  Producer:
+ * display drivers / panel bridges call zenith_set_drm_vblank_us()
+ * whenever the active vblank period changes (e.g. on a 60->120Hz
+ * mode switch in DRM).  Consumer: zenith_get_next_freq()'s
+ * adaptive frame-budget floor when tunables->frame_budget_us_auto
+ * is non-zero.  Zero means "no driver reported yet"; the auto path
+ * then falls back to the userspace-set frame_budget_us so existing
+ * tunings keep working.
+ *
+ * Lockless read on the consumer side; producers use atomic_set()
+ * with no ordering requirements other than "the latest write wins".
+ */
+static atomic_t zenith_drm_vblank_us = ATOMIC_INIT(0);
+
+/**
+ * zenith_set_drm_vblank_us - publish active panel vblank period to zenith
+ * @us: vblank period in microseconds; 0 clears the cache.
+ *
+ * Display drivers / drm-panel bridges call this whenever the active
+ * panel's vblank period changes (e.g. 60 -> 120Hz switch via
+ * drm_atomic_commit_tail).  Lock-free; safe to call from any context
+ * including atomic.  Values larger than ZENITH_FRAME_BUDGET_US_MAX
+ * (50ms, ~20Hz) are silently clamped down because anything above
+ * that is past the useful rate-shaping range and would push the
+ * eff_pct calculation in the consumer to 0 anyway.
+ */
+void zenith_set_drm_vblank_us(unsigned int us)
+{
+	if (us > ZENITH_FRAME_BUDGET_US_MAX)
+		us = ZENITH_FRAME_BUDGET_US_MAX;
+	atomic_set(&zenith_drm_vblank_us, (int)us);
+}
+EXPORT_SYMBOL_GPL(zenith_set_drm_vblank_us);
 static unsigned int zenith_input_boost_active_ms = ZENITH_DEFAULT_INPUT_BOOST_MS;
 
 /* Monotonically-increasing global count of qualifying input events seen
@@ -4238,6 +4303,22 @@ brutal_entry_deferred:
 			budget_us =
 			  READ_ONCE(z_policy->tunables->frame_budget_us);
 
+		/* frame_budget_us_auto: when 1, prefer the drm-side
+		 * cached vblank period over the userspace-set value.
+		 * Drivers populate it via zenith_set_drm_vblank_us().
+		 * The auto path falls back to budget_us silently when
+		 * the cache is empty (e.g. boot before drm has made
+		 * its first commit), so the floor still works on
+		 * stock-tuned systems where userspace writes the rate.
+		 */
+		if (READ_ONCE(z_policy->tunables->frame_budget_us_auto)) {
+			unsigned int auto_us = (unsigned int)
+				atomic_read(&zenith_drm_vblank_us);
+
+			if (auto_us)
+				budget_us = auto_us;
+		}
+
 		if (budget_us && base_pct) {
 			unsigned int eff_pct;
 			unsigned int fp_floor;
@@ -6257,6 +6338,20 @@ static void zenith_auto_tune_work(struct work_struct *w)
 					t->frame_budget_us_per_policy[anchor]);
 			if (!frame_budget_us)
 				frame_budget_us = READ_ONCE(t->frame_budget_us);
+			/* Mirror the hot-path frame_budget_us_auto override
+			 * so the V2 classifier sees the same effective
+			 * budget as the floor itself (which already prefers
+			 * the drm-side cache).  Without this, V2 would
+			 * miss frame_active on auto setups whose userspace
+			 * frame_budget_us is left at 0.
+			 */
+			if (READ_ONCE(t->frame_budget_us_auto)) {
+				unsigned int auto_us = (unsigned int)
+					atomic_read(&zenith_drm_vblank_us);
+
+				if (auto_us)
+					frame_budget_us = auto_us;
+			}
 			frame_active = frame_budget_us &&
 				       READ_ONCE(t->frame_pace_floor_pct);
 			if (frame_active)
@@ -8853,6 +8948,47 @@ static ssize_t frame_budget_us_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr frame_budget_us = __ATTR_RW(frame_budget_us);
 
+/* frame_budget_us_auto sysfs knob.  Boolean (0/1).  When 1, the
+ * adaptive frame-budget floor and the auto-tune V2 classifier both
+ * prefer the drm-side cached vblank period (zenith_drm_vblank_us)
+ * over the userspace-set frame_budget_us.  Falls back to the
+ * userspace value when the cache is empty so existing tunings keep
+ * working on systems whose drm driver doesn't yet call
+ * zenith_set_drm_vblank_us().
+ */
+static ssize_t frame_budget_us_auto_show(struct gov_attr_set *attr_set,
+					 char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->frame_budget_us_auto);
+}
+
+static ssize_t frame_budget_us_auto_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->frame_budget_us_auto, val);
+	return count;
+}
+static struct governor_attr frame_budget_us_auto =
+	__ATTR_RW(frame_budget_us_auto);
+
+/* drm_vblank_us read-only debug knob.  Mirrors the cached
+ * zenith_drm_vblank_us atomic so userspace can verify the drm
+ * driver actually called zenith_set_drm_vblank_us().  Read-only:
+ * userspace tuning should write frame_budget_us instead.
+ */
+static ssize_t drm_vblank_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       (unsigned int)atomic_read(&zenith_drm_vblank_us));
+}
+static struct governor_attr drm_vblank_us = __ATTR_RO(drm_vblank_us);
+
 /* frame_budget_us_per_policy sysfs knob.  CSV "cpu:budget_us[,...]"
  * with the per-policy override semantics described in the comment
  * block at the top of the file.  Empty write clears all overrides.
@@ -9122,6 +9258,8 @@ static struct attribute *zenith_attrs[] = {
 	&boot_boost_ms.attr,
 	&boot_boost_decay_ms.attr,
 	&frame_budget_us.attr,
+	&frame_budget_us_auto.attr,
+	&drm_vblank_us.attr,
 	&frame_budget_us_per_policy.attr,
 	&frame_pace_floor_pct.attr,
 	NULL
@@ -9328,6 +9466,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->boot_boost_ms		= ZENITH_DEFAULT_BOOT_BOOST_MS;
 	tunables->boot_boost_decay_ms	= ZENITH_DEFAULT_BOOT_BOOST_DECAY_MS;
 	tunables->frame_budget_us	= ZENITH_DEFAULT_FRAME_BUDGET_US;
+	tunables->frame_budget_us_auto	= ZENITH_DEFAULT_FRAME_BUDGET_US_AUTO;
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
