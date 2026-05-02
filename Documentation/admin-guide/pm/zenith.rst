@@ -844,7 +844,7 @@ Game mode::
                        ``cpu_curr->comm``.  Defaults seeded with
                        ``UnityMain``, ``UnityGfxDeviceW``, ``il2cpp``,
                        ``GameThread``.  Same RCU-swap semantics as
-                       ``render_comms`` / ``audio_comms`` / 
+                       ``render_comms`` / ``audio_comms`` /
                        ``camera_comms``.  Write empty string to
                        reset to the seed list.
 
