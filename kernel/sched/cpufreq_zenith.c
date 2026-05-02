@@ -365,6 +365,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE	0
 #define ZENITH_DEFAULT_THERMAL_AUTO		1
 #define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
+#define ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS	0
 
 /* thermal_util_derate (default 1, on):
  *
@@ -1301,6 +1302,15 @@ struct zenith_tunables {
 	 * thermal_state=1 written from userspace still forces it.
 	 */
 	unsigned int		thermal_auto;
+
+	/* When 1, replace the binary "thermal_active -> dynamic_up_thresh
+	 * = 90" cliff with a linear ramp from up_threshold (cool, 0%
+	 * pressure) to 90 (hot, 100% pressure).  Smooths long-session
+	 * thermal throttling so users don't perceive a step in
+	 * frequency the moment thermal_active flips on.  Default 0 to
+	 * preserve legacy cliff behaviour for existing tunings.
+	 */
+	unsigned int		thermal_pressure_continuous;
 
 	/* See ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block.  When
 	 * set, zenith_get_util() scales util_out by the (cap - pressure)
@@ -3308,7 +3318,32 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		 */
 		z_policy->brutal_active = false;
 	} else if (zenith_thermal_active(z_policy)) {
-		dynamic_up_thresh = 90; /* Relaxed for thermals */
+		/* Hot.  Default behaviour: snap dynamic_up_thresh to 90
+		 * (the legacy cliff).  When thermal_pressure_continuous
+		 * is set, ramp from the policy's normal up_threshold
+		 * (at 0%% pressure) to 90 (at 100%% pressure) using the
+		 * same arch_scale_thermal_pressure()-derived percentage
+		 * the auto-tune V2 classifier uses; that removes the
+		 * audible / observable step that otherwise happens the
+		 * moment thermal_active flips on after a long burst.
+		 */
+		if (z_policy->tunables->thermal_pressure_continuous) {
+			unsigned int floor = zenith_tunable_or_local(z_policy,
+				z_policy->tunables->up_threshold,
+				z_policy->at_effective_up_threshold);
+			unsigned int pct =
+				zenith_policy_thermal_pressure_pct(z_policy);
+
+			if (pct > 100)
+				pct = 100;
+			if (floor < 90)
+				dynamic_up_thresh = floor +
+					((90U - floor) * pct) / 100U;
+			else
+				dynamic_up_thresh = floor;
+		} else {
+			dynamic_up_thresh = 90; /* Relaxed for thermals */
+		}
 	} else if (z_policy->tunables->up_threshold_hispeed &&
 		   zenith_eff_hispeed_freq(z_policy) &&
 		   policy->cur >= zenith_eff_hispeed_freq(z_policy)) {
@@ -6676,6 +6711,35 @@ static ssize_t thermal_auto_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr thermal_auto = __ATTR_RW(thermal_auto);
 
+/* thermal_pressure_continuous sysfs knob.  Strict 0/1 boolean.  When
+ * 1, dynamic_up_thresh ramps linearly from the policy's normal
+ * up_threshold (at 0 %% thermal pressure) to 90 (at 100 %% thermal
+ * pressure) instead of cliff-jumping to 90 the instant
+ * zenith_thermal_active() flips true.  See the field comment on
+ * struct zenith_tunables for the rationale.
+ */
+static ssize_t thermal_pressure_continuous_show(struct gov_attr_set *attr_set,
+						char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->thermal_pressure_continuous);
+}
+
+static ssize_t thermal_pressure_continuous_store(struct gov_attr_set *attr_set,
+						 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->thermal_pressure_continuous = val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr thermal_pressure_continuous =
+	__ATTR_RW(thermal_pressure_continuous);
+
 /* thermal_util_derate sysfs knob.  Strict 0/1 boolean.  See the
  * ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block for semantics.
  */
@@ -8351,6 +8415,7 @@ static struct attribute *zenith_attrs[] = {
 	&screen_auto.attr,
 	&thermal_state.attr,
 	&thermal_auto.attr,
+	&thermal_pressure_continuous.attr,
 	&thermal_util_derate.attr,
 	&thermal_derate_rate_pct.attr,
 	&freq_stability_margin_pct.attr,
@@ -8549,6 +8614,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->screen_auto		= 1;
 	tunables->thermal_state		= 0;
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
+	tunables->thermal_pressure_continuous =
+		ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS;
 	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
 	tunables->thermal_derate_rate_pct = ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT;
 	tunables->freq_stability_margin_pct = ZENITH_DEFAULT_FREQ_STABILITY_MARGIN_PCT;

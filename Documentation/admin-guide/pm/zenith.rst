@@ -467,6 +467,22 @@ Environment hooks
     must define ``CONFIG_DRM_PANEL_NOTIFY=y`` and provide the
     matching ``<drm/drm_panel_notifier.h>`` header to opt in.
 
+``thermal_pressure_continuous``
+    Boolean (0/1, default 0).  When 0, ``zenith`` uses the legacy
+    cliff: as soon as ``zenith_thermal_active()`` becomes true,
+    ``dynamic_up_thresh`` snaps to 90 % regardless of the actual
+    pressure level.  When 1, ``dynamic_up_thresh`` ramps linearly
+    from the policy's ``up_threshold`` (at 0 % pressure) to 90 % (at
+    100 % pressure), using the same
+    ``arch_scale_thermal_pressure()``-derived percentage that the
+    auto-tune V2 classifier consumes.  Smooths long-session thermal
+    throttling: removes the audible / visible step that would
+    otherwise occur the moment ``thermal_state`` flips on after a
+    long burst.  The ramp end-points are intentionally hard-coded to
+    match the cliff target so the new continuous mode never asks
+    for a higher frequency than the legacy cliff would have allowed
+    at peak pressure.
+
 ``thermal_state``
     Userspace / notifier-driven flag indicating thermal pressure.
     1 = hot, 0 = cool (default).  When 1, ``up_threshold`` is
