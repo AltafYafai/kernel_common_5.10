@@ -1153,6 +1153,13 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * Recommended init.rc tune: 30000 (30 s).
  */
 #define ZENITH_DEFAULT_BOOT_BOOST_MS		0
+
+/* boot_boost_decay_ms upper bound.  30s is enough for the slowest
+ * Android cold-boot animation; anything longer would conflict with
+ * the screen_off detection that may legitimately follow boot.
+ */
+#define ZENITH_DEFAULT_BOOT_BOOST_DECAY_MS	0
+#define ZENITH_BOOT_BOOST_DECAY_MS_MAX		30000
 #define ZENITH_BOOT_BOOST_MAX_MS		300000
 
 /* uclamp_max_respect (default 1): symmetric counterpart to
@@ -1631,6 +1638,18 @@ struct zenith_tunables {
 
 	/* See ZENITH_DEFAULT_BOOT_BOOST_MS. 0 disables the one-shot. */
 	unsigned int		boot_boost_ms;
+
+	/* Trailing decay window for boot_boost, in milliseconds.  When 0
+	 * (default), the boot-boost ends as a hard cliff at
+	 * boot_boost_ms.  When non-zero, after boot_boost_ms expires
+	 * zenith_get_next_freq() applies a linear floor that ramps from
+	 * policy->max down to policy->min over boot_boost_decay_ms,
+	 * mirroring input_boost_decay_ms's tail behaviour.  Useful when
+	 * userspace boot animations or surface-flinger initial paints
+	 * land just past boot_boost_ms and would otherwise see the
+	 * sudden drop.  Capped at ZENITH_BOOT_BOOST_DECAY_MS_MAX.
+	 */
+	unsigned int		boot_boost_decay_ms;
 
 	/* See ZENITH_DEFAULT_FRAME_BUDGET_US. Userspace writes the
 	 * current vblank period in microseconds.  0 disables.
@@ -4044,13 +4063,46 @@ brutal_entry_deferred:
 	    z_policy->tunables->screen_state &&
 	    (!z_policy->tunables->input_boost_big_only ||
 	     z_policy->is_big_cluster)) {
+		u64 boot_now = ktime_get_boottime_ns();
 		u64 deadline_ns = (u64)z_policy->tunables->boot_boost_ms *
 				  NSEC_PER_MSEC;
 
-		if (ktime_get_boottime_ns() < deadline_ns) {
+		if (boot_now < deadline_ns) {
 			if (freq < policy->max) {
 				freq = policy->max;
 				tp_path = "boot_boost";
+			}
+		} else if (z_policy->tunables->boot_boost_decay_ms) {
+			/* Boot-boost decay tail.  Mirror of input_boost's
+			 * decay phase but pinned to wall-clock boottime so
+			 * the ramp shape is independent of how often
+			 * zenith_get_next_freq() runs.  Linearly drops a
+			 * floor from policy->max to policy->min across
+			 * boot_boost_decay_ms after the hard pin window
+			 * expires; eliminates the cliff that otherwise
+			 * dumps boot freq from policy->max to load-derived
+			 * the moment boot_boost_ms passes.
+			 */
+			unsigned int decay_ms =
+				z_policy->tunables->boot_boost_decay_ms;
+			u64 decay_ns = (u64)decay_ms * NSEC_PER_MSEC;
+			u64 elapsed_post = boot_now - deadline_ns;
+
+			if (decay_ns && elapsed_post < decay_ns) {
+				u64 span = policy->max - policy->min;
+				u64 dropped = div64_u64(span * elapsed_post,
+							decay_ns);
+				unsigned int floor_freq;
+
+				if (dropped >= span)
+					floor_freq = policy->min;
+				else
+					floor_freq = policy->max -
+						     (unsigned int)dropped;
+				if (freq < floor_freq) {
+					freq = floor_freq;
+					tp_path = "boot_boost_decay";
+				}
 			}
 		}
 	}
@@ -8617,6 +8669,35 @@ static ssize_t boot_boost_ms_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr boot_boost_ms = __ATTR_RW(boot_boost_ms);
 
+/* boot_boost_decay_ms sysfs knob.  Range
+ * 0..ZENITH_BOOT_BOOST_DECAY_MS_MAX.  See struct zenith_tunables for
+ * semantics.  Mirror of input_boost_decay_ms but for the boot-pin
+ * window: 0 keeps the legacy hard cliff at boot_boost_ms, non-zero
+ * applies a linear floor ramp from policy->max to policy->min after
+ * the pin expires.
+ */
+static ssize_t boot_boost_decay_ms_show(struct gov_attr_set *attr_set,
+					char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->boot_boost_decay_ms);
+}
+
+static ssize_t boot_boost_decay_ms_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_BOOT_BOOST_DECAY_MS_MAX)
+		return -EINVAL;
+	t->boot_boost_decay_ms = val;
+	return count;
+}
+static struct governor_attr boot_boost_decay_ms =
+	__ATTR_RW(boot_boost_decay_ms);
+
 /* frame_budget_us sysfs knob.  Range 0..ZENITH_FRAME_BUDGET_US_MAX
  * (50 ms).  Userspace writes the current vblank period in
  * microseconds whenever the panel changes refresh rate.  0 disables
@@ -8911,6 +8992,7 @@ static struct attribute *zenith_attrs[] = {
 	&psi_cpu_thresh.attr,
 	&psi_io_thresh.attr,
 	&boot_boost_ms.attr,
+	&boot_boost_decay_ms.attr,
 	&frame_budget_us.attr,
 	&frame_budget_us_per_policy.attr,
 	&frame_pace_floor_pct.attr,
@@ -9115,6 +9197,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->psi_cpu_thresh	= ZENITH_DEFAULT_PSI_CPU_THRESH;
 	tunables->psi_io_thresh		= ZENITH_DEFAULT_PSI_IO_THRESH;
 	tunables->boot_boost_ms		= ZENITH_DEFAULT_BOOT_BOOST_MS;
+	tunables->boot_boost_decay_ms	= ZENITH_DEFAULT_BOOT_BOOST_DECAY_MS;
 	tunables->frame_budget_us	= ZENITH_DEFAULT_FRAME_BUDGET_US;
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);

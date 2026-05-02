@@ -413,6 +413,17 @@ Input boost
     Default 100 (no cap).  Set lower to convert the input boost into
     a softer hispeed pin.
 
+``boot_boost_decay_ms``
+    Trailing decay window for ``boot_boost``, in milliseconds
+    (0..30000, default 0).  When 0, the boot-boost ends as a hard
+    cliff at ``boot_boost_ms``.  When non-zero, after
+    ``boot_boost_ms`` expires the governor applies a linear floor
+    that ramps from ``policy->max`` down to ``policy->min`` over
+    ``boot_boost_decay_ms``, mirroring ``input_boost_decay_ms``'s
+    tail behaviour for the boot pin.  Useful when boot animations
+    or surface-flinger initial paints land just past
+    ``boot_boost_ms`` and would otherwise see the sudden drop.
+
 ``boot_boost_ms``
     One-shot pin to ``policy->max`` for this many ms after boot,
     decays past the deadline.  Gated by ``screen_state`` and
