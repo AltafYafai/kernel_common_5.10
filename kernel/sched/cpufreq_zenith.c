@@ -1154,6 +1154,13 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  */
 #define ZENITH_DEFAULT_BOOT_BOOST_MS		0
 
+/* screen_off_glide_ms upper bound.  2s past the 1->0 transition is
+ * generous: AOD / blanking handlers in Android typically settle in
+ * well under 500ms.  0 keeps the historical cliff exactly.
+ */
+#define ZENITH_DEFAULT_SCREEN_OFF_GLIDE_MS	0
+#define ZENITH_SCREEN_OFF_GLIDE_MS_MAX		2000
+
 /* boot_boost_decay_ms upper bound.  30s is enough for the slowest
  * Android cold-boot animation; anything longer would conflict with
  * the screen_off detection that may legitimately follow boot.
@@ -1347,6 +1354,21 @@ struct zenith_tunables {
 	
 	/* Zenith Environment API */
 	unsigned int		screen_state;   /* 1 = ON, 0 = OFF */
+
+	/* Soft-glide window for the 1 -> 0 transition on screen_state.
+	 * 0 (default) preserves the legacy hard cliff: as soon as
+	 * screen_state is observed at 0, dynamic_up_thresh snaps to
+	 * 95 and dynamic_bias snaps to 500 (the 50%% powersave
+	 * penalty).  Non-zero arms a linear ramp on both: starting
+	 * from the natural up_threshold / powersave_bias at the
+	 * moment screen_state went to 0, climbing to the cliff
+	 * targets over screen_off_glide_ms.  Eliminates the cliff
+	 * that otherwise lands the moment AOD / panel-blank handlers
+	 * stamp screen_state=0 while userspace work is still
+	 * winding down.  Capped at ZENITH_SCREEN_OFF_GLIDE_MS_MAX in
+	 * the sysfs store.
+	 */
+	unsigned int		screen_off_glide_ms;
 
 	/* When 1, zenith subscribes to the fb notifier chain and updates
 	 * screen_state automatically on FB_EVENT_BLANK. screen_state
@@ -1888,6 +1910,18 @@ struct zenith_policy {
 	 */
 	u64			brutal_decay_until_ns;
 	unsigned int		brutal_decay_arm_ms;
+
+	/* screen_off_glide_ms tracking.  screen_state_last is the
+	 * screen_state value seen on the previous zenith_get_next_freq()
+	 * tick; transitions are detected by comparing tunables-> against
+	 * this snapshot.  screen_off_arm_ns is set to ktime_get_ns() at
+	 * the moment of the 1 -> 0 transition and cleared on the
+	 * 0 -> 1 transition; non-zero on the screen-off branch means
+	 * the glide ramp is candidate for application.  Single-writer,
+	 * single-reader (zenith_get_next_freq() under update_lock).
+	 */
+	u64			screen_off_arm_ns;
+	unsigned int		screen_state_last;
 
 	/* prefer_silver_aware coordination state.  Snapshot of the
 	 * global prefer_silver hit / miss counters at the previous V1
@@ -3458,9 +3492,73 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	unsigned long uclamp_max = z_policy->tunables->uclamp_max_respect ?
 		zenith_policy_uclamp_max(z_policy) : SCHED_CAPACITY_SCALE;
 
+	{
+		/* Screen-off glide tracking.  Detect 1 -> 0 / 0 -> 1
+		 * transitions on tunables->screen_state and stamp
+		 * screen_off_arm_ns at the moment we go to 0 so the
+		 * glide block below can interpolate towards the cliff
+		 * targets across screen_off_glide_ms.  Cleared on the
+		 * way back up.  Default 0 leaves both sides unarmed
+		 * which makes this a no-op.
+		 */
+		unsigned int cur_screen = z_policy->tunables->screen_state;
+
+		if (z_policy->screen_state_last && !cur_screen)
+			z_policy->screen_off_arm_ns = ktime_get_ns();
+		else if (!z_policy->screen_state_last && cur_screen)
+			z_policy->screen_off_arm_ns = 0;
+		z_policy->screen_state_last = cur_screen;
+	}
+
 	if (z_policy->tunables->screen_state == 0 && !uclamp_min_meaningful) {
-		dynamic_up_thresh = 95; /* Hard to wake up */
-		dynamic_bias = 500;     /* 50% penalty */
+		unsigned int glide_ms =
+			z_policy->tunables->screen_off_glide_ms;
+		u64 now = z_policy->screen_off_arm_ns ? ktime_get_ns() : 0;
+		u64 elapsed_ns = (z_policy->screen_off_arm_ns &&
+				  now > z_policy->screen_off_arm_ns) ?
+				  now - z_policy->screen_off_arm_ns : 0;
+		u64 glide_ns = (u64)glide_ms * NSEC_PER_MSEC;
+
+		if (glide_ms && glide_ns && elapsed_ns < glide_ns) {
+			/* Glide phase: ramp dynamic_up_thresh from the
+			 * natural up_threshold (at the moment the screen
+			 * went off) up to the legacy 95 cliff target
+			 * across screen_off_glide_ms; mirror the same
+			 * proportional ramp on dynamic_bias from the
+			 * configured powersave_bias up to 500 (50 %%
+			 * penalty).  Eliminates the cliff-on-cliff that
+			 * happens when AOD / blanking handlers stamp
+			 * screen_state=0 while userspace work is still
+			 * winding down.  After glide_ms elapses the next
+			 * tick re-enters this branch with elapsed_ns >=
+			 * glide_ns and the legacy assignments below take
+			 * effect verbatim.
+			 */
+			unsigned int floor =
+				zenith_tunable_or_local(z_policy,
+				    z_policy->tunables->up_threshold,
+				    z_policy->at_effective_up_threshold);
+			unsigned int bias_floor =
+				z_policy->tunables->powersave_bias;
+			u64 t256 = div64_u64(elapsed_ns * 256ULL, glide_ns);
+
+			if (t256 > 256)
+				t256 = 256;
+			if (floor < 95)
+				dynamic_up_thresh = floor +
+				    (unsigned int)(((95U - floor) * t256) >> 8);
+			else
+				dynamic_up_thresh = floor;
+			if (bias_floor < 500)
+				dynamic_bias = bias_floor +
+				    (unsigned int)(((500U - bias_floor) * t256)
+							>> 8);
+			else
+				dynamic_bias = bias_floor;
+		} else {
+			dynamic_up_thresh = 95; /* Hard to wake up */
+			dynamic_bias = 500;     /* 50% penalty */
+		}
 		z_policy->brutal_active = false; /* no hysteresis screen-off */
 	} else if (z_policy->tunables->screen_state == 0) {
 		/* Screen is off but userspace has set a meaningful ADPF
@@ -7039,6 +7137,35 @@ static struct governor_attr at_log = __ATTR_RO(at_log);
 
 ZENITH_TUNABLE_UINT_INVAL(screen_state);
 
+/* screen_off_glide_ms sysfs knob.  Range
+ * 0..ZENITH_SCREEN_OFF_GLIDE_MS_MAX.  See struct zenith_tunables for
+ * semantics.  0 keeps the legacy hard cliff at the screen-state 1->0
+ * edge; non-zero arms a linear ramp on both dynamic_up_thresh and
+ * dynamic_bias from the natural up_threshold / powersave_bias to
+ * the cliff targets across the configured window.
+ */
+static ssize_t screen_off_glide_ms_show(struct gov_attr_set *attr_set,
+					char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->screen_off_glide_ms);
+}
+
+static ssize_t screen_off_glide_ms_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_SCREEN_OFF_GLIDE_MS_MAX)
+		return -EINVAL;
+	t->screen_off_glide_ms = val;
+	return count;
+}
+static struct governor_attr screen_off_glide_ms =
+	__ATTR_RW(screen_off_glide_ms);
+
 static ssize_t screen_auto_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->screen_auto);
@@ -8939,6 +9066,7 @@ static struct attribute *zenith_attrs[] = {
 	&iowait_backoff_after_ms.attr,
 	&ignore_nice_load.attr,
 	&screen_state.attr,
+	&screen_off_glide_ms.attr,
 	&screen_auto.attr,
 	&thermal_state.attr,
 	&thermal_auto.attr,
@@ -9143,6 +9271,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->iowait_backoff_after_ms = ZENITH_DEFAULT_IOWAIT_BACKOFF_AFTER_MS;
 	tunables->ignore_nice_load	= 0;
 	tunables->screen_state		= 1;
+	tunables->screen_off_glide_ms	= ZENITH_DEFAULT_SCREEN_OFF_GLIDE_MS;
 	tunables->screen_auto		= 1;
 	tunables->thermal_state		= 0;
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;

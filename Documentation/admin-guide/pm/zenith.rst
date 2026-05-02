@@ -469,6 +469,18 @@ Environment hooks
     so the governor becomes a very sleepy ondemand.  Also disables
     input boost.
 
+``screen_off_glide_ms``
+    Soft-glide window for the 1 -> 0 transition on ``screen_state``,
+    in milliseconds (0..2000, default 0).  When 0, the screen-off
+    cliff is the legacy hard step: ``dynamic_up_thresh`` snaps to 95
+    and ``dynamic_bias`` snaps to 500 (the 50%% powersave penalty)
+    on the very next sample after ``screen_state`` flips to 0.  When
+    non-zero, both quantities ramp linearly from their natural values
+    (``up_threshold`` / ``powersave_bias``) to the cliff targets
+    across the configured window.  Eliminates the cliff that
+    otherwise lands the moment AOD / panel-blank handlers stamp
+    ``screen_state=0`` while userspace work is still winding down.
+
 ``screen_auto``
     Boolean (0/1, default 1).  When 1, ``zenith`` listens to the fb /
     drm-panel notifier chain and automatically updates
