@@ -451,6 +451,22 @@ Environment hooks
     ``screen_state`` on display blank/unblank.  When 0,
     ``screen_state`` is purely userspace-driven.
 
+    The notifier source is selected at boot in this order:
+
+    1. ``CONFIG_DRM_PANEL_NOTIFY=y`` (vendor builds with a
+       ``drm_panel_notifier_register()`` API): preferred whenever
+       registration succeeds.  ``dmesg`` shows
+       ``screen_auto wired through drm panel notifier``.
+    2. ``CONFIG_FB_NOTIFY=y``: fallback when drm is unavailable or
+       fails registration.  Common on legacy / 5.10-stable trees.
+    3. Neither: ``screen_state`` is bookkeeping-only and only
+       userspace can flip it.  ``dmesg`` says so.
+
+    Stock GKI 5.10 does not ship a drm panel notifier; vendor builds
+    that backport one (Qualcomm / MediaTek / Samsung have their own)
+    must define ``CONFIG_DRM_PANEL_NOTIFY=y`` and provide the
+    matching ``<drm/drm_panel_notifier.h>`` header to opt in.
+
 ``thermal_state``
     Userspace / notifier-driven flag indicating thermal pressure.
     1 = hot, 0 = cool (default).  When 1, ``up_threshold`` is

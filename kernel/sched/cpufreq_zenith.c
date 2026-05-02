@@ -46,6 +46,28 @@
 #undef ACPI_PROBE_TABLE_END
 #include <linux/fb.h>
 #endif
+/*
+ * Optional drm_panel_notifier path.
+ *
+ * The Common Android Kernel 5.10 GKI tree does not ship a drm panel
+ * notifier; it is a vendor-only mechanism (Qualcomm's
+ * drm/drm_panel_notifier.h, MediaTek's panel_event_notifier, etc.).
+ * Vendor builds that backport such a notifier framework can opt in
+ * by defining CONFIG_DRM_PANEL_NOTIFY=y and providing a header at
+ * <drm/drm_panel_notifier.h> that declares:
+ *
+ *     int  drm_panel_notifier_register(struct notifier_block *nb);
+ *     int  drm_panel_notifier_unregister(struct notifier_block *nb);
+ *     enum { DRM_PANEL_EVENT_BLANK = ..., };
+ *     enum { DRM_PANEL_BLANK_UNBLANK = 0, DRM_PANEL_BLANK_POWERDOWN = ..., };
+ *     struct drm_panel_notifier { void *data; };  (data points to int *blank)
+ *
+ * On stock GKI builds the config is undefined and this whole block
+ * compiles out, leaving the legacy CONFIG_FB_NOTIFY path unchanged.
+ */
+#ifdef CONFIG_DRM_PANEL_NOTIFY
+#include <drm/drm_panel_notifier.h>
+#endif
 #include <trace/events/power.h>
 
 #define CREATE_TRACE_POINTS
@@ -8892,13 +8914,36 @@ static struct input_handler zenith_input_handler = {
 
 /************************ FB blank notifier (screen_auto) ********************/
 
+/* Common back-end shared by every panel-event source.
+ *
+ * Both the legacy fb_notifier callback and the optional
+ * drm_panel_notifier callback funnel here so the screen_state write
+ * happens in exactly one place.  Splitting them into a helper also
+ * makes it cheap for vendor / out-of-tree drivers to deliver panel
+ * events directly without registering a notifier (e.g. a vendor
+ * mode-set handler can call this from its own ioctl path; the
+ * function has no module-level dependencies).
+ */
+static void zenith_panel_blank_event(int blank, unsigned int unblank_value)
+{
+	unsigned int new_state = (blank == (int)unblank_value) ? 1 : 0;
+
+	/* All zenith policies share one global_tunables (per-cluster
+	 * clones hold a reference to the same struct), so a single write
+	 * propagates everywhere.
+	 */
+	mutex_lock(&global_tunables_lock);
+	if (global_tunables && global_tunables->screen_auto)
+		WRITE_ONCE(global_tunables->screen_state, new_state);
+	mutex_unlock(&global_tunables_lock);
+}
+
 #ifdef CONFIG_FB_NOTIFY
 static int zenith_fb_notifier_cb(struct notifier_block *nb,
 				 unsigned long action, void *data)
 {
 	struct fb_event *evdata = data;
 	int blank;
-	unsigned int new_state;
 
 	/* FB_EVENT_BLANK is the only blank event defined in
 	 * android-common-5.10. Some older trees also ship
@@ -8911,16 +8956,7 @@ static int zenith_fb_notifier_cb(struct notifier_block *nb,
 		return NOTIFY_OK;
 
 	blank = *(int *)evdata->data;
-	new_state = (blank == FB_BLANK_UNBLANK) ? 1 : 0;
-
-	/* All zenith policies share one global_tunables (per-cluster
-	 * clones hold a reference to the same struct), so a single write
-	 * propagates everywhere.
-	 */
-	mutex_lock(&global_tunables_lock);
-	if (global_tunables && global_tunables->screen_auto)
-		WRITE_ONCE(global_tunables->screen_state, new_state);
-	mutex_unlock(&global_tunables_lock);
+	zenith_panel_blank_event(blank, FB_BLANK_UNBLANK);
 
 	return NOTIFY_OK;
 }
@@ -8931,12 +8967,48 @@ static struct notifier_block zenith_fb_notifier = {
 };
 #endif /* CONFIG_FB_NOTIFY */
 
+#ifdef CONFIG_DRM_PANEL_NOTIFY
+/* drm_panel_notifier callback.
+ *
+ * Called by the vendor drm panel notifier chain on display blank
+ * transitions.  The vendor convention (Qualcomm and most adopters) is
+ * to deliver a struct drm_panel_notifier whose .data field points to
+ * an int holding DRM_PANEL_BLANK_UNBLANK, DRM_PANEL_BLANK_POWERDOWN
+ * or DRM_PANEL_BLANK_LP.  Treat anything that is not UNBLANK as a
+ * powered-off panel so screen_state goes to 0.
+ */
+static int zenith_drm_panel_notifier_cb(struct notifier_block *nb,
+					unsigned long action, void *data)
+{
+	struct drm_panel_notifier *evdata = data;
+	int blank;
+
+	if (action != DRM_PANEL_EVENT_BLANK)
+		return NOTIFY_OK;
+	if (!evdata || !evdata->data)
+		return NOTIFY_OK;
+
+	blank = *(int *)evdata->data;
+	zenith_panel_blank_event(blank, DRM_PANEL_BLANK_UNBLANK);
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block zenith_drm_notifier = {
+	.notifier_call	= zenith_drm_panel_notifier_cb,
+	.priority	= 0,
+};
+#endif /* CONFIG_DRM_PANEL_NOTIFY */
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
 	bool input_registered = false;
 #ifdef CONFIG_FB_NOTIFY
 	bool fb_registered = false;
+#endif
+#ifdef CONFIG_DRM_PANEL_NOTIFY
+	bool drm_registered = false;
 #endif
 
 	pr_info("Zenith: V2 Dreadnought (EAS/EM/Display/Thermal) Initialized. By ENI for LO.\n");
@@ -8965,14 +9037,37 @@ static int __init zenith_gov_init(void)
 	else
 		input_registered = true;
 
-#ifdef CONFIG_FB_NOTIFY
-	ret = fb_register_client(&zenith_fb_notifier);
+	/* Panel-state delivery: register the drm_panel_notifier path first
+	 * (preferred when available because the fb notifier chain is
+	 * deprecated upstream and absent on most modern vendor builds), and
+	 * fall back to fb_register_client() if drm is unavailable or its
+	 * registration fails.  Registering both at once would cause every
+	 * blank/unblank event to write screen_state twice, so the fb
+	 * registration is skipped when drm is live.
+	 */
+#ifdef CONFIG_DRM_PANEL_NOTIFY
+	ret = drm_panel_notifier_register(&zenith_drm_notifier);
 	if (ret)
-		pr_warn("Zenith: fb notifier register failed (%d), screen_auto disabled\n",
+		pr_warn("Zenith: drm panel notifier register failed (%d), trying fb fallback\n",
 			ret);
 	else
-		fb_registered = true;
-#else
+		drm_registered = true;
+#endif
+#ifdef CONFIG_FB_NOTIFY
+	if (
+#ifdef CONFIG_DRM_PANEL_NOTIFY
+	    !drm_registered &&
+#endif
+	    1) {
+		ret = fb_register_client(&zenith_fb_notifier);
+		if (ret)
+			pr_warn("Zenith: fb notifier register failed (%d), screen_auto disabled\n",
+				ret);
+		else
+			fb_registered = true;
+	}
+#endif
+#if !defined(CONFIG_FB_NOTIFY) && !defined(CONFIG_DRM_PANEL_NOTIFY)
 	/* screen_auto stores still accept 0/1 (the field is plain
 	 * bookkeeping for userspace introspection) but no notifier
 	 * will ever flip screen_state.  Print once at init so an
@@ -8980,12 +9075,16 @@ static int __init zenith_gov_init(void)
 	 * frequency" can grep dmesg and find the answer immediately
 	 * rather than chasing the runtime path.
 	 */
-	pr_info("Zenith: CONFIG_FB_NOTIFY=n, screen_auto is bookkeeping-only (no panel events delivered)\n");
+	pr_info("Zenith: CONFIG_FB_NOTIFY=n and CONFIG_DRM_PANEL_NOTIFY=n, screen_auto is bookkeeping-only (no panel events delivered)\n");
+#endif
+#ifdef CONFIG_DRM_PANEL_NOTIFY
+	if (drm_registered)
+		pr_info("Zenith: screen_auto wired through drm panel notifier\n");
 #endif
 
 	ret = cpufreq_register_governor(&zenith_gov);
 	if (ret) {
-		/* Roll back the input + fb hooks we successfully
+		/* Roll back the input + fb / drm hooks we successfully
 		 * registered above so that a probe failure here
 		 * leaves no dangling notifier / handler bound to a
 		 * governor that does not exist.  Previously the
@@ -8993,6 +9092,10 @@ static int __init zenith_gov_init(void)
 		 * both registrations; subsequent module-style
 		 * insmod/rmmod cycles would double-register.
 		 */
+#ifdef CONFIG_DRM_PANEL_NOTIFY
+		if (drm_registered)
+			drm_panel_notifier_unregister(&zenith_drm_notifier);
+#endif
 #ifdef CONFIG_FB_NOTIFY
 		if (fb_registered)
 			fb_unregister_client(&zenith_fb_notifier);
