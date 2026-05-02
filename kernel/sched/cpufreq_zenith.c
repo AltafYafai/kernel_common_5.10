@@ -10051,8 +10051,16 @@ static struct input_handler zenith_input_handler = {
  * events directly without registering a notifier (e.g. a vendor
  * mode-set handler can call this from its own ioctl path; the
  * function has no module-level dependencies).
+ *
+ * __maybe_unused is required because the only in-tree callers live
+ * inside CONFIG_FB_NOTIFY and CONFIG_DRM_PANEL_NOTIFY blocks; when
+ * both are disabled the function has no in-tree caller and a -Werror
+ * build would otherwise fail with -Wunused-function.  Out-of-tree
+ * consumers (vendor mode-set / panel ioctl handlers) still get the
+ * helper they need.
  */
-static void zenith_panel_blank_event(int blank, unsigned int unblank_value)
+static void __maybe_unused
+zenith_panel_blank_event(int blank, unsigned int unblank_value)
 {
 	unsigned int new_state = (blank == (int)unblank_value) ? 1 : 0;
 
