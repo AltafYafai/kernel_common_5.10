@@ -284,10 +284,10 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  *
  * Init-time invariant:
  *
- *   - zenith_camera_aware_key, zenith_psi_aware_key, and
- *     zenith_game_auto_key match scalars that still default to 0,
- *     so they correctly start FALSE without any explicit init-time
- *     enable.
+ *   - zenith_camera_aware_key, zenith_psi_aware_key,
+ *     zenith_game_auto_key, and zenith_auto_tune_v3_key match
+ *     scalars that still default to 0, so they correctly start
+ *     FALSE without any explicit init-time enable.
  *   - zenith_audio_aware_key and zenith_render_aware_key match scalars
  *     that were flipped to default 1 in the wave-2 auto-defaults
  *     round, so the keys must be explicitly enabled in zenith_init()
@@ -304,8 +304,9 @@ DEFINE_STATIC_KEY_FALSE(zenith_camera_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_render_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_psi_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_game_auto_key);
+DEFINE_STATIC_KEY_FALSE(zenith_auto_tune_v3_key);
 
-/* Transition invariant for the five feature static keys above:
+/* Transition invariant for the six feature static keys above:
  *
  *   tunables->X (sysfs-visible scalar)  ==  static-key state of zenith_X_key
  *
@@ -734,6 +735,75 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_AT_COOLDOWN_WINDOWS	1
 #define ZENITH_AT_HYSTERESIS_WINDOWS_MAX	8
 #define ZENITH_AT_COOLDOWN_WINDOWS_MAX		8
+
+/* auto_tune_v3 (default 0, off):
+ *
+ * Self-calibrating layer on top of V2.  Reads the per-policy at_log
+ * ring (ZENITH_AT_LOG_NR entries, each one V1-window wide) once per
+ * ZENITH_AT_V3_INTERVAL_NS and counts V2 state transitions inside
+ * the window.  Based on observed transition rate, V3 maintains
+ * bounded signed offsets to two V2 reaction knobs:
+ *
+ *   - auto_tune_hysteresis_windows  (ZENITH_DEFAULT_AT_HYSTERESIS_WINDOWS = 2)
+ *   - auto_tune_cooldown_windows    (ZENITH_DEFAULT_AT_COOLDOWN_WINDOWS  = 1)
+ *
+ * If V2 was observed thrashing (transitions >= ZENITH_AT_V3_THRASH_HI),
+ * the offsets bump up by one (more hysteresis, slower reaction).  If
+ * V2 was observed sticky (transitions <= ZENITH_AT_V3_THRASH_LO), the
+ * offsets bump down by one (less hysteresis, faster reaction).  Either
+ * way the offset is clamped to [ZENITH_AT_V3_OFFSET_MIN ..
+ * ZENITH_AT_V3_OFFSET_MAX] and the resulting eff_value is clamped to
+ * the existing ZENITH_AT_HYSTERESIS_WINDOWS_MAX / _COOLDOWN_WINDOWS_MAX
+ * caps and to a >=1 floor.
+ *
+ * Three modes via the auto_tune_v3 scalar:
+ *
+ *   - 0  off (default)        -- no observation, no adjustments.
+ *   - 1  observe-only         -- collects stats, exposes them via
+ *                                auto_tune_v3_state, does NOT apply
+ *                                offsets.  Equivalent to a dry-run.
+ *   - 2  observe + apply      -- collects stats AND applies the
+ *                                bounded offsets to the V2 reaction
+ *                                knobs.
+ *
+ * The scalar is gated by the zenith_auto_tune_v3_key static branch
+ * (FALSE while scalar = 0) so the calibration tail in
+ * zenith_auto_tune_work() is a single never-taken jump per V1 window
+ * when V3 is off.  When mode = 1, the apply-side helper
+ * zenith_at_eff_*_windows() returns the unmodified base value, so the
+ * hot path is also unaffected.
+ *
+ * Tunable surface:
+ *   - auto_tune_v3              RW 0/1/2  master gate / mode
+ *   - auto_tune_v3_state        RO        snapshot of current
+ *                                         observed transitions/window
+ *                                         and the two live offsets
+ *   - auto_tune_v3_interval_ms  RW        calibration period (default
+ *                                         60000, clamped to [10000,
+ *                                         600000])
+ */
+#define ZENITH_DEFAULT_AUTO_TUNE_V3		0
+#define ZENITH_AT_V3_MODE_OFF			0
+#define ZENITH_AT_V3_MODE_OBSERVE		1
+#define ZENITH_AT_V3_MODE_APPLY			2
+#define ZENITH_AT_V3_MODE_MAX			2
+
+#define ZENITH_DEFAULT_AT_V3_INTERVAL_MS	60000
+#define ZENITH_AT_V3_INTERVAL_MIN_MS		10000
+#define ZENITH_AT_V3_INTERVAL_MAX_MS		600000
+
+/* Transition-rate thresholds.  Counted within the ZENITH_AT_LOG_NR
+ * (=16) window which spans up to ~16 V1 cycles (~160 s with the
+ * default V1 cadence).  HI/LO are absolute counts, not rates per
+ * unit time -- the calibration cadence is stable enough that
+ * counts work fine.
+ */
+#define ZENITH_AT_V3_THRASH_HI			6
+#define ZENITH_AT_V3_THRASH_LO			1
+
+/* Bounded signed offset range for the two V2 reaction knobs. */
+#define ZENITH_AT_V3_OFFSET_MIN			(-1)
+#define ZENITH_AT_V3_OFFSET_MAX			(+4)
 
 #define ZENITH_DEFAULT_AT_CLUSTER_AWARE		1
 #define ZENITH_DEFAULT_AT_V2_SIGNALS		1
@@ -1773,6 +1843,16 @@ struct zenith_tunables {
 	unsigned int		auto_tune_v2;
 	unsigned int		auto_tune_hysteresis_windows;
 	unsigned int		auto_tune_cooldown_windows;
+
+	/* See ZENITH_DEFAULT_AUTO_TUNE_V3 comment block.  0/1/2 master
+	 * gate for V3 self-calibration; the *_store callback also
+	 * syncs the zenith_auto_tune_v3_key static key (FALSE when 0).
+	 * auto_tune_v3_interval_ms is the calibration period; clamped
+	 * to [ZENITH_AT_V3_INTERVAL_MIN_MS, ZENITH_AT_V3_INTERVAL_MAX_MS]
+	 * on store.
+	 */
+	unsigned int		auto_tune_v3;
+	unsigned int		auto_tune_v3_interval_ms;
 	unsigned long		auto_tune_override_mask;
 	unsigned int		auto_tune_cluster_aware;
 	unsigned int		auto_tune_v2_signals;
@@ -2229,6 +2309,28 @@ struct zenith_policy {
 	 * ZENITH_BOOT_COMPLETE_CALM_WINDOWS past the grace period.
 	 */
 	unsigned int		at_boot_calm_streak;
+
+	/* V3 self-calibration state (see ZENITH_DEFAULT_AUTO_TUNE_V3
+	 * comment block).  Updated at the tail of zenith_auto_tune_work()
+	 * once per (auto_tune_v3_interval_ms) wall-clock period when the
+	 * v3 key is enabled.  All fields are owned by the v2 worker
+	 * thread and read either from the same thread (calibration
+	 * step) or via sysfs *_show under the gov_attr_set rwsem (which
+	 * guarantees a consistent snapshot).
+	 *
+	 *   at_v3_last_calib_ns    -- boottime ns of last calibration
+	 *   at_v3_last_transitions -- transitions counted in last window
+	 *   at_v3_hyst_offset      -- signed offset on hysteresis_windows
+	 *   at_v3_cool_offset      -- signed offset on cooldown_windows
+	 *
+	 * Offsets are clamped to [ZENITH_AT_V3_OFFSET_MIN ..
+	 * ZENITH_AT_V3_OFFSET_MAX] and only consumed when the v3 mode
+	 * is APPLY (== 2).
+	 */
+	u64			at_v3_last_calib_ns;
+	unsigned int		at_v3_last_transitions;
+	signed char		at_v3_hyst_offset;
+	signed char		at_v3_cool_offset;
 
 	/* round-U-z10 glide / coordination knobs auto-driven by the V2
 	 * worker via zenith_at_apply_glides() when
@@ -5684,6 +5786,142 @@ static void zenith_at_log_push(struct zenith_policy *z_policy,
 		z_policy->at_log_count++;
 }
 
+/* V3 self-calibration tail.
+ *
+ * Called from zenith_auto_tune_work() once per V1 window when V3 is
+ * enabled (zenith_auto_tune_v3_key TRUE) and the auto_tune_v3 scalar
+ * is non-zero (defended against a momentary tear during a sysfs
+ * store).  Walks the per-policy at_log ring, counts V2 state
+ * transitions, and -- if the wall-clock interval has elapsed since
+ * the last calibration -- updates at_v3_hyst_offset / at_v3_cool_offset
+ * within the bounded range [ZENITH_AT_V3_OFFSET_MIN,
+ * ZENITH_AT_V3_OFFSET_MAX].
+ *
+ * Mode 1 (OBSERVE) updates at_v3_last_transitions and exposes the
+ * value via auto_tune_v3_state but never adjusts the offsets.  Mode 2
+ * (APPLY) does both.
+ *
+ * Cost: at most ZENITH_AT_LOG_NR (=16) loads and a small bounded
+ * amount of arithmetic, gated by the wall-clock interval check
+ * (default 60 s).  Single-threaded with the v2 worker so no locking
+ * is required for the per-policy fields; sysfs *_show readers are
+ * serialised under the gov_attr_set rwsem.
+ */
+static void zenith_at_v3_calibrate(struct zenith_policy *z_policy,
+				   unsigned int mode)
+{
+	struct zenith_tunables *t = z_policy->tunables;
+	u64 now = ktime_get_boottime_ns();
+	u64 interval_ns;
+	unsigned int interval_ms;
+	unsigned int transitions = 0;
+	unsigned int prev_state;
+	unsigned int idx, count, head;
+	bool has_prev = false;
+
+	interval_ms = READ_ONCE(t->auto_tune_v3_interval_ms);
+	if (interval_ms < ZENITH_AT_V3_INTERVAL_MIN_MS)
+		interval_ms = ZENITH_AT_V3_INTERVAL_MIN_MS;
+	if (interval_ms > ZENITH_AT_V3_INTERVAL_MAX_MS)
+		interval_ms = ZENITH_AT_V3_INTERVAL_MAX_MS;
+	interval_ns = (u64)interval_ms * NSEC_PER_MSEC;
+
+	if (z_policy->at_v3_last_calib_ns &&
+	    now - z_policy->at_v3_last_calib_ns < interval_ns)
+		return;
+
+	count = z_policy->at_log_count;
+	head = z_policy->at_log_head;
+	prev_state = 0;
+
+	/* Walk oldest -> newest. */
+	for (idx = 0; idx < count; idx++) {
+		unsigned int slot;
+		struct zenith_at_log_entry *e;
+
+		if (count < ZENITH_AT_LOG_NR)
+			slot = idx;
+		else
+			slot = (head + idx) % ZENITH_AT_LOG_NR;
+
+		e = &z_policy->at_log[slot];
+		if (!has_prev) {
+			prev_state = e->v2_to_state;
+			has_prev = true;
+			continue;
+		}
+		if (e->v2_to_state != prev_state) {
+			transitions++;
+			prev_state = e->v2_to_state;
+		}
+	}
+
+	z_policy->at_v3_last_transitions = transitions;
+	z_policy->at_v3_last_calib_ns = now;
+
+	if (mode != ZENITH_AT_V3_MODE_APPLY)
+		return;
+
+	/* Apply bounded nudge to offsets. */
+	if (transitions >= ZENITH_AT_V3_THRASH_HI) {
+		if (z_policy->at_v3_hyst_offset < ZENITH_AT_V3_OFFSET_MAX)
+			z_policy->at_v3_hyst_offset++;
+		if (z_policy->at_v3_cool_offset < ZENITH_AT_V3_OFFSET_MAX)
+			z_policy->at_v3_cool_offset++;
+	} else if (transitions <= ZENITH_AT_V3_THRASH_LO) {
+		if (z_policy->at_v3_hyst_offset > ZENITH_AT_V3_OFFSET_MIN)
+			z_policy->at_v3_hyst_offset--;
+		if (z_policy->at_v3_cool_offset > ZENITH_AT_V3_OFFSET_MIN)
+			z_policy->at_v3_cool_offset--;
+	}
+}
+
+/* Effective hysteresis_windows / cooldown_windows after V3 nudge.
+ *
+ * Returns the unmodified base when V3 is OFF or in OBSERVE mode.  When
+ * V3 mode is APPLY (== 2), adds the per-policy signed offset and clamps
+ * the result to [1, ZENITH_AT_*_WINDOWS_MAX].  >=1 floor preserves the
+ * V2 state machine invariant that at least one window of agreement is
+ * required before a state change commits.
+ */
+static inline unsigned int
+zenith_at_eff_hyst_windows(struct zenith_policy *z_policy, unsigned int base)
+{
+	int v;
+
+	if (!static_branch_unlikely(&zenith_auto_tune_v3_key))
+		return base;
+	if (READ_ONCE(z_policy->tunables->auto_tune_v3) !=
+	    ZENITH_AT_V3_MODE_APPLY)
+		return base;
+
+	v = (int)base + (int)z_policy->at_v3_hyst_offset;
+	if (v < 1)
+		v = 1;
+	if (v > ZENITH_AT_HYSTERESIS_WINDOWS_MAX)
+		v = ZENITH_AT_HYSTERESIS_WINDOWS_MAX;
+	return (unsigned int)v;
+}
+
+static inline unsigned int
+zenith_at_eff_cool_windows(struct zenith_policy *z_policy, unsigned int base)
+{
+	int v;
+
+	if (!static_branch_unlikely(&zenith_auto_tune_v3_key))
+		return base;
+	if (READ_ONCE(z_policy->tunables->auto_tune_v3) !=
+	    ZENITH_AT_V3_MODE_APPLY)
+		return base;
+
+	v = (int)base + (int)z_policy->at_v3_cool_offset;
+	if (v < 1)
+		v = 1;
+	if (v > ZENITH_AT_COOLDOWN_WINDOWS_MAX)
+		v = ZENITH_AT_COOLDOWN_WINDOWS_MAX;
+	return (unsigned int)v;
+}
+
 /* Reset all observability counters on a single policy.
  *
  * Clears both the per-policy zenith_stats[] array and the auto-tune
@@ -7074,7 +7312,8 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	z_policy->at_last_thermal_pressure = thermal_pressure;
 
 	if (t->auto_tune_v2) {
-		unsigned int need = t->auto_tune_hysteresis_windows;
+		unsigned int need = zenith_at_eff_hyst_windows(z_policy,
+						t->auto_tune_hysteresis_windows);
 		bool emergency = state == ZENITH_AT_STATE_THERMAL_RECOVERY ||
 				 state == ZENITH_AT_STATE_SUSTAINED_PERF;
 
@@ -7101,7 +7340,8 @@ static void zenith_auto_tune_work(struct work_struct *w)
 			z_policy->at_last_state = state;
 			z_policy->at_cooldown_left =
 				min_t(unsigned int,
-				      t->auto_tune_cooldown_windows,
+				      zenith_at_eff_cool_windows(z_policy,
+						t->auto_tune_cooldown_windows),
 				      ZENITH_AT_COOLDOWN_WINDOWS_MAX);
 			at_emergency = emergency;
 			if (!t->auto_tune_cluster_aware &&
@@ -7181,6 +7421,22 @@ static void zenith_auto_tune_work(struct work_struct *w)
 rearm:
 	zenith_at_log_push(z_policy, at_from_state, z_policy->at_last_target,
 			   at_emergency);
+
+	/* V3 self-calibration tail.  Gated by the static branch
+	 * (FALSE while auto_tune_v3 = 0) and the live tunables scalar
+	 * (defends against a momentary tear during a sysfs store; the
+	 * branch can be true while the scalar transitions back to 0).
+	 * Internal cadence gate (auto_tune_v3_interval_ms) limits the
+	 * actual work to once per 10..600 s.  See ZENITH_DEFAULT_AUTO_TUNE_V3
+	 * comment block.
+	 */
+	if (static_branch_unlikely(&zenith_auto_tune_v3_key)) {
+		unsigned int v3_mode = READ_ONCE(t->auto_tune_v3);
+
+		if (v3_mode != ZENITH_AT_V3_MODE_OFF)
+			zenith_at_v3_calibrate(z_policy, v3_mode);
+	}
+
 	schedule_delayed_work(&z_policy->at_work,
 			      msecs_to_jiffies(ZENITH_AUTO_TUNE_PERIOD_MS));
 }
@@ -7314,6 +7570,107 @@ static ssize_t auto_tune_cooldown_windows_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr auto_tune_cooldown_windows =
 	__ATTR_RW(auto_tune_cooldown_windows);
+
+/* auto_tune_v3 sysfs knob (RW).  See ZENITH_DEFAULT_AUTO_TUNE_V3
+ * comment block for full semantics.  Three accepted values:
+ *
+ *   0  off (default)
+ *   1  observe-only (collect telemetry, do not adjust)
+ *   2  apply       (collect telemetry AND adjust V2 hyst/cool windows)
+ *
+ * Store-side: clamps to [0, ZENITH_AT_V3_MODE_MAX], syncs the
+ * zenith_auto_tune_v3_key static branch, and -- on a transition to 0
+ * -- clears any accumulated offsets so a subsequent re-enable starts
+ * from a clean baseline.
+ */
+static ssize_t auto_tune_v3_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->auto_tune_v3);
+}
+
+static ssize_t auto_tune_v3_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	struct zenith_policy *z_policy;
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_AT_V3_MODE_MAX)
+		return -EINVAL;
+	t->auto_tune_v3 = val;
+	zenith_set_static_key(&zenith_auto_tune_v3_key, val);
+	if (val == ZENITH_AT_V3_MODE_OFF) {
+		list_for_each_entry(z_policy, &attr_set->policy_list,
+				    tunables_hook) {
+			z_policy->at_v3_hyst_offset = 0;
+			z_policy->at_v3_cool_offset = 0;
+			z_policy->at_v3_last_calib_ns = 0;
+			z_policy->at_v3_last_transitions = 0;
+		}
+	}
+	return count;
+}
+static struct governor_attr auto_tune_v3 = __ATTR_RW(auto_tune_v3);
+
+/* auto_tune_v3_interval_ms sysfs knob (RW).  Calibration period in
+ * milliseconds.  Default ZENITH_DEFAULT_AT_V3_INTERVAL_MS (60000);
+ * clamped on store to [ZENITH_AT_V3_INTERVAL_MIN_MS,
+ * ZENITH_AT_V3_INTERVAL_MAX_MS].
+ */
+static ssize_t auto_tune_v3_interval_ms_show(struct gov_attr_set *attr_set,
+					     char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_tune_v3_interval_ms);
+}
+
+static ssize_t auto_tune_v3_interval_ms_store(struct gov_attr_set *attr_set,
+					      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val < ZENITH_AT_V3_INTERVAL_MIN_MS)
+		val = ZENITH_AT_V3_INTERVAL_MIN_MS;
+	if (val > ZENITH_AT_V3_INTERVAL_MAX_MS)
+		val = ZENITH_AT_V3_INTERVAL_MAX_MS;
+	t->auto_tune_v3_interval_ms = val;
+	return count;
+}
+static struct governor_attr auto_tune_v3_interval_ms =
+	__ATTR_RW(auto_tune_v3_interval_ms);
+
+/* auto_tune_v3_state sysfs knob (RO).  One line per online policy on
+ * which V3 has been observed at least once:
+ *
+ *   policy<N>: transitions=<n> hyst_offset=<-1..+4> cool_offset=<-1..+4>
+ *
+ * transitions is the V2 state-transition count from the most recent
+ * calibration window; the offsets are the live signed nudges (only
+ * actually applied when auto_tune_v3 == 2).
+ */
+static ssize_t auto_tune_v3_state_show(struct gov_attr_set *attr_set,
+				       char *buf)
+{
+	struct zenith_policy *z_policy;
+	ssize_t pos = 0;
+
+	list_for_each_entry(z_policy, &attr_set->policy_list, tunables_hook) {
+		pos += scnprintf(buf + pos, PAGE_SIZE - pos,
+			"policy%u: transitions=%u hyst_offset=%d cool_offset=%d\n",
+			z_policy->policy ? z_policy->policy->cpu : 0,
+			z_policy->at_v3_last_transitions,
+			(int)z_policy->at_v3_hyst_offset,
+			(int)z_policy->at_v3_cool_offset);
+		if (pos >= PAGE_SIZE - 80)
+			break;
+	}
+	return pos;
+}
+static struct governor_attr auto_tune_v3_state =
+	__ATTR_RO(auto_tune_v3_state);
 
 static ssize_t auto_tune_cluster_aware_show(struct gov_attr_set *attr_set,
 					    char *buf)
@@ -9969,6 +10326,9 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_v2_glides.attr,
 	&auto_tune_hysteresis_windows.attr,
 	&auto_tune_cooldown_windows.attr,
+	&auto_tune_v3.attr,
+	&auto_tune_v3_interval_ms.attr,
+	&auto_tune_v3_state.attr,
 	&auto_tune_cluster_aware.attr,
 	&auto_tune_v2_signals.attr,
 	&auto_tune_thermal_slope.attr,
@@ -10180,6 +10540,9 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_AT_HYSTERESIS_WINDOWS;
 	tunables->auto_tune_cooldown_windows =
 		ZENITH_DEFAULT_AT_COOLDOWN_WINDOWS;
+	tunables->auto_tune_v3 = ZENITH_DEFAULT_AUTO_TUNE_V3;
+	tunables->auto_tune_v3_interval_ms =
+		ZENITH_DEFAULT_AT_V3_INTERVAL_MS;
 	tunables->auto_tune_cluster_aware =
 		ZENITH_DEFAULT_AT_CLUSTER_AWARE;
 	tunables->auto_tune_v2_signals =

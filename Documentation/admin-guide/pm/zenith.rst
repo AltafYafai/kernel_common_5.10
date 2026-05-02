@@ -315,6 +315,52 @@ guardrails.
     change is allowed.  ``thermal_recovery`` and ``sustained_perf``
     bypass this.  Default 1.
 
+``auto_tune_v3``
+    Self-calibrating layer on top of V2.  Three accepted values:
+
+      * ``0`` -- off (default).  No telemetry, no calibration.
+      * ``1`` -- observe-only.  Once per ``auto_tune_v3_interval_ms``,
+        zenith walks the per-policy ``at_log`` ring, counts V2 state
+        transitions, and exposes the result via ``auto_tune_v3_state``.
+        No knobs are adjusted.
+      * ``2`` -- apply.  Same telemetry as observe-only, plus a
+        bounded signed nudge to ``auto_tune_hysteresis_windows`` and
+        ``auto_tune_cooldown_windows``: when V2 was observed
+        thrashing (transitions exceed an internal high-water mark),
+        the offsets bump up by one (more hysteresis, slower
+        reaction); when V2 was observed sticky (transitions below
+        an internal low-water mark), the offsets bump down by one
+        (less hysteresis, faster reaction).  Offsets are clamped to
+        ``[-1, +4]`` and the resulting effective values are clamped
+        to the existing window-count caps and to a ``>=1`` floor.
+
+    The user-set ``auto_tune_hysteresis_windows`` /
+    ``auto_tune_cooldown_windows`` scalars are unchanged; V3 nudges
+    only the *effective* window count read by the V2 worker.  Switch
+    back to ``auto_tune_v3 = 0`` to clear the offsets and revert to
+    the user values verbatim.
+
+    Gated by a static branch so the calibration tail is a single
+    never-taken jump per V1 window when the feature is off.
+
+``auto_tune_v3_interval_ms``
+    Calibration period (ms).  Default 60000 (1 minute).  Clamped on
+    store to ``[10000, 600000]``.
+
+``auto_tune_v3_state``
+    Read-only.  One line per online policy showing the most recent
+    calibration window's transition count and the live signed
+    offsets:
+
+    .. code-block::
+
+        policy0: transitions=4 hyst_offset=+1 cool_offset=+1
+        policy4: transitions=2 hyst_offset=0 cool_offset=0
+        policy7: transitions=0 hyst_offset=-1 cool_offset=-1
+
+    Useful as a dry-run inspection knob in observe-only mode
+    (``auto_tune_v3 = 1``) before opting in to apply mode.
+
 ``auto_tune_cluster_aware``
     Boolean (0/1, default 0).  When 1, V2 actions are anchored on the
     first CPU of each policy and applied per cluster, so big and
