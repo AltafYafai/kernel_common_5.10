@@ -4069,19 +4069,6 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 */
 	unsigned int input_boost_floor = 0;
 
-	/* In-kernel game detector tick.  Gated by the static branch
-	 * (default FALSE while game_auto = 0) and the live tunables
-	 * scalar (defends against a momentary tear during a sysfs
-	 * store; the branch can be true while the scalar transitions
-	 * back to 0).  Maintains the per-policy streak counter and
-	 * renews the global zenith_game_auto_active_until_ns latch on
-	 * sustained match.  See the ZENITH_DEFAULT_GAME_AUTO comment
-	 * block.
-	 */
-	if (static_branch_unlikely(&zenith_game_auto_key) &&
-	    READ_ONCE(z_policy->tunables->game_auto))
-		zenith_policy_game_auto_tick(z_policy);
-
 	/* ADPF / uclamp_max cap.  Sampled once so every decision tier
 	 * below sees a consistent view.  SCHED_CAPACITY_SCALE means
 	 * "no cap" -- the helper returns that sentinel when uclamp is
@@ -4090,6 +4077,22 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 */
 	unsigned long uclamp_max = z_policy->tunables->uclamp_max_respect ?
 		zenith_policy_uclamp_max(z_policy) : SCHED_CAPACITY_SCALE;
+
+	/* In-kernel game detector tick.  Gated by the static branch
+	 * (default FALSE while game_auto = 0) and the live tunables
+	 * scalar (defends against a momentary tear during a sysfs
+	 * store; the branch can be true while the scalar transitions
+	 * back to 0).  Maintains the per-policy streak counter and
+	 * renews the global zenith_game_auto_active_until_ns latch on
+	 * sustained match.  See the ZENITH_DEFAULT_GAME_AUTO comment
+	 * block.  Order: must follow the local declarations above and
+	 * precede any other executable code in this function so the
+	 * the latter is allowed to declare additional locals without
+	 * tripping -Wdeclaration-after-statement.
+	 */
+	if (static_branch_unlikely(&zenith_game_auto_key) &&
+	    READ_ONCE(z_policy->tunables->game_auto))
+		zenith_policy_game_auto_tick(z_policy);
 
 	{
 		/* Screen-off glide tracking.  Detect 1 -> 0 / 0 -> 1
