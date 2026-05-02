@@ -43,14 +43,29 @@ on init
     # ----- Auto-tune -----
     # Worker classifies workload every 10s and switches profiles based on
     # input-event rate, saturation load %, and (if scenario=1) game/audio/
-    # camera/render flags.  Default ON.
+    # camera/render flags.
+    #
+    # As of the wave-1 auto-defaults round, both auto_tune AND
+    # auto_tune_scenario default to 1 in-kernel (see
+    # ZENITH_DEFAULT_AUTO_TUNE_SCENARIO in cpufreq_zenith.c).  We still
+    # write them here explicitly so the boot config is self-documenting
+    # and so re-flashing an older kernel does not silently revert the
+    # behaviour.
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune 1
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_scenario 1
 
     # ----- Auto-tune V2 (smart scenario-driven tuning) -----
     # V2 state machine: classifies into efficiency/balanced/latency/
     # sustained_perf/thermal_recovery and adjusts knobs automatically
-    # within per-profile guardrails.  Default ON.
+    # within per-profile guardrails.
+    #
+    # As of the wave-1 auto-defaults round, auto_tune_v2 defaults to 1
+    # in-kernel (see ZENITH_DEFAULT_AUTO_TUNE_V2 in cpufreq_zenith.c).
+    # All V2 protections (hysteresis, cooldown, override_mask, per-knob
+    # user-wins fallthrough) remain in place; this just gates the state
+    # machine on out of the box.  Set to 0 here to lock the legacy V1
+    # classifier path even on kernels with the new default.
+    #
     # Hysteresis: require this many consecutive 10s windows agreeing
     # before committing a state change.  Prevents mode thrashing.
     # Cooldown: quiet period (in windows) after a state change before
@@ -58,6 +73,19 @@ on init
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_v2 1
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_hysteresis_windows 2
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_cooldown_windows 1
+
+    # ----- prefer_silver coordination -----
+    # When CONFIG_SCHED_PREFER_SILVER=y, the auto-tune classifier
+    # bumps the big/prime cluster up_threshold when the silver-cpu
+    # hit-rate exceeds prefer_silver_hot_threshold_pct, so the big
+    # cluster down-clocks less aggressively while prefer_silver is
+    # actively redirecting load onto silver.
+    #
+    # As of the wave-1 auto-defaults round, prefer_silver_aware
+    # defaults to 1 in-kernel (see ZENITH_DEFAULT_PREFER_SILVER_AWARE
+    # in cpufreq_zenith.c).  On builds without CONFIG_SCHED_PREFER_SILVER
+    # the runtime path is a no-op.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/prefer_silver_aware 1
 
     # ----- Auto-tune V2 glides (round-U-z10 follow-up) -----
     # Master gate for V2-driven population of the round-U-z10 glide /
@@ -240,10 +268,10 @@ on property:sys.boot_completed=1
 #   auto_tune_lo_sat_pct       = 10
 #   auto_tune_hi_events_x2     = 4
 #   auto_tune_lo_events_x2     = 1
-#   auto_tune_scenario         = 0       (1=enable scenario flags)
+#   auto_tune_scenario         = 1       (wave-1 default; 0=disable scenario flags)
 #
 # Auto-tune V2 (V3, smart state machine)
-#   auto_tune_v2               = 1       (0=legacy classifier, 1=bounded V2)
+#   auto_tune_v2               = 1       (wave-1 default; 0=legacy classifier path)
 #   auto_tune_v2_glides        = 1       (V2-driven defaults for round-U-z10 knobs)
 #   auto_tune_hysteresis_windows = 2     (windows before committing state)
 #   auto_tune_cooldown_windows = 1       (quiet windows after state change)
@@ -260,7 +288,7 @@ on property:sys.boot_completed=1
 #   boot_boost_decay_ms          = 0     (0=cliff at boot_boost_ms; V2 uses 5000)
 #   screen_off_glide_ms          = 0     (0=cliff to up_thresh=95; V2 uses 300)
 #   thermal_pressure_continuous  = 0     (0=cliff to up_thresh=90; V2 uses 1)
-#   prefer_silver_aware          = 0     (0=off; V2 uses 1 in efficiency/balanced)
+#   prefer_silver_aware          = 1     (wave-1 default; V2 also uses 1 in efficiency/balanced)
 #   prefer_silver_hot_threshold_pct = 70 (ps hit-rate cutoff for the bump)
 #   prefer_silver_hot_bump_pct   = 5     (up_thresh bump on big/prime when hot)
 #   frame_budget_us_auto         = 0     (0=use frame_budget_us; V2 uses 1)

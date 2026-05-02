@@ -275,9 +275,16 @@ indicates the screen is being driven (UI work) or not (background).
     screen idle.  Default 1.
 
 ``auto_tune_scenario``
-    Boolean (0/1, default 0).  When 1, the classifier's profile
+    Boolean (0/1, default 1).  When 1, the classifier's profile
     selection is biased by scenario flags (game / audio / camera /
     render) lifted from the awareness tiers.
+
+    Default flipped from 0 to 1 in the wave-1 auto-defaults round so
+    V1-only builds (``auto_tune_v2=0``) also benefit from
+    scenario-aware profile selection out of the box.  Floor / cap
+    behaviour stays off because ``audio_floor_pct``,
+    ``render_floor_pct`` and ``camera_floor_pct`` still default to 0
+    -- only the profile-bias path is enabled.
 
 Auto-tune state machine (V2)
 ----------------------------
@@ -288,8 +295,16 @@ states — ``efficiency``, ``balanced``, ``latency``, ``sustained_perf``,
 guardrails.
 
 ``auto_tune_v2``
-    Boolean (0/1, default 0).  Enables the V2 state machine.  V1 must
-    also be enabled (``auto_tune=1``) for V2 to run.
+    Boolean (0/1, default 1).  Enables the V2 state machine.  V1 must
+    also be enabled (``auto_tune=1``, default 1) for V2 to run.
+
+    Default flipped from 0 to 1 in the wave-1 auto-defaults round.
+    All V2 protections remain in place: state changes require
+    ``auto_tune_hysteresis_windows`` consecutive 10 s windows to
+    agree before committing, ``auto_tune_cooldown_windows`` enforces
+    a quiet period after each change, and ``override_mask`` keeps
+    user-pinned knobs out of V2's reach.  Set the knob back to 0 in
+    ``init.zenith.rc`` to lock the legacy classifier path.
 
 ``auto_tune_hysteresis_windows``
     Require this many consecutive 10 s windows to agree before
@@ -567,7 +582,7 @@ Environment hooks
     at peak pressure.
 
 ``prefer_silver_aware``
-    Boolean (0/1, default 0).  When 1 and built with
+    Boolean (0/1, default 1).  When 1 and built with
     ``CONFIG_SCHED_PREFER_SILVER=y``, the auto-tune classifier worker
     samples the global ``prefer_silver`` hit / miss counters once per
     window and computes a hit-rate.  When the rate is at or above
@@ -581,6 +596,12 @@ Environment hooks
     not bumped (they are already absorbing the redirected work).
     When ``CONFIG_SCHED_PREFER_SILVER=n`` the worker stub leaves the
     cached hit-rate at zero and the bump never fires.
+
+    Default flipped from 0 to 1 in the wave-1 auto-defaults round.
+    The runtime path is gated on ``CONFIG_SCHED_PREFER_SILVER=y``
+    *and* a non-trivial silver-cpu hit rate, so on devices without
+    prefer_silver, or under workloads that don't actually exercise
+    silver redirection, the bump never fires.
 
 ``prefer_silver_hot_threshold_pct``
     Hit-rate threshold (0..100, default 50).  Lower the value to

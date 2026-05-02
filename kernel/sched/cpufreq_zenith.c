@@ -377,8 +377,15 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * enough to avoid a perceived step but large enough to noticeably
  * delay big-cluster downclock during sustained UI navigation.
  * Both knobs are tunable; the defaults are conservative.
+ *
+ * Default flipped from 0 to 1 in the wave-1 auto-defaults round so
+ * the prefer_silver coordination kicks in out of the box on builds
+ * that have CONFIG_SCHED_PREFER_SILVER=y.  The bump is cluster-aware
+ * (only big/prime clusters react) and gated on the silver-cpu hit
+ * rate exceeding prefer_silver_hot_threshold_pct, so on devices
+ * without prefer_silver, the runtime path is a no-op.
  */
-#define ZENITH_DEFAULT_PREFER_SILVER_AWARE			0
+#define ZENITH_DEFAULT_PREFER_SILVER_AWARE			1
 #define ZENITH_DEFAULT_PREFER_SILVER_HOT_THRESHOLD_PCT		50
 #define ZENITH_DEFAULT_PREFER_SILVER_HOT_BUMP_PCT		5
 #define ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT			20
@@ -669,10 +676,16 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * render_aware: the comm walks fire even when those gating flags
  * are 0, because here we're using them as detection signals, not as
  * floor/cap policy.  No KMI exposure.
+ *
+ * Default flipped from 0 to 1 in the wave-1 auto-defaults round so
+ * V1-only builds (auto_tune_v2=0) also benefit from scenario-aware
+ * profile selection.  Floor/cap behaviour is still off by default
+ * because audio_floor_pct, render_floor_pct and camera_floor_pct
+ * stay at 0 -- only the profile-bias path is enabled.
  */
-#define ZENITH_DEFAULT_AUTO_TUNE_SCENARIO	0
+#define ZENITH_DEFAULT_AUTO_TUNE_SCENARIO	1
 
-/* auto_tune_v2 safety layer (default 0, off):
+/* auto_tune_v2 safety layer (default 1, on):
  *
  * The legacy auto_tune path applies whole profile presets from one
  * classification window.  V2 keeps the same observer but adds a
@@ -683,8 +696,15 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  *
  * 0 preserves the legacy classifier path.  1 enables the bounded V2
  * state/actions without changing KMI or tracepoint ABI.
+ *
+ * Default flipped from 0 to 1 in the wave-1 auto-defaults round.  V2
+ * only adjusts knobs whose user-set value is the per-knob default;
+ * any operator who has pinned a value via sysfs continues to win
+ * outright.  hysteresis_windows + cooldown_windows + override_mask
+ * remain in place to bound state-thrash.  Set the knob back to 0 in
+ * init.zenith.rc to lock the legacy classifier path.
  */
-#define ZENITH_DEFAULT_AUTO_TUNE_V2		0
+#define ZENITH_DEFAULT_AUTO_TUNE_V2		1
 #define ZENITH_DEFAULT_AT_HYSTERESIS_WINDOWS	2
 #define ZENITH_DEFAULT_AT_COOLDOWN_WINDOWS	1
 #define ZENITH_AT_HYSTERESIS_WINDOWS_MAX	8
