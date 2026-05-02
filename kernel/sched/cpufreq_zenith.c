@@ -282,9 +282,21 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  * static_branch_enable / static_branch_disable, which both sleep
  * acquiring cpus_read_lock() but are safe from sysfs store context.
  *
- * No init-time enable is needed: all four tunables default to 0 in
- * zenith_tunables_init() and zenith_set_profile_defaults() never
- * touches them, so the keys correctly start in the FALSE state.
+ * Init-time invariant:
+ *
+ *   - zenith_camera_aware_key and zenith_psi_aware_key match scalars
+ *     that still default to 0, so they correctly start FALSE without
+ *     any explicit init-time enable.
+ *   - zenith_audio_aware_key and zenith_render_aware_key match scalars
+ *     that were flipped to default 1 in the wave-2 auto-defaults
+ *     round, so the keys must be explicitly enabled in zenith_init()
+ *     after the tunable defaults are written, otherwise the hot path
+ *     would read the scalar as 1 but skip the branch via the still-FALSE
+ *     key.  zenith_init() now calls zenith_set_static_key() against
+ *     each scalar's value (idempotent across re-attaches).
+ *   - zenith_set_profile_defaults() never touches any of the four
+ *     scalars (they are user-managed opt-ins, not preset state), so
+ *     no profile-apply path needs to re-sync the keys.
  */
 DEFINE_STATIC_KEY_FALSE(zenith_audio_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_camera_aware_key);
@@ -314,11 +326,13 @@ DEFINE_STATIC_KEY_FALSE(zenith_psi_aware_key);
  * tick will see the consistent state.
  *
  * Implications for anyone adding a new feature key here:
- *   - The init state of every DEFINE_STATIC_KEY_FALSE is FALSE; do
- *     not flip the key in zenith_init() unless the matching scalar
- *     also defaults nonzero.  No init-time enable is needed for the
- *     four current keys (all four scalars default to 0 in
- *     zenith_tunables_init()).
+ *   - The init state of every DEFINE_STATIC_KEY_FALSE is FALSE.  If
+ *     the matching scalar defaults to a non-zero value, the key must
+ *     be explicitly enabled at init time (after tunables defaults are
+ *     written), otherwise the hot path will read the scalar as 1 but
+ *     skip the static-branch body.  zenith_init() syncs the
+ *     audio_aware / render_aware keys against their default scalars
+ *     for exactly this reason.
  *   - Profile presets in zenith_apply_profile() must not silently
  *     toggle a feature scalar without also calling
  *     zenith_set_static_key(); doing so violates the invariant.  The
@@ -368,7 +382,16 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE	0
 #define ZENITH_DEFAULT_THERMAL_AUTO		1
 #define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
-#define ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS	0
+/*
+ * thermal_pressure_continuous default flipped from 0 to 1 in the
+ * wave-2 auto-defaults round.  The legacy hard-cliff path snapped
+ * dynamic_up_thresh to 90% the moment thermal_state turned on; the
+ * continuous path linearly ramps from up_threshold (at 0% pressure)
+ * to 90% (at 100% pressure) using the same arch_scale_thermal_pressure
+ * percentage that V2 consumes.  No KMI exposure; the runtime path is
+ * gated on thermal_auto and a non-zero pressure reading.
+ */
+#define ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS	1
 
 /* prefer_silver_aware defaults.  See struct zenith_tunables for
  * semantics.  Hot threshold of 50%% means the bump fires when at
@@ -891,8 +914,16 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * useful spectrum where 50 is half-step-ahead, 100 is one-step-
  * ahead.  Values >100 are accepted but rarely helpful (the predictor
  * gets noisy on small deltas).
+ *
+ * Default flipped from 0 to 10 in the wave-2 auto-defaults round.
+ * 10 is intentionally mild: a tenth-of-one-step lookahead.  Combined
+ * with predict_util_smooth=1 (also flipped to 1 in wave-2), the
+ * resulting predictor is two-tap-averaged and only adds util on a
+ * positive slope, so a downward util ramp is never amplified.  Set
+ * this to 0 to disable the predictor entirely; the rest of the
+ * governor path is unchanged.
  */
-#define ZENITH_DEFAULT_PREDICT_UTIL_PCT		0
+#define ZENITH_DEFAULT_PREDICT_UTIL_PCT		10
 #define ZENITH_PREDICT_UTIL_PCT_MAX		200
 
 /* predict_util_smooth (default 0, off):
@@ -921,8 +952,14 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * Same cap / clamp / trace / prev_util update semantics as the
  * base predictor, so reverting to 0 returns to the historical
  * single-tap math with no lingering state.
+ *
+ * Default flipped from 0 to 1 in the wave-2 auto-defaults round.
+ * The smooth path is gated on predict_util_pct > 0, so this default
+ * is a no-op until the predictor itself is enabled.  Pair with the
+ * wave-2 predict_util_pct default of 10 for a mild two-tap-averaged
+ * predictor.
  */
-#define ZENITH_DEFAULT_PREDICT_UTIL_SMOOTH	0
+#define ZENITH_DEFAULT_PREDICT_UTIL_SMOOTH	1
 
 /* render_aware (default 0, off) + render_floor_pct (default 70):
  *
@@ -946,8 +983,17 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * Set render_aware=0 to fully disable the feature (no walks, no
  * cache, no floor).  Set render_floor_pct=0 to leave the comm walk
  * running (for tracepoints) but apply no floor.
+ *
+ * Default flipped from 0 to 1 in the wave-2 auto-defaults round so
+ * SurfaceFlinger / RenderThread / RenderEngine / mali-cmar-back are
+ * picked up by the comm walk out of the box.  The actual freq floor
+ * only fires when one of those threads is the cpu_curr at the moment
+ * of a cpufreq decision (cached for ZENITH_RENDER_CACHE_TTL_NS), so
+ * idle screens see no floor; only active rendering windows do.  The
+ * render_floor_pct default is unchanged (70%) and continues to win
+ * over the V2 effective up_threshold tier.
  */
-#define ZENITH_DEFAULT_RENDER_AWARE		0
+#define ZENITH_DEFAULT_RENDER_AWARE		1
 #define ZENITH_DEFAULT_RENDER_FLOOR_PCT		70
 #define ZENITH_RENDER_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
 
@@ -1163,8 +1209,15 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * Set audio_aware=0 to fully disable the feature (no walks, no
  * cache, no clamp).  Set audio_floor_pct=audio_cap_pct=0 to leave
  * the comm walk running (for tracepoints) but apply no clamp.
+ *
+ * Default flipped from 0 to 1 in the wave-2 auto-defaults round.
+ * audio_floor_pct and audio_cap_pct stay at 0 by default, so the
+ * runtime impact is just the comm walk (cached for
+ * ZENITH_AUDIO_CACHE_TTL_NS) and the V2 scenario flag -- no actual
+ * frequency clamp is applied unless the operator opts in by writing
+ * a non-zero floor / cap.
  */
-#define ZENITH_DEFAULT_AUDIO_AWARE		0
+#define ZENITH_DEFAULT_AUDIO_AWARE		1
 #define ZENITH_DEFAULT_AUDIO_FLOOR_PCT		0
 #define ZENITH_DEFAULT_AUDIO_CAP_PCT		0
 #define ZENITH_AUDIO_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
@@ -9742,6 +9795,20 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->frame_budget_us_auto	= ZENITH_DEFAULT_FRAME_BUDGET_US_AUTO;
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
+
+	/* Sync the audio_aware / render_aware static keys against their
+	 * default scalars.  See the comment above DEFINE_STATIC_KEY_FALSE
+	 * for the invariant: scalars whose default is non-zero (flipped
+	 * in the wave-2 round) need an explicit init-time key enable.
+	 * camera_aware and psi_aware still default to 0 so their keys
+	 * remain FALSE; we do not call them here.  Idempotent across
+	 * re-attaches: zenith_set_static_key() is a no-op if the key is
+	 * already in the requested state.
+	 */
+	zenith_set_static_key(&zenith_audio_aware_key,
+			      tunables->audio_aware);
+	zenith_set_static_key(&zenith_render_aware_key,
+			      tunables->render_aware);
 
 	/* Apply a cmdline-picked preset before the sysfs attr set is
 	 * published, so userspace sees the cmdline-picked preset as the

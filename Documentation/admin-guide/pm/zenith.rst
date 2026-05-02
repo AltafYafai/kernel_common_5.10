@@ -566,7 +566,7 @@ Environment hooks
     matching ``<drm/drm_panel_notifier.h>`` header to opt in.
 
 ``thermal_pressure_continuous``
-    Boolean (0/1, default 0).  When 0, ``zenith`` uses the legacy
+    Boolean (0/1, default 1).  When 0, ``zenith`` uses the legacy
     cliff: as soon as ``zenith_thermal_active()`` becomes true,
     ``dynamic_up_thresh`` snaps to 90 % regardless of the actual
     pressure level.  When 1, ``dynamic_up_thresh`` ramps linearly
@@ -580,6 +580,12 @@ Environment hooks
     match the cliff target so the new continuous mode never asks
     for a higher frequency than the legacy cliff would have allowed
     at peak pressure.
+
+    Default flipped from 0 to 1 in the wave-2 auto-defaults round.
+    The runtime path is gated on ``thermal_auto`` being on (default
+    1) and a non-zero ``arch_scale_thermal_pressure()`` reading, so
+    on cool builds the new default is a no-op.  Set to 0 in
+    ``init.zenith.rc`` to lock the legacy hard-cliff path.
 
 ``prefer_silver_aware``
     Boolean (0/1, default 1).  When 1 and built with
@@ -704,15 +710,27 @@ Predicted util
 --------------
 
 ``predict_util_pct``
-    Percentage (0..100, default 0 = off) of a two-tap util predictor
+    Percentage (0..100, default 10) of a two-tap util predictor
     blended into the EAS proportional target.  Mitigates ramp-up
     latency on bursty workloads at the cost of a small overshoot
     risk.
 
+    Default flipped from 0 to 10 in the wave-2 auto-defaults round.
+    10 is intentionally mild -- a tenth-of-one-step lookahead -- so
+    interactive bursts get a small predictive nudge without amplifying
+    sample-to-sample noise.  Set to 0 in ``init.zenith.rc`` to disable
+    the predictor entirely.
+
 ``predict_util_smooth``
-    Boolean (0/1, default 0).  When 1, the predictor's two taps are
+    Boolean (0/1, default 1).  When 1, the predictor's two taps are
     additionally low-pass filtered before blending, trading peak
     accuracy for less noise.
+
+    Default flipped from 0 to 1 in the wave-2 auto-defaults round.
+    The smooth path is gated on ``predict_util_pct > 0``, so this
+    default is a no-op until the predictor itself is enabled.  Pair
+    with the wave-2 ``predict_util_pct`` default of 10 for a mild
+    two-tap-averaged predictor.
 
 Awareness tiers
 ---------------
@@ -724,23 +742,30 @@ applied between the EAS proportional step and the post-resolve clips.
 
 Render tier::
 
-    render_aware       0/1, default 0.
+    render_aware       0/1, default 1 (wave-2 flip).
     render_comms       \n-separated list of comm prefixes; default
                        includes "RenderEngine", "RenderThread",
                        "surfaceflinger", "GraphicsExecutor", etc.
     render_floor_pct   Floor as percent of policy->max when matched.
-                       Default 0 (off).
+                       Default 70 (unchanged).  The floor only fires
+                       when one of the render comms is the cpu_curr
+                       at the moment of a cpufreq decision (cached
+                       for ZENITH_RENDER_CACHE_TTL_NS), so idle
+                       screens see no floor; only active rendering
+                       windows do.
 
 Audio tier::
 
-    audio_aware        0/1, default 0.
+    audio_aware        0/1, default 1 (wave-2 flip).
     audio_comms        Default includes "AudioFlinger", "AudioOut_",
                        "AudioRecord", "audio.hal", etc.
-    audio_floor_pct    Floor (% of max) when matched.  Default 0.
+    audio_floor_pct    Floor (% of max) when matched.  Default 0
+                       (unchanged) -- comm walk runs but no floor is
+                       applied unless the operator opts in.
     audio_cap_pct      Cap (% of max) when matched, e.g. for
                        low-latency audio threads that should not be
                        allowed to climb to max during low-load
-                       intervals.  Default 0 (no cap).
+                       intervals.  Default 0 (no cap, unchanged).
 
 Camera tier::
 

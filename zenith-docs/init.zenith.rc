@@ -121,16 +121,49 @@ on init
     # up/down delays.  0=uniform, 1=asymmetric.
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/rate_limit_cluster_scale 1
 
-    # ----- Awareness flags (default OFF, opt-in) -----
-    # Each adds a per-tier floor or cap.  Userspace must signal the
-    # state via the `*_active` knobs.  Leave OFF unless you have an
-    # init script that toggles them based on running app.
+    # ----- Awareness flags -----
+    # render_aware / audio_aware are flipped to default 1 in the
+    # wave-2 auto-defaults round (see ZENITH_DEFAULT_RENDER_AWARE /
+    # ZENITH_DEFAULT_AUDIO_AWARE in cpufreq_zenith.c).  We write them
+    # here explicitly so the boot config is self-documenting and
+    # re-flashing onto an older kernel does not silently revert the
+    # behaviour.
     #
-    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/render_aware 1
-    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/audio_aware 1
+    # render_aware: render_floor_pct stays at its kernel default 70%
+    # of policy max.  The floor only fires when SurfaceFlinger /
+    # RenderThread / RenderEngine / mali-cmar-back is the cpu_curr at
+    # the moment of a cpufreq decision (cached for ~4ms), so idle
+    # screens see no floor; only active rendering windows do.
+    #
+    # audio_aware: audio_floor_pct and audio_cap_pct stay at 0, so
+    # the runtime impact is just the comm walk + V2 scenario flag.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/render_aware 1
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/audio_aware 1
+
+    # camera_aware / game_mode / psi_aware are still opt-in.  Leave
+    # commented unless you have an init script that toggles them
+    # based on the running app.
     # write /sys/devices/system/cpu/cpufreq/policy*/zenith/camera_aware 1
     # write /sys/devices/system/cpu/cpufreq/policy*/zenith/game_mode 0
     # write /sys/devices/system/cpu/cpufreq/policy*/zenith/psi_aware 1
+
+    # ----- Predicted util (mild two-tap predictor) -----
+    # predict_util_pct=10 + predict_util_smooth=1 default in-kernel
+    # (wave-2 flip).  10 is a tenth-of-one-step lookahead; smooth
+    # averages two slope taps so single-sample outliers cannot
+    # produce a full-strength prediction on the next tick.  Set
+    # predict_util_pct=0 to disable the predictor entirely.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/predict_util_pct 10
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/predict_util_smooth 1
+
+    # ----- Continuous thermal pressure ramp -----
+    # thermal_pressure_continuous defaults to 1 in-kernel (wave-2
+    # flip).  Replaces the legacy hard cliff (snap to up_thresh=90 the
+    # moment thermal_state turns on) with a linear ramp from
+    # up_threshold (at 0% pressure) to 90% (at 100% pressure), using
+    # the same arch_scale_thermal_pressure() reading the V2
+    # classifier consumes.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/thermal_pressure_continuous 1
 
     # ----- Frame pace floor (adaptive 60/90/120/144 Hz) -----
     # Userspace writes the current vblank period in microseconds whenever
@@ -254,8 +287,8 @@ on property:sys.boot_completed=1
 #   kcpustat_filter_shift      = 1
 #   kcpustat_hispeed_enable    = 1
 #   util_math_v2               = 1
-#   predict_util_pct           = 0       (1-step linear util predictor)
-#   predict_util_smooth        = 0       (0=raw predictor, 1=smoothed)
+#   predict_util_pct           = 10      (wave-2 default; 0 disables predictor)
+#   predict_util_smooth        = 1       (wave-2 default; 0=raw predictor)
 #
 # uclamp respect
 #   uclamp_min_respect         = 1
@@ -287,7 +320,7 @@ on property:sys.boot_completed=1
 #   wakeup_boost_ms              = 0     (0=tick-only, max 200; V2 uses 50)
 #   boot_boost_decay_ms          = 0     (0=cliff at boot_boost_ms; V2 uses 5000)
 #   screen_off_glide_ms          = 0     (0=cliff to up_thresh=95; V2 uses 300)
-#   thermal_pressure_continuous  = 0     (0=cliff to up_thresh=90; V2 uses 1)
+#   thermal_pressure_continuous  = 1     (wave-2 default; 0=cliff to up_thresh=90)
 #   prefer_silver_aware          = 1     (wave-1 default; V2 also uses 1 in efficiency/balanced)
 #   prefer_silver_hot_threshold_pct = 70 (ps hit-rate cutoff for the bump)
 #   prefer_silver_hot_bump_pct   = 5     (up_thresh bump on big/prime when hot)
@@ -298,9 +331,9 @@ on property:sys.boot_completed=1
 #   profile                    = custom  (or performance/balanced/battery/legacy)
 #
 # Awareness floors
-#   render_aware               = 0
+#   render_aware               = 1       (wave-2 default; 0=walks + floor off)
 #   render_floor_pct           = 70
-#   audio_aware                = 0
+#   audio_aware                = 1       (wave-2 default; 0=walks + clamp off)
 #   audio_floor_pct            = 0
 #   audio_cap_pct              = 0
 #   camera_aware               = 0
