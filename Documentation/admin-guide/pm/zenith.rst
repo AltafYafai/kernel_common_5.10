@@ -492,6 +492,46 @@ Input boost
     ``input_boost_big_only``.  0 = disabled, recommended 30000
     (30 s).
 
+``boot_complete``
+    Boolean (0/1).  Boot-completion latch shared globally across all
+    policies (any policy's node is equivalent).  Defaults to 0 at
+    boot; raised to 1 by either:
+
+    - userspace writing ``1`` to the knob.  Typical use is from
+      ``on property:sys.boot_completed=1`` in ``init.zenith.rc``.
+    - the in-kernel auto-tune worker observing
+      ``ZENITH_BOOT_COMPLETE_CALM_WINDOWS`` consecutive committed
+      ``efficiency`` windows past a 5 s grace period (gated on
+      ``boot_complete_auto``).
+
+    When raised, the boost path in ``zenith_get_next_freq()`` snaps
+    the deadline forward to the latch timestamp -- the cluster
+    therefore transitions from Phase 1 (pin to max) to Phase 2
+    (decay via ``boot_boost_decay_ms``) immediately, instead of
+    cliff-cutting to load-derived frequency the way
+    ``write boot_boost_ms 0`` would.
+
+    Write ``0`` to lower the latch (useful for testing the boost
+    path on a running system without a reboot).  Values ``>1`` are
+    rejected with ``EINVAL``.
+
+``boot_complete_auto``
+    Boolean (0/1, default 1).  Gates the in-kernel calm-detect arm
+    of the ``boot_complete`` latch.  When 1, the auto-tune worker
+    increments a per-policy consecutive-``efficiency`` counter and
+    raises the global latch on the first policy that hits
+    ``ZENITH_BOOT_COMPLETE_CALM_WINDOWS`` past the grace period.
+    When 0, only userspace writes to ``boot_complete`` can raise
+    the latch.
+
+    The calm streak counter is per-policy; if any policy
+    classifies non-``efficiency`` for a window, that policy's
+    counter resets but the others keep counting.  The grace period
+    (currently 5 s) prevents the latch from being raised during
+    very early boot when the first auto-tune window can land on
+    ``efficiency`` for trivial reasons (sample-noise classifier
+    bounce before the first heavy workload kicks in).
+
 I/O wait handling
 -----------------
 

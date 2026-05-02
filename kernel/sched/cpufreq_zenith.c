@@ -1300,6 +1300,41 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_BOOT_BOOST_DECAY_MS_MAX		30000
 #define ZENITH_BOOT_BOOST_MAX_MS		300000
 
+/* boot_complete latch (wave-3 follow-up):
+ *
+ * boot_boost_ms is a wall-clock one-shot that pins the cluster to
+ * policy->max for boot_boost_ms milliseconds after boottime origin
+ * regardless of whether the platform has actually finished booting.
+ * On fast devices this leaves a noticeable energy / heat tail at
+ * the end of the wall-clock window after Android has settled.
+ *
+ * The boot_complete latch lets either userspace or the in-kernel
+ * auto-tune worker snap the boost deadline forward to "now" the
+ * moment boot is observed complete:
+ *
+ *   - userspace:  init.zenith.rc raises the latch from
+ *                 on property:sys.boot_completed=1 by writing 1 to
+ *                 the boot_complete sysfs knob.
+ *   - in-kernel:  the auto-tune worker observes a calm streak of at
+ *                 least ZENITH_BOOT_COMPLETE_CALM_WINDOWS consecutive
+ *                 EFFICIENCY windows past a small grace period and
+ *                 raises the latch on the first qualifying policy.
+ *
+ * Once raised, the boot-boost path in zenith_get_next_freq() snaps
+ * the deadline forward to zenith_boot_complete_ns -- the cluster
+ * therefore transitions from Phase 1 (pin to max) to Phase 2 (decay
+ * via boot_boost_decay_ms) immediately, instead of cliff-cutting to
+ * load-derived freq the way "write boot_boost_ms 0" would.
+ *
+ * boot_complete_auto gates the in-kernel calm-detect path; default 1.
+ * Set to 0 to require an explicit userspace write before the boost
+ * is considered complete.
+ */
+#define ZENITH_DEFAULT_BOOT_COMPLETE_AUTO	1
+#define ZENITH_BOOT_COMPLETE_CALM_WINDOWS	2
+#define ZENITH_BOOT_COMPLETE_GRACE_NS \
+	((u64)5000 * NSEC_PER_MSEC)
+
 /* uclamp_max_respect (default 1): symmetric counterpart to
  * uclamp_min_respect.  When set, zenith_get_next_freq() applies an
  * explicit final-freq _cap_ derived from the RQ-aggregated uclamp_max
@@ -1801,6 +1836,14 @@ struct zenith_tunables {
 	unsigned int		camera_active;
 	unsigned int		camera_floor_pct;
 
+	/* See ZENITH_DEFAULT_BOOT_COMPLETE_AUTO comment block.  Gates
+	 * the in-kernel calm-detect arm of the boot_complete latch in
+	 * zenith_auto_tune_work().  Default 1.  Setting to 0 disables
+	 * the in-kernel arm; userspace writes to the boot_complete
+	 * sysfs knob still work.
+	 */
+	unsigned int		boot_complete_auto;
+
 	/* See ZENITH_DEFAULT_BOOT_BOOST_MS. 0 disables the one-shot. */
 	unsigned int		boot_boost_ms;
 
@@ -1863,6 +1906,15 @@ static atomic64_t zenith_input_boost_until_ns = ATOMIC64_INIT(0);
  * with no ordering requirements other than "the latest write wins".
  */
 static atomic_t zenith_drm_vblank_us = ATOMIC_INIT(0);
+
+/* Boot-completion latch.  See ZENITH_DEFAULT_BOOT_COMPLETE_AUTO
+ * comment block above struct zenith_tunables.  Both globals are
+ * read lock-free from zenith_get_next_freq() (the boost path) and
+ * written either from the boot_complete sysfs *_store callback or
+ * from zenith_auto_tune_work() once the calm streak qualifies.
+ */
+static atomic_t zenith_boot_complete = ATOMIC_INIT(0);
+static u64 zenith_boot_complete_ns;
 
 /**
  * zenith_set_drm_vblank_us - publish active panel vblank period to zenith
@@ -2077,6 +2129,16 @@ struct zenith_policy {
 	unsigned int		at_effective_frame_pace_floor_pct;
 	unsigned int		at_effective_game_mode;
 	bool			at_local_actions;
+
+	/* Per-policy consecutive-EFFICIENCY-window counter for the
+	 * boot_complete in-kernel calm detector.  See the
+	 * ZENITH_DEFAULT_BOOT_COMPLETE_AUTO comment block.  Reset to 0
+	 * whenever the resolved V2 state is anything other than
+	 * EFFICIENCY; the auto detector latches zenith_boot_complete on
+	 * the first per-policy worker that hits
+	 * ZENITH_BOOT_COMPLETE_CALM_WINDOWS past the grace period.
+	 */
+	unsigned int		at_boot_calm_streak;
 
 	/* round-U-z10 glide / coordination knobs auto-driven by the V2
 	 * worker via zenith_at_apply_glides() when
@@ -4381,6 +4443,20 @@ brutal_entry_deferred:
 		u64 boot_now = ktime_get_boottime_ns();
 		u64 deadline_ns = (u64)z_policy->tunables->boot_boost_ms *
 				  NSEC_PER_MSEC;
+
+		/* boot_complete latch (sysfs-driven or in-kernel calm-detect).
+		 * When raised, snap the deadline forward to the latch
+		 * timestamp so the cluster transitions from Phase 1
+		 * (pin to max) to Phase 2 (decay via boot_boost_decay_ms)
+		 * immediately, instead of cliff-cutting to load-derived
+		 * the way "write boot_boost_ms 0" would.
+		 */
+		if (atomic_read(&zenith_boot_complete)) {
+			u64 latch_ns = READ_ONCE(zenith_boot_complete_ns);
+
+			if (latch_ns && latch_ns < deadline_ns)
+				deadline_ns = latch_ns;
+		}
 
 		if (boot_now < deadline_ns) {
 			if (freq < policy->max) {
@@ -6821,6 +6897,35 @@ static void zenith_auto_tune_work(struct work_struct *w)
 			zenith_at_apply_glides(z_policy, state);
 		else
 			z_policy->at_local_glides_active = false;
+
+		/* Boot-complete calm detector.  Only runs while the
+		 * latch is still down and the auto arm is enabled.
+		 * Counts consecutive committed-EFFICIENCY windows on
+		 * this policy; the first policy to reach the threshold
+		 * past the boottime grace period raises the latch
+		 * globally.  Subsequent policies / windows short-circuit
+		 * on the atomic_read.
+		 */
+		if (!atomic_read(&zenith_boot_complete) &&
+		    READ_ONCE(t->boot_complete_auto)) {
+			if (state == ZENITH_AT_STATE_EFFICIENCY)
+				z_policy->at_boot_calm_streak++;
+			else
+				z_policy->at_boot_calm_streak = 0;
+
+			if (z_policy->at_boot_calm_streak >=
+			    ZENITH_BOOT_COMPLETE_CALM_WINDOWS) {
+				u64 now_ns = ktime_get_boottime_ns();
+
+				if (now_ns >= ZENITH_BOOT_COMPLETE_GRACE_NS) {
+					WRITE_ONCE(zenith_boot_complete_ns,
+						   now_ns);
+					atomic_set(&zenith_boot_complete, 1);
+					pr_info("zenith: boot_complete latched (auto, calm=%u windows)\n",
+						z_policy->at_boot_calm_streak);
+				}
+			}
+		}
 		goto rearm;
 	}
 
@@ -9244,6 +9349,76 @@ static ssize_t boot_boost_decay_ms_store(struct gov_attr_set *attr_set,
 static struct governor_attr boot_boost_decay_ms =
 	__ATTR_RW(boot_boost_decay_ms);
 
+/* boot_complete sysfs knob.  See ZENITH_DEFAULT_BOOT_COMPLETE_AUTO
+ * comment block.  Read returns the global latch state shared across
+ * all policies (any policy's node is equivalent).  Write 1 to raise
+ * the latch from userspace -- typical use is from
+ * on property:sys.boot_completed=1 in init.zenith.rc.  Write 0 to
+ * lower the latch (useful for testing the boot-boost path on a
+ * running system without a reboot).  Values >1 are rejected.
+ *
+ * Raising the latch (write 1) sets zenith_boot_complete_ns to
+ * ktime_get_boottime_ns() so the boost path snaps the deadline to
+ * the latch timestamp.  Lowering (write 0) clears both the atomic
+ * and the timestamp; the boost behaves as if the latch had never
+ * been raised, except that the wall-clock has advanced -- a
+ * post-deadline boot would simply re-enter the existing
+ * boot_boost_decay_ms tail.
+ */
+static ssize_t boot_complete_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", atomic_read(&zenith_boot_complete));
+}
+
+static ssize_t boot_complete_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	if (val) {
+		WRITE_ONCE(zenith_boot_complete_ns,
+			   ktime_get_boottime_ns());
+		atomic_set(&zenith_boot_complete, 1);
+	} else {
+		atomic_set(&zenith_boot_complete, 0);
+		WRITE_ONCE(zenith_boot_complete_ns, 0);
+	}
+	return count;
+}
+static struct governor_attr boot_complete = __ATTR_RW(boot_complete);
+
+/* boot_complete_auto sysfs knob.  See ZENITH_DEFAULT_BOOT_COMPLETE_AUTO
+ * comment block.  Per-tunables (per-attr-set), unlike the global
+ * boot_complete latch above.  Default 1: the auto-tune worker may
+ * raise the latch on the first policy that observes
+ * ZENITH_BOOT_COMPLETE_CALM_WINDOWS consecutive EFFICIENCY windows
+ * past the grace period.  Set to 0 to require an explicit userspace
+ * write to boot_complete; the calm streak counter still increments
+ * but never raises the latch.
+ */
+static ssize_t boot_complete_auto_show(struct gov_attr_set *attr_set,
+				       char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->boot_complete_auto);
+}
+
+static ssize_t boot_complete_auto_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->boot_complete_auto = val;
+	return count;
+}
+static struct governor_attr boot_complete_auto =
+	__ATTR_RW(boot_complete_auto);
+
 /* frame_budget_us sysfs knob.  Range 0..ZENITH_FRAME_BUDGET_US_MAX
  * (50 ms).  Userspace writes the current vblank period in
  * microseconds whenever the panel changes refresh rate.  0 disables
@@ -9582,6 +9757,8 @@ static struct attribute *zenith_attrs[] = {
 	&psi_io_thresh.attr,
 	&boot_boost_ms.attr,
 	&boot_boost_decay_ms.attr,
+	&boot_complete.attr,
+	&boot_complete_auto.attr,
 	&frame_budget_us.attr,
 	&frame_budget_us_auto.attr,
 	&drm_vblank_us.attr,
@@ -9791,6 +9968,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->psi_io_thresh		= ZENITH_DEFAULT_PSI_IO_THRESH;
 	tunables->boot_boost_ms		= ZENITH_DEFAULT_BOOT_BOOST_MS;
 	tunables->boot_boost_decay_ms	= ZENITH_DEFAULT_BOOT_BOOST_DECAY_MS;
+	tunables->boot_complete_auto	= ZENITH_DEFAULT_BOOT_COMPLETE_AUTO;
 	tunables->frame_budget_us	= ZENITH_DEFAULT_FRAME_BUDGET_US;
 	tunables->frame_budget_us_auto	= ZENITH_DEFAULT_FRAME_BUDGET_US_AUTO;
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;

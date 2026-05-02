@@ -212,10 +212,17 @@ on property:sys.boot_completed=1
     # a tidy-up.
     # write /sys/devices/system/cpu/cpufreq/policy*/zenith/profile balanced
 
-    # Drop boot_boost early if we want it cleared (the kernel ignores
-    # writes-while-armed past the deadline anyway, but explicit clear
-    # frees any future userspace from worrying about residual state).
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/boot_boost_ms 0
+    # Raise the boot_complete latch (wave-3).  This snaps the
+    # boot_boost deadline forward to "now" so the cluster transitions
+    # from Phase 1 (pin to max) to Phase 2 (decay via
+    # boot_boost_decay_ms) instead of cliff-cutting to load-derived
+    # the way "write boot_boost_ms 0" would.  Idempotent across
+    # multiple boot_completed events.  The kernel also raises the
+    # latch on its own once the auto-tune worker observes a calm
+    # streak (boot_complete_auto=1 by default), so this write is
+    # belt-and-braces -- if init runs first, great; if the kernel
+    # latches first, this write is a no-op.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/boot_complete 1
 
 # ----- Reference: every Zenith knob, defaults shown -----
 # (Listed for grep / discovery.  Do not uncomment unless you actually
@@ -349,6 +356,8 @@ on property:sys.boot_completed=1
 #
 # Boot / frame pacing
 #   boot_boost_ms              = 0       (overridden to 30000 above)
+#   boot_complete              = 0       (wave-3 latch; raised by sys.boot_completed)
+#   boot_complete_auto         = 1       (wave-3 default; in-kernel calm-detect)
 #   frame_budget_us            = 0       (vblank period; 0=disabled)
 #   frame_budget_us_per_policy = (none)  (CSV per-policy override)
 #   frame_pace_floor_pct       = 0
