@@ -59,6 +59,17 @@ on init
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_hysteresis_windows 2
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_cooldown_windows 1
 
+    # ----- Auto-tune V2 glides (round-U-z10 follow-up) -----
+    # Master gate for V2-driven population of the round-U-z10 glide /
+    # coordination knobs (brutal_decay_ms, wakeup_boost_ms,
+    # boot_boost_decay_ms, screen_off_glide_ms,
+    # thermal_pressure_continuous, prefer_silver_aware,
+    # frame_budget_us_auto).  Already default ON in the kernel; we
+    # write it here explicitly so the intent is visible to anyone
+    # auditing the boot config.  Set to 0 to lock all seven glide
+    # knobs back to their per-knob defaults (legacy hard cliffs).
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_v2_glides 1
+
     # ----- Smoothness tunables (V3) -----
     # Frequency stability margin: hold current freq when the new target
     # is within this % of policy->max below current.  Prevents tiny
@@ -233,10 +244,27 @@ on property:sys.boot_completed=1
 #
 # Auto-tune V2 (V3, smart state machine)
 #   auto_tune_v2               = 1       (0=legacy classifier, 1=bounded V2)
+#   auto_tune_v2_glides        = 1       (V2-driven defaults for round-U-z10 knobs)
 #   auto_tune_hysteresis_windows = 2     (windows before committing state)
 #   auto_tune_cooldown_windows = 1       (quiet windows after state change)
 #   auto_tune_reset_overrides  = WO      (write 1 to clear user-override mask)
 #   auto_tune_status           = RO      (diagnostic: state, reason, signals)
+#   at_log                     = RO      (round-U-z10: ringbuf of last 16 V2 transitions)
+#   stats_reset                = WO      (round-U-z10: write any value to clear stats + at_log)
+#
+# Round-U-z10 glide / coordination knobs (auto-driven by V2 when
+# auto_tune_v2 && auto_tune_v2_glides; user write of non-zero wins
+# outright):
+#   brutal_decay_ms              = 0     (0=cliff, max 500; V2 uses 150 in latency)
+#   wakeup_boost_ms              = 0     (0=tick-only, max 200; V2 uses 50)
+#   boot_boost_decay_ms          = 0     (0=cliff at boot_boost_ms; V2 uses 5000)
+#   screen_off_glide_ms          = 0     (0=cliff to up_thresh=95; V2 uses 300)
+#   thermal_pressure_continuous  = 0     (0=cliff to up_thresh=90; V2 uses 1)
+#   prefer_silver_aware          = 0     (0=off; V2 uses 1 in efficiency/balanced)
+#   prefer_silver_hot_threshold_pct = 70 (ps hit-rate cutoff for the bump)
+#   prefer_silver_hot_bump_pct   = 5     (up_thresh bump on big/prime when hot)
+#   frame_budget_us_auto         = 0     (0=use frame_budget_us; V2 uses 1)
+#   drm_vblank_us                = RO    (cached drm panel vblank period in us)
 #
 # Profile
 #   profile                    = custom  (or performance/balanced/battery/legacy)
