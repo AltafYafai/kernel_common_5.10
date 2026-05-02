@@ -550,6 +550,18 @@ Environment hooks
     on idle-to-busy transitions, so the first tick after a long idle
     can climb without the rate-limit clamp.
 
+``wakeup_boost_ms``
+    Wall-clock duration of the wakeup-boost bypass, in milliseconds
+    (0..200, default 0).  When 0, the legacy tick-based bypass is the
+    only mechanism: the next ``ZENITH_WAKEUP_BOOST_TICKS`` (currently
+    2) upward transitions skip ``up_rate_limit`` after the detector
+    fires.  When non-zero, the detection sites additionally arm a
+    per-CPU ``ktime_get_ns()``-based deadline; the up-rate bypass
+    stays active until both the tick counter has expired AND the
+    deadline has lapsed.  Useful when ``up_rate_limit`` is small
+    enough that two ticks elapse in microseconds, leaving the bypass
+    too short to actually escape the cold-start sample.
+
 kcpustat hispeed blend
 ----------------------
 

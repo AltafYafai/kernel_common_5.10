@@ -505,6 +505,13 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_WAKEUP_BUSY_THRESH_PCT		40
 #define ZENITH_WAKEUP_BOOST_TICKS		2
 
+/* wakeup_boost_ms upper bound.  200ms is past the perceptible
+ * threshold for a wakeup transition; longer windows just bleed
+ * into the steady-state climb logic and waste battery.
+ */
+#define ZENITH_DEFAULT_WAKEUP_BOOST_MS		0
+#define ZENITH_WAKEUP_BOOST_MS_MAX		200
+
 /* down_threshold_adaptive (default 0, off):
  *
  * Mirrors up_threshold_adaptive on the brutality exit side.  When set
@@ -1410,6 +1417,19 @@ struct zenith_tunables {
 	 */
 	unsigned int		wakeup_boost;
 
+	/* Time-based extension of wakeup_boost.  When 0 (default), the
+	 * legacy tick-based ZENITH_WAKEUP_BOOST_TICKS countdown is used
+	 * verbatim.  When non-zero, the detection sites additionally
+	 * arm a per-CPU deadline at now + wakeup_boost_ms; the rate-
+	 * limit bypass remains active until either the tick counter
+	 * reaches zero AND the deadline has expired.  Lets userspace
+	 * tune the bypass duration in real wall-clock time, regardless
+	 * of how often zenith_freq_throttle() actually runs (which on
+	 * Android can vary widely with up_rate_limit and topology).
+	 * Capped at ZENITH_WAKEUP_BOOST_MS_MAX in the sysfs store.
+	 */
+	unsigned int		wakeup_boost_ms;
+
 	/* See ZENITH_DEFAULT_DOWN_THRESHOLD_ADAPTIVE.  Percent by which
 	 * bursty load can lower the brutality exit threshold.  0 disables.
 	 */
@@ -2003,6 +2023,15 @@ struct zenith_cpu {
 	 */
 	unsigned long		wakeup_prev_util;
 	u8			wakeup_boost_ticks;
+
+	/* Deadline mirror of wakeup_boost_ticks.  0 means no
+	 * wall-clock-based bypass armed; non-zero is an absolute
+	 * ktime_get_ns() value at which the time-based portion of the
+	 * up-rate bypass stops applying.  Set together with
+	 * wakeup_boost_ticks at the detection sites when
+	 * tunables->wakeup_boost_ms is non-zero.
+	 */
+	u64			wakeup_boost_until_ns;
 
 	/* kcpustat hispeed-blend sampler state (consumed by
 	 * zenith_kcpustat_sample / zenith_kcpustat_blend). Two-phase
@@ -2650,9 +2679,26 @@ static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, 
 		for_each_cpu(cpu, z_policy->policy->cpus) {
 			z_cpu = &per_cpu(zenith_cpu, cpu);
 
+			/* Tick-based bypass: legacy fast path that bypasses
+			 * the up-rate limit for ZENITH_WAKEUP_BOOST_TICKS
+			 * upward transitions after an idle->busy detection.
+			 */
 			if (z_cpu->wakeup_boost_ticks) {
 				z_cpu->wakeup_boost_ticks--;
 				return false;
+			}
+
+			/* Wall-clock-based bypass armed by wakeup_boost_ms.
+			 * Stays active until the deadline passes; no need
+			 * to decrement.  Self-disarms on first sample past
+			 * the deadline so subsequent ticks fall through to
+			 * the normal up_rate_limit gate.
+			 */
+			if (z_cpu->wakeup_boost_until_ns) {
+				if (ktime_get_ns() <
+				    z_cpu->wakeup_boost_until_ns)
+					return false;
+				z_cpu->wakeup_boost_until_ns = 0;
 			}
 		}
 		if (next_freq - z_policy->next_freq >= spike)
@@ -4571,8 +4617,18 @@ static void zenith_update_single(struct update_util_data *hook, u64 time, unsign
 				       max_cap) : 0;
 
 		if (prev_pct < ZENITH_WAKEUP_IDLE_THRESH_PCT &&
-		    cur_pct >= ZENITH_WAKEUP_BUSY_THRESH_PCT)
+		    cur_pct >= ZENITH_WAKEUP_BUSY_THRESH_PCT) {
+			unsigned int ms = READ_ONCE(tunables->wakeup_boost_ms);
+
 			z_cpu->wakeup_boost_ticks = ZENITH_WAKEUP_BOOST_TICKS;
+			if (ms) {
+				if (ms > ZENITH_WAKEUP_BOOST_MS_MAX)
+					ms = ZENITH_WAKEUP_BOOST_MS_MAX;
+				z_cpu->wakeup_boost_until_ns =
+					ktime_get_ns() +
+					(u64)ms * NSEC_PER_MSEC;
+			}
+		}
 	}
 	z_cpu->wakeup_prev_util = util;
 
@@ -4633,9 +4689,20 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 							100) / j_max) : 0;
 
 				if (prev_pct < ZENITH_WAKEUP_IDLE_THRESH_PCT &&
-				    cur_pct >= ZENITH_WAKEUP_BUSY_THRESH_PCT)
+				    cur_pct >= ZENITH_WAKEUP_BUSY_THRESH_PCT) {
+					unsigned int ms = READ_ONCE(
+						tunables->wakeup_boost_ms);
+
 					j_z_cpu->wakeup_boost_ticks =
 						ZENITH_WAKEUP_BOOST_TICKS;
+					if (ms) {
+						if (ms > ZENITH_WAKEUP_BOOST_MS_MAX)
+							ms = ZENITH_WAKEUP_BOOST_MS_MAX;
+						j_z_cpu->wakeup_boost_until_ns =
+							ktime_get_ns() +
+							(u64)ms * NSEC_PER_MSEC;
+					}
+				}
 			}
 			j_z_cpu->wakeup_prev_util = j_util;
 
@@ -7176,6 +7243,31 @@ static ssize_t wakeup_boost_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr wakeup_boost = __ATTR_RW(wakeup_boost);
 
+/* wakeup_boost_ms sysfs knob.  Range 0..ZENITH_WAKEUP_BOOST_MS_MAX.
+ * 0 disables the wall-clock bypass and leaves only the legacy
+ * tick-based ZENITH_WAKEUP_BOOST_TICKS countdown.  Non-zero arms a
+ * deadline at the detection sites; the up-rate bypass holds until
+ * either the tick counter expires or the deadline lapses.
+ */
+static ssize_t wakeup_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->wakeup_boost_ms);
+}
+
+static ssize_t wakeup_boost_ms_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_WAKEUP_BOOST_MS_MAX)
+		return -EINVAL;
+	t->wakeup_boost_ms = val;
+	return count;
+}
+static struct governor_attr wakeup_boost_ms = __ATTR_RW(wakeup_boost_ms);
+
 static ssize_t rate_limit_cluster_scale_show(struct gov_attr_set *attr_set,
 					     char *buf)
 {
@@ -8778,6 +8870,7 @@ static struct attribute *zenith_attrs[] = {
 	&freq_stability_margin_pct.attr,
 	&down_rate_adaptive.attr,
 	&wakeup_boost.attr,
+	&wakeup_boost_ms.attr,
 	&down_threshold_adaptive.attr,
 	&rate_limit_cluster_scale.attr,
 	&input_boost_ms.attr,
@@ -8984,6 +9077,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->freq_stability_margin_pct = ZENITH_DEFAULT_FREQ_STABILITY_MARGIN_PCT;
 	tunables->down_rate_adaptive	= ZENITH_DEFAULT_DOWN_RATE_ADAPTIVE;
 	tunables->wakeup_boost		= ZENITH_DEFAULT_WAKEUP_BOOST;
+	tunables->wakeup_boost_ms	= ZENITH_DEFAULT_WAKEUP_BOOST_MS;
 	tunables->down_threshold_adaptive = ZENITH_DEFAULT_DOWN_THRESHOLD_ADAPTIVE;
 	tunables->rate_limit_cluster_scale = ZENITH_DEFAULT_RATE_LIMIT_CLUSTER_SCALE;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
