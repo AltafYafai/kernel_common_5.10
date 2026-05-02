@@ -626,6 +626,34 @@ Read-only diagnostics
     hits.  Read once from userspace after a benchmark to attribute
     the freq-time histogram to specific tiers.
 
+``zenith_stats_reset`` (write-only)
+    Write any non-zero value to clear ``zenith_stats`` and the
+    ``at_log`` ring on every policy that shares this tunables set.
+    Writing ``0`` is intentionally a no-op (avoids a stray
+    ``echo > zenith_stats_reset`` erasing the data the operator was
+    about to read).
+
+``at_log``
+    Per-policy ring buffer of the most recent auto-tune classifier
+    samples.  Each sample is one ``ZENITH_AUTO_TUNE_PERIOD_MS`` window
+    (10 s by default), the depth of the ring is
+    ``ZENITH_AT_LOG_NR`` (16) so each policy keeps about 160 s of
+    post-mortem.  Output is one header line per policy followed by
+    one line per sample (oldest first), with ``key=value`` pairs::
+
+        ts_ns=  ktime_get_ns() at push time
+        reason= V1 / V2 reason name
+        from=   V2 state at the start of the window
+        to=     V2 state after this window's actions
+        target= V1 picked profile name
+        sat=    saturation rate (% of samples > saturation_load_pct)
+        evx2=   input event rate (events / 2 s)
+        thp=    arch_scale_thermal_pressure() at push (0..1024)
+        slope=  thermal pressure delta vs the previous window
+        var=    load variance EWMA × 256
+        flags=  ZENITH_AT_FLAG_* signal mask
+        emerg=  1 if a V2 emergency state was committed
+
 Typical recipes
 ===============
 

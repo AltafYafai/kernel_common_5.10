@@ -189,6 +189,24 @@
  * unchanged: the loop bound is eff_nr, not the array ceiling.
  */
 #define ZENITH_EFF_BINS_MAX			8
+
+/* Depth of the per-policy auto-tune classifier ring buffer.
+ *
+ * Each entry records one V1 classifier window (the worker fires every
+ * ZENITH_AUTO_TUNE_PERIOD_MS = 10 s) plus the V2 state machine view at
+ * that moment.  16 entries gives roughly 160 s of post-mortem visible
+ * via the read-only at_log sysfs node, which covers a typical bench
+ * run, an app launch, a bursty UI sequence or a thermal-recovery cycle
+ * without any extra tooling.
+ *
+ * The ring is a single-writer/multi-reader buffer: only the per-policy
+ * delayed_work worker pushes; sysfs readers walk it from oldest to
+ * newest under no extra locking, accepting at most one window of
+ * tearing on the wrap (rare and harmless for diagnostics).  Storage is
+ * ~64 bytes per entry, so 16 entries cost ~1 KiB per policy.
+ */
+#define ZENITH_AT_LOG_NR			16
+
 #define ZENITH_CLIMB_MODE_SNAP			0	/* default */
 #define ZENITH_CLIMB_MODE_STEP			1
 #define ZENITH_PROFILE_CUSTOM			0	/* default */
@@ -1552,6 +1570,28 @@ enum zenith_stat_idx {
 	ZENITH_STAT_NR
 };
 
+/* One sample written by the auto-tune classifier worker into the
+ * per-policy at_log ring (see ZENITH_AT_LOG_NR).  Mirrors the
+ * at_last_* mirrors on struct zenith_policy at the moment the worker
+ * resolved the new V1 target / V2 state, so userspace can correlate a
+ * decision against the signals that drove it without bpftrace.
+ */
+struct zenith_at_log_entry {
+	u64		ts_ns;
+	u32		flags;			/* ZENITH_AT_FLAG_* mask */
+	u32		var_x256;
+	u32		thermal_pressure;	/* 0..1024 */
+	u16		sat_pct;		/* 0..100 */
+	u16		events_rate_x2;
+	u16		thermal_slope;		/* signed-stored-as-u16 */
+	u8		v1_target;		/* enum profile id */
+	u8		v2_from_state;
+	u8		v2_to_state;
+	u8		reason;			/* enum at_reason */
+	u8		emergency;		/* 1 if state_overridden by slope */
+	u8		_pad[3];
+};
+
 struct zenith_policy {
 	struct cpufreq_policy	*policy;
 	struct zenith_tunables	*tunables;
@@ -1690,6 +1730,17 @@ struct zenith_policy {
 	unsigned int		at_effective_game_mode;
 	bool			at_local_actions;
 	struct delayed_work	at_work;
+
+	/* Auto-tune classifier ring buffer.  Single-writer (the
+	 * delayed_work worker), multi-reader (sysfs at_log readers).
+	 * at_log_head is the next write slot; at_log_count is the total
+	 * number of entries pushed since the last reset, capped at the
+	 * ring depth on read.  Both are reset by writing to
+	 * zenith_stats_reset.
+	 */
+	struct zenith_at_log_entry at_log[ZENITH_AT_LOG_NR];
+	unsigned int		at_log_head;
+	unsigned int		at_log_count;
 
 	/* Cached topology bit: true when any CPU in the policy has
 	 * arch_scale_cpu_capacity == SCHED_CAPACITY_SCALE, i.e. the
@@ -4517,6 +4568,73 @@ static void zenith_refresh_rate_delays(struct gov_attr_set *attr_set)
 	}
 }
 
+/* Push a one-shot sample into the per-policy auto-tune ring buffer.
+ *
+ * Called from the tail of zenith_auto_tune_work() after the V1
+ * classifier has resolved a target and the V2 state machine has
+ * settled on a state.  Reads the freshly-populated at_last_* mirrors
+ * on z_policy so the caller does not have to redundantly thread the
+ * same dozen-odd values; only from_state is taken as a parameter
+ * because at_last_state has already been overwritten with the new
+ * state by the time we get here.
+ *
+ * The ring is a simple head-advances-then-wraps circular buffer.
+ * The worker is the only writer and it is single-shot per policy
+ * (a delayed_work, not a timer with overlapping fire), so no
+ * locking is needed on the writer side.  Sysfs readers walk the
+ * ring under no extra lock and accept tearing on the wrap window;
+ * the on-disk semantics are "last N samples observed by the worker",
+ * which is exactly what diagnostics want.
+ */
+static void zenith_at_log_push(struct zenith_policy *z_policy,
+			       unsigned int from_state,
+			       unsigned int v1_target,
+			       bool emergency)
+{
+	struct zenith_at_log_entry *e;
+	unsigned int slot;
+
+	slot = z_policy->at_log_head;
+	if (slot >= ZENITH_AT_LOG_NR)
+		slot = 0;
+	e = &z_policy->at_log[slot];
+
+	e->ts_ns		= ktime_get_ns();
+	e->flags		= z_policy->at_last_flags;
+	e->var_x256		= z_policy->at_last_var_x256;
+	e->thermal_pressure	= z_policy->at_last_thermal_pressure;
+	e->sat_pct		= z_policy->at_last_sat_pct;
+	e->events_rate_x2	= z_policy->at_last_events_rate_x2;
+	e->thermal_slope	= z_policy->at_last_thermal_slope;
+	e->v1_target		= (u8)v1_target;
+	e->v2_from_state	= (u8)from_state;
+	e->v2_to_state		= (u8)z_policy->at_last_state;
+	e->reason		= (u8)z_policy->at_last_reason;
+	e->emergency		= emergency ? 1 : 0;
+
+	z_policy->at_log_head = (slot + 1) % ZENITH_AT_LOG_NR;
+	if (z_policy->at_log_count < ZENITH_AT_LOG_NR)
+		z_policy->at_log_count++;
+}
+
+/* Reset all observability counters on a single policy.
+ *
+ * Clears both the per-policy zenith_stats[] array and the auto-tune
+ * classifier ring.  Used by the zenith_stats_reset sysfs node so an
+ * operator can mark a "start of measurement" point before a benchmark
+ * without having to re-init the governor.  The decision-tier counters
+ * are racy with the fast path (the per-CPU update path increments
+ * them with a plain ++), but that race is bounded to a few lost
+ * counts on the boundary which is acceptable for diagnostics.
+ */
+static void zenith_policy_observability_reset(struct zenith_policy *z_policy)
+{
+	memset(z_policy->stats, 0, sizeof(z_policy->stats));
+	memset(z_policy->at_log, 0, sizeof(z_policy->at_log));
+	z_policy->at_log_head = 0;
+	z_policy->at_log_count = 0;
+}
+
 static void zenith_reset_local_actions(struct zenith_policy *z_policy)
 {
 	z_policy->at_effective_up_rate_limit_us = z_policy->tunables->up_rate_limit_us;
@@ -5554,6 +5672,8 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	unsigned int thermal_pressure = 0;
 	unsigned int thermal_delta = 0;
 	unsigned int frame_budget_us = 0;
+	unsigned int at_from_state = z_policy->at_last_state;
+	bool at_emergency = false;
 
 	if (!t->auto_tune)
 		return;	/* tunable turned off; stop the chain */
@@ -5777,6 +5897,7 @@ static void zenith_auto_tune_work(struct work_struct *w)
 				min_t(unsigned int,
 				      t->auto_tune_cooldown_windows,
 				      ZENITH_AT_COOLDOWN_WINDOWS_MAX);
+			at_emergency = emergency;
 			if (!t->auto_tune_cluster_aware &&
 			    target != t->active_profile) {
 				zenith_apply_profile(t, target);
@@ -5813,6 +5934,8 @@ static void zenith_auto_tune_work(struct work_struct *w)
 
 	/* Re-arm for the next classification window. */
 rearm:
+	zenith_at_log_push(z_policy, at_from_state, z_policy->at_last_target,
+			   at_emergency);
 	schedule_delayed_work(&z_policy->at_work,
 			      msecs_to_jiffies(ZENITH_AUTO_TUNE_PERIOD_MS));
 }
@@ -6411,6 +6534,86 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 	return len;
 }
 static struct governor_attr zenith_stats = __ATTR_RO(zenith_stats);
+
+/* Reset all per-policy observability counters: zenith_stats[] and the
+ * auto-tune classifier ring (at_log).  Write any non-zero value to
+ * trigger; writing 0 is a no-op so a misfired "echo > stats_reset"
+ * can't accidentally erase the data the operator was about to read.
+ */
+static ssize_t zenith_stats_reset_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_policy *z_pol;
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (!val)
+		return count;
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook)
+		zenith_policy_observability_reset(z_pol);
+	return count;
+}
+static struct governor_attr zenith_stats_reset =
+	__ATTR_WO(zenith_stats_reset);
+
+/* Read-only dump of the per-policy auto-tune classifier ring buffer.
+ *
+ * One line per entry, oldest first, capped at ZENITH_AT_LOG_NR per
+ * policy.  Format chosen to fit comfortably under PAGE_SIZE for the
+ * common HMP topology (2 policies × 16 entries) while remaining
+ * grep-friendly: every key is name=value with no quoted strings or
+ * commas.
+ */
+static ssize_t at_log_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct zenith_policy *z_pol;
+	ssize_t len = 0;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
+		unsigned int count = z_pol->at_log_count;
+		unsigned int head = z_pol->at_log_head;
+		unsigned int start, i;
+
+		if (count > ZENITH_AT_LOG_NR)
+			count = ZENITH_AT_LOG_NR;
+		start = (count == ZENITH_AT_LOG_NR) ? head : 0;
+
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "policy%u(%s): %u entries\n",
+				 z_pol->policy->cpu,
+				 zenith_at_cluster_name(z_pol->cluster_class),
+				 count);
+		if (len >= PAGE_SIZE)
+			break;
+
+		for (i = 0; i < count; i++) {
+			struct zenith_at_log_entry *e =
+				&z_pol->at_log[(start + i) % ZENITH_AT_LOG_NR];
+
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+				"  ts_ns=%llu reason=%s from=%s to=%s target=%s sat=%u evx2=%u thp=%u slope=%u var=%u flags=0x%x emerg=%u\n",
+				(unsigned long long)e->ts_ns,
+				zenith_at_reason_name(e->reason),
+				zenith_at_state_name(e->v2_from_state),
+				zenith_at_state_name(e->v2_to_state),
+				zenith_profile_name(e->v1_target),
+				e->sat_pct,
+				e->events_rate_x2,
+				e->thermal_pressure,
+				e->thermal_slope,
+				e->var_x256,
+				e->flags,
+				e->emergency);
+			if (len >= PAGE_SIZE)
+				break;
+		}
+		if (len >= PAGE_SIZE)
+			break;
+	}
+	return len;
+}
+static struct governor_attr at_log = __ATTR_RO(at_log);
 
 ZENITH_TUNABLE_UINT_INVAL(screen_state);
 
@@ -8095,6 +8298,8 @@ static struct attribute *zenith_attrs[] = {
 	&profile.attr,
 	&profile_values.attr,
 	&zenith_stats.attr,
+	&zenith_stats_reset.attr,
+	&at_log.attr,
 	&auto_tune_status.attr,
 	&auto_tune_reset_overrides.attr,
 	&auto_tune.attr,
