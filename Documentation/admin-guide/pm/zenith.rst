@@ -822,6 +822,31 @@ Game mode::
     game_mode          0 = off, 1 = level-1 (input-boost emphasis,
                        2 = level-2 (sustained big-cluster bias).
                        Default 0.
+    game_auto          Boolean (0/1, default 0).  Master gate for the
+                       in-kernel game detector.  When 1, every cpufreq
+                       decision walks the policy's online cpus and
+                       matches cpu_curr->comm against the
+                       ``game_auto_comms`` table; a 32-decision
+                       streak of matches latches a global "game
+                       active" state for 5 s.  While the state is
+                       active, the effective ``game_mode`` is forced
+                       to at least 1, so the existing level-1
+                       overlays (hispeed boost + input-boost decay
+                       stretch) apply automatically.  Higher
+                       user-set or V2-resolved values are preserved
+                       verbatim.
+    game_auto_state    Read-only.  Returns 1 while the global latch
+                       is in the future, 0 otherwise.  Useful for
+                       tooling that wants to confirm the detector
+                       fired distinct from a manual ``game_mode``
+                       write.
+    game_auto_comms    CSV of comm prefixes matched against
+                       ``cpu_curr->comm``.  Defaults seeded with
+                       ``UnityMain``, ``UnityGfxDeviceW``, ``il2cpp``,
+                       ``GameThread``.  Same RCU-swap semantics as
+                       ``render_comms`` / ``audio_comms`` / 
+                       ``camera_comms``.  Write empty string to
+                       reset to the seed list.
 
 Frame pacing
 ------------

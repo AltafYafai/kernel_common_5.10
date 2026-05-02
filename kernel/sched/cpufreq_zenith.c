@@ -284,9 +284,10 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  *
  * Init-time invariant:
  *
- *   - zenith_camera_aware_key and zenith_psi_aware_key match scalars
- *     that still default to 0, so they correctly start FALSE without
- *     any explicit init-time enable.
+ *   - zenith_camera_aware_key, zenith_psi_aware_key, and
+ *     zenith_game_auto_key match scalars that still default to 0,
+ *     so they correctly start FALSE without any explicit init-time
+ *     enable.
  *   - zenith_audio_aware_key and zenith_render_aware_key match scalars
  *     that were flipped to default 1 in the wave-2 auto-defaults
  *     round, so the keys must be explicitly enabled in zenith_init()
@@ -294,7 +295,7 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  *     would read the scalar as 1 but skip the branch via the still-FALSE
  *     key.  zenith_init() now calls zenith_set_static_key() against
  *     each scalar's value (idempotent across re-attaches).
- *   - zenith_set_profile_defaults() never touches any of the four
+ *   - zenith_set_profile_defaults() never touches any of the five
  *     scalars (they are user-managed opt-ins, not preset state), so
  *     no profile-apply path needs to re-sync the keys.
  */
@@ -302,8 +303,9 @@ DEFINE_STATIC_KEY_FALSE(zenith_audio_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_camera_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_render_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_psi_aware_key);
+DEFINE_STATIC_KEY_FALSE(zenith_game_auto_key);
 
-/* Transition invariant for the four feature static keys above:
+/* Transition invariant for the five feature static keys above:
  *
  *   tunables->X (sysfs-visible scalar)  ==  static-key state of zenith_X_key
  *
@@ -1040,6 +1042,40 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_GAME_L2_HISPEED_BOOST_PCT	120
 #define ZENITH_GAME_L2_BOOST_DECAY_PCT		160
 #define ZENITH_GAME_MODE_MAX			2
+
+/* game_auto (default 0, off):
+ *
+ * In-kernel heuristic for raising the effective game_mode without a
+ * userspace gameswitch helper.  Walks each policy's online cpus and
+ * matches cpu_curr->comm against the rcu-protected zenith_game_auto
+ * comm table (see zenith_game_auto_comms[] for the seed list).  When
+ * the same cpufreq decision sees the comm match for at least
+ * ZENITH_GAME_AUTO_DETECT_STREAK consecutive calls, the global latch
+ * zenith_game_auto_active_until_ns is set to
+ * (now + ZENITH_GAME_AUTO_ACTIVE_TTL_NS).
+ *
+ * While the latch is in the future, zenith_eff_game_mode() reports
+ * max(user game_mode, V2 effective, 1) -- so the existing game_mode=1
+ * overlays (hispeed boost + input_boost decay stretch) apply
+ * automatically.  The latch is auto-renewed on every fresh detection;
+ * absent re-detection, it expires after ZENITH_GAME_AUTO_ACTIVE_TTL_NS
+ * and the system reverts to the user / V2 game_mode value.
+ *
+ * Default 0 (off) so non-game devices and headless builds pay no
+ * runtime cost.  When set to 1, the static key zenith_game_auto_key
+ * gates the comm walk -- a single never-taken jump per cpufreq
+ * decision when the feature is off.
+ *
+ * Tunable surface:
+ *   - game_auto         RW 0/1   master gate
+ *   - game_auto_state   RO 0/1   shows the current global latch state
+ *   - game_auto_comms   RW CSV   comm prefix table (RCU-swapped on
+ *                                store like render_comms / audio_comms)
+ */
+#define ZENITH_DEFAULT_GAME_AUTO		0
+#define ZENITH_GAME_AUTO_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
+#define ZENITH_GAME_AUTO_DETECT_STREAK		32
+#define ZENITH_GAME_AUTO_ACTIVE_TTL_NS		(5ULL * NSEC_PER_SEC)
 
 /* frame_budget_us (default 0, off) + frame_pace_floor_pct (default 0):
  *
@@ -1809,6 +1845,13 @@ struct zenith_tunables {
 	/* See ZENITH_DEFAULT_GAME_MODE. 0/1, normalised on store. */
 	unsigned int		game_mode;
 
+	/* See ZENITH_DEFAULT_GAME_AUTO comment block.  0/1 master gate
+	 * for the in-kernel game detector.  Flipped via the matching
+	 * sysfs node; the *_store callback also syncs the
+	 * zenith_game_auto_key static key (FALSE when scalar = 0).
+	 */
+	unsigned int		game_auto;
+
 	/* See ZENITH_DEFAULT_PSI_AWARE / ZENITH_DEFAULT_PSI_MEM_THRESH /
 	 * ZENITH_DEFAULT_PSI_CPU_THRESH / ZENITH_DEFAULT_PSI_IO_THRESH.
 	 * All thresholds are 0..100 integer percent of the 10s SOME
@@ -1915,6 +1958,53 @@ static atomic_t zenith_drm_vblank_us = ATOMIC_INIT(0);
  */
 static atomic_t zenith_boot_complete = ATOMIC_INIT(0);
 static u64 zenith_boot_complete_ns;
+
+/* In-kernel game detector global latch.  See the
+ * ZENITH_DEFAULT_GAME_AUTO comment block.  Read lock-free via
+ * READ_ONCE() from zenith_eff_game_mode() (the helper consumed by
+ * the hot-path readers of game_mode), and written either from the
+ * hot-path detector zenith_policy_game_auto_tick() or from the
+ * game_auto sysfs *_store callback (which clears the latch on
+ * disable so a stale latch does not survive game_auto = 0).
+ *
+ * The value is the boottime nanosecond deadline at which the latch
+ * expires.  Zero means "no game detected".  The compare/expire
+ * check is "now < latch", so wraparound is not a concern in any
+ * realistic uptime.
+ */
+static u64 zenith_game_auto_active_until_ns;
+
+/* True if the in-kernel game detector latch is currently in the
+ * future, i.e. a recent fresh detection has happened and is still
+ * within ZENITH_GAME_AUTO_ACTIVE_TTL_NS.  Lock-free; readers tolerate
+ * a stale value by at most one cpufreq tick.
+ */
+static bool zenith_game_auto_active(void)
+{
+	u64 until = READ_ONCE(zenith_game_auto_active_until_ns);
+
+	if (!until)
+		return false;
+	return ktime_get_ns() < until;
+}
+
+/* Returns the effective game_mode used by all hot-path overlays:
+ *   max(user_or_v2_game_mode, in-kernel auto detector)
+ *
+ * base_gm is whatever the existing zenith_tunable_or_local() pair
+ * (t->game_mode vs z_policy->at_effective_game_mode) returned -- the
+ * auto detector only ever bumps an under-1 result up to 1.  Higher
+ * user / V2 values are preserved verbatim.  The static-branch gate
+ * means a no-op single never-taken jump when game_auto = 0.
+ */
+static inline unsigned int zenith_eff_game_mode(unsigned int base_gm)
+{
+	if (static_branch_unlikely(&zenith_game_auto_key) &&
+	    base_gm < 1 &&
+	    zenith_game_auto_active())
+		return 1;
+	return base_gm;
+}
 
 /**
  * zenith_set_drm_vblank_us - publish active panel vblank period to zenith
@@ -2246,6 +2336,20 @@ struct zenith_policy {
 	 */
 	bool			camera_auto_match;
 	u64			camera_cache_stamp_ns;
+
+	/* Cached per-policy result of the game-auto comm walk + streak
+	 * counter for the in-kernel game detector.  See
+	 * ZENITH_DEFAULT_GAME_AUTO comment block.  TTL is
+	 * ZENITH_GAME_AUTO_CACHE_TTL_NS for the comm-match cache; the
+	 * streak counter increments on each hot-path call that observes
+	 * a match (subject to the cache TTL) and resets to 0 on the
+	 * first miss.  When it reaches ZENITH_GAME_AUTO_DETECT_STREAK,
+	 * the global zenith_game_auto_active_until_ns latch is renewed
+	 * for ZENITH_GAME_AUTO_ACTIVE_TTL_NS and the streak resets.
+	 */
+	bool			game_auto_match;
+	u64			game_auto_cache_stamp_ns;
+	unsigned int		game_auto_streak;
 
 	/* Last seen zenith_input_boost_until_ns deadline observed inside
 	 * an active boost window for this policy.  Latched in the input
@@ -3174,7 +3278,8 @@ static inline unsigned int zenith_eff_hispeed_freq(struct zenith_policy *z_polic
 	unsigned int pct = z_policy->tunables->hispeed_freq_pct;
 
 	if (!eff && pct) {
-		unsigned int gm = z_policy->tunables->game_mode;
+		unsigned int gm = zenith_eff_game_mode(
+				z_policy->tunables->game_mode);
 
 		if (gm >= 2)
 			pct = (pct * ZENITH_GAME_L2_HISPEED_BOOST_PCT) / 100;
@@ -3290,6 +3395,7 @@ struct zenith_comm_table {
 static struct zenith_comm_table __rcu *zenith_render_table;
 static struct zenith_comm_table __rcu *zenith_audio_table;
 static struct zenith_comm_table __rcu *zenith_camera_table;
+static struct zenith_comm_table __rcu *zenith_game_auto_table;
 static DEFINE_MUTEX(zenith_comm_table_lock);
 
 static struct zenith_comm_table *
@@ -3645,6 +3751,114 @@ static bool zenith_policy_has_camera(struct zenith_policy *z_policy)
 	return match;
 }
 
+/* Default seed list for the in-kernel game detector.  See the
+ * ZENITH_DEFAULT_GAME_AUTO comment block.  Used at zenith_gov_init()
+ * time and as the reset target when game_auto_comms is written empty;
+ * live matching always reads the RCU table.
+ *
+ * Entries are tuned for typical Android game engines:
+ *
+ *   - UnityMain          Unity main thread (most common Unity name)
+ *   - UnityGfxDeviceW    Unity gfx device worker
+ *   - il2cpp             Unity IL2CPP scripting backend worker
+ *   - GameThread         Unreal Engine main thread (also some custom
+ *                        engines).  This is one Android system-wide
+ *                        contender that stylistically conflicts with
+ *                        Android's own RenderThread; we keep it on
+ *                        the assumption that it is dominant on big
+ *                        cores only when an actual Unreal title is
+ *                        running.  Userspace can drop it via the
+ *                        game_auto_comms knob if it conflicts.
+ */
+static const char * const zenith_game_auto_comms[] = {
+	"UnityMain",
+	"UnityGfxDeviceW",
+	"il2cpp",
+	"GameThread",
+};
+
+/* Hot-path comm walk used by the in-kernel game detector.  TTL'd
+ * for ZENITH_GAME_AUTO_CACHE_TTL_NS so a 60/120/144 Hz cpufreq
+ * decision rate only does the strncmp loop a few times per second.
+ * Caller gates on the static_branch_unlikely(zenith_game_auto_key)
+ * branch and the live tunables->game_auto scalar; this helper does
+ * not re-check either.  Returns the raw comm-match boolean for the
+ * caller (zenith_policy_game_auto_tick) to feed into the streak
+ * counter.
+ */
+static bool zenith_policy_has_game_auto(struct zenith_policy *z_policy)
+{
+	u64 now = ktime_get_ns();
+	struct cpufreq_policy *policy = z_policy->policy;
+	unsigned int cpu;
+	bool match = false;
+
+	if (z_policy->game_auto_cache_stamp_ns &&
+	    now - z_policy->game_auto_cache_stamp_ns <
+	    ZENITH_GAME_AUTO_CACHE_TTL_NS)
+		return z_policy->game_auto_match;
+
+	rcu_read_lock();
+	{
+		struct zenith_comm_table *t =
+			rcu_dereference(zenith_game_auto_table);
+
+		for_each_cpu(cpu, policy->cpus) {
+			struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+			unsigned int i;
+
+			if (!curr || !t)
+				continue;
+			for (i = 0; i < t->nr; i++) {
+				const char *needle = t->entries[i];
+
+				if (!strncmp(curr->comm, needle,
+					     strlen(needle))) {
+					match = true;
+					break;
+				}
+			}
+			if (match)
+				break;
+		}
+	}
+	rcu_read_unlock();
+
+	z_policy->game_auto_match = match;
+	z_policy->game_auto_cache_stamp_ns = now;
+	return match;
+}
+
+/* Per-policy hot-path tick for the in-kernel game detector.  Called
+ * once per zenith_get_next_freq() invocation, gated by the
+ * zenith_game_auto_key static branch and the live tunables->game_auto
+ * scalar.  Maintains the per-policy streak counter and renews the
+ * global zenith_game_auto_active_until_ns latch when the streak
+ * crosses ZENITH_GAME_AUTO_DETECT_STREAK.  Resets streak on miss so
+ * we only latch on a sustained match.
+ *
+ * Streak reset on detection (rather than continued increment) keeps
+ * the atomic write rate bounded -- one write per
+ * (DETECT_STREAK * cache_TTL) at the most pessimistic, ~128 ms
+ * worst case at the default knob values.
+ */
+static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
+{
+	bool match = zenith_policy_has_game_auto(z_policy);
+	u64 until;
+
+	if (match)
+		z_policy->game_auto_streak++;
+	else
+		z_policy->game_auto_streak = 0;
+
+	if (z_policy->game_auto_streak >= ZENITH_GAME_AUTO_DETECT_STREAK) {
+		until = ktime_get_ns() + ZENITH_GAME_AUTO_ACTIVE_TTL_NS;
+		WRITE_ONCE(zenith_game_auto_active_until_ns, until);
+		z_policy->game_auto_streak = 0;
+	}
+}
+
 /* Predicate used by the cached_raw_freq shortcut in
  * zenith_get_next_freq().  Returns true when the efficient_freq
  * ladder has any armed bin deadline; in that case the cache hit
@@ -3752,6 +3966,19 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * boost at all).
 	 */
 	unsigned int input_boost_floor = 0;
+
+	/* In-kernel game detector tick.  Gated by the static branch
+	 * (default FALSE while game_auto = 0) and the live tunables
+	 * scalar (defends against a momentary tear during a sysfs
+	 * store; the branch can be true while the scalar transitions
+	 * back to 0).  Maintains the per-policy streak counter and
+	 * renews the global zenith_game_auto_active_until_ns latch on
+	 * sustained match.  See the ZENITH_DEFAULT_GAME_AUTO comment
+	 * block.
+	 */
+	if (static_branch_unlikely(&zenith_game_auto_key) &&
+	    READ_ONCE(z_policy->tunables->game_auto))
+		zenith_policy_game_auto_tick(z_policy);
 
 	/* ADPF / uclamp_max cap.  Sampled once so every decision tier
 	 * below sees a consistent view.  SCHED_CAPACITY_SCALE means
@@ -3983,9 +4210,10 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			unsigned int cap_pct = zenith_tunable_or_local(
 				z_policy, z_policy->tunables->input_boost_cap_pct,
 				z_policy->at_effective_input_boost_cap_pct);
-			unsigned int gm = zenith_tunable_or_local(
-				z_policy, z_policy->tunables->game_mode,
-				z_policy->at_effective_game_mode);
+			unsigned int gm = zenith_eff_game_mode(
+				zenith_tunable_or_local(z_policy,
+					z_policy->tunables->game_mode,
+					z_policy->at_effective_game_mode));
 			unsigned int boost_ceiling;
 
 			/* game_mode=2 (turbo) overrides the user-set cap and
@@ -4120,9 +4348,10 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			 * always pins policy->max on threshold crossing.
 			 * Runtime-only; the stored tunable is left untouched.
 			 */
-			if (zenith_tunable_or_local(z_policy,
-					z_policy->tunables->game_mode,
-					z_policy->at_effective_game_mode) >= 2)
+			if (zenith_eff_game_mode(
+					zenith_tunable_or_local(z_policy,
+						z_policy->tunables->game_mode,
+						z_policy->at_effective_game_mode)) >= 2)
 				climb_mode = ZENITH_CLIMB_MODE_SNAP;
 
 			if (climb_mode == ZENITH_CLIMB_MODE_STEP) {
@@ -4212,9 +4441,10 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 
 brutal_entry_deferred:
 		if ((z_policy->tunables->climb_mode == ZENITH_CLIMB_MODE_SNAP ||
-		     zenith_tunable_or_local(z_policy,
+		     zenith_eff_game_mode(
+			zenith_tunable_or_local(z_policy,
 				z_policy->tunables->game_mode,
-				z_policy->at_effective_game_mode) >= 2) &&
+				z_policy->at_effective_game_mode)) >= 2) &&
 		    z_policy->brutal_active) {
 			unsigned int eff_down =
 				zenith_tunable_or_local(z_policy,
@@ -9120,6 +9350,21 @@ static ssize_t camera_comms_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr camera_comms = __ATTR_RW(camera_comms);
 
+static ssize_t game_auto_comms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return zenith_show_comm_table(&zenith_game_auto_table, buf);
+}
+
+static ssize_t game_auto_comms_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	return zenith_store_comm_table(&zenith_game_auto_table,
+				       zenith_game_auto_comms,
+				       ARRAY_SIZE(zenith_game_auto_comms),
+				       buf, count);
+}
+static struct governor_attr game_auto_comms = __ATTR_RW(game_auto_comms);
+
 /* camera_active sysfs knob.  Tri-state override:
  *   0  ZENITH_CAMERA_OVERRIDE_AUTO        consult comm table
  *   1  ZENITH_CAMERA_OVERRIDE_FORCE_ON    floor always applied
@@ -9198,6 +9443,48 @@ static ssize_t game_mode_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr game_mode = __ATTR_RW(game_mode);
+
+/* game_auto sysfs knob.  Master gate for the in-kernel game
+ * detector.  See the ZENITH_DEFAULT_GAME_AUTO comment block.  Strict
+ * 0/1 boolean.  Syncs the zenith_game_auto_key static branch and,
+ * on disable, clears the global zenith_game_auto_active_until_ns
+ * latch so a stale "game active" state does not survive game_auto =
+ * 0 (otherwise a write of 0 would leave the helper still returning
+ * 1 until the existing TTL expired).
+ */
+static ssize_t game_auto_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->game_auto);
+}
+
+static ssize_t game_auto_store(struct gov_attr_set *attr_set,
+			       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->game_auto = val;
+	zenith_set_static_key(&zenith_game_auto_key, val);
+	if (!val)
+		WRITE_ONCE(zenith_game_auto_active_until_ns, 0);
+	return count;
+}
+static struct governor_attr game_auto = __ATTR_RW(game_auto);
+
+/* game_auto_state sysfs knob.  Read-only view of the global latch
+ * state.  Returns 1 when the in-kernel detector currently considers
+ * a game active (i.e. a fresh detection landed within
+ * ZENITH_GAME_AUTO_ACTIVE_TTL_NS), 0 otherwise.  Useful for tooling
+ * that wants to confirm the detector fired, distinct from a manual
+ * game_mode write.
+ */
+static ssize_t game_auto_state_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n", zenith_game_auto_active() ? 1 : 0);
+}
+static struct governor_attr game_auto_state = __ATTR_RO(game_auto_state);
 
 /* psi_aware sysfs knob.  Strict 0/1 boolean.  See ZENITH_DEFAULT_PSI_AWARE
  * comment block for semantics.  No cache invalidation -- the value is
@@ -9759,6 +10046,9 @@ static struct attribute *zenith_attrs[] = {
 	&boot_boost_decay_ms.attr,
 	&boot_complete.attr,
 	&boot_complete_auto.attr,
+	&game_auto.attr,
+	&game_auto_state.attr,
+	&game_auto_comms.attr,
 	&frame_budget_us.attr,
 	&frame_budget_us_auto.attr,
 	&drm_vblank_us.attr,
@@ -9962,6 +10252,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->camera_active		= ZENITH_DEFAULT_CAMERA_ACTIVE;
 	tunables->camera_floor_pct	= ZENITH_DEFAULT_CAMERA_FLOOR_PCT;
 	tunables->game_mode		= ZENITH_DEFAULT_GAME_MODE;
+	tunables->game_auto		= ZENITH_DEFAULT_GAME_AUTO;
 	tunables->psi_aware		= ZENITH_DEFAULT_PSI_AWARE;
 	tunables->psi_mem_thresh	= ZENITH_DEFAULT_PSI_MEM_THRESH;
 	tunables->psi_cpu_thresh	= ZENITH_DEFAULT_PSI_CPU_THRESH;
@@ -10430,6 +10721,9 @@ static int __init zenith_gov_init(void)
 	rcu_assign_pointer(zenith_camera_table,
 		zenith_alloc_comm_table_from_defaults(zenith_camera_comms,
 			ARRAY_SIZE(zenith_camera_comms)));
+	rcu_assign_pointer(zenith_game_auto_table,
+		zenith_alloc_comm_table_from_defaults(zenith_game_auto_comms,
+			ARRAY_SIZE(zenith_game_auto_comms)));
 
 	ret = input_register_handler(&zenith_input_handler);
 	if (ret)
