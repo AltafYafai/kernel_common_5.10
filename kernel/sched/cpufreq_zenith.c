@@ -284,10 +284,9 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  *
  * Init-time invariant:
  *
- *   - zenith_camera_aware_key, zenith_psi_aware_key,
- *     zenith_game_auto_key, and zenith_auto_tune_v3_key match
- *     scalars that still default to 0, so they correctly start
- *     FALSE without any explicit init-time enable.
+ *   - zenith_camera_aware_key and zenith_psi_aware_key match scalars
+ *     that still default to 0, so they correctly start FALSE without
+ *     any explicit init-time enable.
  *   - zenith_audio_aware_key and zenith_render_aware_key match scalars
  *     that were flipped to default 1 in the wave-2 auto-defaults
  *     round, so the keys must be explicitly enabled in zenith_init()
@@ -295,7 +294,17 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  *     would read the scalar as 1 but skip the branch via the still-FALSE
  *     key.  zenith_init() now calls zenith_set_static_key() against
  *     each scalar's value (idempotent across re-attaches).
- *   - zenith_set_profile_defaults() never touches any of the five
+ *   - zenith_game_auto_key and zenith_auto_tune_v3_key match scalars
+ *     that were flipped to non-zero defaults in the wave-7
+ *     auto-defaults round (game_auto = 1, auto_tune_v3 = 2), so the
+ *     same init-time sync rule applies: zenith_init() must enable
+ *     the key against the default scalar value.  The auto_tune_v3
+ *     key is binary even though the scalar is tri-valued (0/1/2);
+ *     zenith_set_static_key() treats any non-zero value as TRUE, so
+ *     observe-only mode (scalar = 1) and apply mode (scalar = 2)
+ *     both produce key = TRUE.  See ZENITH_DEFAULT_AUTO_TUNE_V3
+ *     comment block.
+ *   - zenith_set_profile_defaults() never touches any of the six
  *     scalars (they are user-managed opt-ins, not preset state), so
  *     no profile-apply path needs to re-sync the keys.
  */
@@ -736,7 +745,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_HYSTERESIS_WINDOWS_MAX	8
 #define ZENITH_AT_COOLDOWN_WINDOWS_MAX		8
 
-/* auto_tune_v3 (default 0, off):
+/* auto_tune_v3 (default 2, apply):
  *
  * Self-calibrating layer on top of V2.  Reads the per-policy at_log
  * ring (ZENITH_AT_LOG_NR entries, each one V1-window wide) once per
@@ -758,20 +767,29 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  *
  * Three modes via the auto_tune_v3 scalar:
  *
- *   - 0  off (default)        -- no observation, no adjustments.
+ *   - 0  off                  -- no observation, no adjustments.
  *   - 1  observe-only         -- collects stats, exposes them via
  *                                auto_tune_v3_state, does NOT apply
  *                                offsets.  Equivalent to a dry-run.
  *   - 2  observe + apply      -- collects stats AND applies the
  *                                bounded offsets to the V2 reaction
- *                                knobs.
+ *                                knobs.  This is the wave-7 default.
  *
+ * Default 2 (apply, wave-7 round): once per
+ * auto_tune_v3_interval_ms (default 60 s) the calibrator nudges
+ * V2's effective hysteresis/cooldown windows toward whatever fits
+ * the live workload.  Bounded offsets ([-1, +4]) and a >=1 floor on
+ * the resulting effective value mean V3 cannot push V2 into a
+ * state-change-impossible configuration even at the worst extreme.
  * The scalar is gated by the zenith_auto_tune_v3_key static branch
  * (FALSE while scalar = 0) so the calibration tail in
- * zenith_auto_tune_work() is a single never-taken jump per V1 window
- * when V3 is off.  When mode = 1, the apply-side helper
- * zenith_at_eff_*_windows() returns the unmodified base value, so the
- * hot path is also unaffected.
+ * zenith_auto_tune_work() collapses to a single never-taken jump
+ * per V1 window when an operator turns the feature off.
+ *
+ * Init-time invariant: the static key zenith_auto_tune_v3_key must
+ * be synced TRUE in zenith_init() against the default-non-zero
+ * scalar (same pattern as wave-2 audio_aware / render_aware).  See
+ * the DEFINE_STATIC_KEY_FALSE comment block.
  *
  * Tunable surface:
  *   - auto_tune_v3              RW 0/1/2  master gate / mode
@@ -782,7 +800,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  *                                         60000, clamped to [10000,
  *                                         600000])
  */
-#define ZENITH_DEFAULT_AUTO_TUNE_V3		0
+#define ZENITH_DEFAULT_AUTO_TUNE_V3		2
 #define ZENITH_AT_V3_MODE_OFF			0
 #define ZENITH_AT_V3_MODE_OBSERVE		1
 #define ZENITH_AT_V3_MODE_APPLY			2
@@ -1113,7 +1131,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_GAME_L2_BOOST_DECAY_PCT		160
 #define ZENITH_GAME_MODE_MAX			2
 
-/* game_auto (default 0, off):
+/* game_auto (default 1, on):
  *
  * In-kernel heuristic for raising the effective game_mode without a
  * userspace gameswitch helper.  Walks each policy's online cpus and
@@ -1131,10 +1149,18 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * absent re-detection, it expires after ZENITH_GAME_AUTO_ACTIVE_TTL_NS
  * and the system reverts to the user / V2 game_mode value.
  *
- * Default 0 (off) so non-game devices and headless builds pay no
- * runtime cost.  When set to 1, the static key zenith_game_auto_key
- * gates the comm walk -- a single never-taken jump per cpufreq
- * decision when the feature is off.
+ * Default 1 (on, wave-7 round): the seed comm list is conservative
+ * (Unity / Unreal main / il2cpp / GameThread) and the worst-case
+ * false-positive cost is a 5-second level-1 game_mode bump that
+ * cannot push V2 into a state-change-impossible configuration.  The
+ * static key zenith_game_auto_key still gates the comm walk so the
+ * hot-path cost when no game thread is present is a single bounded
+ * for_each_cpu() with an early break on first match.
+ *
+ * Init-time invariant: the static key zenith_game_auto_key must be
+ * synced TRUE in zenith_init() against the default-1 scalar (same
+ * pattern as wave-2 audio_aware / render_aware).  See the
+ * DEFINE_STATIC_KEY_FALSE comment block.
  *
  * Tunable surface:
  *   - game_auto         RW 0/1   master gate
@@ -1142,7 +1168,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  *   - game_auto_comms   RW CSV   comm prefix table (RCU-swapped on
  *                                store like render_comms / audio_comms)
  */
-#define ZENITH_DEFAULT_GAME_AUTO		0
+#define ZENITH_DEFAULT_GAME_AUTO		1
 #define ZENITH_GAME_AUTO_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
 #define ZENITH_GAME_AUTO_DETECT_STREAK		32
 #define ZENITH_GAME_AUTO_ACTIVE_TTL_NS		(5ULL * NSEC_PER_SEC)
@@ -10631,19 +10657,28 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 
-	/* Sync the audio_aware / render_aware static keys against their
-	 * default scalars.  See the comment above DEFINE_STATIC_KEY_FALSE
-	 * for the invariant: scalars whose default is non-zero (flipped
-	 * in the wave-2 round) need an explicit init-time key enable.
+	/* Sync the audio_aware / render_aware / game_auto / auto_tune_v3
+	 * static keys against their default scalars.  See the comment
+	 * above DEFINE_STATIC_KEY_FALSE for the invariant: scalars whose
+	 * default is non-zero need an explicit init-time key enable.
+	 * audio_aware / render_aware were flipped to 1 in wave-2;
+	 * game_auto was flipped to 1 and auto_tune_v3 to 2 in wave-7.
 	 * camera_aware and psi_aware still default to 0 so their keys
 	 * remain FALSE; we do not call them here.  Idempotent across
 	 * re-attaches: zenith_set_static_key() is a no-op if the key is
-	 * already in the requested state.
+	 * already in the requested state.  zenith_set_static_key()
+	 * coerces non-zero scalars (including the auto_tune_v3 = 2
+	 * APPLY mode) to TRUE, which is the correct branch state for
+	 * any non-OFF mode.
 	 */
 	zenith_set_static_key(&zenith_audio_aware_key,
 			      tunables->audio_aware);
 	zenith_set_static_key(&zenith_render_aware_key,
 			      tunables->render_aware);
+	zenith_set_static_key(&zenith_game_auto_key,
+			      tunables->game_auto);
+	zenith_set_static_key(&zenith_auto_tune_v3_key,
+			      tunables->auto_tune_v3);
 
 	/* Apply a cmdline-picked preset before the sysfs attr set is
 	 * published, so userspace sees the cmdline-picked preset as the

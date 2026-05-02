@@ -318,13 +318,14 @@ guardrails.
 ``auto_tune_v3``
     Self-calibrating layer on top of V2.  Three accepted values:
 
-      * ``0`` -- off (default).  No telemetry, no calibration.
+      * ``0`` -- off.  No telemetry, no calibration.
       * ``1`` -- observe-only.  Once per ``auto_tune_v3_interval_ms``,
         zenith walks the per-policy ``at_log`` ring, counts V2 state
         transitions, and exposes the result via ``auto_tune_v3_state``.
         No knobs are adjusted.
-      * ``2`` -- apply.  Same telemetry as observe-only, plus a
-        bounded signed nudge to ``auto_tune_hysteresis_windows`` and
+      * ``2`` -- apply (**default since wave 7**).  Same telemetry as
+        observe-only, plus a bounded signed nudge to
+        ``auto_tune_hysteresis_windows`` and
         ``auto_tune_cooldown_windows``: when V2 was observed
         thrashing (transitions exceed an internal high-water mark),
         the offsets bump up by one (more hysteresis, slower
@@ -868,9 +869,10 @@ Game mode::
     game_mode          0 = off, 1 = level-1 (input-boost emphasis,
                        2 = level-2 (sustained big-cluster bias).
                        Default 0.
-    game_auto          Boolean (0/1, default 0).  Master gate for the
-                       in-kernel game detector.  When 1, every cpufreq
-                       decision walks the policy's online cpus and
+    game_auto          Boolean (0/1, default **1** since wave 7).
+                       Master gate for the in-kernel game detector.
+                       When 1, every cpufreq decision walks the
+                       policy's online cpus and
                        matches cpu_curr->comm against the
                        ``game_auto_comms`` table; a 32-decision
                        streak of matches latches a global "game
