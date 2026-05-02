@@ -19,4 +19,18 @@ extern bool prefer_silver_check_cpu_util(int cpu);
 extern int  find_best_silver_cpu(struct task_struct *p);
 extern unsigned long ps_cpu_util(int cpu);
 
+/*
+ * prefer_silver_get_hit_miss - read the cumulative hit / miss counters
+ *
+ * Lightweight kernel-internal accessor used by other in-tree subsystems
+ * (e.g. the zenith CPUFreq governor) that want to react to how
+ * aggressively prefer_silver is currently redirecting wake-ups onto the
+ * silver/LITTLE cluster.  Both arguments are required; pass non-NULL
+ * pointers to receive the snapshot.  Counts are atomic_t-backed inside
+ * prefer_silver.c and may wrap on extremely long uptime; consumers
+ * should always work from differences between successive snapshots
+ * rather than absolute values.
+ */
+extern void prefer_silver_get_hit_miss(unsigned int *hit, unsigned int *miss);
+
 #endif /* _OPLUS_PREFER_SILVER_H_ */

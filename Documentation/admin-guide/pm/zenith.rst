@@ -483,6 +483,33 @@ Environment hooks
     for a higher frequency than the legacy cliff would have allowed
     at peak pressure.
 
+``prefer_silver_aware``
+    Boolean (0/1, default 0).  When 1 and built with
+    ``CONFIG_SCHED_PREFER_SILVER=y``, the auto-tune classifier worker
+    samples the global ``prefer_silver`` hit / miss counters once per
+    window and computes a hit-rate.  When the rate is at or above
+    ``prefer_silver_hot_threshold_pct``, big / prime cluster policies
+    raise ``dynamic_up_thresh`` by ``prefer_silver_hot_bump_pct``
+    points (clamped at 95) so the big cluster down-clocks less
+    aggressively during sustained UI / app navigation -- the regime
+    where ``prefer_silver`` is steering most light wake-ups onto the
+    silver / LITTLE cluster and the big cluster's measured load is
+    artificially deflated.  Little cluster policies are intentionally
+    not bumped (they are already absorbing the redirected work).
+    When ``CONFIG_SCHED_PREFER_SILVER=n`` the worker stub leaves the
+    cached hit-rate at zero and the bump never fires.
+
+``prefer_silver_hot_threshold_pct``
+    Hit-rate threshold (0..100, default 50).  Lower the value to
+    fire the bump more aggressively, raise it to require a clearer
+    signal that ``prefer_silver`` is actively redistributing load.
+
+``prefer_silver_hot_bump_pct``
+    Number of percentage points (0..20, default 5) added to
+    ``dynamic_up_thresh`` on big / prime cluster policies when the
+    bump fires.  Final ``dynamic_up_thresh`` is capped at 95 so the
+    bump cannot exceed the screen-off cliff.
+
 ``thermal_state``
     Userspace / notifier-driven flag indicating thermal pressure.
     1 = hot, 0 = cool (default).  When 1, ``up_threshold`` is

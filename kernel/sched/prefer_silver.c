@@ -30,6 +30,23 @@ int sysctl_freq_ratio_thresh = 95;
  * ------------------------------------------------------------------ */
 static atomic_t ps_hit_count       = ATOMIC_INIT(0);
 static atomic_t ps_miss_count      = ATOMIC_INIT(0);
+
+/*
+ * Lightweight kernel-internal accessor for the cumulative hit / miss
+ * counters.  Used by other in-tree subsystems (zenith CPUFreq governor,
+ * scheduler diagnostics) that want a recent-rate signal without
+ * going through the debugfs seq_file path.  Pass non-NULL pointers
+ * for both arguments.  The counters are atomic_t-backed and may wrap
+ * on extremely long uptime, so consumers should always derive a rate
+ * from successive snapshots rather than reading absolute values.
+ */
+void prefer_silver_get_hit_miss(unsigned int *hit, unsigned int *miss)
+{
+	if (hit)
+		*hit = (unsigned int)atomic_read(&ps_hit_count);
+	if (miss)
+		*miss = (unsigned int)atomic_read(&ps_miss_count);
+}
 static atomic_t ps_miss_no_silver  = ATOMIC_INIT(0);
 static atomic_t ps_miss_freq       = ATOMIC_INIT(0);
 static atomic_t ps_miss_util       = ATOMIC_INIT(0);

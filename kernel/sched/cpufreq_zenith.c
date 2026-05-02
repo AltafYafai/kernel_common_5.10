@@ -68,6 +68,9 @@
 #ifdef CONFIG_DRM_PANEL_NOTIFY
 #include <drm/drm_panel_notifier.h>
 #endif
+#ifdef CONFIG_SCHED_PREFER_SILVER
+#include <linux/prefer_silver.h>
+#endif
 #include <trace/events/power.h>
 
 #define CREATE_TRACE_POINTS
@@ -366,6 +369,19 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_THERMAL_AUTO		1
 #define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
 #define ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS	0
+
+/* prefer_silver_aware defaults.  See struct zenith_tunables for
+ * semantics.  Hot threshold of 50%% means the bump fires when at
+ * least half of the recent prefer_silver decisions actually
+ * redirected onto a silver core; hot bump of 5 points is small
+ * enough to avoid a perceived step but large enough to noticeably
+ * delay big-cluster downclock during sustained UI navigation.
+ * Both knobs are tunable; the defaults are conservative.
+ */
+#define ZENITH_DEFAULT_PREFER_SILVER_AWARE			0
+#define ZENITH_DEFAULT_PREFER_SILVER_HOT_THRESHOLD_PCT		50
+#define ZENITH_DEFAULT_PREFER_SILVER_HOT_BUMP_PCT		5
+#define ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT			20
 
 /* thermal_util_derate (default 1, on):
  *
@@ -701,6 +717,15 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_FLAG_GAME			(1U << 9)
 #define ZENITH_AT_FLAG_THERMAL_SLOPE		(1U << 10)
 #define ZENITH_AT_FLAG_LOCAL_ACTIONS		(1U << 11)
+/* Set by the V1 classifier worker when prefer_silver_aware is on AND
+ * the prefer_silver hit-rate over the last classifier window crossed
+ * the prefer_silver_hot_threshold_pct cutoff.  Read-only signal; the
+ * actual dynamic_up_thresh bump is applied directly in
+ * zenith_get_next_freq() (the signal does not feed the V2 state
+ * machine because prefer_silver redistribution is workload-dependent
+ * and would race with the existing thermal / PSI / frame triggers).
+ */
+#define ZENITH_AT_FLAG_PREFER_SILVER_HOT	(1U << 12)
 
 #define ZENITH_AT_OVERRIDE_UP_RATE		(1UL << 0)
 #define ZENITH_AT_OVERRIDE_DOWN_RATE		(1UL << 1)
@@ -1312,6 +1337,27 @@ struct zenith_tunables {
 	 */
 	unsigned int		thermal_pressure_continuous;
 
+	/* prefer_silver_aware: when 1, on big / prime cluster policies,
+	 * raise dynamic_up_thresh by prefer_silver_hot_bump_pct percent
+	 * (additive points) whenever the prefer_silver hit-rate over
+	 * the last classifier window is at or above
+	 * prefer_silver_hot_threshold_pct.  The intent is to reflect
+	 * the fact that prefer_silver hides light load from the big
+	 * cluster, so the big cluster sees an artificially "lighter"
+	 * load and would otherwise downclock more aggressively than it
+	 * should.  Little cluster policies are intentionally not bumped
+	 * (they are already absorbing the redirected light tasks).
+	 *
+	 * Default 0 (off).  Has no effect when
+	 * CONFIG_SCHED_PREFER_SILVER=n: the worker does not import
+	 * prefer_silver_get_hit_miss() in that build, so the cached
+	 * hit-rate stays at 0 and the bump never fires regardless of
+	 * the tunable value.
+	 */
+	unsigned int		prefer_silver_aware;
+	unsigned int		prefer_silver_hot_threshold_pct;
+	unsigned int		prefer_silver_hot_bump_pct;
+
 	/* See ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block.  When
 	 * set, zenith_get_util() scales util_out by the (cap - pressure)
 	 * / cap fraction whenever pressure exceeds
@@ -1773,6 +1819,20 @@ struct zenith_policy {
 	struct zenith_at_log_entry at_log[ZENITH_AT_LOG_NR];
 	unsigned int		at_log_head;
 	unsigned int		at_log_count;
+
+	/* prefer_silver_aware coordination state.  Snapshot of the
+	 * global prefer_silver hit / miss counters at the previous V1
+	 * classifier window, plus the resulting hit-rate (0..100) for
+	 * the most-recent window.  The hit-rate is read on the hot
+	 * path by zenith_get_next_freq() and only updated by the worker,
+	 * so the read is unsynchronised but bounded to the previous
+	 * complete window.  When CONFIG_SCHED_PREFER_SILVER=n these
+	 * fields stay at 0 (the worker never updates them) and the
+	 * downstream bump never fires.
+	 */
+	unsigned int		ps_prev_hit;
+	unsigned int		ps_prev_miss;
+	unsigned int		ps_hit_rate_pct;
 
 	/* Cached topology bit: true when any CPU in the policy has
 	 * arch_scale_cpu_capacity == SCHED_CAPACITY_SCALE, i.e. the
@@ -3387,6 +3447,47 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			dynamic_up_thresh -= swing;
 	}
 
+	/* prefer_silver_aware coordination: when prefer_silver is hot
+	 * and this policy belongs to a big / prime cluster, raise
+	 * dynamic_up_thresh by prefer_silver_hot_bump_pct points
+	 * (clamped to ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT) so the
+	 * big cluster down-clocks less aggressively during sustained
+	 * UI / app workloads where prefer_silver is steering the
+	 * light wake-ups onto the silver/LITTLE cluster.  Skipped on
+	 * the little cluster (already absorbing the redirected work)
+	 * and skipped whenever a harder override above has pinned
+	 * dynamic_up_thresh strictly higher than the natural
+	 * up_threshold (screen-off, thermal cliff, hispeed pin) —
+	 * those values are absolute and must not be inflated further.
+	 *
+	 * The (dynamic_up_thresh <= natural) test deliberately allows
+	 * the bump to ride on top of the variance-adaptive shaping
+	 * lower in the same chain (which only ever lowers
+	 * dynamic_up_thresh below natural), preserving its smoothing
+	 * effect while restoring the climb resistance prefer_silver
+	 * was eroding by hiding light load from this cluster.
+	 */
+	if (z_policy->tunables->prefer_silver_aware &&
+	    z_policy->cluster_class != ZENITH_CLUSTER_LITTLE &&
+	    z_policy->ps_hit_rate_pct >=
+		    z_policy->tunables->prefer_silver_hot_threshold_pct) {
+		unsigned int natural = zenith_tunable_or_local(z_policy,
+			z_policy->tunables->up_threshold,
+			z_policy->at_effective_up_threshold);
+
+		if (dynamic_up_thresh <= natural) {
+			unsigned int bump =
+			    z_policy->tunables->prefer_silver_hot_bump_pct;
+
+			if (bump > ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT)
+				bump = ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT;
+			if (dynamic_up_thresh + bump <= 95)
+				dynamic_up_thresh += bump;
+			else
+				dynamic_up_thresh = 95;
+		}
+	}
+
 	if (max_cap)
 		tp_load_pct = (unsigned int)((util * 100) / max_cap);
 
@@ -4623,6 +4724,65 @@ static void zenith_refresh_rate_delays(struct gov_attr_set *attr_set)
 		zenith_update_cluster_rate_scale(z_pol);
 		zenith_update_rate_delay_ns(z_pol);
 	}
+}
+
+/* Update the per-policy prefer_silver hit-rate snapshot.
+ *
+ * Called once per V1 classifier window from zenith_auto_tune_work().
+ * Reads the global prefer_silver hit / miss atomic counters via the
+ * accessor exported by kernel/sched/prefer_silver.c, computes the
+ * delta against the previous window's snapshot, and stores the
+ * resulting hit-rate as a percentage (0..100) on z_policy for
+ * zenith_get_next_freq() to consume.  When the rate crosses the
+ * tunable's hot threshold, ORs ZENITH_AT_FLAG_PREFER_SILVER_HOT
+ * into *flags so the at_log dump and trace events reflect the
+ * trigger.
+ *
+ * On builds without CONFIG_SCHED_PREFER_SILVER the accessor symbol
+ * is unavailable, so the helper is a no-op stub and the cached
+ * hit-rate stays at zero — the downstream bump in
+ * zenith_get_next_freq() never fires regardless of the tunable.
+ */
+static void zenith_at_update_prefer_silver_rate(struct zenith_policy *z_policy,
+						struct zenith_tunables *t,
+						unsigned int *flags)
+{
+#ifdef CONFIG_SCHED_PREFER_SILVER
+	unsigned int hit_now = 0, miss_now = 0;
+	unsigned int hit_delta, miss_delta, total_delta;
+	unsigned int rate;
+
+	prefer_silver_get_hit_miss(&hit_now, &miss_now);
+
+	hit_delta  = hit_now  - z_policy->ps_prev_hit;
+	miss_delta = miss_now - z_policy->ps_prev_miss;
+	total_delta = hit_delta + miss_delta;
+
+	z_policy->ps_prev_hit  = hit_now;
+	z_policy->ps_prev_miss = miss_now;
+
+	if (!total_delta) {
+		/* No prefer_silver activity in this window.  Decay the
+		 * cached rate towards zero so a brief idle period
+		 * cannot leave a stale "hot" reading behind.
+		 */
+		z_policy->ps_hit_rate_pct = 0;
+		return;
+	}
+
+	rate = (hit_delta * 100U) / total_delta;
+	if (rate > 100)
+		rate = 100;
+	z_policy->ps_hit_rate_pct = rate;
+
+	if (t->prefer_silver_aware &&
+	    rate >= t->prefer_silver_hot_threshold_pct)
+		*flags |= ZENITH_AT_FLAG_PREFER_SILVER_HOT;
+#else
+	(void)z_policy;
+	(void)t;
+	(void)flags;
+#endif
 }
 
 /* Push a one-shot sample into the per-policy auto-tune ring buffer.
@@ -5910,6 +6070,8 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		reason = ZENITH_AT_REASON_VARIANCE;
 	}
 
+	zenith_at_update_prefer_silver_rate(z_policy, t, &flags);
+
 	z_policy->at_last_total = total;
 	z_policy->at_last_saturated = saturated;
 	z_policy->at_last_sat_pct = sat_pct;
@@ -6739,6 +6901,88 @@ static ssize_t thermal_pressure_continuous_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr thermal_pressure_continuous =
 	__ATTR_RW(thermal_pressure_continuous);
+
+/* prefer_silver_aware: strict 0/1.  See struct zenith_tunables for
+ * semantics.  When CONFIG_SCHED_PREFER_SILVER=n the field is still
+ * stored and round-tripped via sysfs so userspace tools that probe
+ * the governor's tunable list don't choke on a missing node, but
+ * the run-time bump path is dead because the worker stub never
+ * updates ps_hit_rate_pct.
+ */
+static ssize_t prefer_silver_aware_show(struct gov_attr_set *attr_set,
+					char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->prefer_silver_aware);
+}
+
+static ssize_t prefer_silver_aware_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->prefer_silver_aware = val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+static struct governor_attr prefer_silver_aware =
+	__ATTR_RW(prefer_silver_aware);
+
+/* prefer_silver_hot_threshold_pct: 0..100.  When the per-window
+ * prefer_silver hit-rate is at or above this percentage,
+ * prefer_silver_aware fires the bump on big / prime clusters.
+ */
+static ssize_t prefer_silver_hot_threshold_pct_show(
+		struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->prefer_silver_hot_threshold_pct);
+}
+
+static ssize_t prefer_silver_hot_threshold_pct_store(
+		struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->prefer_silver_hot_threshold_pct = val;
+	return count;
+}
+static struct governor_attr prefer_silver_hot_threshold_pct =
+	__ATTR_RW(prefer_silver_hot_threshold_pct);
+
+/* prefer_silver_hot_bump_pct: 0..ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT.
+ * Additive points added to dynamic_up_thresh on big / prime clusters
+ * when the prefer_silver hit-rate is hot.  Clamped to the max in the
+ * fast path; this store enforces the same range so userspace gets
+ * an early -EINVAL on out-of-range values.
+ */
+static ssize_t prefer_silver_hot_bump_pct_show(
+		struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->prefer_silver_hot_bump_pct);
+}
+
+static ssize_t prefer_silver_hot_bump_pct_store(
+		struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT)
+		return -EINVAL;
+	t->prefer_silver_hot_bump_pct = val;
+	return count;
+}
+static struct governor_attr prefer_silver_hot_bump_pct =
+	__ATTR_RW(prefer_silver_hot_bump_pct);
 
 /* thermal_util_derate sysfs knob.  Strict 0/1 boolean.  See the
  * ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block for semantics.
@@ -8416,6 +8660,9 @@ static struct attribute *zenith_attrs[] = {
 	&thermal_state.attr,
 	&thermal_auto.attr,
 	&thermal_pressure_continuous.attr,
+	&prefer_silver_aware.attr,
+	&prefer_silver_hot_threshold_pct.attr,
+	&prefer_silver_hot_bump_pct.attr,
 	&thermal_util_derate.attr,
 	&thermal_derate_rate_pct.attr,
 	&freq_stability_margin_pct.attr,
@@ -8616,6 +8863,11 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
 	tunables->thermal_pressure_continuous =
 		ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS;
+	tunables->prefer_silver_aware	= ZENITH_DEFAULT_PREFER_SILVER_AWARE;
+	tunables->prefer_silver_hot_threshold_pct =
+		ZENITH_DEFAULT_PREFER_SILVER_HOT_THRESHOLD_PCT;
+	tunables->prefer_silver_hot_bump_pct =
+		ZENITH_DEFAULT_PREFER_SILVER_HOT_BUMP_PCT;
 	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
 	tunables->thermal_derate_rate_pct = ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT;
 	tunables->freq_stability_margin_pct = ZENITH_DEFAULT_FREQ_STABILITY_MARGIN_PCT;
