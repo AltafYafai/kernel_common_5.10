@@ -664,6 +664,46 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  */
 #define ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE	0
 #define ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY	1
+
+/* Input-boost quiet-period extension (always-on, compile-time
+ * constants).  When zenith_input_event observes that the gap since
+ * the previous input event exceeds ZENITH_INPUT_QUIET_THRESHOLD_MS,
+ * the next event's full-pin window is widened by
+ * ZENITH_INPUT_QUIET_BOOST_MULT_PCT (>= 100) and clamped at
+ * ZENITH_INPUT_QUIET_BOOST_MAX_MS so a misconfigured input_boost_ms
+ * cannot grow the window without bound.
+ *
+ * Rationale: the very first tap / key / scroll after the user has
+ * been idle (reading, watching a static frame) is the single
+ * highest-leverage responsiveness window the governor has.  By the
+ * second tap of a sustained interaction the cluster is already
+ * pinned by either input_boost or the load-driven hispeed tier; the
+ * marginal value of an extra-long boost on each subsequent tap is
+ * small.  Extending only the first-after-quiet event keeps the
+ * average power impact tiny while making the "device feels slow when
+ * I pick it up" failure mode go away.
+ *
+ * QUIET_THRESHOLD_MS = 1000: anything shorter than this and the
+ * existing input_boost_ms / input_boost_decay_ms windows already
+ * cover the gap.  At 1 second of no input, even an input_boost_ms
+ * of 200 ms (the maximum sane value) has fully decayed and the
+ * cluster is back on natural shaping, so the next event genuinely
+ * is a "wake-from-quiet" event.
+ *
+ * MULT_PCT = 200: doubles the active phase.  Conservative; could be
+ * higher but doubling hits a clear "whole-frame" extra (16 ms at
+ * 60 Hz on top of an 80 ms default = ~6 frames worth) without
+ * spending energy beyond the natural decay tail.
+ *
+ * MAX_MS = 250: hard ceiling.  Guards against the extension scaling
+ * an input_boost_ms that has been raised by userspace beyond a sane
+ * range.  Past 250 ms the input_boost_decay_ms window dominates the
+ * energy bill anyway, so capping the extension here costs nothing.
+ */
+#define ZENITH_INPUT_QUIET_THRESHOLD_MS		1000
+#define ZENITH_INPUT_QUIET_BOOST_MULT_PCT	200
+#define ZENITH_INPUT_QUIET_BOOST_MAX_MS		250
+
 /* ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT controls the ceiling of the
  * full-pin phase of an active input boost: the first input_boost_ms
  * after a key / touch event.  0 means "no cap" -- pin to
@@ -2111,6 +2151,22 @@ struct zenith_tunables {
  * with atomic64_read so no governor lock is needed in the producer.
  */
 static atomic64_t zenith_input_boost_until_ns = ATOMIC64_INIT(0);
+
+/*
+ * Wall-clock timestamp of the last input event observed by
+ * zenith_input_event.  Producer: zenith_input_event itself, on every
+ * EV_KEY / EV_ABS / EV_REL event.  Consumer: also zenith_input_event,
+ * to detect a "first input after quiet period" and grant that first
+ * event an extended full-pin window (see ZENITH_INPUT_QUIET_*).
+ *
+ * Initialised to 0 so the very first event after boot is always
+ * treated as a quiet-period entry.  Maintained as atomic64 so the
+ * producer can read-then-write without holding any lock; multiple
+ * input devices can fire concurrently with no consistency hazard
+ * worse than two adjacent events both deciding the gap was long
+ * enough to extend, which is harmless.
+ */
+static atomic64_t zenith_input_last_event_ns = ATOMIC64_INIT(0);
 
 /*
  * Cached drm-panel vblank period, in microseconds.  Producer:
@@ -11238,7 +11294,8 @@ static void zenith_input_event(struct input_handle *handle, unsigned int type,
 			       unsigned int code, int value)
 {
 	unsigned int active = READ_ONCE(zenith_input_boost_active_ms);
-	u64 deadline;
+	u64 now_ns, last_ns, deadline;
+	unsigned int effective_ms;
 
 	if (type != EV_KEY && type != EV_ABS && type != EV_REL)
 		return;
@@ -11251,7 +11308,32 @@ static void zenith_input_event(struct input_handle *handle, unsigned int type,
 	if (!active)
 		return;
 
-	deadline = ktime_get_ns() + (u64)active * NSEC_PER_MSEC;
+	now_ns = ktime_get_ns();
+	last_ns = (u64)atomic64_read(&zenith_input_last_event_ns);
+	atomic64_set(&zenith_input_last_event_ns, now_ns);
+
+	/* Quiet-period extension.  When the gap since the previous
+	 * event exceeds ZENITH_INPUT_QUIET_THRESHOLD_MS (or this is the
+	 * very first event after boot, last_ns == 0), widen the
+	 * full-pin window by ZENITH_INPUT_QUIET_BOOST_MULT_PCT and clip
+	 * at ZENITH_INPUT_QUIET_BOOST_MAX_MS.  Sustained-interaction
+	 * events (gap < threshold) keep the original active duration.
+	 */
+	effective_ms = active;
+	if (!last_ns ||
+	    now_ns - last_ns >=
+	    (u64)ZENITH_INPUT_QUIET_THRESHOLD_MS * NSEC_PER_MSEC) {
+		unsigned int extended = (active *
+					 ZENITH_INPUT_QUIET_BOOST_MULT_PCT) /
+					100;
+
+		if (extended > ZENITH_INPUT_QUIET_BOOST_MAX_MS)
+			extended = ZENITH_INPUT_QUIET_BOOST_MAX_MS;
+		if (extended > effective_ms)
+			effective_ms = extended;
+	}
+
+	deadline = now_ns + (u64)effective_ms * NSEC_PER_MSEC;
 	atomic64_set(&zenith_input_boost_until_ns, deadline);
 }
 
