@@ -282,6 +282,38 @@
 #define ZENITH_PEAK_HYSTERESIS_STREAK_MAX		16
 #define ZENITH_PEAK_HYSTERESIS_PEAK_THRESH_PCT		90
 
+/* boost_idle_thresh / boost_idle_streak
+ * (defaults 15 / 3, [Stage 4 / Patch F]):
+ *
+ * Boost early-exit on persistent idle.  When an input boost is
+ * armed (now < zenith_input_boost_until_ns) but the cluster has
+ * sat below load_pct boost_idle_thresh for boost_idle_streak
+ * consecutive ticks, the per-policy tier-0 preempts the boost
+ * on this tick instead of pinning to the boost ceiling.
+ *
+ * Goal: stop pinning the cluster to peak when the workload that
+ * triggered the boost has clearly drained.  A user tap that
+ * launches an app is a typical case: the launch animation
+ * finishes well before input_boost_ms expires, but the natural
+ * idle that follows would still see the cluster pinned at the
+ * boost ceiling for the rest of the window.  Boost early-exit
+ * trims the energy tail without affecting the launch-frame
+ * latency the boost was actually for.
+ *
+ * Per-policy preemption only: the global
+ * zenith_input_boost_until_ns is intentionally left armed so
+ * other clusters that are still busy keep their boost.  Each
+ * policy makes its own idle-streak decision.
+ *
+ * Either tunable at 0 disables the early-exit (legacy
+ * boost-honoured-to-its-deadline behaviour).  Range checks:
+ * thresh in 0..100 (load percent), streak in
+ * 0..ZENITH_BOOST_IDLE_STREAK_MAX.
+ */
+#define ZENITH_DEFAULT_BOOST_IDLE_THRESH		15
+#define ZENITH_DEFAULT_BOOST_IDLE_STREAK		3
+#define ZENITH_BOOST_IDLE_STREAK_MAX			16
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -1963,6 +1995,17 @@ struct zenith_tunables {
 	unsigned int		peak_hysteresis_streak;
 	unsigned int		peak_step_down_pct;
 
+	/* See ZENITH_DEFAULT_BOOST_IDLE_THRESH /
+	 * ZENITH_DEFAULT_BOOST_IDLE_STREAK (Patch F).  Either at 0
+	 * disables the boost early-exit (boost is honoured to its
+	 * deadline regardless of in-cluster idle).  Range checks:
+	 * thresh in 0..100 (load percent), streak in
+	 * 0..ZENITH_BOOST_IDLE_STREAK_MAX.  Reads via READ_ONCE on
+	 * the eval hot path.
+	 */
+	unsigned int		boost_idle_thresh;
+	unsigned int		boost_idle_streak;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -2644,11 +2687,19 @@ static atomic64_t zenith_auto_input_events = ATOMIC64_INIT(0);
  *   zenith_in_boosts_skipped_disabled
  *     Events that fell through because input_boost_ms == 0
  *     (boost feature disabled at event time).
+ *   zenith_in_boosts_early_exit
+ *     [Stage 4 / Patch F] Per-policy decisions where the
+ *     persistent-idle streak (boost_idle_low_streak) crossed
+ *     the boost_idle_streak threshold and the policy preempted
+ *     the still-armed input boost on its tier-0 path this tick.
+ *     The global zenith_input_boost_until_ns is left untouched;
+ *     other policies continue to honour the boost.
  */
 static atomic64_t zenith_in_events_total = ATOMIC64_INIT(0);
 static atomic64_t zenith_in_boosts_armed = ATOMIC64_INIT(0);
 static atomic64_t zenith_in_boosts_quiet_extended = ATOMIC64_INIT(0);
 static atomic64_t zenith_in_boosts_skipped_disabled = ATOMIC64_INIT(0);
+static atomic64_t zenith_in_boosts_early_exit = ATOMIC64_INIT(0);
 
 /* Per-policy decision-stat buckets exposed via the readonly
  * `zenith_stats` sysfs node.  See struct zenith_policy::stats[] for
@@ -2860,6 +2911,18 @@ struct zenith_policy {
 	 * hysteresis needed).  0 means "no anchor armed".
 	 */
 	unsigned int		peak_hyst_anchor_freq;
+
+	/* Persistent-idle streak counter for boost early-exit
+	 * [Stage 4 / Patch F].  Increments on every tick where an
+	 * input boost is armed (now < zenith_input_boost_until_ns)
+	 * AND the cluster's load_pct is below
+	 * tunables->boost_idle_thresh.  Reset on boost expiry, on
+	 * any non-idle sample inside the boost window, or after a
+	 * preemption tick fires.  Capped at
+	 * ZENITH_BOOST_IDLE_STREAK_MAX so a stuck-near-zero workload
+	 * cannot accumulate unbounded streak credit.
+	 */
+	unsigned int		boost_idle_low_streak;
 
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
@@ -5176,6 +5239,22 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 					z_policy->tunables->game_mode,
 					z_policy->at_effective_game_mode));
 			unsigned int boost_ceiling;
+			unsigned int idle_streak_th =
+				READ_ONCE(z_policy->tunables->boost_idle_streak);
+
+			/* Patch F: persistent-idle preemption.  If a
+			 * boost is still armed but the cluster has been
+			 * idle for boost_idle_streak ticks, skip the
+			 * boost on this tier-0 path so the lower tiers
+			 * pick the freq.  The global until_ns is left
+			 * armed; other policies still see the boost.
+			 */
+			if (idle_streak_th &&
+			    z_policy->boost_idle_low_streak >= idle_streak_th) {
+				atomic64_inc(&zenith_in_boosts_early_exit);
+				z_policy->boost_idle_low_streak = 0;
+				goto skip_input_boost;
+			}
 
 			/* game_mode=2 (turbo) overrides the user-set cap and
 			 * pins the full-boost phase to policy->max regardless
@@ -5210,6 +5289,26 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			 * first set.
 			 */
 			z_policy->boost_active_until_ns = until;
+
+			/* Patch F: update the persistent-idle streak.
+			 * Increment when the cluster's load_pct sits
+			 * below boost_idle_thresh; reset otherwise.
+			 * Capped at ZENITH_BOOST_IDLE_STREAK_MAX so a
+			 * stuck-near-zero workload can't accumulate
+			 * unbounded streak credit.
+			 */
+			{
+				unsigned int idle_thresh =
+					READ_ONCE(z_policy->tunables->boost_idle_thresh);
+
+				if (idle_thresh && tp_load_pct < idle_thresh) {
+					if (z_policy->boost_idle_low_streak <
+					    ZENITH_BOOST_IDLE_STREAK_MAX)
+						z_policy->boost_idle_low_streak++;
+				} else {
+					z_policy->boost_idle_low_streak = 0;
+				}
+			}
 
 			/* A capped ceiling that lands below policy->min would
 			 * push the decay floor negative; clamp to min so the
@@ -5269,8 +5368,22 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 				pin_to_target = true;
 				goto apply_uclamp_max_cap;
 			}
+		} else {
+			/* Boost expired naturally; drop any accumulated
+			 * idle-streak credit so the next boost arming
+			 * starts from zero (Patch F).
+			 */
+			z_policy->boost_idle_low_streak = 0;
 		}
+	} else {
+		/* Boost feature gated off (input_boost_ms == 0,
+		 * screen off, or input_boost_big_only excluded this
+		 * cluster): clear the idle streak so a later re-enable
+		 * sees a fresh count.
+		 */
+		z_policy->boost_idle_low_streak = 0;
 	}
+skip_input_boost:
 
 	/* 1. Ondemand Brutality (with hysteresis).
 	 *
@@ -7958,6 +8071,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int input_boost_touchdown_extra_ms;
 		unsigned int peak_hysteresis_streak;
 		unsigned int peak_step_down_pct;
+		unsigned int boost_idle_thresh;
+		unsigned int boost_idle_streak;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -8029,6 +8144,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.peak_hysteresis_streak = 4,
 			.peak_step_down_pct = 97,
+			/* Stage 4 / Patch F: PERFORMANCE disables the
+			 * boost early-exit.  The whole point of the
+			 * profile is to honour every UX boost in full;
+			 * a few ticks of below-threshold load inside a
+			 * boost window is not a reason to drop the
+			 * cluster off the boost ceiling.
+			 */
+			.boost_idle_thresh = 0,
+			.boost_idle_streak = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -8106,6 +8230,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK,
 			.peak_step_down_pct =
 				ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT,
+			/* Stage 4 / Patch F: BALANCED matches cold-boot
+			 * defaults (15% threshold, 3-tick streak).  This
+			 * is the energy-optimisation profile, so trimming
+			 * the boost tail when load actually drained makes
+			 * sense as a default.
+			 */
+			.boost_idle_thresh =
+				ZENITH_DEFAULT_BOOST_IDLE_THRESH,
+			.boost_idle_streak =
+				ZENITH_DEFAULT_BOOST_IDLE_STREAK,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -8188,6 +8322,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.peak_hysteresis_streak = 2,
 			.peak_step_down_pct = 90,
+			/* Stage 4 / Patch F: BATTERY uses an aggressive
+			 * early-exit (25% threshold, 2-tick streak) so
+			 * the boost ceiling is dropped as soon as the
+			 * launch animation visibly drains.  Combined
+			 * with the lower input_boost_ms in this profile
+			 * the energy tail of a tap-and-release gesture
+			 * is closer to a hard cliff than a 60 ms decay.
+			 */
+			.boost_idle_thresh = 25,
+			.boost_idle_streak = 2,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -8266,6 +8410,12 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.peak_hysteresis_streak = 0,
 			.peak_step_down_pct = 0,
+			/* Stage 4 / Patch F: LEGACY disables the boost
+			 * early-exit; boosts are honoured to their
+			 * configured deadline.
+			 */
+			.boost_idle_thresh = 0,
+			.boost_idle_streak = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -8327,6 +8477,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->peak_hysteresis_streak,
 		   p->peak_hysteresis_streak);
 	WRITE_ONCE(t->peak_step_down_pct, p->peak_step_down_pct);
+	WRITE_ONCE(t->boost_idle_thresh, p->boost_idle_thresh);
+	WRITE_ONCE(t->boost_idle_streak, p->boost_idle_streak);
 
 	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
 	 * the governor-wide caches used by the input handler fast
@@ -9604,13 +9756,16 @@ static ssize_t zenith_input_stats_show(struct gov_attr_set *attr_set,
 		"events_total=%llu\n"
 		"boosts_armed=%llu\n"
 		"boosts_quiet_extended=%llu\n"
-		"boosts_skipped_disabled=%llu\n",
+		"boosts_skipped_disabled=%llu\n"
+		"boosts_early_exit=%llu\n",
 		(unsigned long long)atomic64_read(&zenith_in_events_total),
 		(unsigned long long)atomic64_read(&zenith_in_boosts_armed),
 		(unsigned long long)atomic64_read(
 			&zenith_in_boosts_quiet_extended),
 		(unsigned long long)atomic64_read(
-			&zenith_in_boosts_skipped_disabled));
+			&zenith_in_boosts_skipped_disabled),
+		(unsigned long long)atomic64_read(
+			&zenith_in_boosts_early_exit));
 }
 
 static struct governor_attr zenith_input_stats =
@@ -11008,6 +11163,63 @@ peak_step_down_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr peak_step_down_pct =
 	__ATTR_RW(peak_step_down_pct);
 
+/* boost_idle_thresh sysfs knob (Patch F).
+ * Range 0..100.  load_pct below which a boost-active tick is
+ * counted toward the persistent-idle streak.  0 disables the
+ * boost early-exit (boost is always honoured to its deadline).
+ */
+static ssize_t
+boost_idle_thresh_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->boost_idle_thresh);
+}
+
+static ssize_t
+boost_idle_thresh_store(struct gov_attr_set *attr_set,
+			const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	WRITE_ONCE(t->boost_idle_thresh, val);
+	return count;
+}
+
+static struct governor_attr boost_idle_thresh =
+	__ATTR_RW(boost_idle_thresh);
+
+/* boost_idle_streak sysfs knob (Patch F).
+ * Range 0..ZENITH_BOOST_IDLE_STREAK_MAX.  Number of consecutive
+ * idle ticks (load_pct < boost_idle_thresh) inside an active
+ * boost window before the policy preempts the boost on its
+ * tier-0 path.  0 disables the boost early-exit.
+ */
+static ssize_t
+boost_idle_streak_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->boost_idle_streak);
+}
+
+static ssize_t
+boost_idle_streak_store(struct gov_attr_set *attr_set,
+			const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_BOOST_IDLE_STREAK_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->boost_idle_streak, val);
+	return count;
+}
+
+static struct governor_attr boost_idle_streak =
+	__ATTR_RW(boost_idle_streak);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -12185,6 +12397,8 @@ static struct attribute *zenith_attrs[] = {
 	&predict_up_window.attr,
 	&peak_hysteresis_streak.attr,
 	&peak_step_down_pct.attr,
+	&boost_idle_thresh.attr,
+	&boost_idle_streak.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -12422,6 +12636,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->peak_hysteresis_streak =
 		ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK;
 	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
+	tunables->boost_idle_thresh	= ZENITH_DEFAULT_BOOST_IDLE_THRESH;
+	tunables->boost_idle_streak	= ZENITH_DEFAULT_BOOST_IDLE_STREAK;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
