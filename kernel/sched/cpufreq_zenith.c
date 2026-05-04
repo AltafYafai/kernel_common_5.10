@@ -1293,6 +1293,31 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_RENDER_FLOOR_PCT		70
 #define ZENITH_RENDER_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
 
+/* render_floor_min_runtime_ms (default 50, [Stage 4 / Patch B]):
+ *
+ * Debounce window for the render-thread floor.  When a render
+ * thread first becomes the cpu_curr after a quiet period, the
+ * floor is *not* applied until the thread has been observed for
+ * at least render_floor_min_runtime_ms milliseconds.  A render
+ * thread that rises and falls inside the debounce window (e.g.
+ * an idle SurfaceFlinger flush, a one-shot RenderEngine wakeup)
+ * never floors the cluster.
+ *
+ * 0 disables the debounce: the floor fires the moment the
+ * render thread is picked up, which is the original Wave-2
+ * behaviour.  Capped at ZENITH_RENDER_FLOOR_MIN_RUNTIME_MS_MAX
+ * so a bad echo can't push the debounce into the seconds range
+ * and silently disable the floor for whole frames.
+ *
+ * The debounce is tracked by a per-policy stamp
+ * (render_first_seen_ns) that is taken on the first sample with
+ * has_render==true and reset to 0 on the first sample with
+ * has_render==false.  No timers, no work_struct: the check is a
+ * single ktime_get_ns() comparison on the existing eval path.
+ */
+#define ZENITH_DEFAULT_RENDER_FLOOR_MIN_RUNTIME_MS	50
+#define ZENITH_RENDER_FLOOR_MIN_RUNTIME_MS_MAX		1000
+
 /* game_mode (default 0, off):
  *
  * When game_mode=1, zenith applies two lightweight runtime overlays
@@ -2296,6 +2321,14 @@ struct zenith_tunables {
 	unsigned int		render_aware;
 	unsigned int		render_floor_pct;
 
+	/* See ZENITH_DEFAULT_RENDER_FLOOR_MIN_RUNTIME_MS.  Debounce
+	 * window in milliseconds.  Reads via READ_ONCE on the eval
+	 * hot path; writes via WRITE_ONCE from sysfs and from
+	 * zenith_apply_profile().  Range
+	 * 0..ZENITH_RENDER_FLOOR_MIN_RUNTIME_MS_MAX.
+	 */
+	unsigned int		render_floor_min_runtime_ms;
+
 	/* See ZENITH_DEFAULT_GAME_MODE. 0/1, normalised on store. */
 	unsigned int		game_mode;
 
@@ -2665,6 +2698,18 @@ struct zenith_policy {
 	unsigned long		util_history[ZENITH_PREDICT_UP_WINDOW_MAX];
 	unsigned int		util_history_idx;
 	unsigned int		util_history_count;
+
+	/* Render-thread floor debounce stamp [Stage 4 / Patch B].
+	 * Set to ktime_get_ns() on the first eval where
+	 * zenith_policy_has_render() returns true after a quiet
+	 * period (previous sample saw has_render==false).  Reset to
+	 * 0 the first time has_render returns false, so the debounce
+	 * window restarts on each fresh render-thread arrival.
+	 * Compared against tunables->render_floor_min_runtime_ms
+	 * before the floor is allowed to fire.  Zero-initialised at
+	 * policy alloc; no special teardown.
+	 */
+	u64			render_first_seen_ns;
 
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
@@ -5721,6 +5766,14 @@ brutal_entry_deferred:
 	 * (policy->max * render_floor_pct / 100).  Caches the comm walk
 	 * for ZENITH_RENDER_CACHE_TTL_NS to keep the hot path cheap.
 	 * Floor is still capped by the uclamp_max tier below.
+	 *
+	 * Patch B: debounce the floor by render_floor_min_runtime_ms.
+	 * Stamp the first-seen time on the false->true transition, clear
+	 * on any sample where has_render is false.  Apply the floor only
+	 * when the render thread has been observed for at least the
+	 * debounce window; this filters one-shot SurfaceFlinger flushes
+	 * and idle RenderEngine wakes that would otherwise bounce the
+	 * cluster up to render_floor_pct for a single sample.
 	 */
 	if (ZENITH_FEATURE_ENABLED(render_aware) &&
 	    z_policy->tunables->render_floor_pct) {
@@ -5728,16 +5781,36 @@ brutal_entry_deferred:
 		unsigned int rf = (policy->max *
 				   z_policy->tunables->render_floor_pct) /
 				  100;
+		unsigned int debounce_ms =
+			READ_ONCE(z_policy->tunables->render_floor_min_runtime_ms);
+		bool debounce_ok = true;
+		u64 now_ns_render;
 
 		if (rf > policy->max)
 			rf = policy->max;
+
+		if (has_render) {
+			now_ns_render = ktime_get_ns();
+			if (z_policy->render_first_seen_ns == 0)
+				z_policy->render_first_seen_ns = now_ns_render;
+			if (debounce_ms) {
+				u64 thresh = (u64)debounce_ms * NSEC_PER_MSEC;
+
+				if (now_ns_render -
+				    z_policy->render_first_seen_ns < thresh)
+					debounce_ok = false;
+			}
+		} else {
+			z_policy->render_first_seen_ns = 0;
+		}
+
 		if (trace_zenith_render_floor_enabled())
 			trace_zenith_render_floor(
 				cpumask_first(policy->cpus),
 				has_render,
 				z_policy->tunables->render_floor_pct,
-				has_render ? rf : 0);
-		if (has_render && freq < rf) {
+				(has_render && debounce_ok) ? rf : 0);
+		if (has_render && debounce_ok && freq < rf) {
 			freq = rf;
 			tp_path = "render_floor";
 		}
@@ -7629,6 +7702,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int input_boost_down_rate_mult_pct;
 		unsigned int predict_up_thresh;
 		unsigned int predict_up_window;
+		unsigned int render_floor_pct;
+		unsigned int render_floor_min_runtime_ms;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -7677,6 +7752,14 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.predict_up_thresh = 48,
 			.predict_up_window = 4,
+			/* Stage 4 / Patch B: PERFORMANCE keeps the
+			 * render floor strong (80%% of max, vs 70%%
+			 * default) and tightens the debounce to 20 ms
+			 * so frame deadlines aren't lost to a slow
+			 * floor-arm on transient render activity.
+			 */
+			.render_floor_pct = 80,
+			.render_floor_min_runtime_ms = 20,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -7735,6 +7818,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PREDICT_UP_THRESH,
 			.predict_up_window =
 				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			/* Stage 4 / Patch B: BALANCED matches cold-
+			 * boot defaults (70%% floor, 50 ms debounce).
+			 */
+			.render_floor_pct =
+				ZENITH_DEFAULT_RENDER_FLOOR_PCT,
+			.render_floor_min_runtime_ms =
+				ZENITH_DEFAULT_RENDER_FLOOR_MIN_RUNTIME_MS,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -7791,6 +7881,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.predict_up_thresh = 0,
 			.predict_up_window =
 				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			/* Stage 4 / Patch B: BATTERY softens the render
+			 * floor to 50%% and stretches the debounce to
+			 * 100 ms.  Render activity still floors the
+			 * cluster but only after the workload is sticky;
+			 * one-shot SurfaceFlinger flushes don't pay the
+			 * floor.
+			 */
+			.render_floor_pct = 50,
+			.render_floor_min_runtime_ms = 100,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -7848,6 +7947,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.predict_up_thresh = 0,
 			.predict_up_window =
 				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			/* Stage 4 / Patch B: LEGACY disables the floor
+			 * outright (render_floor_pct=0) since the floor
+			 * is a Stage-1+ feature.  The debounce knob is
+			 * left at 0 (no debounce) for forward
+			 * compatibility if the user re-enables the
+			 * floor through sysfs.
+			 */
+			.render_floor_pct = 0,
+			.render_floor_min_runtime_ms = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -7901,6 +8009,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		p->input_boost_down_rate_mult_pct;
 	WRITE_ONCE(t->predict_up_thresh, p->predict_up_thresh);
 	WRITE_ONCE(t->predict_up_window, p->predict_up_window);
+	t->render_floor_pct	= p->render_floor_pct;
+	WRITE_ONCE(t->render_floor_min_runtime_ms,
+		   p->render_floor_min_runtime_ms);
 
 	/* Mirror input_boost_ms to the governor-wide cache used by the
 	 * input handler fast path.
@@ -10823,6 +10934,36 @@ static ssize_t render_floor_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr render_floor_pct = __ATTR_RW(render_floor_pct);
 
+/* render_floor_min_runtime_ms sysfs knob.  Debounce window in
+ * milliseconds for the render-thread floor; 0 disables the
+ * debounce so the floor fires the moment a render thread is
+ * picked up.  See ZENITH_DEFAULT_RENDER_FLOOR_MIN_RUNTIME_MS for
+ * details.  Capped at ZENITH_RENDER_FLOOR_MIN_RUNTIME_MS_MAX.
+ */
+static ssize_t
+render_floor_min_runtime_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->render_floor_min_runtime_ms);
+}
+
+static ssize_t
+render_floor_min_runtime_ms_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_RENDER_FLOOR_MIN_RUNTIME_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->render_floor_min_runtime_ms, val);
+	return count;
+}
+
+static struct governor_attr render_floor_min_runtime_ms =
+	__ATTR_RW(render_floor_min_runtime_ms);
+
 /* audio_aware sysfs knob.  Strict 0/1 boolean; non-zero values are
  * normalised to 1 on store.  No cache invalidation: tunables->audio_aware
  * is read fresh on every zenith_get_next_freq() call.  Toggling from 1
@@ -11668,6 +11809,7 @@ static struct attribute *zenith_attrs[] = {
 	&render_aware.attr,
 	&render_comms.attr,
 	&render_floor_pct.attr,
+	&render_floor_min_runtime_ms.attr,
 	&audio_aware.attr,
 	&audio_comms.attr,
 	&audio_floor_pct.attr,
@@ -11905,6 +12047,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->predict_util_smooth	= ZENITH_DEFAULT_PREDICT_UTIL_SMOOTH;
 	tunables->render_aware		= ZENITH_DEFAULT_RENDER_AWARE;
 	tunables->render_floor_pct	= ZENITH_DEFAULT_RENDER_FLOOR_PCT;
+	tunables->render_floor_min_runtime_ms =
+		ZENITH_DEFAULT_RENDER_FLOOR_MIN_RUNTIME_MS;
 	tunables->audio_aware		= ZENITH_DEFAULT_AUDIO_AWARE;
 	tunables->audio_floor_pct	= ZENITH_DEFAULT_AUDIO_FLOOR_PCT;
 	tunables->audio_cap_pct		= ZENITH_DEFAULT_AUDIO_CAP_PCT;
