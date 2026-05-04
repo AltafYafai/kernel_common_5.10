@@ -2537,6 +2537,35 @@ static unsigned int zenith_input_boost_active_ms = ZENITH_DEFAULT_INPUT_BOOST_MS
 static atomic64_t zenith_auto_input_events = ATOMIC64_INIT(0);
 #define ZENITH_AUTO_TUNE_PERIOD_MS	10000	/* classify every 10s  */
 
+/* Stage 4 / Patch I -- governor-wide input observability counters.
+ *
+ * Each counter is a monotonic atomic64; readers get a snapshot via
+ * the `zenith_input_stats` sysfs node and subtract last-observed
+ * values to compute rates.  Counters never reset; rollover on a 64-
+ * bit atomic is "never" in practice.  The cost on the input path is
+ * one atomic64_inc per counter touched; in the trace-disabled hot
+ * path that's three increments per qualifying event, all cheap.
+ *
+ * Counters:
+ *
+ *   zenith_in_events_total
+ *     Every EV_KEY/EV_ABS/EV_REL event seen by zenith_input_event,
+ *     regardless of whether the boost is enabled.
+ *   zenith_in_boosts_armed
+ *     Events that wrote zenith_input_boost_until_ns (i.e.
+ *     active != 0 at event time).
+ *   zenith_in_boosts_quiet_extended
+ *     Subset of armed boosts where the quiet-period extension
+ *     widened the boost window past the configured active duration.
+ *   zenith_in_boosts_skipped_disabled
+ *     Events that fell through because input_boost_ms == 0
+ *     (boost feature disabled at event time).
+ */
+static atomic64_t zenith_in_events_total = ATOMIC64_INIT(0);
+static atomic64_t zenith_in_boosts_armed = ATOMIC64_INIT(0);
+static atomic64_t zenith_in_boosts_quiet_extended = ATOMIC64_INIT(0);
+static atomic64_t zenith_in_boosts_skipped_disabled = ATOMIC64_INIT(0);
+
 /* Per-policy decision-stat buckets exposed via the readonly
  * `zenith_stats` sysfs node.  See struct zenith_policy::stats[] for
  * the storage and zenith_path_to_bucket() for the tp_path -> bucket
@@ -2560,6 +2589,15 @@ enum zenith_stat_idx {
 	ZENITH_STAT_EM_CAP,		/* em_cap */
 	ZENITH_STAT_EAS,		/* fall-through, no override */
 	ZENITH_STAT_OTHER,		/* unmapped tp_path */
+	/* Stage 4 / Patch I additions.  Split out the tp_paths
+	 * previously bucketed into ZENITH_STAT_OTHER (predict_up,
+	 * peak_prearm, peak_rescue) so testers can read the
+	 * fire-rate of each Stage-3+ tier independently of the
+	 * legacy buckets.
+	 */
+	ZENITH_STAT_PREDICT_UP,		/* predict_up */
+	ZENITH_STAT_PEAK_PREARM,	/* peak_prearm */
+	ZENITH_STAT_PEAK_RESCUE,	/* peak_rescue */
 	ZENITH_STAT_NR
 };
 
@@ -4524,6 +4562,12 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
 		return ZENITH_STAT_LIGHT_CAP;
 	if (!strcmp(path, "em_cap"))
 		return ZENITH_STAT_EM_CAP;
+	if (!strcmp(path, "predict_up"))
+		return ZENITH_STAT_PREDICT_UP;
+	if (!strcmp(path, "peak_prearm"))
+		return ZENITH_STAT_PEAK_PREARM;
+	if (!strcmp(path, "peak_rescue"))
+		return ZENITH_STAT_PEAK_RESCUE;
 	return ZENITH_STAT_OTHER;
 }
 
@@ -9214,6 +9258,9 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 		[ZENITH_STAT_EM_CAP]		= "em_cap",
 		[ZENITH_STAT_EAS]		= "eas",
 		[ZENITH_STAT_OTHER]		= "other",
+		[ZENITH_STAT_PREDICT_UP]	= "predict_up",
+		[ZENITH_STAT_PEAK_PREARM]	= "peak_prearm",
+		[ZENITH_STAT_PEAK_RESCUE]	= "peak_rescue",
 	};
 	unsigned long sum[ZENITH_STAT_NR] = { 0 };
 	struct zenith_policy *z_pol;
@@ -9256,6 +9303,39 @@ static ssize_t zenith_stats_reset_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr zenith_stats_reset =
 	__ATTR_WO(zenith_stats_reset);
+
+/* Stage 4 / Patch I -- governor-wide input observability sysfs node.
+ *
+ * Read-only; emits one "name=value" line per atomic counter so
+ * userspace can scrape by field name.  All counters are
+ * monotonic-since-boot atomic64s so the reader's job is to subtract
+ * a stored snapshot to get a rate.  See the block comment above
+ * zenith_in_events_total for what each counter records.
+ *
+ * The counters are governor-wide (one set, not per-policy) because
+ * input events are observed once per dispatch and applied to all
+ * policies that have boosting enabled.  Putting the node on the
+ * gov_attr_set means it appears under every cpufreq policy
+ * directory but reads the same global atomics.
+ */
+static ssize_t zenith_input_stats_show(struct gov_attr_set *attr_set,
+				       char *buf)
+{
+	return sprintf(buf,
+		"events_total=%llu\n"
+		"boosts_armed=%llu\n"
+		"boosts_quiet_extended=%llu\n"
+		"boosts_skipped_disabled=%llu\n",
+		(unsigned long long)atomic64_read(&zenith_in_events_total),
+		(unsigned long long)atomic64_read(&zenith_in_boosts_armed),
+		(unsigned long long)atomic64_read(
+			&zenith_in_boosts_quiet_extended),
+		(unsigned long long)atomic64_read(
+			&zenith_in_boosts_skipped_disabled));
+}
+
+static struct governor_attr zenith_input_stats =
+	__ATTR_RO(zenith_input_stats);
 
 /* Read-only dump of the per-policy auto-tune classifier ring buffer.
  *
@@ -11736,6 +11816,7 @@ static struct attribute *zenith_attrs[] = {
 	&profile_values.attr,
 	&zenith_stats.attr,
 	&zenith_stats_reset.attr,
+	&zenith_input_stats.attr,
 	&at_log.attr,
 	&auto_tune_status.attr,
 	&auto_tune_reset_overrides.attr,
@@ -12334,9 +12415,12 @@ static void zenith_input_event(struct input_handle *handle, unsigned int type,
 	 * auto_tune mid-session has recent data. Cheap atomic inc.
 	 */
 	atomic64_inc(&zenith_auto_input_events);
+	atomic64_inc(&zenith_in_events_total);
 
-	if (!active)
+	if (!active) {
+		atomic64_inc(&zenith_in_boosts_skipped_disabled);
 		return;
+	}
 
 	now_ns = ktime_get_ns();
 	last_ns = (u64)atomic64_read(&zenith_input_last_event_ns);
@@ -12366,6 +12450,9 @@ static void zenith_input_event(struct input_handle *handle, unsigned int type,
 
 	deadline = now_ns + (u64)effective_ms * NSEC_PER_MSEC;
 	atomic64_set(&zenith_input_boost_until_ns, deadline);
+	atomic64_inc(&zenith_in_boosts_armed);
+	if (effective_ms > active)
+		atomic64_inc(&zenith_in_boosts_quiet_extended);
 
 	/* Observability: emit a tracepoint capturing the boost arming
 	 * decision.  Default-disabled; consumers (testers /
