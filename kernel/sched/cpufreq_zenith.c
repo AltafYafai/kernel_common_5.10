@@ -193,6 +193,7 @@
 #define ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_STREAK	3
 #define ZENITH_DEFAULT_PEAK_HEADROOM_JUMP_PCT		100
 #define ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS		50
+#define ZENITH_DEFAULT_PEAK_HEADROOM_PREARM		1
 #define ZENITH_PEAK_HEADROOM_STREAK_MAX			16
 #define ZENITH_PEAK_HEADROOM_HOLD_MS_MAX		1000
 
@@ -1716,6 +1717,36 @@ struct zenith_tunables {
 	unsigned int		peak_headroom_starve_streak;
 	unsigned int		peak_headroom_jump_pct;
 	unsigned int		peak_headroom_hold_ms;
+
+	/* Pre-arm tier for the peak-headroom rescue.  When 1 (the
+	 * default), an early softer intervention fires while the
+	 * starvation streak is accumulating but has not yet crossed
+	 * peak_headroom_starve_streak.  Specifically: if the previous
+	 * sample was starving (peak_starve_count > 0) and the current
+	 * cluster freq is still below an effective hispeed_freq value
+	 * that would itself escape the starvation floor, lift freq up
+	 * to that hispeed value before the rescue tier even runs.
+	 *
+	 * Effect: a graduated response curve.  Sample 1 of starvation
+	 * pulls the cluster into the hispeed band; subsequent samples
+	 * either clear (because hispeed was enough) or progress to the
+	 * full rescue (because hispeed wasn't enough and the streak
+	 * crosses).  The pre-arm self-disables the moment it actually
+	 * works -- once freq >= floor_freq, the next sample's starve
+	 * check evaluates false and peak_starve_count resets to 0,
+	 * which is also the gate that lets the pre-arm fire, so the
+	 * intervention is naturally one-shot per starvation episode.
+	 *
+	 * 0 disables the pre-arm: starvation episodes go directly to
+	 * the full rescue after the streak hits.  Mostly useful for
+	 * debugging or for tracker A/B comparisons of the rescue tier
+	 * alone vs. the rescue+pre-arm pair.  Also automatically a
+	 * no-op when hispeed_freq is unconfigured (eff_hispeed == 0)
+	 * or when the configured eff_hispeed value is itself below the
+	 * floor_freq (lifting to a sub-floor hispeed wouldn't escape
+	 * starvation, so we let the rescue handle it).
+	 */
+	unsigned int		peak_headroom_prearm;
 
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
@@ -5058,6 +5089,49 @@ brutal_entry_deferred:
 			 */
 			z_policy->hispeed_active = false;
 			z_policy->hispeed_entry_count = 0;
+		}
+	}
+
+	/* 2b'. Peak-headroom pre-arm.  Soft early intervention that
+	 * lifts the cluster up to eff_hispeed_freq while the
+	 * starvation streak is accumulating but has not yet crossed
+	 * peak_headroom_starve_streak.  See peak_headroom_prearm in
+	 * struct zenith_tunables for the full rationale.
+	 *
+	 * Trigger: gate is on, rescue gate is on (so peak_starve_count
+	 * is being maintained at all), max_cap and policy->max non-
+	 * zero, pin_to_target is false, eff_hispeed is configured,
+	 * peak_starve_count > 0 (last sample was starving), current
+	 * freq is below eff_hispeed, and lifting to eff_hispeed would
+	 * actually escape the starvation floor (eff_hispeed >=
+	 * floor_freq -- otherwise the rescue tier 2c would just
+	 * re-flag the cluster as starving on the next sample, the
+	 * hispeed pull would be wasted energy, and the rescue would
+	 * be delayed).
+	 *
+	 * Effect: a one-shot per-episode graduated response.  Once the
+	 * pull lands and freq >= floor_freq, 2c's starve check
+	 * resolves false and peak_starve_count resets to 0, which is
+	 * also the gate that lets this pre-arm fire, so the
+	 * intervention won't repeat until a fresh starvation episode
+	 * begins.  If eff_hispeed wasn't enough (peak_starve_count
+	 * keeps climbing past the streak), the rescue tier in 2c
+	 * fires as normal.
+	 */
+	if (z_policy->tunables->peak_headroom_rescue &&
+	    z_policy->tunables->peak_headroom_prearm &&
+	    max_cap && policy->max && !pin_to_target &&
+	    z_policy->peak_starve_count > 0) {
+		unsigned int eff_hispeed = zenith_eff_hispeed_freq(z_policy);
+		unsigned int floor_pct =
+			z_policy->tunables->peak_headroom_freq_floor_pct;
+		unsigned int floor_freq =
+			(policy->max / 100) * floor_pct;
+
+		if (eff_hispeed && eff_hispeed >= floor_freq &&
+		    freq < eff_hispeed) {
+			freq = eff_hispeed;
+			tp_path = "peak_prearm";
 		}
 	}
 
@@ -9812,6 +9886,33 @@ static ssize_t peak_headroom_hold_ms_store(struct gov_attr_set *attr_set,
 static struct governor_attr peak_headroom_hold_ms =
 	__ATTR_RW(peak_headroom_hold_ms);
 
+/* peak_headroom_prearm sysfs knob.  Boolean gate for the soft early
+ * intervention tier (2b') that lifts the cluster to eff_hispeed_freq
+ * while the starvation streak is accumulating but has not yet
+ * crossed peak_headroom_starve_streak.  Accepts 0 or 1 only.
+ */
+static ssize_t peak_headroom_prearm_show(struct gov_attr_set *attr_set,
+					 char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peak_headroom_prearm);
+}
+
+static ssize_t peak_headroom_prearm_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->peak_headroom_prearm = val;
+	return count;
+}
+
+static struct governor_attr peak_headroom_prearm =
+	__ATTR_RW(peak_headroom_prearm);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -10926,6 +11027,7 @@ static struct attribute *zenith_attrs[] = {
 	&peak_headroom_starve_streak.attr,
 	&peak_headroom_jump_pct.attr,
 	&peak_headroom_hold_ms.attr,
+	&peak_headroom_prearm.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -11151,6 +11253,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PEAK_HEADROOM_JUMP_PCT;
 	tunables->peak_headroom_hold_ms =
 		ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS;
+	tunables->peak_headroom_prearm =
+		ZENITH_DEFAULT_PEAK_HEADROOM_PREARM;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
