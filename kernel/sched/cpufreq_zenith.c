@@ -11797,6 +11797,9 @@ static void zenith_input_event(struct input_handle *handle, unsigned int type,
 	unsigned int active = READ_ONCE(zenith_input_boost_active_ms);
 	u64 now_ns, last_ns, deadline;
 	unsigned int effective_ms;
+	bool was_quiet = false;
+	unsigned int gap_ms = 0;
+	unsigned int source = 0;
 
 	if (type != EV_KEY && type != EV_ABS && type != EV_REL)
 		return;
@@ -11832,10 +11835,54 @@ static void zenith_input_event(struct input_handle *handle, unsigned int type,
 			extended = ZENITH_INPUT_QUIET_BOOST_MAX_MS;
 		if (extended > effective_ms)
 			effective_ms = extended;
+		was_quiet = true;
 	}
 
 	deadline = now_ns + (u64)effective_ms * NSEC_PER_MSEC;
 	atomic64_set(&zenith_input_boost_until_ns, deadline);
+
+	/* Observability: emit a tracepoint capturing the boost arming
+	 * decision.  Default-disabled; consumers (testers /
+	 * developers) opt in via
+	 *
+	 *   echo 1 > /sys/kernel/debug/tracing/events/cpufreq_zenith/zenith_input_boost/enable
+	 *
+	 * The tracepoint is gated by trace_zenith_input_boost_enabled()
+	 * so the cost in the disabled case is a single conditional
+	 * branch on a static-key.  All emit-side computations
+	 * (gap_ms, source) are guarded by the same gate so they
+	 * cannot show up in the hot path when nobody is tracing.
+	 */
+	if (trace_zenith_input_boost_enabled()) {
+		u64 gap_ns;
+
+		if (last_ns && now_ns > last_ns)
+			gap_ns = now_ns - last_ns;
+		else
+			gap_ns = 0;
+		if (gap_ns) {
+			u64 gap_ms_u64 = div_u64(gap_ns, NSEC_PER_MSEC);
+
+			gap_ms = gap_ms_u64 > U32_MAX ? U32_MAX :
+				 (unsigned int)gap_ms_u64;
+		}
+
+		switch (type) {
+		case EV_ABS:
+			source = 1; /* touchscreen */
+			break;
+		case EV_KEY:
+			source = 2; /* key */
+			break;
+		default:
+			source = 0; /* generic / EV_REL et al */
+			break;
+		}
+
+		trace_zenith_input_boost(effective_ms, active,
+					 effective_ms > active,
+					 was_quiet, gap_ms, source);
+	}
 }
 
 static int zenith_input_connect(struct input_handler *handler,

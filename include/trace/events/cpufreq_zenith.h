@@ -396,6 +396,67 @@ TRACE_EVENT(zenith_game_mode,
 	TP_printk("cpu=%d active=%d", __entry->cpu, __entry->active)
 );
 
+/* Input-boost arming and extension trace.  Emitted from
+ * zenith_input_event() at most once per qualifying input event.
+ *
+ *   active_ms     -- effective full-pin duration the boost was
+ *                    armed for, in milliseconds.  Reflects any
+ *                    quiet-period extension applied by the
+ *                    first-tap-after-quiet logic.
+ *   base_ms       -- the base full-pin duration the tunable
+ *                    requested, before any extension.  Equal to
+ *                    active_ms when no extension fired.
+ *   extended      -- true iff the quiet-period extension fired
+ *                    on this event (i.e. active_ms > base_ms).
+ *   was_quiet     -- true iff the most recent input was older
+ *                    than the quiet-period threshold (i.e. this
+ *                    event is the first tap after a quiet period).
+ *   quiet_gap_ms  -- gap, in milliseconds, between the previous
+ *                    input event and this one.  Capped on the
+ *                    emit side at U32_MAX ms.
+ *   source        -- a small enum describing the input source:
+ *                    0 = unknown / generic, 1 = touchscreen,
+ *                    2 = key.  Other values reserved for future
+ *                    classifiers; consumers should treat unknown
+ *                    values as "other".
+ *
+ * Pure observability event.  Adding / enabling the tracepoint
+ * does not change any zenith decision logic.  Default-disabled
+ * via the tracepoint subsystem; enable per-CPU debug with
+ *   echo 1 > /sys/kernel/debug/tracing/events/cpufreq_zenith/zenith_input_boost/enable
+ */
+TRACE_EVENT(zenith_input_boost,
+
+	TP_PROTO(unsigned int active_ms, unsigned int base_ms,
+		 bool extended, bool was_quiet, unsigned int quiet_gap_ms,
+		 unsigned int source),
+
+	TP_ARGS(active_ms, base_ms, extended, was_quiet, quiet_gap_ms, source),
+
+	TP_STRUCT__entry(
+		__field(unsigned int,	active_ms)
+		__field(unsigned int,	base_ms)
+		__field(bool,		extended)
+		__field(bool,		was_quiet)
+		__field(unsigned int,	quiet_gap_ms)
+		__field(unsigned int,	source)
+	),
+
+	TP_fast_assign(
+		__entry->active_ms	= active_ms;
+		__entry->base_ms	= base_ms;
+		__entry->extended	= extended;
+		__entry->was_quiet	= was_quiet;
+		__entry->quiet_gap_ms	= quiet_gap_ms;
+		__entry->source		= source;
+	),
+
+	TP_printk("active_ms=%u base_ms=%u extended=%d was_quiet=%d gap_ms=%u source=%u",
+		  __entry->active_ms, __entry->base_ms,
+		  __entry->extended, __entry->was_quiet,
+		  __entry->quiet_gap_ms, __entry->source)
+);
+
 #endif /* _TRACE_CPUFREQ_ZENITH_H */
 
 /* This part must be outside protection */
