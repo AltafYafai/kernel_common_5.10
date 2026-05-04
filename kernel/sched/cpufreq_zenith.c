@@ -4050,6 +4050,72 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
 	return ZENITH_STAT_OTHER;
 }
 
+/* Cached "does this SoC have a dedicated BIG / mid cluster?" probe.
+ *
+ * On a 3+-cluster topology (1+3+4 et al) at least one cluster sits
+ * strictly between the LITTLE and PRIME capacity bands, so its policy
+ * is classified ZENITH_CLUSTER_BIG by zenith_update_cluster_rate_scale().
+ * On a 2-cluster (true big.LITTLE) topology the lone non-LITTLE
+ * cluster is at max_cap and gets classified ZENITH_CLUSTER_PRIME -- the
+ * BIG class is unused.
+ *
+ * The prefer_silver_aware bump path needs to distinguish these two cases
+ * so it can fire on the lowest non-LITTLE cluster in either topology
+ * (BIG on tri-cluster, PRIME on 2-cluster) without wrongly inflating
+ * up_threshold on PRIME when a separate BIG cluster also exists.
+ *
+ * Topology is invariant after boot, so the result is computed once on
+ * the first call and cached.  capacity_orig is read via
+ * arch_scale_cpu_capacity() which matches what
+ * zenith_update_cluster_rate_scale() uses, keeping classification and
+ * topology probe consistent on every SoC.
+ */
+static bool zenith_topology_has_big_class(void)
+{
+	/*
+	 * State: 0 = unknown, 1 = false, 2 = true.  Encoding both the
+	 * cached value and its validity in a single atomic_t means a
+	 * concurrent caller cannot observe "valid" without also seeing
+	 * the corresponding result -- side-stepping the
+	 * smp_wmb / smp_rmb pairing that a separate (cached_result,
+	 * cached_valid) pair would require on weakly-ordered ARM64.
+	 * Topology is invariant after boot, so multiple racing first
+	 * callers all compute the same result and converge.
+	 */
+	static atomic_t cached = ATOMIC_INIT(0);
+	int snap = atomic_read(&cached);
+	unsigned int little_thresh, big_cap = 0, second_cap = 0, cpu;
+	bool has_big;
+
+	if (snap)
+		return snap == 2;
+
+	little_thresh =
+		(SCHED_CAPACITY_SCALE * ZENITH_CLUSTER_LITTLE_THRESH_PCT) / 100;
+
+	for_each_possible_cpu(cpu) {
+		unsigned int cap = arch_scale_cpu_capacity(cpu);
+
+		if (cap > big_cap) {
+			second_cap = big_cap;
+			big_cap = cap;
+		} else if (cap < big_cap && cap > second_cap) {
+			second_cap = cap;
+		}
+	}
+
+	/* A dedicated BIG class exists when there is a non-LITTLE
+	 * capacity level strictly below the system maximum.  On
+	 * 2-cluster phones second_cap is either zero (single non-LITTLE
+	 * cluster) or below little_thresh (every non-max CPU was a
+	 * LITTLE-equivalent).  On 3+-cluster phones second_cap sits
+	 * comfortably above little_thresh and below big_cap.
+	 */
+	has_big = (second_cap >= little_thresh && second_cap < big_cap);
+	atomic_set(&cached, has_big ? 2 : 1);
+	return has_big;
+}
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
@@ -4272,16 +4338,36 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	}
 
 	/* prefer_silver_aware coordination: when prefer_silver is hot
-	 * and this policy belongs to a big / prime cluster, raise
+	 * and this policy belongs to the BIG / mid cluster, raise
 	 * dynamic_up_thresh by prefer_silver_hot_bump_pct points
 	 * (clamped to ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT) so the
 	 * big cluster down-clocks less aggressively during sustained
 	 * UI / app workloads where prefer_silver is steering the
-	 * light wake-ups onto the silver/LITTLE cluster.  Skipped on
-	 * the little cluster (already absorbing the redirected work)
-	 * and skipped whenever a harder override above has pinned
+	 * light wake-ups onto the silver/LITTLE cluster.
+	 *
+	 * Fires on the lowest non-LITTLE cluster only:
+	 *
+	 *   - 3+-cluster topology (1+3+4 et al): cluster_class == BIG.
+	 *     PRIME is excluded -- prefer_silver only redirects *light*
+	 *     wake-ups onto silver (the heavy-task gate in
+	 *     find_best_silver_cpu() rejects anything above
+	 *     sysctl_heavy_task_thresh), so the work it hides from the
+	 *     rest of the system is BIG-cluster work, never PRIME work.
+	 *     Inflating up_threshold on PRIME would just delay
+	 *     down-shifts on the highest-leakage cluster: pure power
+	 *     tax with no perf return.
+	 *   - 2-cluster topology (true big.LITTLE): no BIG class exists
+	 *     and the lone non-LITTLE cluster is classified PRIME.  Fall
+	 *     through to PRIME there so the bump still fires on the
+	 *     cluster that absorbs the heavy work, exactly as before
+	 *     this restriction was introduced.  The
+	 *     zenith_topology_has_big_class() probe distinguishes the
+	 *     two cases at runtime via capacity_orig, with the result
+	 *     cached for the lifetime of the kernel.
+	 *
+	 * Also skipped whenever a harder override above has pinned
 	 * dynamic_up_thresh strictly higher than the natural
-	 * up_threshold (screen-off, thermal cliff, hispeed pin) —
+	 * up_threshold (screen-off, thermal cliff, hispeed pin) --
 	 * those values are absolute and must not be inflated further.
 	 *
 	 * The (dynamic_up_thresh <= natural) test deliberately allows
@@ -4294,7 +4380,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	if (zenith_glide_value(z_policy,
 			z_policy->tunables->prefer_silver_aware,
 			z_policy->at_local_prefer_silver_aware) &&
-	    z_policy->cluster_class != ZENITH_CLUSTER_LITTLE &&
+	    (z_policy->cluster_class == ZENITH_CLUSTER_BIG ||
+	     (z_policy->cluster_class == ZENITH_CLUSTER_PRIME &&
+	      !zenith_topology_has_big_class())) &&
 	    z_policy->ps_hit_rate_pct >=
 		    z_policy->tunables->prefer_silver_hot_threshold_pct) {
 		unsigned int natural = zenith_tunable_or_local(z_policy,
