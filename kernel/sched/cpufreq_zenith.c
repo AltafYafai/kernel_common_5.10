@@ -628,6 +628,25 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		100
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	4000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
+
+/* Screen-on softening of powersave_bias.  Default 50: halve the
+ * effective bias whenever the screen is on (tunables->screen_state
+ * == 1), leaving the configured value in full effect on screen-off
+ * and on the thermal-active path.  Rationale: powersave_bias
+ * values inherited from the BALANCED (50, i.e. 5 %% shave) and
+ * BATTERY (150, 15 %% shave) profiles are tuned for the average
+ * over screen-on + screen-off duty cycles, but the screen-on path
+ * itself is the single most responsiveness-sensitive window the
+ * cluster has.  Halving the screen-on shave keeps the configured
+ * profile's screen-off behaviour intact (where the existing 500 /
+ * 50 %% screen-off override already dominates), while removing
+ * about half of the steady-state shave that's been quietly
+ * suppressing the cluster's peak ramp during interactive use.
+ *
+ * Range 0..100 (percent).  100 = no softening (legacy behaviour);
+ * 50 = halve; 0 = zero out the bias entirely on screen-on.
+ */
+#define ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT	50
 #define ZENITH_DEFAULT_IO_IS_BUSY		1
 #define ZENITH_DEFAULT_INPUT_BOOST_MS		80
 #define ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS	30
@@ -1834,6 +1853,23 @@ struct zenith_tunables {
 	 */
 	unsigned int		auto_tune;
 	unsigned int		powersave_bias;
+
+	/* Screen-on multiplier applied to powersave_bias before tier 3
+	 * (Powersave Bias) consumes it.  Range 0..100 (percent).  When
+	 * tunables->screen_state == 1 and the screen-off / thermal
+	 * overrides have not replaced dynamic_bias, the effective
+	 * dynamic_bias is scaled by screen_on_bias_pct / 100.  See
+	 * ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT for the full rationale.
+	 *
+	 * 100 disables the softening entirely (legacy behaviour: full
+	 * configured bias applies on screen-on); 50 (the default)
+	 * halves the bias on screen-on; 0 zeroes the bias on
+	 * screen-on (full responsiveness, no shave).  Values above 100
+	 * are rejected on store; the range is clamped on the read side
+	 * defensively in case userspace bypasses the sysfs validator.
+	 */
+	unsigned int		screen_on_bias_pct;
+
 	unsigned int		io_is_busy;
 
 	/* When 1, dampen the brutality-path load_pct by the fraction
@@ -5209,7 +5245,26 @@ brutal_entry_deferred:
 	 * heavy work is not penalised. A threshold of 100 keeps the legacy
 	 * "always-bias" behaviour; 0 disables the bias entirely without
 	 * having to also write powersave_bias=0.
+	 *
+	 * 3a. Screen-on bias softening.  When the screen is on
+	 * (tunables->screen_state == 1), scale dynamic_bias down by
+	 * screen_on_bias_pct / 100.  See ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT
+	 * for the rationale.  No-op when:
+	 *   - screen_state != 1 (screen-off and uclamp-meaningful screen-
+	 *     off paths are unaffected; the screen-off override at
+	 *     dynamic_bias = 500 has already taken effect upstream).
+	 *   - dynamic_bias == 0 (bias was already cleared upstream).
+	 *   - screen_on_bias_pct >= 100 (no softening configured).
+	 * The defensive >= 100 short-circuit also covers the case where
+	 * userspace bypasses the sysfs store validator and writes a
+	 * bogus value above 100.
 	 */
+	if (z_policy->tunables->screen_state == 1 && dynamic_bias &&
+	    z_policy->tunables->screen_on_bias_pct < 100) {
+		dynamic_bias = (dynamic_bias *
+				z_policy->tunables->screen_on_bias_pct) / 100;
+	}
+
 	if (dynamic_bias && max_cap &&
 	    (util * 100) / max_cap < z_policy->tunables->bias_load_threshold) {
 		margin = freq * dynamic_bias / 1000;
@@ -10019,6 +10074,34 @@ static ssize_t powersave_bias_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr powersave_bias = __ATTR_RW(powersave_bias);
 
+/* screen_on_bias_pct sysfs knob.  See struct zenith_tunables doc and
+ * ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT for full semantics.  Range
+ * 0..100 (percent).  100 disables the softening (legacy behaviour);
+ * 50 (the default) halves the configured powersave_bias whenever
+ * the screen is on; 0 zeroes the bias on screen-on.
+ */
+static ssize_t screen_on_bias_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->screen_on_bias_pct);
+}
+
+static ssize_t screen_on_bias_pct_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->screen_on_bias_pct = val;
+	zenith_invalidate_cache(attr_set);
+	return count;
+}
+
+static struct governor_attr screen_on_bias_pct =
+	__ATTR_RW(screen_on_bias_pct);
+
 static ssize_t up_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 {
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_rate_limit_us);
@@ -11061,6 +11144,7 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_lo_events_x2.attr,
 	&auto_tune_scenario.attr,
 	&powersave_bias.attr,
+	&screen_on_bias_pct.attr,
 	&io_is_busy.attr,
 	&iowait_boost_min.attr,
 	&iowait_stack_pct.attr,
@@ -11290,6 +11374,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_AT_SUSTAINED_GAMING;
 	tunables->auto_tune_scenario	= ZENITH_DEFAULT_AUTO_TUNE_SCENARIO;
 	tunables->powersave_bias	= ZENITH_DEFAULT_POWERSAVE_BIAS;
+	tunables->screen_on_bias_pct	= ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT;
 	tunables->io_is_busy		= ZENITH_DEFAULT_IO_IS_BUSY;
 	tunables->iowait_boost_min	= ZENITH_DEFAULT_IOWAIT_BOOST_MIN;
 	tunables->iowait_stack_pct	= ZENITH_DEFAULT_IOWAIT_STACK_PCT;
