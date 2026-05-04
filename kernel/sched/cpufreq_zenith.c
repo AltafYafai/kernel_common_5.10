@@ -187,13 +187,14 @@
  * 0 disables the watchdog entirely (legacy behaviour: nothing
  * lifts the cluster off the load-based + hispeed pipeline output).
  */
-#define ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE	1
-#define ZENITH_PEAK_HEADROOM_STARVE_LOAD_PCT	90
-#define ZENITH_PEAK_HEADROOM_FREQ_FLOOR_PCT	85
-#define ZENITH_PEAK_HEADROOM_STARVE_STREAK	3
-#define ZENITH_PEAK_HEADROOM_JUMP_PCT		100
-#define ZENITH_PEAK_HEADROOM_HOLD_MS		50
-#define ZENITH_PEAK_HEADROOM_STREAK_MAX		16
+#define ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE		1
+#define ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_LOAD_PCT	90
+#define ZENITH_DEFAULT_PEAK_HEADROOM_FREQ_FLOOR_PCT	85
+#define ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_STREAK	3
+#define ZENITH_DEFAULT_PEAK_HEADROOM_JUMP_PCT		100
+#define ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS		50
+#define ZENITH_PEAK_HEADROOM_STREAK_MAX			16
+#define ZENITH_PEAK_HEADROOM_HOLD_MS_MAX		1000
 
 /* up_threshold_adaptive (default 0, off):
  *
@@ -1662,10 +1663,59 @@ struct zenith_tunables {
 	 * ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE for full semantics.
 	 * 1 enables the rescue (the default); 0 disables it entirely.
 	 * The rescue is also gated by max_cap and policy->max being
-	 * non-zero and pin_to_target being false, so this is the only
-	 * user-visible knob needed.
+	 * non-zero and pin_to_target being false.
 	 */
 	unsigned int		peak_headroom_rescue;
+
+	/* Per-policy parameters for the peak-headroom rescue tier.
+	 * See ZENITH_DEFAULT_PEAK_HEADROOM_* for full semantics and
+	 * default values.  All five exist as sysfs knobs so a tester
+	 * can A/B-tune the rescue at runtime without rebuilding the
+	 * kernel.
+	 *
+	 *   peak_headroom_starve_load_pct (1..100, default 90)
+	 *     Minimum load_pct at which a sample counts as "starving".
+	 *     A value of 100 means only fully-saturated samples count;
+	 *     0 is rejected on store (rescue would fire continuously).
+	 *
+	 *   peak_headroom_freq_floor_pct (1..100, default 85)
+	 *     Cluster freq must be below this fraction of policy->max
+	 *     for a sample to count as "starving".  100 means rescue
+	 *     fires whenever freq < policy->max (always-on under
+	 *     starvation); values closer to 0 require the cluster to
+	 *     be very deep below peak before the rescue triggers.
+	 *
+	 *   peak_headroom_starve_streak (0..PEAK_HEADROOM_STREAK_MAX,
+	 *     default 3)
+	 *     Number of consecutive starving samples required before
+	 *     the rescue may fire.  The streak counter must exceed
+	 *     this value, so the effective wait is streak+1 windows.
+	 *     0 fires on the very first starving sample.
+	 *
+	 *   peak_headroom_jump_pct (1..100, default 100)
+	 *     Target as a percentage of policy->max when the rescue
+	 *     fires.  100 pins to policy->max; lower values rescue
+	 *     to an intermediate freq.  0 is rejected on store
+	 *     (rescue with target 0 makes no sense).
+	 *
+	 *   peak_headroom_hold_ms (0..PEAK_HEADROOM_HOLD_MS_MAX,
+	 *     default 50)
+	 *     Minimum gap between two consecutive rescue fires, in
+	 *     milliseconds.  Prevents stacking rescues on adjacent
+	 *     ticks before the cpufreq driver has applied the
+	 *     previous request.  0 disables the hold-down (rescue
+	 *     can fire on every starving sample past the streak).
+	 *
+	 * The streak field is u8 for cache locality, so the sysfs
+	 * store caps at PEAK_HEADROOM_STREAK_MAX (16); hold_ms caps
+	 * at PEAK_HEADROOM_HOLD_MS_MAX (1000) so a runaway value
+	 * cannot effectively pin the rescue off forever.
+	 */
+	unsigned int		peak_headroom_starve_load_pct;
+	unsigned int		peak_headroom_freq_floor_pct;
+	unsigned int		peak_headroom_starve_streak;
+	unsigned int		peak_headroom_jump_pct;
+	unsigned int		peak_headroom_hold_ms;
 
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
@@ -5030,9 +5080,19 @@ brutal_entry_deferred:
 	if (z_policy->tunables->peak_headroom_rescue &&
 	    max_cap && policy->max && !pin_to_target) {
 		unsigned int load_pct = (util * 100) / max_cap;
+		unsigned int starve_load =
+			z_policy->tunables->peak_headroom_starve_load_pct;
+		unsigned int floor_pct =
+			z_policy->tunables->peak_headroom_freq_floor_pct;
+		unsigned int streak =
+			z_policy->tunables->peak_headroom_starve_streak;
+		unsigned int jump_pct =
+			z_policy->tunables->peak_headroom_jump_pct;
+		unsigned int hold_ms =
+			z_policy->tunables->peak_headroom_hold_ms;
 		unsigned int floor_freq =
-			(policy->max / 100) * ZENITH_PEAK_HEADROOM_FREQ_FLOOR_PCT;
-		bool starving = (load_pct >= ZENITH_PEAK_HEADROOM_STARVE_LOAD_PCT) &&
+			(policy->max / 100) * floor_pct;
+		bool starving = (load_pct >= starve_load) &&
 				(freq < floor_freq);
 
 		if (starving) {
@@ -5043,24 +5103,20 @@ brutal_entry_deferred:
 			z_policy->peak_starve_count = 0;
 		}
 
-		if (z_policy->peak_starve_count >
-		    ZENITH_PEAK_HEADROOM_STARVE_STREAK) {
+		if (z_policy->peak_starve_count > streak) {
 			u64 now_ns = ktime_get_ns();
 
 			if (now_ns >= z_policy->peak_rescue_until_ns) {
 				unsigned int rescue_freq =
-					(policy->max / 100) *
-					ZENITH_PEAK_HEADROOM_JUMP_PCT;
+					(policy->max / 100) * jump_pct;
 
-				if (rescue_freq > policy->max ||
-				    !ZENITH_PEAK_HEADROOM_JUMP_PCT)
+				if (rescue_freq > policy->max || !jump_pct)
 					rescue_freq = policy->max;
 				if (freq < rescue_freq) {
 					freq = rescue_freq;
 					tp_path = "peak_rescue";
 					z_policy->peak_rescue_until_ns = now_ns +
-						(u64)ZENITH_PEAK_HEADROOM_HOLD_MS *
-						NSEC_PER_MSEC;
+						(u64)hold_ms * NSEC_PER_MSEC;
 				}
 			}
 		}
@@ -9614,6 +9670,148 @@ static ssize_t peak_headroom_rescue_store(struct gov_attr_set *attr_set,
 static struct governor_attr peak_headroom_rescue =
 	__ATTR_RW(peak_headroom_rescue);
 
+/* peak_headroom_starve_load_pct sysfs knob.  Minimum cluster
+ * load_pct (0..100, util / max_cap * 100) at which a sample counts
+ * as "starving" for the peak-headroom rescue tier.  Accepts 1..100;
+ * 0 is rejected (rescue would fire on every sample).
+ */
+static ssize_t peak_headroom_starve_load_pct_show(struct gov_attr_set *attr_set,
+						  char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peak_headroom_starve_load_pct);
+}
+
+static ssize_t peak_headroom_starve_load_pct_store(struct gov_attr_set *attr_set,
+						   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
+		return -EINVAL;
+	t->peak_headroom_starve_load_pct = val;
+	return count;
+}
+
+static struct governor_attr peak_headroom_starve_load_pct =
+	__ATTR_RW(peak_headroom_starve_load_pct);
+
+/* peak_headroom_freq_floor_pct sysfs knob.  Maximum fraction of
+ * policy->max (1..100) below which the cluster freq must sit before
+ * a sample counts as "starving" for the rescue tier.  100 means
+ * "any time freq < policy->max"; smaller values demand a deeper
+ * sub-peak gap before triggering.  0 is rejected (any positive freq
+ * would be above 0% of policy->max so the freq guard would never
+ * fire).
+ */
+static ssize_t peak_headroom_freq_floor_pct_show(struct gov_attr_set *attr_set,
+						 char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peak_headroom_freq_floor_pct);
+}
+
+static ssize_t peak_headroom_freq_floor_pct_store(struct gov_attr_set *attr_set,
+						  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
+		return -EINVAL;
+	t->peak_headroom_freq_floor_pct = val;
+	return count;
+}
+
+static struct governor_attr peak_headroom_freq_floor_pct =
+	__ATTR_RW(peak_headroom_freq_floor_pct);
+
+/* peak_headroom_starve_streak sysfs knob.  Number of consecutive
+ * starving samples required before the rescue may fire.  Accepts
+ * 0..PEAK_HEADROOM_STREAK_MAX (16) since the underlying counter is
+ * a u8 saturating at that value.  0 fires on the very first
+ * starving sample.
+ */
+static ssize_t peak_headroom_starve_streak_show(struct gov_attr_set *attr_set,
+						char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peak_headroom_starve_streak);
+}
+
+static ssize_t peak_headroom_starve_streak_store(struct gov_attr_set *attr_set,
+						 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_PEAK_HEADROOM_STREAK_MAX)
+		return -EINVAL;
+	t->peak_headroom_starve_streak = val;
+	return count;
+}
+
+static struct governor_attr peak_headroom_starve_streak =
+	__ATTR_RW(peak_headroom_starve_streak);
+
+/* peak_headroom_jump_pct sysfs knob.  Target as percentage of
+ * policy->max for the rescue freq.  Accepts 1..100; 100 pins to
+ * policy->max (the default), 50 rescues to half of policy->max,
+ * etc.  0 is rejected (rescue with target 0 would never raise
+ * freq).
+ */
+static ssize_t peak_headroom_jump_pct_show(struct gov_attr_set *attr_set,
+					   char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peak_headroom_jump_pct);
+}
+
+static ssize_t peak_headroom_jump_pct_store(struct gov_attr_set *attr_set,
+					    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
+		return -EINVAL;
+	t->peak_headroom_jump_pct = val;
+	return count;
+}
+
+static struct governor_attr peak_headroom_jump_pct =
+	__ATTR_RW(peak_headroom_jump_pct);
+
+/* peak_headroom_hold_ms sysfs knob.  Minimum gap between two
+ * rescue fires, in milliseconds.  Accepts
+ * 0..PEAK_HEADROOM_HOLD_MS_MAX (1000); 0 disables the hold-down
+ * (rescue can fire on every starving sample past the streak),
+ * larger values rate-limit more aggressively.
+ */
+static ssize_t peak_headroom_hold_ms_show(struct gov_attr_set *attr_set,
+					  char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peak_headroom_hold_ms);
+}
+
+static ssize_t peak_headroom_hold_ms_store(struct gov_attr_set *attr_set,
+					   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PEAK_HEADROOM_HOLD_MS_MAX)
+		return -EINVAL;
+	t->peak_headroom_hold_ms = val;
+	return count;
+}
+
+static struct governor_attr peak_headroom_hold_ms =
+	__ATTR_RW(peak_headroom_hold_ms);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -10723,6 +10921,11 @@ static struct attribute *zenith_attrs[] = {
 	&hispeed_entry_streak.attr,
 	&brutal_entry_streak.attr,
 	&peak_headroom_rescue.attr,
+	&peak_headroom_starve_load_pct.attr,
+	&peak_headroom_freq_floor_pct.attr,
+	&peak_headroom_starve_streak.attr,
+	&peak_headroom_jump_pct.attr,
+	&peak_headroom_hold_ms.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -10938,6 +11141,16 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->hispeed_entry_streak	= ZENITH_DEFAULT_HISPEED_ENTRY_STREAK;
 	tunables->brutal_entry_streak	= ZENITH_DEFAULT_BRUTAL_ENTRY_STREAK;
 	tunables->peak_headroom_rescue	= ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE;
+	tunables->peak_headroom_starve_load_pct =
+		ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_LOAD_PCT;
+	tunables->peak_headroom_freq_floor_pct =
+		ZENITH_DEFAULT_PEAK_HEADROOM_FREQ_FLOOR_PCT;
+	tunables->peak_headroom_starve_streak =
+		ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_STREAK;
+	tunables->peak_headroom_jump_pct =
+		ZENITH_DEFAULT_PEAK_HEADROOM_JUMP_PCT;
+	tunables->peak_headroom_hold_ms =
+		ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
