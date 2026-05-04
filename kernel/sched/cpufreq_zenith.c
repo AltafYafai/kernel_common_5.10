@@ -343,6 +343,30 @@
 #define ZENITH_DEFAULT_BG_UTIL_SCALE_PCT		100
 #define ZENITH_BG_UTIL_SCALE_PCT_MIN			1
 
+/* sleeper_tail_thresh_us / sleeper_tail_pct
+ * (defaults 0 / 90, [Stage 4 / Patch H]):
+ *
+ * Sleeper-tail shaving.  When the cluster has been idle (no
+ * runnable load_pct samples) for sleeper_tail_thresh_us
+ * microseconds, shave the next freq decision down by
+ * sleeper_tail_pct / 100, clamped at policy->min.  Saves
+ * leakage on sleep entry by parking the cluster one DVFS rung
+ * lower than it would otherwise sit on the wake-up tick.
+ *
+ * thresh_us == 0 (default) disables the tier; sleeper_tail_pct
+ * is bounded in 50..100 (anything below 50 would slam the
+ * cluster too low on wake and re-up immediately, which is the
+ * opposite of what we want).
+ *
+ * Reads via READ_ONCE on the eval hot path; writes via
+ * WRITE_ONCE from sysfs and from zenith_apply_profile().
+ */
+#define ZENITH_DEFAULT_SLEEPER_TAIL_THRESH_US		0
+#define ZENITH_SLEEPER_TAIL_THRESH_US_MAX		100000
+#define ZENITH_DEFAULT_SLEEPER_TAIL_PCT			90
+#define ZENITH_SLEEPER_TAIL_PCT_MIN			50
+#define ZENITH_SLEEPER_TAIL_PCT_MAX			100
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -2043,6 +2067,14 @@ struct zenith_tunables {
 	 */
 	unsigned int		bg_util_scale_pct;
 
+	/* See ZENITH_DEFAULT_SLEEPER_TAIL_THRESH_US /
+	 * ZENITH_DEFAULT_SLEEPER_TAIL_PCT (Patch H).  thresh_us == 0
+	 * disables.  pct bounded in 50..100; eval path reads via
+	 * READ_ONCE.
+	 */
+	unsigned int		sleeper_tail_thresh_us;
+	unsigned int		sleeper_tail_pct;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -2960,6 +2992,13 @@ struct zenith_policy {
 	 * cannot accumulate unbounded streak credit.
 	 */
 	unsigned int		boost_idle_low_streak;
+
+	/* Last-runnable timestamp [Stage 4 / Patch H].  Stamped
+	 * with ktime_get_ns() in zenith_get_next_freq() whenever
+	 * tp_load_pct > 0 (the cluster has any util).  Read by the
+	 * sleeper-tail tier to gate the freq shave.
+	 */
+	u64			last_runnable_ns;
 
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
@@ -5265,6 +5304,14 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	if (max_cap)
 		tp_load_pct = (unsigned int)((util * 100) / max_cap);
 
+	/* Patch H: stamp last_runnable_ns whenever the cluster has
+	 * any util.  Read by the post-tier sleeper-tail shave to
+	 * decide whether the cluster has been idle long enough to
+	 * justify shaving the next freq decision.
+	 */
+	if (tp_load_pct > 0)
+		z_policy->last_runnable_ns = ktime_get_ns();
+
 	/* 0. Input Boost — pin to policy->max for the non-decay portion of
 	 * input_boost_ms after a key or touch event, then linearly ramp
 	 * down across the trailing input_boost_decay_ms so the gesture
@@ -6376,6 +6423,43 @@ apply_uclamp_max_cap:
 	 */
 	freq = zenith_apply_peak_hysteresis(z_policy, policy, freq,
 					    pin_to_target, &tp_path);
+
+	/* Patch H: sleeper-tail shaving.  When the cluster has been
+	 * idle for at least sleeper_tail_thresh_us microseconds and
+	 * the freq we'd otherwise pick is above policy->min, shave
+	 * the freq by sleeper_tail_pct / 100 (clamped at
+	 * policy->min).  Bypassed when pin_to_target is set so user-
+	 * experience boosts always win.
+	 *
+	 * thresh_us == 0 disables the tier; pct == 100 makes the
+	 * shave a no-op so we early-out to avoid the multiply on
+	 * the common case.
+	 */
+	if (!pin_to_target && freq > policy->min) {
+		unsigned int thresh_us =
+			READ_ONCE(z_policy->tunables->sleeper_tail_thresh_us);
+		unsigned int shave_pct =
+			READ_ONCE(z_policy->tunables->sleeper_tail_pct);
+
+		if (thresh_us && shave_pct &&
+		    shave_pct < ZENITH_SLEEPER_TAIL_PCT_MAX) {
+			u64 now_ns = ktime_get_ns();
+			u64 idle_ns = now_ns - z_policy->last_runnable_ns;
+			u64 thresh_ns = (u64)thresh_us * NSEC_PER_USEC;
+
+			if (idle_ns >= thresh_ns) {
+				unsigned int shaved =
+					(freq / 100) * shave_pct;
+
+				if (shaved < policy->min)
+					shaved = policy->min;
+				if (shaved < freq) {
+					freq = shaved;
+					tp_path = "sleeper_tail";
+				}
+			}
+		}
+	}
 
 	/* cached_raw_freq shortcut: when the pre-resolve freq matches
 	 * the value we cached on the previous tick AND nothing has
@@ -8129,6 +8213,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int boost_idle_thresh;
 		unsigned int boost_idle_streak;
 		unsigned int bg_util_scale_pct;
+		unsigned int sleeper_tail_thresh_us;
+		unsigned int sleeper_tail_pct;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -8216,6 +8302,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * the device's recovery from a deep-sleep wake.
 			 */
 			.bg_util_scale_pct = 100,
+			/* Stage 4 / Patch H: PERFORMANCE disables sleeper-
+			 * tail shaving so wake-up freq is unshaved.
+			 */
+			.sleeper_tail_thresh_us = 0,
+			.sleeper_tail_pct = 100,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -8308,6 +8399,12 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * lower freq tier while the device is locked.
 			 */
 			.bg_util_scale_pct = 75,
+			/* Stage 4 / Patch H: BALANCED arms sleeper-tail
+			 * shaving with a 20 ms idle threshold and a 90%
+			 * shave.  Mild trim on the wake-up tick.
+			 */
+			.sleeper_tail_thresh_us = 20000,
+			.sleeper_tail_pct = 90,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -8406,6 +8503,12 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * already opted in to slower performance.
 			 */
 			.bg_util_scale_pct = 60,
+			/* Stage 4 / Patch H: BATTERY uses an aggressive
+			 * 10 ms threshold and 80% shave for maximum
+			 * leakage savings.
+			 */
+			.sleeper_tail_thresh_us = 10000,
+			.sleeper_tail_pct = 80,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -8495,6 +8598,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * had no notion of screen-off util scaling).
 			 */
 			.bg_util_scale_pct = 100,
+			/* Stage 4 / Patch H: LEGACY disables sleeper-tail
+			 * shaving (legacy governor had no notion).
+			 */
+			.sleeper_tail_thresh_us = 0,
+			.sleeper_tail_pct = 100,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -8559,6 +8667,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->boost_idle_thresh, p->boost_idle_thresh);
 	WRITE_ONCE(t->boost_idle_streak, p->boost_idle_streak);
 	WRITE_ONCE(t->bg_util_scale_pct, p->bg_util_scale_pct);
+	WRITE_ONCE(t->sleeper_tail_thresh_us,
+		   p->sleeper_tail_thresh_us);
+	WRITE_ONCE(t->sleeper_tail_pct, p->sleeper_tail_pct);
 
 	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
 	 * the governor-wide caches used by the input handler fast
@@ -11330,6 +11441,61 @@ bg_util_scale_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr bg_util_scale_pct =
 	__ATTR_RW(bg_util_scale_pct);
 
+/* sleeper_tail_thresh_us sysfs knob (Patch H).
+ * Range 0..ZENITH_SLEEPER_TAIL_THRESH_US_MAX.  0 disables.
+ */
+static ssize_t
+sleeper_tail_thresh_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->sleeper_tail_thresh_us);
+}
+
+static ssize_t
+sleeper_tail_thresh_us_store(struct gov_attr_set *attr_set,
+			     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_SLEEPER_TAIL_THRESH_US_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->sleeper_tail_thresh_us, val);
+	return count;
+}
+
+static struct governor_attr sleeper_tail_thresh_us =
+	__ATTR_RW(sleeper_tail_thresh_us);
+
+/* sleeper_tail_pct sysfs knob (Patch H).
+ * Range ZENITH_SLEEPER_TAIL_PCT_MIN..ZENITH_SLEEPER_TAIL_PCT_MAX.
+ */
+static ssize_t
+sleeper_tail_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->sleeper_tail_pct);
+}
+
+static ssize_t
+sleeper_tail_pct_store(struct gov_attr_set *attr_set,
+		       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val < ZENITH_SLEEPER_TAIL_PCT_MIN ||
+	    val > ZENITH_SLEEPER_TAIL_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->sleeper_tail_pct, val);
+	return count;
+}
+
+static struct governor_attr sleeper_tail_pct =
+	__ATTR_RW(sleeper_tail_pct);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -12510,6 +12676,8 @@ static struct attribute *zenith_attrs[] = {
 	&boost_idle_thresh.attr,
 	&boost_idle_streak.attr,
 	&bg_util_scale_pct.attr,
+	&sleeper_tail_thresh_us.attr,
+	&sleeper_tail_pct.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -12750,6 +12918,9 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->boost_idle_thresh	= ZENITH_DEFAULT_BOOST_IDLE_THRESH;
 	tunables->boost_idle_streak	= ZENITH_DEFAULT_BOOST_IDLE_STREAK;
 	tunables->bg_util_scale_pct	= ZENITH_DEFAULT_BG_UTIL_SCALE_PCT;
+	tunables->sleeper_tail_thresh_us =
+		ZENITH_DEFAULT_SLEEPER_TAIL_THRESH_US;
+	tunables->sleeper_tail_pct	= ZENITH_DEFAULT_SLEEPER_TAIL_PCT;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
