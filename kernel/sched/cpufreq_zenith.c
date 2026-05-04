@@ -152,6 +152,49 @@
 #define ZENITH_DEFAULT_BRUTAL_ENTRY_STREAK	0
 #define ZENITH_BRUTAL_ENTRY_STREAK_MAX		16
 
+/* peak_headroom_rescue (default 1, on):
+ *
+ * Watchdog tier that rescues the cluster from sustained-high-util
+ * starvation.  When the load-based + hispeed pipeline leaves the
+ * cluster well below policy->max even though load_pct is pegged
+ * (auto-tune profile cap, calibration drift, accumulated down-rate
+ * progress, or efficient_freq ladder gating), this tier forces a
+ * one-shot up-shift toward policy->max.
+ *
+ * Trigger condition (both must hold for STARVE_STREAK + 1
+ * consecutive samples):
+ *
+ *   load_pct >= ZENITH_PEAK_HEADROOM_STARVE_LOAD_PCT (default 90)
+ *   freq < (policy->max * ZENITH_PEAK_HEADROOM_FREQ_FLOOR_PCT / 100)
+ *     (default 85, i.e. cluster freq is below 85%% of policy->max)
+ *
+ * Rescue action: bump freq up to (policy->max *
+ * ZENITH_PEAK_HEADROOM_JUMP_PCT / 100) (default 100, i.e. pin to
+ * policy->max) and arm a hold-down deadline so a second rescue
+ * cannot fire within ZENITH_PEAK_HEADROOM_HOLD_MS (default 50 ms).
+ *
+ * Bounded by:
+ *   - The streak counter is u8 and saturates at
+ *     ZENITH_PEAK_HEADROOM_STREAK_MAX so it cannot wrap on long
+ *     sustained runs.
+ *   - The downstream caps (uclamp_max, light_cap, audio_cap,
+ *     em_cap, PSI cap) all apply after the rescue, so userspace
+ *     power hints and the EM validator stay authoritative.
+ *   - The rescue is skipped when pin_to_target is already true
+ *     (input_boost full-pin / brutality snap_max / brutal_hold);
+ *     those paths have already pinned the cluster high.
+ *
+ * 0 disables the watchdog entirely (legacy behaviour: nothing
+ * lifts the cluster off the load-based + hispeed pipeline output).
+ */
+#define ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE	1
+#define ZENITH_PEAK_HEADROOM_STARVE_LOAD_PCT	90
+#define ZENITH_PEAK_HEADROOM_FREQ_FLOOR_PCT	85
+#define ZENITH_PEAK_HEADROOM_STARVE_STREAK	3
+#define ZENITH_PEAK_HEADROOM_JUMP_PCT		100
+#define ZENITH_PEAK_HEADROOM_HOLD_MS		50
+#define ZENITH_PEAK_HEADROOM_STREAK_MAX		16
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -1556,6 +1599,15 @@ struct zenith_tunables {
 	 */
 	unsigned int		brutal_entry_streak;
 
+	/* Watchdog gate for the peak-headroom rescue tier.  See
+	 * ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE for full semantics.
+	 * 1 enables the rescue (the default); 0 disables it entirely.
+	 * The rescue is also gated by max_cap and policy->max being
+	 * non-zero and pin_to_target being false, so this is the only
+	 * user-visible knob needed.
+	 */
+	unsigned int		peak_headroom_rescue;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -2262,6 +2314,31 @@ struct zenith_policy {
 	 * cap of 16 but defensive against future cap bumps).
 	 */
 	u8			brutal_entry_count;
+
+	/* Entry-side streak counter for the peak-headroom rescue tier.
+	 * Increments on every sample where the cluster is starving
+	 * (load_pct >= STARVE_LOAD_PCT and freq < FREQ_FLOOR_PCT of
+	 * policy->max), resets when either condition breaks.  The
+	 * rescue fires only when the streak exceeds STARVE_STREAK,
+	 * giving STARVE_STREAK+1 consecutive sample windows of
+	 * starvation as the entry hysteresis.  Capped to a small u8 to
+	 * avoid wraparound on indefinitely-sustained heavy load.
+	 */
+	u8			peak_starve_count;
+
+	/* Hold-down deadline for the peak-headroom rescue tier.  Stamped
+	 * to ktime_get_ns() + PEAK_HEADROOM_HOLD_MS at the moment the
+	 * rescue fires.  While now < this deadline, repeated streak
+	 * crossings are observed (the streak counter still increments)
+	 * but no second rescue freq-bump is applied.  Eliminates the
+	 * pathological case where a rescue lifts freq, the very next
+	 * sample observes load_pct still >= STARVE_LOAD_PCT and freq
+	 * still < FLOOR_PCT (because the cpufreq driver hasn't applied
+	 * the previous request yet), and another rescue fires --
+	 * stacking two unwanted up-shifts on what should be a single
+	 * rescue event.  Cleared (set to 0) at policy init.
+	 */
+	u64			peak_rescue_until_ns;
 
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
@@ -4857,6 +4934,68 @@ brutal_entry_deferred:
 			z_policy->hispeed_active = false;
 			z_policy->hispeed_entry_count = 0;
 		}
+	}
+
+	/* 2c. Peak-headroom rescue.  Watchdog tier that lifts the
+	 * cluster off a sustained-high-util / sub-peak floor.  See
+	 * ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE for the full rationale.
+	 *
+	 * Skipped when:
+	 *   - The tunable gate is off (peak_headroom_rescue == 0).
+	 *   - max_cap or policy->max is 0 (init / no freq table).
+	 *   - pin_to_target is true (input_boost / brutality already
+	 *     pinned the cluster, no rescue needed).
+	 *
+	 * Streak-and-hold-down design mirrors the hispeed and brutality
+	 * tiers above (hispeed_entry_count / brutal_entry_count) so
+	 * single-sample noise can't fire a rescue, and a fired rescue
+	 * can't restack on the very next tick before the cpufreq driver
+	 * has a chance to apply the previous request.
+	 */
+	if (z_policy->tunables->peak_headroom_rescue &&
+	    max_cap && policy->max && !pin_to_target) {
+		unsigned int load_pct = (util * 100) / max_cap;
+		unsigned int floor_freq =
+			(policy->max / 100) * ZENITH_PEAK_HEADROOM_FREQ_FLOOR_PCT;
+		bool starving = (load_pct >= ZENITH_PEAK_HEADROOM_STARVE_LOAD_PCT) &&
+				(freq < floor_freq);
+
+		if (starving) {
+			if (z_policy->peak_starve_count <
+			    ZENITH_PEAK_HEADROOM_STREAK_MAX)
+				z_policy->peak_starve_count++;
+		} else {
+			z_policy->peak_starve_count = 0;
+		}
+
+		if (z_policy->peak_starve_count >
+		    ZENITH_PEAK_HEADROOM_STARVE_STREAK) {
+			u64 now_ns = ktime_get_ns();
+
+			if (now_ns >= z_policy->peak_rescue_until_ns) {
+				unsigned int rescue_freq =
+					(policy->max / 100) *
+					ZENITH_PEAK_HEADROOM_JUMP_PCT;
+
+				if (rescue_freq > policy->max ||
+				    !ZENITH_PEAK_HEADROOM_JUMP_PCT)
+					rescue_freq = policy->max;
+				if (freq < rescue_freq) {
+					freq = rescue_freq;
+					tp_path = "peak_rescue";
+					z_policy->peak_rescue_until_ns = now_ns +
+						(u64)ZENITH_PEAK_HEADROOM_HOLD_MS *
+						NSEC_PER_MSEC;
+				}
+			}
+		}
+	} else {
+		/* Tunable disabled, max_cap == 0, or pin_to_target
+		 * already covers the cluster: drop streak credit so we
+		 * don't carry partial entry across a disable cycle or a
+		 * boost-pin window.
+		 */
+		z_policy->peak_starve_count = 0;
 	}
 
 	/* 3. Powersave Bias.
@@ -9372,6 +9511,34 @@ static ssize_t brutal_entry_streak_store(struct gov_attr_set *attr_set,
 static struct governor_attr brutal_entry_streak =
 	__ATTR_RW(brutal_entry_streak);
 
+/* peak_headroom_rescue sysfs knob.  Boolean gate for the watchdog
+ * tier that lifts the cluster off a sustained-high-util / sub-peak
+ * floor.  See ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE for the full
+ * rationale.  Accepts 0 (disabled) or 1 (enabled, default); any
+ * other value is rejected.
+ */
+static ssize_t peak_headroom_rescue_show(struct gov_attr_set *attr_set,
+					 char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peak_headroom_rescue);
+}
+
+static ssize_t peak_headroom_rescue_store(struct gov_attr_set *attr_set,
+					  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->peak_headroom_rescue = val;
+	return count;
+}
+
+static struct governor_attr peak_headroom_rescue =
+	__ATTR_RW(peak_headroom_rescue);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -10480,6 +10647,7 @@ static struct attribute *zenith_attrs[] = {
 	&hispeed_hyst_pct.attr,
 	&hispeed_entry_streak.attr,
 	&brutal_entry_streak.attr,
+	&peak_headroom_rescue.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -10694,6 +10862,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->hispeed_hyst_pct	= ZENITH_DEFAULT_HISPEED_HYST_PCT;
 	tunables->hispeed_entry_streak	= ZENITH_DEFAULT_HISPEED_ENTRY_STREAK;
 	tunables->brutal_entry_streak	= ZENITH_DEFAULT_BRUTAL_ENTRY_STREAK;
+	tunables->peak_headroom_rescue	= ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
