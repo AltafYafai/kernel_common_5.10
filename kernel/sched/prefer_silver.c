@@ -52,6 +52,7 @@ static atomic_t ps_miss_freq       = ATOMIC_INIT(0);
 static atomic_t ps_miss_util       = ATOMIC_INIT(0);
 static atomic_t ps_miss_affinity   = ATOMIC_INIT(0);
 static atomic_t ps_miss_task_heavy = ATOMIC_INIT(0);
+static atomic_t ps_miss_uclamp     = ATOMIC_INIT(0);
 static atomic_t ps_boot_miss       = ATOMIC_INIT(0);
 
 /* ------------------------------------------------------------------ *
@@ -171,6 +172,7 @@ static bool ps_ensure_detected(void)
 	atomic_set(&ps_miss_freq,       0);
 	atomic_set(&ps_miss_util,       0);
 	atomic_set(&ps_miss_task_heavy, 0);
+	atomic_set(&ps_miss_uclamp,     0);
 
 	smp_wmb();
 	atomic_set(&ps_detected, 1);
@@ -312,6 +314,30 @@ int find_best_silver_cpu(struct task_struct *p)
 		return -1;
 	}
 
+#ifdef CONFIG_UCLAMP_TASK
+	/*
+	 * Respect UCLAMP_MIN.  If userspace pinned this task's effective
+	 * lower-bound capacity above the silver cluster's orig capacity
+	 * (e.g., top-app / audio / SF threads boosted via the schedtune
+	 * or uclamp cgroup interfaces), redirecting onto silver would
+	 * silently violate the userspace-set capacity floor and force
+	 * the silver cluster to ramp to compensate -- the worst possible
+	 * outcome for both performance and power.  Defer to the normal
+	 * CFS / EAS placement path in that case.
+	 *
+	 * Gated on ps_silver_cap so the comparison is only made once
+	 * detect_cluster_capacity() has produced a real number; on the
+	 * boot-miss / detection-failure path we already returned -1
+	 * above via ps_ensure_detected().
+	 */
+	if (ps_silver_cap &&
+	    uclamp_eff_value(p, UCLAMP_MIN) > ps_silver_cap) {
+		atomic_inc(&ps_miss_count);
+		atomic_inc(&ps_miss_uclamp);
+		return -1;
+	}
+#endif
+
 	skip_freq_gate = (task_util_pct < 40);
 
 retry:
@@ -433,6 +459,7 @@ static int ps_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "miss_freq:         %d\n",   atomic_read(&ps_miss_freq));
 	seq_printf(m, "miss_util:         %d\n",   atomic_read(&ps_miss_util));
 	seq_printf(m, "miss_task_heavy:   %d\n",   atomic_read(&ps_miss_task_heavy));
+	seq_printf(m, "miss_uclamp:       %d\n",   atomic_read(&ps_miss_uclamp));
 	seq_puts(m,   "--- tunables ---\n");
 	seq_printf(m, "heavy_task_thresh: %d%%\n", sysctl_heavy_task_thresh);
 	seq_printf(m, "cpu_util_thresh:   %d%%\n", sysctl_cpu_util_thresh);
@@ -478,6 +505,7 @@ static ssize_t ps_reset_write(struct file *f, const char __user *buf,
 	atomic_set(&ps_miss_freq,       0);
 	atomic_set(&ps_miss_util,       0);
 	atomic_set(&ps_miss_task_heavy, 0);
+	atomic_set(&ps_miss_uclamp,     0);
 	pr_info("prefer_silver: counters reset\n");
 	return count;
 }
