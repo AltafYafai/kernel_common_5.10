@@ -7256,7 +7256,30 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 	rcu_read_unlock();
 
 #ifdef CONFIG_SCHED_PREFER_SILVER
-	if (prefer_silver_check_task_util(p)) {
+	/*
+	 * Defer to EAS whenever the Energy Model is loaded and EAS is
+	 * engaged.  On SD_BALANCE_WAKE EAS short-circuits at the top
+	 * of this function (returns from find_energy_efficient_cpu()),
+	 * so reaching here on an EAS-enabled build means either:
+	 *   1. EAS picked, was satisfied, and we never executed this
+	 *      block (no-op gate);
+	 *   2. EAS bailed because the root domain is overutilized,
+	 *      in which case redirecting light wake-ups onto silver
+	 *      would concentrate work on the cluster that already
+	 *      has the least headroom -- the opposite of what an
+	 *      overutilized system needs.
+	 *   3. This is SD_BALANCE_FORK / SD_BALANCE_EXEC, where EAS
+	 *      does not run by design but the EM-driven topology is
+	 *      still the authoritative description of which cluster
+	 *      a task belongs on; deferring keeps placement
+	 *      consistent across wake / fork.
+	 *
+	 * On builds without an Energy Model in DT (sched_energy_enabled()
+	 * permanently false), prefer_silver remains the sole light-task
+	 * placement biaser and runs unchanged.
+	 */
+	if (!sched_energy_enabled() &&
+	    prefer_silver_check_task_util(p)) {
 		int silver_cpu = find_best_silver_cpu(p);
 		if (silver_cpu >= 0)
 			return silver_cpu;
