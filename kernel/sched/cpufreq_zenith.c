@@ -314,6 +314,35 @@
 #define ZENITH_DEFAULT_BOOST_IDLE_STREAK		3
 #define ZENITH_BOOST_IDLE_STREAK_MAX			16
 
+/* bg_util_scale_pct
+ * (default 100 = off, [Stage 4 / Patch G]):
+ *
+ * Background-task util scaling.  When the display is off
+ * (tunables->screen_state == 0), scale the util signal returned
+ * by zenith_get_util() down to bg_util_scale_pct percent of its
+ * natural value.  All downstream tiers (brutality, EAS,
+ * ladder) see the lower signal, so freq decisions during
+ * screen-off run further from policy->max for the same
+ * underlying load.
+ *
+ * Goal: trim energy on background sync / wake-lock work that
+ * runs while the device is locked.  These workloads are
+ * typically not user-perceivable; running them on a slightly
+ * cheaper freq point is a free energy win.
+ *
+ * Bypassed when screen_state == 1 so display-on responsiveness
+ * is unchanged.  100 (default) is a no-op (full util passes
+ * through).  0 is rejected by the sysfs store -- the kernel
+ * already has cpu-idle paths for the "no work" case; this knob
+ * is for *scaling* not for *gating*.  Range checked at
+ * 1..100 to avoid that footgun.
+ *
+ * Reads via READ_ONCE on the eval hot path (zenith_get_util()
+ * is called once per CPU per evaluation tick).
+ */
+#define ZENITH_DEFAULT_BG_UTIL_SCALE_PCT		100
+#define ZENITH_BG_UTIL_SCALE_PCT_MIN			1
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -2006,6 +2035,14 @@ struct zenith_tunables {
 	unsigned int		boost_idle_thresh;
 	unsigned int		boost_idle_streak;
 
+	/* See ZENITH_DEFAULT_BG_UTIL_SCALE_PCT (Patch G).  Scales
+	 * zenith_get_util() output down to this percent of natural
+	 * util when tunables->screen_state == 0.  Range 1..100.
+	 * 100 (default) is a no-op pass-through.  Reads via
+	 * READ_ONCE on the eval hot path.
+	 */
+	unsigned int		bg_util_scale_pct;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -3560,6 +3597,24 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 			z_cpu->prev_util_2 = prev;
 			z_cpu->prev_util = util_out;
 		}
+	}
+
+	/* Patch G: background-task util scaling.  When the display
+	 * is off, scale util_out down to bg_util_scale_pct percent
+	 * of its natural value so the downstream freq decision
+	 * lands lower for the same underlying load.  Bypassed when
+	 * the screen is on so display-on responsiveness is
+	 * unchanged.  100 is a pass-through; the multiply path is
+	 * skipped to avoid the cost on the common case.
+	 */
+	{
+		unsigned int scale_pct =
+			READ_ONCE(z_cpu->z_policy->tunables->bg_util_scale_pct);
+		unsigned int screen =
+			READ_ONCE(z_cpu->z_policy->tunables->screen_state);
+
+		if (!screen && scale_pct && scale_pct < 100)
+			util_out = (util_out * scale_pct) / 100;
 	}
 
 	return util_out;
@@ -8073,6 +8128,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int peak_step_down_pct;
 		unsigned int boost_idle_thresh;
 		unsigned int boost_idle_streak;
+		unsigned int bg_util_scale_pct;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -8153,6 +8209,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.boost_idle_thresh = 0,
 			.boost_idle_streak = 0,
+			/* Stage 4 / Patch G: PERFORMANCE keeps full util
+			 * even when the screen is off.  This profile is
+			 * for users who want maximum responsiveness on
+			 * unlock; trimming background util would slow
+			 * the device's recovery from a deep-sleep wake.
+			 */
+			.bg_util_scale_pct = 100,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -8240,6 +8303,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_BOOST_IDLE_THRESH,
 			.boost_idle_streak =
 				ZENITH_DEFAULT_BOOST_IDLE_STREAK,
+			/* Stage 4 / Patch G: BALANCED scales screen-off
+			 * util to 75% so background sync work runs on a
+			 * lower freq tier while the device is locked.
+			 */
+			.bg_util_scale_pct = 75,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -8332,6 +8400,12 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.boost_idle_thresh = 25,
 			.boost_idle_streak = 2,
+			/* Stage 4 / Patch G: BATTERY scales screen-off
+			 * util to 60% -- aggressive but appropriate
+			 * for the battery profile where the user has
+			 * already opted in to slower performance.
+			 */
+			.bg_util_scale_pct = 60,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -8416,6 +8490,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.boost_idle_thresh = 0,
 			.boost_idle_streak = 0,
+			/* Stage 4 / Patch G: LEGACY keeps full util
+			 * regardless of screen state (legacy governor
+			 * had no notion of screen-off util scaling).
+			 */
+			.bg_util_scale_pct = 100,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -8479,6 +8558,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->peak_step_down_pct, p->peak_step_down_pct);
 	WRITE_ONCE(t->boost_idle_thresh, p->boost_idle_thresh);
 	WRITE_ONCE(t->boost_idle_streak, p->boost_idle_streak);
+	WRITE_ONCE(t->bg_util_scale_pct, p->bg_util_scale_pct);
 
 	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
 	 * the governor-wide caches used by the input handler fast
@@ -11220,6 +11300,36 @@ boost_idle_streak_store(struct gov_attr_set *attr_set,
 static struct governor_attr boost_idle_streak =
 	__ATTR_RW(boost_idle_streak);
 
+/* bg_util_scale_pct sysfs knob (Patch G).
+ * Range ZENITH_BG_UTIL_SCALE_PCT_MIN..100.  Scales the util
+ * signal returned by zenith_get_util() down to this percent
+ * when the display is off.  100 is a pass-through (default).
+ * 0 is rejected -- this is a scale knob, not a gate.
+ */
+static ssize_t
+bg_util_scale_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->bg_util_scale_pct);
+}
+
+static ssize_t
+bg_util_scale_pct_store(struct gov_attr_set *attr_set,
+			const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val < ZENITH_BG_UTIL_SCALE_PCT_MIN || val > 100)
+		return -EINVAL;
+	WRITE_ONCE(t->bg_util_scale_pct, val);
+	return count;
+}
+
+static struct governor_attr bg_util_scale_pct =
+	__ATTR_RW(bg_util_scale_pct);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -12399,6 +12509,7 @@ static struct attribute *zenith_attrs[] = {
 	&peak_step_down_pct.attr,
 	&boost_idle_thresh.attr,
 	&boost_idle_streak.attr,
+	&bg_util_scale_pct.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -12638,6 +12749,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
 	tunables->boost_idle_thresh	= ZENITH_DEFAULT_BOOST_IDLE_THRESH;
 	tunables->boost_idle_streak	= ZENITH_DEFAULT_BOOST_IDLE_STREAK;
+	tunables->bg_util_scale_pct	= ZENITH_DEFAULT_BG_UTIL_SCALE_PCT;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
