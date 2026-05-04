@@ -5852,6 +5852,28 @@ static void zenith_at_update_prefer_silver_rate(struct zenith_policy *z_policy,
 	unsigned int hit_delta, miss_delta, total_delta;
 	unsigned int rate;
 
+	/*
+	 * Disable transition fast path: when sysctl_prefer_silver was
+	 * flipped to 0 mid-run, the global hit / miss counters stop
+	 * incrementing.  The (!total_delta) branch below would still
+	 * correctly zero the cached rate -- but only on the next
+	 * worker window, leaving the previous "hot" reading active
+	 * for one full classifier cycle's worth of zenith_get_next_freq()
+	 * calls.  Drop the cache immediately on observing the disable
+	 * so the up-threshold bump path also flips off in the same
+	 * window the user expected.
+	 *
+	 * The previous-snapshot fields are zeroed too so re-enabling
+	 * prefer_silver later does not see a stale baseline that would
+	 * make the next window's delta artificially large.
+	 */
+	if (!READ_ONCE(sysctl_prefer_silver)) {
+		z_policy->ps_hit_rate_pct = 0;
+		z_policy->ps_prev_hit     = 0;
+		z_policy->ps_prev_miss    = 0;
+		return;
+	}
+
 	prefer_silver_get_hit_miss(&hit_now, &miss_now);
 
 	hit_delta  = hit_now  - z_policy->ps_prev_hit;
