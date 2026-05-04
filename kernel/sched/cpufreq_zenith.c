@@ -254,6 +254,34 @@
 #define ZENITH_PREDICT_UP_WINDOW_MIN			2
 #define ZENITH_PREDICT_UP_WINDOW_MAX			8
 
+/* peak_hysteresis_streak / peak_step_down_pct
+ * (defaults 3 / 95, [Stage 4 / Patch E]):
+ *
+ * Peak-return hysteresis.  When the previous evaluation pinned
+ * the cluster at or near peak (freq >=
+ * ZENITH_PEAK_HYSTERESIS_PEAK_THRESH_PCT of policy->max) and the
+ * current evaluation wants to drop sharply, hold a soft floor
+ * at (prev_freq * peak_step_down_pct / 100) for the next
+ * peak_hysteresis_streak samples.  After the streak drains, the
+ * cluster falls naturally through the lower tiers.
+ *
+ * Goal: smooth the off-peak descent on bursty workloads.  A
+ * render thread that just finished a frame and is now idle
+ * waiting for vblank produces a single sample of low load while
+ * the next frame is still queued; the natural descent would
+ * plunge to EAS-suggested freq and then bounce back up the next
+ * sample.  Hysteresis trades a few ms of higher freq for a
+ * smoother descent and far fewer freq transitions.
+ *
+ * Either tunable at 0 disables the tier (legacy).  Range checks
+ * keep streak in 0..ZENITH_PEAK_HYSTERESIS_STREAK_MAX and
+ * step_down_pct in 0..100.
+ */
+#define ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK		3
+#define ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT		95
+#define ZENITH_PEAK_HYSTERESIS_STREAK_MAX		16
+#define ZENITH_PEAK_HYSTERESIS_PEAK_THRESH_PCT		90
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -1924,6 +1952,17 @@ struct zenith_tunables {
 	 */
 	unsigned int		predict_up_window;
 
+	/* See ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK /
+	 * ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT (Patch E).  Either at 0
+	 * disables the tier (legacy descent-from-peak).  Range
+	 * checks: streak in 0..ZENITH_PEAK_HYSTERESIS_STREAK_MAX,
+	 * step_down_pct in 0..100.  Reads via READ_ONCE on the eval
+	 * hot path; writes via WRITE_ONCE from sysfs and from
+	 * zenith_apply_profile().
+	 */
+	unsigned int		peak_hysteresis_streak;
+	unsigned int		peak_step_down_pct;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -2643,6 +2682,7 @@ enum zenith_stat_idx {
 	ZENITH_STAT_PREDICT_UP,		/* predict_up */
 	ZENITH_STAT_PEAK_PREARM,	/* peak_prearm */
 	ZENITH_STAT_PEAK_RESCUE,	/* peak_rescue */
+	ZENITH_STAT_PEAK_HYST,		/* peak_hyst (Patch E) */
 	ZENITH_STAT_NR
 };
 
@@ -2793,6 +2833,33 @@ struct zenith_policy {
 	 * policy alloc; no special teardown.
 	 */
 	u64			render_first_seen_ns;
+
+	/* Peak-return hysteresis streak counter [Stage 4 / Patch E].
+	 * Increments on every consecutive sample where the previous
+	 * cached_raw_freq was at peak class
+	 * (>= ZENITH_PEAK_HYSTERESIS_PEAK_THRESH_PCT * policy->max
+	 * / 100) and the current freq wants to drop sharply.  When
+	 * < tunables->peak_hysteresis_streak, the soft floor at
+	 * (prev_freq * peak_step_down_pct / 100) is applied; when
+	 * the streak drains, the cluster falls naturally through
+	 * the lower tiers.  Reset on any sample where the previous
+	 * freq is below peak class, or when the freq tier already
+	 * computes a value at or above the soft floor.  Capped at
+	 * ZENITH_PEAK_HYSTERESIS_STREAK_MAX so a stuck-near-peak
+	 * regime cannot accumulate unbounded streak credit.
+	 */
+	unsigned int		peak_low_streak;
+
+	/* Anchor freq for the peak-return hysteresis tier
+	 * [Stage 4 / Patch E].  Captured on the transition from a
+	 * peak-class previous freq to a non-peak natural freq, then
+	 * used as the source for the soft floor
+	 * (anchor * peak_step_down_pct / 100) until the streak
+	 * drains.  Cleared on streak drain or on a sample where the
+	 * computed freq is already at or above the soft floor (no
+	 * hysteresis needed).  0 means "no anchor armed".
+	 */
+	unsigned int		peak_hyst_anchor_freq;
 
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
@@ -4613,6 +4680,8 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
 		return ZENITH_STAT_PEAK_PREARM;
 	if (!strcmp(path, "peak_rescue"))
 		return ZENITH_STAT_PEAK_RESCUE;
+	if (!strcmp(path, "peak_hyst"))
+		return ZENITH_STAT_PEAK_HYST;
 	return ZENITH_STAT_OTHER;
 }
 
@@ -4680,6 +4749,82 @@ static bool zenith_topology_has_big_class(void)
 	has_big = (second_cap >= little_thresh && second_cap < big_cap);
 	atomic_set(&cached, has_big ? 2 : 1);
 	return has_big;
+}
+
+/* Peak-return hysteresis (Patch E).  Pulled out of
+ * zenith_get_next_freq() so the deeply-nested gating logic can be
+ * expressed without overflowing checkpatch's max-tab limit.
+ *
+ * Pre: caller has computed freq through the lower freq-tier
+ * passes.  Post: returns the freq with the soft floor applied
+ * (or the input freq unchanged if the tier is disabled or the
+ * cluster isn't in a peak-exit transition).  *tp_path is set to
+ * "peak_hyst" iff the soft floor fired.
+ */
+static unsigned int
+zenith_apply_peak_hysteresis(struct zenith_policy *z_policy,
+			     struct cpufreq_policy *policy,
+			     unsigned int freq, bool pin_to_target,
+			     const char **tp_path)
+{
+	unsigned int hyst_streak =
+		READ_ONCE(z_policy->tunables->peak_hysteresis_streak);
+	unsigned int step_down_pct =
+		READ_ONCE(z_policy->tunables->peak_step_down_pct);
+	unsigned int prev, peak_thresh, anchor, floor_freq;
+
+	if (!hyst_streak || !step_down_pct ||
+	    !policy->max || pin_to_target) {
+		z_policy->peak_hyst_anchor_freq = 0;
+		z_policy->peak_low_streak = 0;
+		return freq;
+	}
+
+	prev = z_policy->cached_raw_freq;
+	peak_thresh = (policy->max / 100) *
+		ZENITH_PEAK_HYSTERESIS_PEAK_THRESH_PCT;
+
+	/* (Re)anchor on every sample where the previous
+	 * cached_raw_freq sits in the peak class.  This lets the
+	 * anchor track the cluster while it is pinned at peak, then
+	 * survive the descent because the cap-to-floor write below
+	 * pushes prev out of the peak class on subsequent ticks.
+	 */
+	if (prev >= peak_thresh) {
+		z_policy->peak_hyst_anchor_freq = prev;
+		z_policy->peak_low_streak = 0;
+	}
+
+	anchor = z_policy->peak_hyst_anchor_freq;
+	if (!anchor)
+		return freq;
+
+	floor_freq = (anchor / 100) * step_down_pct;
+	if (floor_freq > policy->max)
+		floor_freq = policy->max;
+
+	if (freq >= floor_freq) {
+		/* Natural freq is at or above the soft floor; release
+		 * the anchor.
+		 */
+		z_policy->peak_hyst_anchor_freq = 0;
+		z_policy->peak_low_streak = 0;
+		return freq;
+	}
+
+	if (z_policy->peak_low_streak >= hyst_streak) {
+		/* Streak drained; release and let the natural descent
+		 * resume.
+		 */
+		z_policy->peak_hyst_anchor_freq = 0;
+		z_policy->peak_low_streak = 0;
+		return freq;
+	}
+
+	if (z_policy->peak_low_streak < ZENITH_PEAK_HYSTERESIS_STREAK_MAX)
+		z_policy->peak_low_streak++;
+	*tp_path = "peak_hyst";
+	return floor_freq;
 }
 
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
@@ -6046,6 +6191,23 @@ apply_uclamp_max_cap:
 			}
 		}
 	}
+
+	/* X. Peak-return hysteresis (Patch E).
+	 *
+	 * If the previous evaluation pinned the cluster at peak class
+	 * (cached_raw_freq >= ZENITH_PEAK_HYSTERESIS_PEAK_THRESH_PCT
+	 * of policy->max) and the current freq wants to drop below the
+	 * soft floor (prev * peak_step_down_pct / 100), hold the soft
+	 * floor for the next peak_hysteresis_streak samples then
+	 * release.  pin_to_target paths (input_boost full-pin,
+	 * brutality, climb_step) bypass this tier so the user-
+	 * experience tier wins.
+	 *
+	 * Cost in the disabled path is one branch; in the enabled
+	 * path it's a few unsigned multiplies and one streak compare.
+	 */
+	freq = zenith_apply_peak_hysteresis(z_policy, policy, freq,
+					    pin_to_target, &tp_path);
 
 	/* cached_raw_freq shortcut: when the pre-resolve freq matches
 	 * the value we cached on the previous tick AND nothing has
@@ -7794,6 +7956,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int render_floor_pct;
 		unsigned int render_floor_min_runtime_ms;
 		unsigned int input_boost_touchdown_extra_ms;
+		unsigned int peak_hysteresis_streak;
+		unsigned int peak_step_down_pct;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -7856,6 +8020,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * what makes a phone "feel snappy".
 			 */
 			.input_boost_touchdown_extra_ms = 80,
+			/* Stage 4 / Patch E: PERFORMANCE pins the soft
+			 * floor higher (97% of anchor) and holds it
+			 * for 4 samples.  The cluster paid for the
+			 * peak; an extra few ms of high freq is cheap
+			 * compared to bouncing through a frame deadline
+			 * because EAS plunged on a single low sample.
+			 */
+			.peak_hysteresis_streak = 4,
+			.peak_step_down_pct = 97,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -7926,6 +8099,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.input_boost_touchdown_extra_ms =
 				ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS,
+			/* Stage 4 / Patch E: BALANCED matches cold-boot
+			 * defaults (3-sample streak, 95% step-down).
+			 */
+			.peak_hysteresis_streak =
+				ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK,
+			.peak_step_down_pct =
+				ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -7998,6 +8178,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * battery profile.
 			 */
 			.input_boost_touchdown_extra_ms = 30,
+			/* Stage 4 / Patch E: BATTERY shortens the
+			 * streak to 2 samples and steepens the step
+			 * down to 90% so the cluster falls off peak
+			 * faster.  Hysteresis is still useful (one
+			 * sample of low load isn't enough to confirm
+			 * the workload is gone) but we don't want to
+			 * pay 4 samples of extra freq.
+			 */
+			.peak_hysteresis_streak = 2,
+			.peak_step_down_pct = 90,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -8069,6 +8259,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * unchanged).
 			 */
 			.input_boost_touchdown_extra_ms = 0,
+			/* Stage 4 / Patch E: LEGACY disables peak-
+			 * return hysteresis entirely so the descent
+			 * shape is identical to the pre-Stage-4
+			 * governor.
+			 */
+			.peak_hysteresis_streak = 0,
+			.peak_step_down_pct = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -8127,6 +8324,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   p->render_floor_min_runtime_ms);
 	WRITE_ONCE(t->input_boost_touchdown_extra_ms,
 		   p->input_boost_touchdown_extra_ms);
+	WRITE_ONCE(t->peak_hysteresis_streak,
+		   p->peak_hysteresis_streak);
+	WRITE_ONCE(t->peak_step_down_pct, p->peak_step_down_pct);
 
 	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
 	 * the governor-wide caches used by the input handler fast
@@ -9339,6 +9539,7 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 		[ZENITH_STAT_PREDICT_UP]	= "predict_up",
 		[ZENITH_STAT_PEAK_PREARM]	= "peak_prearm",
 		[ZENITH_STAT_PEAK_RESCUE]	= "peak_rescue",
+		[ZENITH_STAT_PEAK_HYST]		= "peak_hyst",
 	};
 	unsigned long sum[ZENITH_STAT_NR] = { 0 };
 	struct zenith_policy *z_pol;
@@ -10748,6 +10949,65 @@ static ssize_t predict_up_window_store(struct gov_attr_set *attr_set,
 static struct governor_attr predict_up_window =
 	__ATTR_RW(predict_up_window);
 
+/* peak_hysteresis_streak sysfs knob (Patch E).
+ * Range 0..ZENITH_PEAK_HYSTERESIS_STREAK_MAX.  Number of
+ * consecutive samples after a peak-class previous freq for
+ * which the soft floor is held; 0 disables the hysteresis tier.
+ */
+static ssize_t
+peak_hysteresis_streak_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peak_hysteresis_streak);
+}
+
+static ssize_t
+peak_hysteresis_streak_store(struct gov_attr_set *attr_set,
+			     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PEAK_HYSTERESIS_STREAK_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->peak_hysteresis_streak, val);
+	return count;
+}
+
+static struct governor_attr peak_hysteresis_streak =
+	__ATTR_RW(peak_hysteresis_streak);
+
+/* peak_step_down_pct sysfs knob (Patch E).
+ * Range 0..100.  Soft-floor freq for the hysteresis tier as a
+ * percentage of the peak-anchor freq; 0 disables the tier.  100
+ * makes the floor identical to the anchor (the cluster won't
+ * descend at all during the streak).  95 (default) gives a 5%
+ * stair-step descent.
+ */
+static ssize_t
+peak_step_down_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peak_step_down_pct);
+}
+
+static ssize_t
+peak_step_down_pct_store(struct gov_attr_set *attr_set,
+			 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	WRITE_ONCE(t->peak_step_down_pct, val);
+	return count;
+}
+
+static struct governor_attr peak_step_down_pct =
+	__ATTR_RW(peak_step_down_pct);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -11923,6 +12183,8 @@ static struct attribute *zenith_attrs[] = {
 	&peak_headroom_prearm.attr,
 	&predict_up_thresh.attr,
 	&predict_up_window.attr,
+	&peak_hysteresis_streak.attr,
+	&peak_step_down_pct.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -12157,6 +12419,9 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PEAK_HEADROOM_PREARM;
 	tunables->predict_up_thresh	= ZENITH_DEFAULT_PREDICT_UP_THRESH;
 	tunables->predict_up_window	= ZENITH_DEFAULT_PREDICT_UP_WINDOW;
+	tunables->peak_hysteresis_streak =
+		ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK;
+	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
