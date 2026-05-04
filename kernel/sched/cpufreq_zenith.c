@@ -3000,6 +3000,18 @@ struct zenith_policy {
 	 */
 	u64			last_runnable_ns;
 
+	/* Last decision tag chosen by zenith_get_next_freq() on this
+	 * policy [Stage 4 / Patch J].  Stamped right after the
+	 * stats[] update at the end of every eval (cached and
+	 * uncached paths both update it).  Read-only sysfs node
+	 * "last_decision_path" dumps the current value per-policy,
+	 * formatted "policy<cpu>(<cluster>): <tag>\n".  Pointers
+	 * are to .rodata string literals so storage is a single
+	 * pointer assignment, no copy.  Reads use READ_ONCE for
+	 * coherency with the eval-side WRITE_ONCE.
+	 */
+	const char		*last_decision_path;
+
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
 	 * (cheap, no locks, no cachelines dirtied) but the eval path
@@ -6478,6 +6490,13 @@ apply_uclamp_max_cap:
 	    !zenith_ladder_pending(z_policy)) {
 		z_policy->stats[ZENITH_STAT_DECISIONS]++;
 		z_policy->stats[ZENITH_STAT_CACHE_HITS]++;
+		/* Patch J: stamp the per-policy last decision tag on
+		 * the cache-hit path too so the sysfs node reflects
+		 * the most recent path even when the cache shortcut
+		 * wins.  WRITE_ONCE pairs with READ_ONCE in the show
+		 * handler.
+		 */
+		WRITE_ONCE(z_policy->last_decision_path, tp_path);
 		/* Emit the same summary tracepoint on cache-hit so a
 		 * trace consumer sees a continuous record of decisions
 		 * rather than gaps every time the cache shortcut wins.
@@ -6673,6 +6692,10 @@ apply_uclamp_max_cap:
 
 	z_policy->stats[ZENITH_STAT_DECISIONS]++;
 	z_policy->stats[zenith_path_to_bucket(tp_path)]++;
+	/* Patch J: stamp the per-policy last decision tag.  Pairs
+	 * with READ_ONCE in the last_decision_path sysfs handler.
+	 */
+	WRITE_ONCE(z_policy->last_decision_path, tp_path);
 
 	/* Update the variance EWMA used by the up_threshold_adaptive
 	 * shaping at the top of the next eval.  Uses tp_load_pct as the
@@ -10020,6 +10043,43 @@ static ssize_t at_log_show(struct gov_attr_set *attr_set, char *buf)
 }
 static struct governor_attr at_log = __ATTR_RO(at_log);
 
+/* last_decision_path sysfs node (Patch J).  Read-only.  Dumps
+ * one line per policy in attr_set->policy_list with the most
+ * recent tp_path tag chosen by zenith_get_next_freq() on that
+ * policy.  Format:
+ *
+ *   policy<cpu>(<cluster>): <tag>
+ *
+ * Tag pointers are .rodata literals stamped via WRITE_ONCE in
+ * the eval path; reads use READ_ONCE so a torn pointer is
+ * impossible.  Initial value before the first eval tick is
+ * "init", set in zenith_init().
+ */
+static ssize_t last_decision_path_show(struct gov_attr_set *attr_set,
+				       char *buf)
+{
+	struct zenith_policy *z_pol;
+	ssize_t len = 0;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
+		const char *tag = READ_ONCE(z_pol->last_decision_path);
+
+		if (!tag)
+			tag = "init";
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "policy%u(%s): %s\n",
+				 z_pol->policy->cpu,
+				 zenith_at_cluster_name(z_pol->cluster_class),
+				 tag);
+		if (len >= PAGE_SIZE)
+			break;
+	}
+	return len;
+}
+
+static struct governor_attr last_decision_path =
+	__ATTR_RO(last_decision_path);
+
 ZENITH_TUNABLE_UINT_INVAL(screen_state);
 
 /* screen_off_glide_ms sysfs knob.  Range
@@ -12688,6 +12748,7 @@ static struct attribute *zenith_attrs[] = {
 	&zenith_stats_reset.attr,
 	&zenith_input_stats.attr,
 	&at_log.attr,
+	&last_decision_path.attr,
 	&auto_tune_status.attr,
 	&auto_tune_reset_overrides.attr,
 	&auto_tune.attr,
@@ -12864,6 +12925,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 	z_policy->policy = policy;
 	raw_spin_lock_init(&z_policy->update_lock);
 	INIT_DELAYED_WORK(&z_policy->at_work, zenith_auto_tune_work);
+	/* Patch J: prime the per-policy decision tag so the sysfs
+	 * node returns a meaningful value before the first eval.
+	 */
+	z_policy->last_decision_path = "init";
 
 	ret = zenith_kthread_create(z_policy);
 	if (ret)
