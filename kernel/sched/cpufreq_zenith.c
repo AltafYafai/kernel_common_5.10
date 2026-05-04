@@ -4390,11 +4390,42 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			z_policy->at_effective_up_threshold);
 
 		if (dynamic_up_thresh <= natural) {
-			unsigned int bump =
+			unsigned int bump_max =
 			    z_policy->tunables->prefer_silver_hot_bump_pct;
+			unsigned int rate     = z_policy->ps_hit_rate_pct;
+			unsigned int thresh   =
+			    z_policy->tunables->prefer_silver_hot_threshold_pct;
+			unsigned int bump;
 
-			if (bump > ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT)
-				bump = ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT;
+			if (bump_max > ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT)
+				bump_max = ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT;
+
+			/*
+			 * Linear ramp: at hit_rate == threshold, bump = 0;
+			 * at hit_rate == 100, bump = bump_max.  Replaces the
+			 * step function (flat bump_max above threshold, 0
+			 * below) so the tail of the ramp is smooth, a 51%
+			 * hit rate doesn't yield the same up_threshold
+			 * inflation as a 99% one, and the worst-case bump
+			 * is unchanged from the previous fixed form.
+			 *
+			 * thresh >= 100 would make the denominator zero or
+			 * negative; the outer >=-test already required
+			 * rate >= thresh to enter this branch, so for
+			 * thresh == 100 the only legal rate is also 100,
+			 * collapsing the ramp to bump_max as an exact case.
+			 * Treat thresh > 100 (impossible per the sysfs
+			 * store handler's 0..100 clamp, but defensive)
+			 * as no bump.
+			 */
+			if (rate <= thresh || thresh > 100)
+				bump = 0;
+			else if (thresh == 100)
+				bump = bump_max;
+			else
+				bump = (bump_max * (rate - thresh)) /
+				       (100u - thresh);
+
 			if (dynamic_up_thresh + bump <= 95)
 				dynamic_up_thresh += bump;
 			else
