@@ -627,6 +627,32 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		100
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	4000
+
+/* Multiplier for the effective down-rate delay while an input
+ * boost is active.  Range 100..1000 (percent).  100 = no extension
+ * (legacy behaviour); 200 (the default) = double the down-rate
+ * delay during the input_boost full-pin window; 500 = quintuple.
+ *
+ * Rationale: within the input_boost_until_ns window the cluster is
+ * pinned high precisely because the user is actively interacting.
+ * Letting the down-rate gate fire at its normal cadence inside
+ * that window pulls the cluster off peak the moment a sample's
+ * load proportional math drops below the previous freq -- which
+ * happens between every render tick and the next on a typical
+ * scroll / swipe -- producing the "post-tap cliff drop" pattern
+ * users describe as stutter even though the user is still
+ * interacting.  Multiplying down_rate_delay during the boost
+ * window holds the cluster up across the gaps without changing
+ * any other tier.
+ *
+ * Self-disarms: once now >= input_boost_until_ns the multiplier
+ * disappears on the very next call into zenith_up_down_rate_limit,
+ * so the steady-state idle path is unaffected.  Capped at 1000%%
+ * (10x) on store so a runaway value can not effectively pin the
+ * cluster forever.
+ */
+#define ZENITH_DEFAULT_INPUT_BOOST_DOWN_RATE_MULT_PCT	200
+#define ZENITH_INPUT_BOOST_DOWN_RATE_MULT_PCT_MAX	1000
 #define ZENITH_DEFAULT_POWERSAVE_BIAS		0
 
 /* Screen-on softening of powersave_bias.  Default 50: halve the
@@ -2032,6 +2058,19 @@ struct zenith_tunables {
 	 * every tap.  Range 0..100; values > 100 rejected by sysfs.
 	 */
 	unsigned int		input_boost_cap_pct;
+
+	/* Multiplier for the effective down-rate delay applied to the
+	 * cluster while an input boost is active (now <
+	 * zenith_input_boost_until_ns).  Range 100..1000 (percent).
+	 * 100 disables the extension and restores the legacy
+	 * "down_rate_delay during boost == down_rate_delay outside
+	 * boost" behaviour.  See ZENITH_DEFAULT_INPUT_BOOST_DOWN_RATE_-
+	 * MULT_PCT for the full rationale; the extension is gated by
+	 * input_boost_big_only the same way the boost itself is, so
+	 * configurations that suppress the boost on LITTLE also keep
+	 * LITTLE on its normal down-rate cadence.
+	 */
+	unsigned int		input_boost_down_rate_mult_pct;
 
 	/* Efficient-frequency soft-cap ladder, up to ZENITH_EFF_BINS_MAX
 	 * entries. Sorted ascending by frequency. The up_delay_us array
@@ -3493,6 +3532,35 @@ static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, 
 		if (var > 256)
 			var = 256;
 		down_delay = (down_delay * (256 + var)) / 256;
+	}
+
+	/* Input-boost-aware down-rate extension.  While the
+	 * input_boost full-pin window is in effect (now <
+	 * zenith_input_boost_until_ns), multiply down_delay by
+	 * tunables->input_boost_down_rate_mult_pct / 100.  Holds the
+	 * cluster up across the inter-frame gaps inside an active
+	 * scroll / swipe.  See ZENITH_DEFAULT_INPUT_BOOST_DOWN_RATE_-
+	 * MULT_PCT for the full rationale.  No-op when:
+	 *   - the multiplier is at 100%% (legacy behaviour);
+	 *   - no input boost is active (until == 0 or expired);
+	 *   - the configured cluster gate (input_boost_big_only)
+	 *     would suppress the boost itself for this cluster
+	 *     (LITTLE in the default config, where down-rate
+	 *     extension would just delay parking the cluster).
+	 */
+	{
+		unsigned int mult_pct =
+			READ_ONCE(tunables->input_boost_down_rate_mult_pct);
+
+		if (mult_pct > 100 &&
+		    (!READ_ONCE(tunables->input_boost_big_only) ||
+		     z_policy->is_big_cluster)) {
+			u64 until = (u64)atomic64_read(
+					&zenith_input_boost_until_ns);
+
+			if (until && (u64)time < until)
+				down_delay = (down_delay * mult_pct) / 100;
+		}
 	}
 
 	if (next_freq > z_policy->next_freq) {
@@ -9256,6 +9324,34 @@ static ssize_t input_boost_cap_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr input_boost_cap_pct =
 	__ATTR_RW(input_boost_cap_pct);
 
+/* input_boost_down_rate_mult_pct sysfs knob.  Range
+ * 100..ZENITH_INPUT_BOOST_DOWN_RATE_MULT_PCT_MAX (1000).  See
+ * ZENITH_DEFAULT_INPUT_BOOST_DOWN_RATE_MULT_PCT for full semantics.
+ */
+static ssize_t input_boost_down_rate_mult_pct_show(struct gov_attr_set *attr_set,
+						   char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->input_boost_down_rate_mult_pct);
+}
+
+static ssize_t input_boost_down_rate_mult_pct_store(struct gov_attr_set *attr_set,
+						    const char *buf,
+						    size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val < 100 ||
+	    val > ZENITH_INPUT_BOOST_DOWN_RATE_MULT_PCT_MAX)
+		return -EINVAL;
+	t->input_boost_down_rate_mult_pct = val;
+	return count;
+}
+
+static struct governor_attr input_boost_down_rate_mult_pct =
+	__ATTR_RW(input_boost_down_rate_mult_pct);
+
 /* Parse up to ZENITH_EFF_BINS_MAX unsigned ints separated by whitespace
  * into out[], returning the number parsed. Extra tokens are ignored.
  * Returns -EINVAL if any token fails kstrtouint or if no tokens parse.
@@ -11172,6 +11268,7 @@ static struct attribute *zenith_attrs[] = {
 	&input_boost_decay_curve.attr,
 	&input_boost_big_only.attr,
 	&input_boost_cap_pct.attr,
+	&input_boost_down_rate_mult_pct.attr,
 	&efficient_freq.attr,
 	&eff_bin_hyst_pct.attr,
 	&up_delay_us.attr,
@@ -11406,6 +11503,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->input_boost_decay_curve = ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE;
 	tunables->input_boost_big_only	= ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY;
 	tunables->input_boost_cap_pct	= ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT;
+	tunables->input_boost_down_rate_mult_pct =
+		ZENITH_DEFAULT_INPUT_BOOST_DOWN_RATE_MULT_PCT;
 	tunables->efficient_freq	= ZENITH_DEFAULT_EFFICIENT_FREQ;
 	tunables->eff_bin_hyst_pct	= ZENITH_DEFAULT_EFF_BIN_HYST_PCT;
 	tunables->up_delay_us		= ZENITH_DEFAULT_UP_DELAY_US;
