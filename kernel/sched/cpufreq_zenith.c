@@ -367,6 +367,56 @@
 #define ZENITH_SLEEPER_TAIL_PCT_MIN			50
 #define ZENITH_SLEEPER_TAIL_PCT_MAX			100
 
+/* peer_ramp_window_ms / peer_ramp_floor_pct
+ * (defaults 25 / 60, [Stage 4 / Patch D]):
+ *
+ * Multi-cluster pre-arm coordination.  Cross-cluster IPC chains
+ * (binder hops between an app-side BIG worker and a service-side
+ * PRIME worker, audio pipelines feeding a render thread, etc.)
+ * tend to need both clusters at a usable freq within a few
+ * milliseconds of each other.  In the legacy path, when one
+ * cluster is woken into peak by predict_up / peak_prearm /
+ * peak_rescue, the peer cluster has to climb from idle by
+ * itself, paying a full hispeed warm-up window before its half
+ * of the IPC chain runs at speed.
+ *
+ * The arming side: when a cluster lifts to eff_hispeed (or
+ * higher) via one of the peak tiers, stamp a deadline on the
+ * peer cluster's slot.  The reading side: while that deadline
+ * has not expired, the peer applies a soft floor at
+ * peer_ramp_floor_pct of policy->max so it is no longer sitting
+ * at idle when the cross-cluster wake arrives.  Class-based, not
+ * policy-based: BIG arms PRIME and vice versa.  LITTLE does not
+ * participate -- it is rarely on the producing side of a peer-
+ * ramp-worthy IPC chain, and floor-arming it would interfere
+ * with the bg_util_scale_pct screen-off path on devices that
+ * route low-priority work to the small cluster.
+ *
+ * Self-disarms on the deadline.  No streak / debounce: the
+ * triggers (predict_up trend window, peak_starve_count >=
+ * starve_streak, peak_prearm gate) already require multiple
+ * samples worth of evidence, so by the time the peer fires we
+ * have all the confirmation we need.  Re-armings just bump the
+ * deadline forward; harmless.
+ *
+ * peer_ramp_window_ms == 0 disables both sides (no arming
+ * writes, no floor reads).  peer_ramp_floor_pct == 0 disables
+ * just the floor (deadlines still get stamped but never
+ * fire) -- mostly useful for trace consumers that want to see
+ * the arming events without having the floor influence freq.
+ *
+ * 100 ms / 100% are the upper bounds.  The 100 ms cap is
+ * loose: at peer_ramp_floor_pct=60 the floor only matters when
+ * the natural freq would be below 60% of policy->max, which on
+ * a real workload is a small fraction of the window.  The
+ * 100% cap on the floor is the obvious one (anything higher is
+ * just policy->max).
+ */
+#define ZENITH_DEFAULT_PEER_RAMP_WINDOW_MS		25
+#define ZENITH_PEER_RAMP_WINDOW_MS_MAX			100
+#define ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT		60
+#define ZENITH_PEER_RAMP_FLOOR_PCT_MAX			100
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -2075,6 +2125,17 @@ struct zenith_tunables {
 	unsigned int		sleeper_tail_thresh_us;
 	unsigned int		sleeper_tail_pct;
 
+	/* See ZENITH_DEFAULT_PEER_RAMP_WINDOW_MS /
+	 * ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT (Patch D).
+	 * peer_ramp_window_ms == 0 disables both sides of the multi-
+	 * cluster pre-arm coordination.  peer_ramp_floor_pct == 0
+	 * suppresses the floor while leaving the deadline writes in
+	 * place.  Reads via READ_ONCE on the eval hot path; writes
+	 * via WRITE_ONCE from sysfs and zenith_apply_profile().
+	 */
+	unsigned int		peer_ramp_window_ms;
+	unsigned int		peer_ramp_floor_pct;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -2625,6 +2686,28 @@ static atomic64_t zenith_input_boost_until_ns = ATOMIC64_INIT(0);
 static atomic64_t zenith_input_last_event_ns = ATOMIC64_INIT(0);
 
 /*
+ * Peer-ramp deadlines (Patch D).  One slot per BIG/PRIME class.
+ * The slot named for class X holds the deadline that X should
+ * apply -- i.e. it is *written by X's peer* when the peer ramps,
+ * and *read by X* on its next eval.  Concretely:
+ *
+ *   BIG ramps   -> writes zenith_peer_ramp_until_ns_prime
+ *   PRIME ramps -> writes zenith_peer_ramp_until_ns_big
+ *   BIG eval    -> reads  zenith_peer_ramp_until_ns_big
+ *   PRIME eval  -> reads  zenith_peer_ramp_until_ns_prime
+ *
+ * LITTLE neither writes nor reads.  See section "peer_ramp_*"
+ * in the macro block at the top of the file for the rationale.
+ *
+ * Both stay 0 until the first ramp; deadlines are a forward
+ * wall-clock ns and naturally expire as ktime_get_ns() advances
+ * past them.  No reset path is needed: the read side is just a
+ * "is now < until" compare.
+ */
+static atomic64_t zenith_peer_ramp_until_ns_big   = ATOMIC64_INIT(0);
+static atomic64_t zenith_peer_ramp_until_ns_prime = ATOMIC64_INIT(0);
+
+/*
  * Cached drm-panel vblank period, in microseconds.  Producer:
  * display drivers / panel bridges call zenith_set_drm_vblank_us()
  * whenever the active vblank period changes (e.g. on a 60->120Hz
@@ -2803,6 +2886,7 @@ enum zenith_stat_idx {
 	ZENITH_STAT_PEAK_PREARM,	/* peak_prearm */
 	ZENITH_STAT_PEAK_RESCUE,	/* peak_rescue */
 	ZENITH_STAT_PEAK_HYST,		/* peak_hyst (Patch E) */
+	ZENITH_STAT_PEER_RAMP,		/* peer_ramp (Patch D) */
 	ZENITH_STAT_NR
 };
 
@@ -4851,6 +4935,8 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
 		return ZENITH_STAT_PEAK_RESCUE;
 	if (!strcmp(path, "peak_hyst"))
 		return ZENITH_STAT_PEAK_HYST;
+	if (!strcmp(path, "peer_ramp"))
+		return ZENITH_STAT_PEER_RAMP;
 	return ZENITH_STAT_OTHER;
 }
 
@@ -4994,6 +5080,72 @@ zenith_apply_peak_hysteresis(struct zenith_policy *z_policy,
 		z_policy->peak_low_streak++;
 	*tp_path = "peak_hyst";
 	return floor_freq;
+}
+
+/* Peer-ramp helpers (Patch D).  Translate a cluster_class to the
+ * deadline atomic each side of the protocol cares about.
+ *
+ * peer_atomic_for() picks the slot that the *peer* of the given
+ * cluster will read on its next eval.  An arming write goes here.
+ *
+ * self_atomic_for() picks the slot that the given cluster reads
+ * itself.  This was written by the cluster's peer the last time
+ * the peer ramped.
+ *
+ * Returns NULL for LITTLE on both, since LITTLE neither arms nor
+ * is armed under this scheme (see the macro block at the top of
+ * the file for why).
+ */
+static atomic64_t *
+zenith_peer_ramp_peer_atomic(unsigned int cluster_class)
+{
+	switch (cluster_class) {
+	case ZENITH_CLUSTER_BIG:
+		return &zenith_peer_ramp_until_ns_prime;
+	case ZENITH_CLUSTER_PRIME:
+		return &zenith_peer_ramp_until_ns_big;
+	default:
+		return NULL;
+	}
+}
+
+static atomic64_t *
+zenith_peer_ramp_self_atomic(unsigned int cluster_class)
+{
+	switch (cluster_class) {
+	case ZENITH_CLUSTER_BIG:
+		return &zenith_peer_ramp_until_ns_big;
+	case ZENITH_CLUSTER_PRIME:
+		return &zenith_peer_ramp_until_ns_prime;
+	default:
+		return NULL;
+	}
+}
+
+/* Stamp a deadline on the peer cluster's slot.  Called from the
+ * three peak tiers (predict_up, peak_prearm, peak_rescue) right
+ * after they decide to lift the cluster.  Cheap: one tunable
+ * read, one switch, one atomic64_set.  Re-armings just bump the
+ * deadline forward, so concurrent stamps from the same cluster
+ * (e.g. predict_up on tick N then peak_prearm on tick N+1) end
+ * up with the latest deadline winning, which is what we want.
+ *
+ * Gated entirely on peer_ramp_window_ms.  Set to 0 and this
+ * function is a couple of branches and a return.
+ */
+static void
+zenith_peer_ramp_arm(struct zenith_policy *z_policy, u64 now_ns)
+{
+	unsigned int window_ms =
+		READ_ONCE(z_policy->tunables->peer_ramp_window_ms);
+	atomic64_t *peer;
+
+	if (!window_ms)
+		return;
+	peer = zenith_peer_ramp_peer_atomic(z_policy->cluster_class);
+	if (!peer)
+		return;
+	atomic64_set(peer, now_ns + (u64)window_ms * NSEC_PER_MSEC);
 }
 
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
@@ -5793,6 +5945,12 @@ brutal_entry_deferred:
 				    z_policy->tunables->predict_up_thresh) {
 					freq = eff_hispeed;
 					tp_path = "predict_up";
+					/* Patch D: arm the peer cluster
+					 * for cross-cluster IPC chains.
+					 * No-op when peer_ramp_window_ms
+					 * is 0 or this is LITTLE.
+					 */
+					zenith_peer_ramp_arm(z_policy, now_ns);
 				}
 			}
 		}
@@ -5901,6 +6059,10 @@ brutal_entry_deferred:
 		    freq < eff_hispeed) {
 			freq = eff_hispeed;
 			tp_path = "peak_prearm";
+			/* Patch D: arm the peer cluster's deadline
+			 * so its next eval picks up a soft floor.
+			 */
+			zenith_peer_ramp_arm(z_policy, ktime_get_ns());
 		}
 	}
 
@@ -5960,6 +6122,12 @@ brutal_entry_deferred:
 					tp_path = "peak_rescue";
 					z_policy->peak_rescue_until_ns = now_ns +
 						(u64)hold_ms * NSEC_PER_MSEC;
+					/* Patch D: arm peer cluster.  Same
+					 * now_ns the rescue computed its
+					 * own hold-down off of, so the
+					 * deadlines are aligned.
+					 */
+					zenith_peer_ramp_arm(z_policy, now_ns);
 				}
 			}
 		}
@@ -6320,6 +6488,50 @@ brutal_entry_deferred:
 		if (active && cf && freq < cf) {
 			freq = cf;
 			tp_path = "camera_floor";
+		}
+	}
+
+	/* 3c'''''. Peer-ramp soft floor (Patch D).
+	 *
+	 * If the peer cluster (BIG <-> PRIME) ramped to peak in the
+	 * recent past via predict_up / peak_prearm / peak_rescue, it
+	 * stamped a deadline on this cluster's slot.  While that
+	 * deadline has not expired, hold a soft floor at
+	 * peer_ramp_floor_pct of policy->max so the IPC chain doesn't
+	 * spend its first few samples stalled at idle freq waiting
+	 * for the level signal to land.
+	 *
+	 * The atomic is a single ktime_get_ns() compare; both the
+	 * window and floor knobs short-circuit when 0.  pin_to_target
+	 * paths bypass: input_boost / brutality already pin the
+	 * cluster higher, so layering a floor under them is wasted
+	 * arithmetic.  LITTLE has no peer atomic so the lookup
+	 * returns NULL and the tier is a single branch on that
+	 * cluster.
+	 */
+	if (!pin_to_target && policy->max &&
+	    z_policy->tunables->peer_ramp_window_ms &&
+	    z_policy->tunables->peer_ramp_floor_pct) {
+		atomic64_t *self =
+			zenith_peer_ramp_self_atomic(z_policy->cluster_class);
+
+		if (self) {
+			u64 until = (u64)atomic64_read(self);
+			u64 now_ns = ktime_get_ns();
+
+			if (now_ns < until) {
+				unsigned int floor =
+					(policy->max *
+					 z_policy->tunables->peer_ramp_floor_pct) /
+					100;
+
+				if (floor > policy->max)
+					floor = policy->max;
+				if (freq < floor) {
+					freq = floor;
+					tp_path = "peer_ramp";
+				}
+			}
 		}
 	}
 
@@ -8238,6 +8450,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int bg_util_scale_pct;
 		unsigned int sleeper_tail_thresh_us;
 		unsigned int sleeper_tail_pct;
+		unsigned int peer_ramp_window_ms;
+		unsigned int peer_ramp_floor_pct;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -8330,6 +8544,17 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.sleeper_tail_thresh_us = 0,
 			.sleeper_tail_pct = 100,
+			/* Stage 4 / Patch D: PERFORMANCE widens the peer-
+			 * ramp window to 40 ms and lifts the floor to 70%%
+			 * of policy->max.  IPC chains under this profile
+			 * are typically the latency-sensitive kind --
+			 * binder hops on app launch, render -> compositor
+			 * -> display -- so giving the peer cluster a
+			 * bigger and slightly higher pre-arm is worth the
+			 * energy.
+			 */
+			.peer_ramp_window_ms = 40,
+			.peer_ramp_floor_pct = 70,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -8428,6 +8653,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.sleeper_tail_thresh_us = 20000,
 			.sleeper_tail_pct = 90,
+			/* Stage 4 / Patch D: BALANCED matches cold-boot
+			 * defaults (25 ms window, 60%% floor).  Mild
+			 * pre-arm: enough to shave warm-up latency on
+			 * common cross-cluster wakes without paying for
+			 * a full hispeed pin on every peer event.
+			 */
+			.peer_ramp_window_ms =
+				ZENITH_DEFAULT_PEER_RAMP_WINDOW_MS,
+			.peer_ramp_floor_pct =
+				ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -8532,6 +8767,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.sleeper_tail_thresh_us = 10000,
 			.sleeper_tail_pct = 80,
+			/* Stage 4 / Patch D: BATTERY disables peer-ramp.
+			 * The user has opted in to slower performance,
+			 * and the energy cost of holding the peer at
+			 * a 60%%+ floor for 25 ms after every BIG/PRIME
+			 * peak is exactly the kind of overhead this
+			 * profile exists to avoid.
+			 */
+			.peer_ramp_window_ms = 0,
+			.peer_ramp_floor_pct = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -8626,6 +8870,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.sleeper_tail_thresh_us = 0,
 			.sleeper_tail_pct = 100,
+			/* Stage 4 / Patch D: LEGACY disables peer-ramp.
+			 * Pre-Stage-1 governor had no cross-cluster
+			 * coordination; LEGACY preserves that behaviour
+			 * end-to-end.
+			 */
+			.peer_ramp_window_ms = 0,
+			.peer_ramp_floor_pct = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -8693,6 +8944,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->sleeper_tail_thresh_us,
 		   p->sleeper_tail_thresh_us);
 	WRITE_ONCE(t->sleeper_tail_pct, p->sleeper_tail_pct);
+	WRITE_ONCE(t->peer_ramp_window_ms, p->peer_ramp_window_ms);
+	WRITE_ONCE(t->peer_ramp_floor_pct, p->peer_ramp_floor_pct);
 
 	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
 	 * the governor-wide caches used by the input handler fast
@@ -9906,6 +10159,7 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 		[ZENITH_STAT_PEAK_PREARM]	= "peak_prearm",
 		[ZENITH_STAT_PEAK_RESCUE]	= "peak_rescue",
 		[ZENITH_STAT_PEAK_HYST]		= "peak_hyst",
+		[ZENITH_STAT_PEER_RAMP]		= "peer_ramp",
 	};
 	unsigned long sum[ZENITH_STAT_NR] = { 0 };
 	struct zenith_policy *z_pol;
@@ -11556,6 +11810,67 @@ sleeper_tail_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr sleeper_tail_pct =
 	__ATTR_RW(sleeper_tail_pct);
 
+/* peer_ramp_window_ms sysfs knob (Patch D).
+ * Range 0..ZENITH_PEER_RAMP_WINDOW_MS_MAX (100).  0 disables the
+ * peer-ramp coordination on both sides (no arming writes from
+ * the peak tiers, no floor reads).  Non-zero values are the
+ * post-peak window during which the peer cluster applies the
+ * soft floor after this cluster ramps.
+ */
+static ssize_t
+peer_ramp_window_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peer_ramp_window_ms);
+}
+
+static ssize_t
+peer_ramp_window_ms_store(struct gov_attr_set *attr_set,
+			  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PEER_RAMP_WINDOW_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->peer_ramp_window_ms, val);
+	return count;
+}
+
+static struct governor_attr peer_ramp_window_ms =
+	__ATTR_RW(peer_ramp_window_ms);
+
+/* peer_ramp_floor_pct sysfs knob (Patch D).
+ * Range 0..ZENITH_PEER_RAMP_FLOOR_PCT_MAX (100).  Soft floor as
+ * a percent of policy->max applied while a peer-ramp deadline
+ * is active.  0 leaves the deadlines being stamped (visible to
+ * trace consumers) but suppresses the floor itself.
+ */
+static ssize_t
+peer_ramp_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peer_ramp_floor_pct);
+}
+
+static ssize_t
+peer_ramp_floor_pct_store(struct gov_attr_set *attr_set,
+			  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PEER_RAMP_FLOOR_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->peer_ramp_floor_pct, val);
+	return count;
+}
+
+static struct governor_attr peer_ramp_floor_pct =
+	__ATTR_RW(peer_ramp_floor_pct);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -12738,6 +13053,8 @@ static struct attribute *zenith_attrs[] = {
 	&bg_util_scale_pct.attr,
 	&sleeper_tail_thresh_us.attr,
 	&sleeper_tail_pct.attr,
+	&peer_ramp_window_ms.attr,
+	&peer_ramp_floor_pct.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -12986,6 +13303,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->sleeper_tail_thresh_us =
 		ZENITH_DEFAULT_SLEEPER_TAIL_THRESH_US;
 	tunables->sleeper_tail_pct	= ZENITH_DEFAULT_SLEEPER_TAIL_PCT;
+	tunables->peer_ramp_window_ms	=
+		ZENITH_DEFAULT_PEER_RAMP_WINDOW_MS;
+	tunables->peer_ramp_floor_pct	=
+		ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
