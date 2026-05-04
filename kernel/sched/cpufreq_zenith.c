@@ -197,6 +197,63 @@
 #define ZENITH_PEAK_HEADROOM_STREAK_MAX			16
 #define ZENITH_PEAK_HEADROOM_HOLD_MS_MAX		1000
 
+/* Predictive up-shift via util-trend ring (tier 2a').
+ *
+ * The peak-headroom rescue (tier 2c) is reactive: it waits for
+ * peak_headroom_starve_streak consecutive saturated samples below
+ * the freq floor before lifting the cluster, which on a 16 ms
+ * sampling cadence is 48..64 ms of starvation before the rescue
+ * lands.  The pre-arm tier 2b' shaves one window off the front of
+ * that.  This tier shaves two more by acting on a *trend*, not on
+ * a level: when the recent util signal is rising fast enough to
+ * predict that hispeed_load is about to be crossed, lift the
+ * cluster to eff_hispeed_freq one or two ticks before the level-
+ * triggered hispeed tier would have done so.
+ *
+ * Trigger:
+ *   delta_x256 = (newest - oldest) over the last predict_up_window
+ *                samples, expressed as 256ths of max_cap so the
+ *                threshold is unitless.  The compare is
+ *                delta_x256 >= predict_up_thresh.
+ *   freq < eff_hispeed_freq (otherwise the lift is a no-op).
+ *   peak_starve_count == 0 (don't double-fire with rescue / pre-
+ *                arm; let those handle it once starvation has
+ *                begun).
+ *   peak_rescue_until_ns has expired (don't refire inside a
+ *                rescue hold-down window).
+ *
+ * Effect:
+ *   Lift freq up to eff_hispeed_freq, set tp_path = "predict_up".
+ *   Counter slot ZENITH_STAT_PREDICT_UP records the firing.  The
+ *   subsequent hispeed tier (2b) will keep the floor in place if
+ *   load_pct actually does cross hispeed_load on the next tick;
+ *   otherwise the cluster naturally falls back through the EAS
+ *   ladder after the rate-limit window closes.
+ *
+ * Risk:
+ *   Oscillation when the window is short enough to react to PELT
+ *   noise.  Mitigated by:
+ *     - Gating on peak_starve_count == 0 keeps predict_up from
+ *       fighting rescue / pre-arm during sustained-high regimes.
+ *     - Default thresh of 64 ( == 25%% of max_cap rise across the
+ *       window) is conservative; testers can dial it down to 32
+ *       (~12.5%%) for more eager prediction.
+ *     - The lift is to eff_hispeed_freq, not policy->max -- the
+ *       cluster still has the rescue / brutality tiers above it
+ *       when the trend turns out to be a real climb.
+ *
+ * 0 disables the tier (legacy behaviour: hispeed entry waits for
+ * the level signal to arrive).  predict_up_window minimum is 2
+ * (need at least two samples to compute a delta) and maximum is
+ * ZENITH_PREDICT_UP_WINDOW_MAX so the per-policy ring buffer
+ * stays small.
+ */
+#define ZENITH_DEFAULT_PREDICT_UP_THRESH		64
+#define ZENITH_DEFAULT_PREDICT_UP_WINDOW		4
+#define ZENITH_PREDICT_UP_THRESH_MAX			255
+#define ZENITH_PREDICT_UP_WINDOW_MIN			2
+#define ZENITH_PREDICT_UP_WINDOW_MAX			8
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -1793,6 +1850,30 @@ struct zenith_tunables {
 	 */
 	unsigned int		peak_headroom_prearm;
 
+	/* Predictive up-shift trend gate (tier 2a').  See
+	 * ZENITH_DEFAULT_PREDICT_UP_THRESH for full semantics.  When
+	 * non-zero, zenith_get_next_freq() compares the rise across
+	 * the last predict_up_window util samples against this
+	 * threshold (expressed as 256ths of max_cap so the value is
+	 * unitless: 64 == ~25%% of max_cap rise across the window).
+	 * 0 disables the tier; max ZENITH_PREDICT_UP_THRESH_MAX (255)
+	 * is the largest value the unitless trend can take, at which
+	 * point the tier effectively never fires (would require a
+	 * full max_cap rise across the window).
+	 */
+	unsigned int		predict_up_thresh;
+
+	/* Window size for the predict_up trend ring, in samples.
+	 * Must be in [ZENITH_PREDICT_UP_WINDOW_MIN ..
+	 * ZENITH_PREDICT_UP_WINDOW_MAX].  The trend compare reads the
+	 * util sample written predict_up_window ticks ago against the
+	 * one written this tick; out-of-range values are rejected on
+	 * sysfs store.  A larger window smooths PELT noise out of the
+	 * trend signal at the cost of one more tick of warm-up after
+	 * a cold attach.
+	 */
+	unsigned int		predict_up_window;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -2570,6 +2651,20 @@ struct zenith_policy {
 	 * rescue event.  Cleared (set to 0) at policy init.
 	 */
 	u64			peak_rescue_until_ns;
+
+	/* Util-trend ring for the predictive up-shift tier (2a').  The
+	 * tail of zenith_get_next_freq() pushes the current sample's
+	 * util into util_history[util_history_idx] and advances the
+	 * index modulo predict_up_window.  util_history_count tracks
+	 * how many slots have been written since policy attach (or
+	 * since the last shrink-on-window-store), so the tier can wait
+	 * for the ring to warm up before evaluating a trend on
+	 * unwritten zeroes.  Capped at ZENITH_PREDICT_UP_WINDOW_MAX so
+	 * the storage cost is bounded.
+	 */
+	unsigned long		util_history[ZENITH_PREDICT_UP_WINDOW_MAX];
+	unsigned int		util_history_idx;
+	unsigned int		util_history_count;
 
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
@@ -5133,6 +5228,70 @@ brutal_entry_deferred:
 		}
 	}
 
+	/* 2a'. Predictive up-shift via util-trend ring.  Lifts the
+	 * cluster up to eff_hispeed_freq before the level-triggered
+	 * hispeed tier (2b) catches a rising workload.  See the block
+	 * comment above ZENITH_DEFAULT_PREDICT_UP_THRESH for the full
+	 * rationale.
+	 *
+	 * Trigger:
+	 *   - tunables->predict_up_thresh > 0 (gate);
+	 *   - max_cap and policy->max non-zero (init guard);
+	 *   - pin_to_target false (don't fight an explicit pin tier);
+	 *   - eff_hispeed_freq configured and freq < eff_hispeed_freq;
+	 *   - peak_starve_count == 0 (don't double-fire with rescue
+	 *     / pre-arm during sustained-high regimes);
+	 *   - peak_rescue_until_ns expired (don't refire inside a
+	 *     rescue hold-down window);
+	 *   - util_history_count >= predict_up_window (warm-up gate);
+	 *   - delta_x256 = ((newest - oldest) * 256) / max_cap >=
+	 *     predict_up_thresh.
+	 *
+	 * Effect: lift freq to eff_hispeed_freq, set tp_path
+	 * "predict_up".  The hispeed tier (2b) sees freq already at
+	 * the floor and naturally treats the lift as a continuation;
+	 * the rescue tier (2c) sees freq lifted out of the starvation
+	 * window and resets peak_starve_count on its first sample.
+	 */
+	if (z_policy->tunables->predict_up_thresh &&
+	    max_cap && policy->max && !pin_to_target) {
+		unsigned int window = z_policy->tunables->predict_up_window;
+		unsigned int eff_hispeed = zenith_eff_hispeed_freq(z_policy);
+		u64 now_ns = ktime_get_ns();
+
+		if (window < ZENITH_PREDICT_UP_WINDOW_MIN)
+			window = ZENITH_PREDICT_UP_WINDOW_MIN;
+		else if (window > ZENITH_PREDICT_UP_WINDOW_MAX)
+			window = ZENITH_PREDICT_UP_WINDOW_MAX;
+
+		if (eff_hispeed && freq < eff_hispeed &&
+		    z_policy->peak_starve_count == 0 &&
+		    now_ns >= z_policy->peak_rescue_until_ns &&
+		    z_policy->util_history_count >= window) {
+			unsigned int idx = z_policy->util_history_idx;
+			unsigned int newest_idx =
+				(idx + ZENITH_PREDICT_UP_WINDOW_MAX - 1) %
+				ZENITH_PREDICT_UP_WINDOW_MAX;
+			unsigned int oldest_idx =
+				(idx + ZENITH_PREDICT_UP_WINDOW_MAX - window) %
+				ZENITH_PREDICT_UP_WINDOW_MAX;
+			unsigned long newest = z_policy->util_history[newest_idx];
+			unsigned long oldest = z_policy->util_history[oldest_idx];
+
+			if (newest > oldest) {
+				unsigned long delta = newest - oldest;
+				unsigned int delta_x256 = (unsigned int)
+					((delta * 256) / max_cap);
+
+				if (delta_x256 >=
+				    z_policy->tunables->predict_up_thresh) {
+					freq = eff_hispeed;
+					tp_path = "predict_up";
+				}
+			}
+		}
+	}
+
 	/* 2b. Hispeed floor — intermediate snap tier.
 	 *
 	 * When load has crossed hispeed_load but is still below
@@ -5954,6 +6113,25 @@ apply_uclamp_max_cap:
 		z_policy->load_var_ewma_x256 =
 			(z_policy->load_var_ewma_x256 * 7 + delta * 256) / 8;
 		z_policy->last_load_pct = tp_load_pct;
+	}
+
+	/* Push the current util sample into the predict_up trend ring
+	 * so the next eval can compare a window of samples and decide
+	 * whether to fire tier 2a'.  Done unconditionally (not gated
+	 * on tunables->predict_up_thresh) so flipping the tunable on
+	 * after a quiet period doesn't observe a ring of unwritten
+	 * zeroes.  util_history_count saturates at the ring size so
+	 * the value is a clean "are we warmed up" gate.
+	 */
+	{
+		unsigned int idx = z_policy->util_history_idx;
+
+		z_policy->util_history[idx] = util;
+		z_policy->util_history_idx =
+			(idx + 1) % ZENITH_PREDICT_UP_WINDOW_MAX;
+		if (z_policy->util_history_count <
+		    ZENITH_PREDICT_UP_WINDOW_MAX)
+			z_policy->util_history_count++;
 	}
 
 	return target_freq;
@@ -7449,6 +7627,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int peak_headroom_hold_ms;
 		unsigned int screen_on_bias_pct;
 		unsigned int input_boost_down_rate_mult_pct;
+		unsigned int predict_up_thresh;
+		unsigned int predict_up_window;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -7489,6 +7669,14 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_hold_ms = 25,
 			.screen_on_bias_pct = 0,
 			.input_boost_down_rate_mult_pct = 300,
+			/* Stage 4 / Patch A: PERFORMANCE wants eager
+			 * prediction.  Lower thresh (48 vs 64 default)
+			 * fires the lift on smaller rises; window stays
+			 * at the default (4) so the trend is computed
+			 * over the same warm-up period.
+			 */
+			.predict_up_thresh = 48,
+			.predict_up_window = 4,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -7538,6 +7726,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT,
 			.input_boost_down_rate_mult_pct =
 				ZENITH_DEFAULT_INPUT_BOOST_DOWN_RATE_MULT_PCT,
+			/* Stage 4 / Patch A: BALANCED matches the cold-
+			 * boot ZENITH_DEFAULT_* values exactly so a
+			 * plain compile produces the same behaviour as
+			 * an explicit echo balanced > profile.
+			 */
+			.predict_up_thresh =
+				ZENITH_DEFAULT_PREDICT_UP_THRESH,
+			.predict_up_window =
+				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -7585,6 +7782,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_hold_ms = 100,
 			.screen_on_bias_pct = 80,
 			.input_boost_down_rate_mult_pct = 150,
+			/* Stage 4 / Patch A: BATTERY disables prediction.
+			 * The pre-shift would burn frame-edge energy that
+			 * the rest of the BATTERY profile is specifically
+			 * trying to avoid, and the level-triggered
+			 * hispeed tier is good enough at this freq cap.
+			 */
+			.predict_up_thresh = 0,
+			.predict_up_window =
+				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -7635,6 +7841,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_hold_ms = 200,
 			.screen_on_bias_pct = 100,
 			.input_boost_down_rate_mult_pct = 100,
+			/* Stage 4 / Patch A: LEGACY disables prediction
+			 * (no Stage 4 features in the historical-
+			 * compatibility profile).
+			 */
+			.predict_up_thresh = 0,
+			.predict_up_window =
+				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -7686,6 +7899,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	t->screen_on_bias_pct	= p->screen_on_bias_pct;
 	t->input_boost_down_rate_mult_pct =
 		p->input_boost_down_rate_mult_pct;
+	WRITE_ONCE(t->predict_up_thresh, p->predict_up_thresh);
+	WRITE_ONCE(t->predict_up_window, p->predict_up_window);
 
 	/* Mirror input_boost_ms to the governor-wide cache used by the
 	 * input handler fast path.
@@ -10170,6 +10385,63 @@ static ssize_t peak_headroom_prearm_store(struct gov_attr_set *attr_set,
 static struct governor_attr peak_headroom_prearm =
 	__ATTR_RW(peak_headroom_prearm);
 
+/* predict_up_thresh sysfs knob.  Trend threshold for the
+ * predictive up-shift tier (2a') in 256ths of max_cap; see the
+ * block comment above ZENITH_DEFAULT_PREDICT_UP_THRESH for what
+ * the unit means and how the trigger is gated.  0 disables the
+ * tier, max ZENITH_PREDICT_UP_THRESH_MAX (255).
+ */
+static ssize_t predict_up_thresh_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->predict_up_thresh);
+}
+
+static ssize_t predict_up_thresh_store(struct gov_attr_set *attr_set,
+				       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_PREDICT_UP_THRESH_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->predict_up_thresh, val);
+	return count;
+}
+
+static struct governor_attr predict_up_thresh =
+	__ATTR_RW(predict_up_thresh);
+
+/* predict_up_window sysfs knob.  Window size for the predict_up
+ * trend ring, in samples.  Range
+ * [ZENITH_PREDICT_UP_WINDOW_MIN .. ZENITH_PREDICT_UP_WINDOW_MAX]
+ * (2..8).  Out-of-range values are rejected.  Larger windows
+ * smooth PELT noise out of the trend signal at the cost of one
+ * more tick of warm-up after a cold attach.
+ */
+static ssize_t predict_up_window_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->predict_up_window);
+}
+
+static ssize_t predict_up_window_store(struct gov_attr_set *attr_set,
+				       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val < ZENITH_PREDICT_UP_WINDOW_MIN ||
+	    val > ZENITH_PREDICT_UP_WINDOW_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->predict_up_window, val);
+	return count;
+}
+
+static struct governor_attr predict_up_window =
+	__ATTR_RW(predict_up_window);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -11313,6 +11585,8 @@ static struct attribute *zenith_attrs[] = {
 	&peak_headroom_jump_pct.attr,
 	&peak_headroom_hold_ms.attr,
 	&peak_headroom_prearm.attr,
+	&predict_up_thresh.attr,
+	&predict_up_window.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -11542,6 +11816,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS;
 	tunables->peak_headroom_prearm =
 		ZENITH_DEFAULT_PEAK_HEADROOM_PREARM;
+	tunables->predict_up_thresh	= ZENITH_DEFAULT_PREDICT_UP_THRESH;
+	tunables->predict_up_window	= ZENITH_DEFAULT_PREDICT_UP_WINDOW;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
