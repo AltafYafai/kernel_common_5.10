@@ -7433,6 +7433,22 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int wakeup_boost;
 		unsigned int down_threshold_adaptive;
 		unsigned int rate_limit_cluster_scale;
+		/* Stage 1 / Stage 2 additions, profile-driven so users
+		 * never have to touch them: scenario-detected profile
+		 * flips (camera/render -> PERFORMANCE, memstall ->
+		 * BATTERY, audio -> BALANCED, game-mode sustained ->
+		 * PERFORMANCE, thermal/screen-off/PSI -> ...) all
+		 * re-apply this table via zenith_apply_profile().
+		 */
+		unsigned int peak_headroom_rescue;
+		unsigned int peak_headroom_prearm;
+		unsigned int peak_headroom_starve_load_pct;
+		unsigned int peak_headroom_freq_floor_pct;
+		unsigned int peak_headroom_starve_streak;
+		unsigned int peak_headroom_jump_pct;
+		unsigned int peak_headroom_hold_ms;
+		unsigned int screen_on_bias_pct;
+		unsigned int input_boost_down_rate_mult_pct;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -7461,6 +7477,18 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.wakeup_boost = 1,
 			.down_threshold_adaptive = 10,
 			.rate_limit_cluster_scale = 1,
+			/* Stage 1/2: aggressive rescue, no bias on
+			 * screen, 3x down-rate during input boost.
+			 */
+			.peak_headroom_rescue = 1,
+			.peak_headroom_prearm = 1,
+			.peak_headroom_starve_load_pct = 88,
+			.peak_headroom_freq_floor_pct = 80,
+			.peak_headroom_starve_streak = 2,
+			.peak_headroom_jump_pct = 100,
+			.peak_headroom_hold_ms = 25,
+			.screen_on_bias_pct = 0,
+			.input_boost_down_rate_mult_pct = 300,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -7488,6 +7516,28 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.wakeup_boost = 1,
 			.down_threshold_adaptive = 5,
 			.rate_limit_cluster_scale = 1,
+			/* Stage 1/2: same compile-time defaults as
+			 * ZENITH_DEFAULT_*; this is the cold-boot
+			 * baseline.
+			 */
+			.peak_headroom_rescue =
+				ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE,
+			.peak_headroom_prearm =
+				ZENITH_DEFAULT_PEAK_HEADROOM_PREARM,
+			.peak_headroom_starve_load_pct =
+				ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_LOAD_PCT,
+			.peak_headroom_freq_floor_pct =
+				ZENITH_DEFAULT_PEAK_HEADROOM_FREQ_FLOOR_PCT,
+			.peak_headroom_starve_streak =
+				ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_STREAK,
+			.peak_headroom_jump_pct =
+				ZENITH_DEFAULT_PEAK_HEADROOM_JUMP_PCT,
+			.peak_headroom_hold_ms =
+				ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS,
+			.screen_on_bias_pct =
+				ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT,
+			.input_boost_down_rate_mult_pct =
+				ZENITH_DEFAULT_INPUT_BOOST_DOWN_RATE_MULT_PCT,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -7515,6 +7565,26 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.wakeup_boost = 1,
 			.down_threshold_adaptive = 0,
 			.rate_limit_cluster_scale = 1,
+			/* Stage 1/2: keep the rescue safety net (the
+			 * tester's "never reaches peak" complaint
+			 * matters even on BATTERY) but disable the
+			 * pre-arm and bound the rescue to 90%% of max
+			 * to save the peak-freq energy slope.  Looser
+			 * starve_streak (5) and longer hold (100ms)
+			 * stop rescue churn from waking the cluster
+			 * unnecessarily.  Light bias softening (80%%)
+			 * keeps screen-on responsive without paying
+			 * the BALANCED energy cost.
+			 */
+			.peak_headroom_rescue = 1,
+			.peak_headroom_prearm = 0,
+			.peak_headroom_starve_load_pct = 92,
+			.peak_headroom_freq_floor_pct = 90,
+			.peak_headroom_starve_streak = 5,
+			.peak_headroom_jump_pct = 90,
+			.peak_headroom_hold_ms = 100,
+			.screen_on_bias_pct = 80,
+			.input_boost_down_rate_mult_pct = 150,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -7542,6 +7612,29 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.wakeup_boost = 1,
 			.down_threshold_adaptive = 0,
 			.rate_limit_cluster_scale = 1,
+			/* Stage 1/2: LEGACY restores pre-Stage-1
+			 * behaviour wholesale.  Rescue and pre-arm
+			 * disabled (rescue gate off cancels the entire
+			 * peak-headroom path; pre-arm follows for
+			 * defence in depth).  screen_on_bias_pct = 100
+			 * disables the bias softening (effective bias
+			 * == raw bias).  input_boost_down_rate_mult_-
+			 * pct = 100 disables the down-rate extension
+			 * (effective down_delay == raw down_delay
+			 * during boost).  The diagnostic /
+			 * sub-rescue knobs are populated with the
+			 * loosest values for forward compatibility
+			 * (in case rescue is turned back on by sysfs).
+			 */
+			.peak_headroom_rescue = 0,
+			.peak_headroom_prearm = 0,
+			.peak_headroom_starve_load_pct = 95,
+			.peak_headroom_freq_floor_pct = 95,
+			.peak_headroom_starve_streak = 16,
+			.peak_headroom_jump_pct = 100,
+			.peak_headroom_hold_ms = 200,
+			.screen_on_bias_pct = 100,
+			.input_boost_down_rate_mult_pct = 100,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -7580,6 +7673,19 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	t->wakeup_boost		= p->wakeup_boost;
 	t->down_threshold_adaptive = p->down_threshold_adaptive;
 	t->rate_limit_cluster_scale = p->rate_limit_cluster_scale;
+	t->peak_headroom_rescue	= p->peak_headroom_rescue;
+	t->peak_headroom_prearm	= p->peak_headroom_prearm;
+	t->peak_headroom_starve_load_pct =
+		p->peak_headroom_starve_load_pct;
+	t->peak_headroom_freq_floor_pct =
+		p->peak_headroom_freq_floor_pct;
+	t->peak_headroom_starve_streak =
+		p->peak_headroom_starve_streak;
+	t->peak_headroom_jump_pct = p->peak_headroom_jump_pct;
+	t->peak_headroom_hold_ms = p->peak_headroom_hold_ms;
+	t->screen_on_bias_pct	= p->screen_on_bias_pct;
+	t->input_boost_down_rate_mult_pct =
+		p->input_boost_down_rate_mult_pct;
 
 	/* Mirror input_boost_ms to the governor-wide cache used by the
 	 * input handler fast path.
