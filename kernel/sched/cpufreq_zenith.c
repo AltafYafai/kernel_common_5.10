@@ -664,7 +664,26 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  */
 #define ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE	0
 #define ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY	1
-#define ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT	80	/* 0 = no cap, pin to policy->max */
+/* ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT controls the ceiling of the
+ * full-pin phase of an active input boost: the first input_boost_ms
+ * after a key / touch event.  0 means "no cap" -- pin to
+ * policy->max for the duration of the full-pin phase, then decay
+ * across input_boost_decay_ms back to policy->min.  Tester reports
+ * of "device runs cold and never reaches peak frequency under
+ * sustained interactive load (gameplay touch, fast scrolling)" trace
+ * back to a non-zero cap eating the top of the cluster's range
+ * during the very window where the user is actively asking for it.
+ *
+ * Default 0 (no cap, pin to policy->max).  Userspace setpoints, the
+ * BALANCED / BATTERY profiles, and per-policy local overrides via
+ * profile_values can still cap the ceiling lower for power-sensitive
+ * configurations.  The full-pin phase is short (default 80 ms) and
+ * the trailing decay phase is shorter still (default 30 ms), so
+ * "pin to policy->max on every input event" is bounded in time and
+ * downstream caps (uclamp_max, audio_cap, em_cap, light_cap,
+ * thermal_state) all apply on top.
+ */
+#define ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT	0
 #define ZENITH_DEFAULT_EFFICIENT_FREQ		0
 
 /* eff_bin_hyst_pct (default 0, off):
