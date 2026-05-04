@@ -734,6 +734,31 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_INPUT_BOOST_MS		80
 #define ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS	30
 
+/* input_boost_touchdown_extra_ms (default 50, [Stage 4 / Patch C]):
+ *
+ * Touchdown vs coordinate-stream differentiation.  An EV_KEY/
+ * BTN_TOUCH press (touchdown) is the user's "I just started
+ * interacting" signal: latency from touchdown to first frame is
+ * the visible feel of the device.  An EV_ABS coordinate stream
+ * mid-gesture is "I'm already interacting" -- the cluster should
+ * already be on a high tier from the touchdown that started the
+ * gesture, so a per-coordinate widen-the-window effort is wasted
+ * energy.
+ *
+ * This knob extends the input-boost active window by an extra
+ * input_boost_touchdown_extra_ms milliseconds *only* on the
+ * touchdown event.  Coordinate-stream EV_ABS events use the
+ * unmodified input_boost_ms window plus the existing quiet-period
+ * extension (see ZENITH_INPUT_QUIET_BOOST_MULT_PCT).
+ *
+ * 0 disables the touchdown extra entirely (legacy behaviour:
+ * touchdown gets the same window as a coordinate event).  Capped
+ * at ZENITH_INPUT_BOOST_TOUCHDOWN_EXTRA_MS_MAX so a runaway echo
+ * can't accidentally pin the cluster up for seconds.
+ */
+#define ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS	50
+#define ZENITH_INPUT_BOOST_TOUCHDOWN_EXTRA_MS_MAX	500
+
 /* input_boost_decay_curve (default 0, linear):
  *
  * The input-boost decay path lowers a synthetic floor from the full
@@ -2131,6 +2156,16 @@ struct zenith_tunables {
 	unsigned int		input_boost_ms;
 	unsigned int		input_boost_decay_ms;
 
+	/* Touchdown-vs-coordinate-stream extra window for the input
+	 * boost (Patch C).  Range
+	 * 0..ZENITH_INPUT_BOOST_TOUCHDOWN_EXTRA_MS_MAX.  See
+	 * ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS for semantics.
+	 * Mirrored to zenith_input_boost_touchdown_extra_ms_cache on
+	 * store and on profile apply, read by zenith_input_event() on
+	 * the EV_KEY/BTN_TOUCH press path.
+	 */
+	unsigned int		input_boost_touchdown_extra_ms;
+
 	/* Shape of the input_boost decay-phase floor.  0 = linear
 	 * (legacy), 1 = cubic ease-in (floor holds high, drops fast at
 	 * the tail).  See ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE for
@@ -2529,6 +2564,16 @@ void zenith_set_drm_vblank_us(unsigned int us)
 }
 EXPORT_SYMBOL_GPL(zenith_set_drm_vblank_us);
 static unsigned int zenith_input_boost_active_ms = ZENITH_DEFAULT_INPUT_BOOST_MS;
+
+/* Governor-wide cache for the touchdown-extra knob (Patch C).
+ * Mirrored from t->input_boost_touchdown_extra_ms by sysfs store
+ * and zenith_apply_profile().  Read by zenith_input_event() on
+ * the EV_KEY/BTN_TOUCH down path.  Stored as plain unsigned int
+ * with READ_ONCE/WRITE_ONCE; the racy reader doesn't care if it
+ * sees a stale value across the store window.
+ */
+static unsigned int zenith_input_boost_touchdown_extra_ms_cache =
+	ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS;
 
 /* Monotonically-increasing global count of qualifying input events seen
  * by zenith_input_event. Auto-tune workers sample this periodically and
@@ -7748,6 +7793,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int predict_up_window;
 		unsigned int render_floor_pct;
 		unsigned int render_floor_min_runtime_ms;
+		unsigned int input_boost_touchdown_extra_ms;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -7804,6 +7850,12 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.render_floor_pct = 80,
 			.render_floor_min_runtime_ms = 20,
+			/* Stage 4 / Patch C: PERFORMANCE adds an extra
+			 * 80 ms on touchdown -- the user-perceived
+			 * latency from finger-down to first frame is
+			 * what makes a phone "feel snappy".
+			 */
+			.input_boost_touchdown_extra_ms = 80,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -7869,6 +7921,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_RENDER_FLOOR_PCT,
 			.render_floor_min_runtime_ms =
 				ZENITH_DEFAULT_RENDER_FLOOR_MIN_RUNTIME_MS,
+			/* Stage 4 / Patch C: BALANCED matches cold-boot
+			 * default (50 ms touchdown extra).
+			 */
+			.input_boost_touchdown_extra_ms =
+				ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -7934,6 +7991,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.render_floor_pct = 50,
 			.render_floor_min_runtime_ms = 100,
+			/* Stage 4 / Patch C: BATTERY drops the touchdown
+			 * extra to 30 ms.  Touchdown latency still gets
+			 * a small bonus, but the energy cost of an
+			 * 80 ms extra-pin tail is too high for the
+			 * battery profile.
+			 */
+			.input_boost_touchdown_extra_ms = 30,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -8000,6 +8064,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.render_floor_pct = 0,
 			.render_floor_min_runtime_ms = 0,
+			/* Stage 4 / Patch C: LEGACY disables the
+			 * touchdown extra (legacy boost cadence
+			 * unchanged).
+			 */
+			.input_boost_touchdown_extra_ms = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -8056,11 +8125,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	t->render_floor_pct	= p->render_floor_pct;
 	WRITE_ONCE(t->render_floor_min_runtime_ms,
 		   p->render_floor_min_runtime_ms);
+	WRITE_ONCE(t->input_boost_touchdown_extra_ms,
+		   p->input_boost_touchdown_extra_ms);
 
-	/* Mirror input_boost_ms to the governor-wide cache used by the
-	 * input handler fast path.
+	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
+	 * the governor-wide caches used by the input handler fast
+	 * path so a profile flip is picked up on the next event.
 	 */
 	WRITE_ONCE(zenith_input_boost_active_ms, t->input_boost_ms);
+	WRITE_ONCE(zenith_input_boost_touchdown_extra_ms_cache,
+		   t->input_boost_touchdown_extra_ms);
 }
 
 /* early_param("zenith.profile", ...) — accepts one of the canonical
@@ -9163,6 +9237,8 @@ static ssize_t profile_values_show(struct gov_attr_set *attr_set, char *buf)
 {
 	struct zenith_tunables scratch;
 	u32 saved_active_ms = READ_ONCE(zenith_input_boost_active_ms);
+	u32 saved_touchdown_extra_ms =
+		READ_ONCE(zenith_input_boost_touchdown_extra_ms_cache);
 	ssize_t len = 0;
 	int i;
 	static const struct {
@@ -9218,11 +9294,13 @@ static ssize_t profile_values_show(struct gov_attr_set *attr_set, char *buf)
 				 scratch.rate_limit_cluster_scale);
 	}
 
-	/* Restore the boost-active mirror that zenith_apply_profile()
-	 * stamps on every call.  Use WRITE_ONCE to match the writer
-	 * semantics elsewhere in the file.
+	/* Restore the boost-active and touchdown-extra mirrors that
+	 * zenith_apply_profile() stamps on every call.  Use WRITE_ONCE
+	 * to match the writer semantics elsewhere in the file.
 	 */
 	WRITE_ONCE(zenith_input_boost_active_ms, saved_active_ms);
+	WRITE_ONCE(zenith_input_boost_touchdown_extra_ms_cache,
+		   saved_touchdown_extra_ms);
 	return len;
 }
 static struct governor_attr profile_values = __ATTR_RO(profile_values);
@@ -9770,6 +9848,43 @@ static ssize_t input_boost_decay_ms_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr input_boost_decay_ms =
 	__ATTR_RW(input_boost_decay_ms);
+
+/* input_boost_touchdown_extra_ms sysfs knob (Patch C).
+ *
+ * Extends the input-boost active window by an extra
+ * input_boost_touchdown_extra_ms ms on EV_KEY/BTN_TOUCH press.
+ * 0 disables the touchdown extra.  Capped at
+ * ZENITH_INPUT_BOOST_TOUCHDOWN_EXTRA_MS_MAX so a runaway echo
+ * can't pin the cluster up indefinitely.
+ *
+ * Mirrors the stored value to
+ * zenith_input_boost_touchdown_extra_ms_cache so the input fast
+ * path doesn't have to walk the tunables list.
+ */
+static ssize_t
+input_boost_touchdown_extra_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->input_boost_touchdown_extra_ms);
+}
+
+static ssize_t
+input_boost_touchdown_extra_ms_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_INPUT_BOOST_TOUCHDOWN_EXTRA_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->input_boost_touchdown_extra_ms, val);
+	WRITE_ONCE(zenith_input_boost_touchdown_extra_ms_cache, val);
+	return count;
+}
+
+static struct governor_attr input_boost_touchdown_extra_ms =
+	__ATTR_RW(input_boost_touchdown_extra_ms);
 
 /* input_boost_decay_curve sysfs knob.  0 = linear (legacy),
  * 1 = cubic ease-in.  See ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE.
@@ -11867,6 +11982,7 @@ static struct attribute *zenith_attrs[] = {
 	&rate_limit_cluster_scale.attr,
 	&input_boost_ms.attr,
 	&input_boost_decay_ms.attr,
+	&input_boost_touchdown_extra_ms.attr,
 	&input_boost_decay_curve.attr,
 	&input_boost_big_only.attr,
 	&input_boost_cap_pct.attr,
@@ -12105,6 +12221,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->rate_limit_cluster_scale = ZENITH_DEFAULT_RATE_LIMIT_CLUSTER_SCALE;
 	tunables->input_boost_ms	= ZENITH_DEFAULT_INPUT_BOOST_MS;
 	tunables->input_boost_decay_ms	= ZENITH_DEFAULT_INPUT_BOOST_DECAY_MS;
+	tunables->input_boost_touchdown_extra_ms =
+		ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS;
 	tunables->input_boost_decay_curve = ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE;
 	tunables->input_boost_big_only	= ZENITH_DEFAULT_INPUT_BOOST_BIG_ONLY;
 	tunables->input_boost_cap_pct	= ZENITH_DEFAULT_INPUT_BOOST_CAP_PCT;
@@ -12149,6 +12267,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->frame_budget_us_auto	= ZENITH_DEFAULT_FRAME_BUDGET_US_AUTO;
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
+	WRITE_ONCE(zenith_input_boost_touchdown_extra_ms_cache,
+		   ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS);
 
 	/* Sync the audio_aware / render_aware / game_auto / auto_tune_v3
 	 * static keys against their default scalars.  See the comment
@@ -12446,6 +12566,26 @@ static void zenith_input_event(struct input_handle *handle, unsigned int type,
 		if (extended > effective_ms)
 			effective_ms = extended;
 		was_quiet = true;
+	}
+
+	/* Touchdown detection (Patch C).  Only the EV_KEY/BTN_TOUCH
+	 * press counts as a touchdown.  Coordinate-stream EV_ABS and
+	 * BTN_TOUCH release (value == 0) take the unmodified path.
+	 * The extra is added on top of any quiet-period extension --
+	 * a touchdown after a long quiet gap gets both bonuses, which
+	 * is exactly what the user feels (cold start of a gesture).
+	 */
+	if (type == EV_KEY && code == BTN_TOUCH && value == 1) {
+		unsigned int extra =
+			READ_ONCE(zenith_input_boost_touchdown_extra_ms_cache);
+
+		if (extra) {
+			u64 widened64 = (u64)effective_ms + extra;
+
+			if (widened64 > U32_MAX)
+				widened64 = U32_MAX;
+			effective_ms = (unsigned int)widened64;
+		}
 	}
 
 	deadline = now_ns + (u64)effective_ms * NSEC_PER_MSEC;
