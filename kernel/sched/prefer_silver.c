@@ -57,11 +57,26 @@ static atomic_t ps_boot_miss       = ATOMIC_INIT(0);
 
 /* ------------------------------------------------------------------ *
  * Cluster state
+ *
+ * On a 2-cluster (true big.LITTLE) topology ps_big_mask covers every
+ * CPU not in ps_silver_mask, exactly mirroring the previous "anything
+ * non-silver" semantics.  On a 3-cluster topology (1+3+4, 1+2+2+3,
+ * etc.) ps_big_mask covers the BIG / mid cluster only, excluding the
+ * single PRIME core; this prevents an idle PRIME from accidentally
+ * winning the gold-fallback comparator in find_best_silver_cpu() and
+ * pulling a light wake-up onto the cluster that is supposed to stay
+ * parked for the heavy / latency-sensitive workloads it was sized for.
+ *
+ * If detect_cluster_capacity() cannot resolve a BIG cluster (e.g.,
+ * exotic 4+-cluster designs) ps_big_mask is left empty; the fallback
+ * path then naturally degrades to the existing miss path -- never
+ * worse than current behavior.
  * ------------------------------------------------------------------ */
 static unsigned long ps_silver_cap;
 static unsigned long ps_gold_cap;
 static cpumask_t     ps_silver_mask;
 static cpumask_t     ps_silver_online;
+static cpumask_t     ps_big_mask;
 static atomic_t      ps_detected = ATOMIC_INIT(0);
 
 static void update_silver_online(void)
@@ -77,11 +92,14 @@ static inline bool cpu_is_silver(int cpu)
 static bool detect_cluster_capacity(void)
 {
 	cpumask_t tmp_silver_mask;
+	cpumask_t tmp_big_mask;
 	unsigned long min_cap    = ULONG_MAX;
 	unsigned long second_cap = ULONG_MAX;
+	unsigned long max_cap    = 0;
 	int cpu;
 
 	cpumask_clear(&tmp_silver_mask);
+	cpumask_clear(&tmp_big_mask);
 
 #ifdef CONFIG_SCHED_WALT
 	if (!list_empty(&cluster_head)) {
@@ -102,6 +120,8 @@ static bool detect_cluster_capacity(void)
 				continue;
 
 			cap = capacity_orig_of(first_cpu);
+			if (cap > max_cap)
+				max_cap = cap;
 
 			if (cap < min_cap) {
 				if (min_cap != ULONG_MAX)
@@ -121,6 +141,8 @@ static bool detect_cluster_capacity(void)
 		unsigned long cap = capacity_orig_of(cpu);
 		if (cap < min_cap)
 			min_cap = cap;
+		if (cap > max_cap)
+			max_cap = cap;
 	}
 	for_each_possible_cpu(cpu) {
 		unsigned long cap = capacity_orig_of(cpu);
@@ -141,9 +163,49 @@ validate:
 	if (cpumask_weight(&tmp_silver_mask) >= num_possible_cpus())
 		return false;
 
+	/*
+	 * Resolve the BIG cluster.  Two cases:
+	 *
+	 *   - 3+-cluster (PRIME exists at top): max_cap is meaningfully
+	 *     above second_cap.  BIG = CPUs whose capacity_orig_of() lies
+	 *     within +/-5% of second_cap; this naturally excludes both
+	 *     silver (covered by the 115% silver gate above) and prime
+	 *     (which is at max_cap, well beyond +5% of second_cap).
+	 *   - 2-cluster (true big.LITTLE): max_cap == second_cap (or no
+	 *     usable second_cap was found).  BIG = every non-silver CPU,
+	 *     identical to the previous "cpu_online_mask minus silver"
+	 *     fallback comparator.
+	 *
+	 * Either way, ps_big_mask is the comparator find_best_silver_cpu()
+	 * uses to evaluate the gold-fallback path.  Leaving it empty on
+	 * detection failure is safe: the fallback then resolves to the
+	 * existing miss path rather than mis-routing onto prime.
+	 */
+	if (second_cap != ULONG_MAX &&
+	    max_cap > (second_cap * 105 / 100)) {
+		unsigned long big_lo = (second_cap * 95)  / 100;
+		unsigned long big_hi = (second_cap * 105) / 100;
+
+		for_each_possible_cpu(cpu) {
+			unsigned long cap;
+
+			if (cpumask_test_cpu(cpu, &tmp_silver_mask))
+				continue;
+			cap = capacity_orig_of(cpu);
+			if (cap >= big_lo && cap <= big_hi)
+				cpumask_set_cpu(cpu, &tmp_big_mask);
+		}
+	} else {
+		for_each_possible_cpu(cpu) {
+			if (!cpumask_test_cpu(cpu, &tmp_silver_mask))
+				cpumask_set_cpu(cpu, &tmp_big_mask);
+		}
+	}
+
 	ps_silver_cap = min_cap;
 	ps_gold_cap   = (second_cap == ULONG_MAX) ? (min_cap * 2) : second_cap;
 	cpumask_copy(&ps_silver_mask, &tmp_silver_mask);
+	cpumask_copy(&ps_big_mask,    &tmp_big_mask);
 	update_silver_online();
 
 	if (cpumask_empty(&ps_silver_online))
@@ -177,9 +239,10 @@ static bool ps_ensure_detected(void)
 	smp_wmb();
 	atomic_set(&ps_detected, 1);
 
-	pr_info("prefer_silver v7.9: ready cap=%lu/%lu mask=%*pbl online=%*pbl boot_miss=%d\n",
+	pr_info("prefer_silver v7.9: ready cap=%lu/%lu silver=%*pbl big=%*pbl online=%*pbl boot_miss=%d\n",
 		ps_silver_cap, ps_gold_cap,
 		cpumask_pr_args(&ps_silver_mask),
+		cpumask_pr_args(&ps_big_mask),
 		cpumask_pr_args(&ps_silver_online),
 		atomic_read(&ps_boot_miss));
 
@@ -394,10 +457,32 @@ retry:
 
 	if (best_cpu_fallback >= 0 && !aff_blocked) {
 		unsigned long g_util;
+		cpumask_t big_online;
 
-		for_each_cpu(i, cpu_online_mask) {
-			if (cpu_is_silver(i))
-				continue;
+		/*
+		 * Compare the silver fallback candidate against the BIG
+		 * cluster only.  On 3+-cluster topologies (1+3+4 et al)
+		 * this excludes PRIME from the comparator -- otherwise an
+		 * idle PRIME core could win the comparison and pull a
+		 * light wake-up onto the cluster the SoC vendor sized
+		 * for heavy / latency-sensitive workloads.  On 2-cluster
+		 * (true big.LITTLE) ps_big_mask covers every non-silver
+		 * CPU, so this loop visits exactly the same set as the
+		 * previous "cpu_online_mask minus silver" walk.
+		 *
+		 * If detect_cluster_capacity() failed to populate
+		 * ps_big_mask (e.g., exotic 4+-cluster designs), the
+		 * intersection below is empty and min_gold_util stays at
+		 * ULONG_MAX.  The (min_gold_util == ULONG_MAX) branch in
+		 * the gold-vs-silver decision below treats that as
+		 * "accept the silver fallback unconditionally", which is
+		 * also exactly today's behavior on a SoC where every
+		 * non-silver CPU is offline -- so detection failure is
+		 * never worse than the pre-patch path.
+		 */
+		cpumask_and(&big_online, &ps_big_mask, cpu_online_mask);
+
+		for_each_cpu(i, &big_online) {
 			if (!cpumask_test_cpu(i, p->cpus_ptr))
 				continue;
 			g_util = ps_cpu_util(i);
@@ -470,6 +555,18 @@ static int ps_stats_show(struct seq_file *m, void *v)
 	seq_puts(m, "silver_mask:       ");
 	first = true;
 	for_each_cpu(cpu, &ps_silver_mask) {
+		if (!first)
+			seq_puts(m, ",");
+		seq_printf(m, "%d", cpu);
+		first = false;
+	}
+	if (first)
+		seq_puts(m, "(none)");
+	seq_puts(m, "\n");
+
+	seq_puts(m, "big_mask:          ");
+	first = true;
+	for_each_cpu(cpu, &ps_big_mask) {
 		if (!first)
 			seq_puts(m, ",");
 		seq_printf(m, "%d", cpu);
@@ -585,6 +682,7 @@ int __init prefer_silver_init(void)
 
 	cpumask_clear(&ps_silver_mask);
 	cpumask_clear(&ps_silver_online);
+	cpumask_clear(&ps_big_mask);
 
 	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
 					"sched/prefer_silver:online",
