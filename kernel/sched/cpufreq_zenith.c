@@ -1485,6 +1485,28 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_HYSTERESIS_WINDOWS_MAX	8
 #define ZENITH_AT_COOLDOWN_WINDOWS_MAX		8
 
+/* Variance-promotion threshold (load_var_ewma_x256, units of 1/256
+ * of the squared-deviation EWMA reported by the V1 classifier).
+ * When the ewma is at-or-above this value AND the V2 state machine
+ * is currently in LATENCY, V2 promotes to SUSTAINED_PERF on the
+ * variance signal alone (reason=variance) -- the rationale is that
+ * an oscillating workload spends too much time crossing thresholds
+ * for LATENCY's per-tick reaction; SUSTAINED_PERF holds the freq
+ * up across the bursts.
+ *
+ * 768 was chosen empirically as a good knee for phone workloads:
+ * background music (steady) sits ~200, app launch / scroll
+ * (medium burst) ~500, camera viewfinder / 3D ~900-1500.  Lower
+ * values promote eagerly and risk holding sustained_perf longer
+ * than necessary; higher values delay promotion and risk under-
+ * frequency on bursty workloads.
+ *
+ * Tunable from userspace via auto_tune_v2_var_promote_thresh sysfs;
+ * 0 disables variance-driven promotion entirely.
+ */
+#define ZENITH_DEFAULT_AT_V2_VAR_PROMOTE_THRESH	768
+#define ZENITH_AT_V2_VAR_PROMOTE_THRESH_MAX	65535U
+
 /* auto_tune_v3 (default 2, apply):
  *
  * Self-calibrating layer on top of V2.  Reads the per-policy at_log
@@ -3020,6 +3042,11 @@ struct zenith_tunables {
 	unsigned int		auto_tune_v2;
 	unsigned int		auto_tune_hysteresis_windows;
 	unsigned int		auto_tune_cooldown_windows;
+	/* See ZENITH_DEFAULT_AT_V2_VAR_PROMOTE_THRESH.  load_var_ewma_x256
+	 * threshold above which V2 promotes LATENCY to SUSTAINED_PERF on
+	 * the variance signal alone.  0 disables variance-driven promotion.
+	 */
+	unsigned int		auto_tune_v2_var_promote_thresh;
 
 	/* See ZENITH_DEFAULT_AUTO_TUNE_V3 comment block.  0/1/2 master
 	 * gate for V3 self-calibration; the *_store callback also
@@ -10866,7 +10893,9 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		target = zenith_at_profile_for_state(z_policy, state);
 		reason = ZENITH_AT_REASON_FRAME;
 	} else if (t->auto_tune_v2 &&
-		   z_policy->load_var_ewma_x256 >= 768 &&
+		   t->auto_tune_v2_var_promote_thresh &&
+		   z_policy->load_var_ewma_x256 >=
+				t->auto_tune_v2_var_promote_thresh &&
 		   state == ZENITH_AT_STATE_LATENCY) {
 		state = ZENITH_AT_STATE_SUSTAINED_PERF;
 		target = zenith_at_profile_for_state(z_policy, state);
@@ -11190,6 +11219,30 @@ static ssize_t auto_tune_cooldown_windows_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr auto_tune_cooldown_windows =
 	__ATTR_RW(auto_tune_cooldown_windows);
+
+static ssize_t auto_tune_v2_var_promote_thresh_show(struct gov_attr_set *attr_set,
+						    char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_tune_v2_var_promote_thresh);
+}
+
+static ssize_t auto_tune_v2_var_promote_thresh_store(struct gov_attr_set *attr_set,
+						     const char *buf,
+						     size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_AT_V2_VAR_PROMOTE_THRESH_MAX)
+		return -EINVAL;
+	t->auto_tune_v2_var_promote_thresh = val;
+	return count;
+}
+
+static struct governor_attr auto_tune_v2_var_promote_thresh =
+	__ATTR_RW(auto_tune_v2_var_promote_thresh);
 
 /* auto_tune_v3 sysfs knob (RW).  See ZENITH_DEFAULT_AUTO_TUNE_V3
  * comment block for full semantics.  Three accepted values:
@@ -15173,6 +15226,7 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_v2_tiers.attr,
 	&auto_tune_hysteresis_windows.attr,
 	&auto_tune_cooldown_windows.attr,
+	&auto_tune_v2_var_promote_thresh.attr,
 	&auto_tune_v3.attr,
 	&auto_tune_v3_interval_ms.attr,
 	&auto_tune_v3_state.attr,
@@ -15452,6 +15506,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_AT_HYSTERESIS_WINDOWS;
 	tunables->auto_tune_cooldown_windows =
 		ZENITH_DEFAULT_AT_COOLDOWN_WINDOWS;
+	tunables->auto_tune_v2_var_promote_thresh =
+		ZENITH_DEFAULT_AT_V2_VAR_PROMOTE_THRESH;
 	tunables->auto_tune_v3 = ZENITH_DEFAULT_AUTO_TUNE_V3;
 	tunables->auto_tune_v3_interval_ms =
 		ZENITH_DEFAULT_AT_V3_INTERVAL_MS;
