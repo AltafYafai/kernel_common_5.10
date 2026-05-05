@@ -3424,6 +3424,45 @@ void zenith_set_drm_vblank_us(unsigned int us)
 }
 EXPORT_SYMBOL_GPL(zenith_set_drm_vblank_us);
 
+/* Audit fix K4: v4l2 fd-open hook callbacks.  Strong symbols that
+ * override the weak stubs in drivers/media/v4l2-core/v4l2-dev.c.
+ *
+ * Both callbacks are called outside of v4l2's videodev_lock so they
+ * can run on any context cheaply (just an atomic_inc / atomic_dec).
+ * No filtering by vfl_type or v4l2_dev capabilities -- any
+ * /dev/video* open counts.  See the zenith_v4l2_active_fds comment
+ * for the false-positive analysis (short answer: harmless, all
+ * v4l2 capture workloads benefit from LATENCY).
+ *
+ * Exported so the v4l2 driver (which is built from a different
+ * compilation unit) can resolve them via weak-symbol override.  No
+ * other in-kernel caller is expected; the EXPORT_SYMBOL_GPL is for
+ * the link-time relaxation, not for module use.
+ */
+/* Opaque forward declaration: zenith does not look inside vdev, just
+ * passes it through.  Avoids dragging linux/videodev2.h into a
+ * cpufreq governor TU.
+ */
+struct video_device;
+
+void zenith_v4l2_open_notify(struct video_device *vdev)
+{
+	(void)vdev;	/* unused; we don't filter by vfl_type yet */
+	atomic_inc(&zenith_v4l2_active_fds);
+}
+EXPORT_SYMBOL_GPL(zenith_v4l2_open_notify);
+
+void zenith_v4l2_release_notify(struct video_device *vdev)
+{
+	int v;
+
+	(void)vdev;
+	v = atomic_dec_return(&zenith_v4l2_active_fds);
+	if (unlikely(v < 0))
+		atomic_set(&zenith_v4l2_active_fds, 0);
+}
+EXPORT_SYMBOL_GPL(zenith_v4l2_release_notify);
+
 /* Governor-wide caches for the frame-overrun knobs (Patch K3).
  * The producer (zenith_drm_vblank_event()) runs from the display
  * driver context with no struct zenith_policy in scope; if the
@@ -3524,6 +3563,31 @@ static unsigned int zenith_input_boost_touchdown_extra_ms_cache =
  * subtract their last-observed value to get an events-per-window rate.
  */
 static atomic64_t zenith_auto_input_events = ATOMIC64_INIT(0);
+
+/* Audit fix K4: deterministic camera detection via v4l2 fd-open hook.
+ *
+ * The runqueue-snapshot comm-walk in zenith_policy_has_camera() is a
+ * probabilistic signal -- camera HALs that sleep most of the time
+ * (cameraserver, camerahalserver) are rarely on-CPU when the walk
+ * runs, so the cache fills with `false` and the camera flag never
+ * fires.  K4 wires zenith into v4l2-core via two weak-symbol notify
+ * callbacks (drivers/media/v4l2-core/v4l2-dev.c).  Every successful
+ * v4l2 fd open bumps this refcount; release decrements.  Any nonzero
+ * value is treated by the auto_tune scenario block as "camera active"
+ * regardless of the comm-walk result.
+ *
+ * Counter is signed so a tearing race during release that would
+ * otherwise underflow to UINT_MAX is observable as a negative value
+ * during diagnosis instead of silently looking like a stuck camera.
+ * The notify functions clamp to >= 0 on every store.
+ *
+ * False-positive surface: any process that opens /dev/videoN
+ * (USB webcam, screen recorder sink, software encoder using v4l2
+ * codec node) is also accounted.  All such workloads are similarly
+ * media-bandwidth-bound and benefit from the LATENCY state, so the
+ * "false positive" actually does the right thing.
+ */
+static atomic_t zenith_v4l2_active_fds = ATOMIC_INIT(0);
 #define ZENITH_AUTO_TUNE_PERIOD_MS	10000	/* classify every 10s  */
 
 /* Audit fix F1: scenario-active classifier window.
@@ -5579,6 +5643,19 @@ static bool zenith_policy_has_camera(struct zenith_policy *z_policy)
 	struct cpufreq_policy *policy = z_policy->policy;
 	unsigned int cpu;
 	bool match = false;
+
+	/* Audit fix K4: deterministic short-circuit.  Any open v4l2 fd
+	 * means camera (or webcam, or v4l2 codec node, or screen
+	 * recorder sink) is active; treat as match without doing the
+	 * runqueue walk at all.  Bypasses the comm-walk cache too --
+	 * the v4l2 hook updates atomically on every open / release so
+	 * the value is always fresh, no TTL needed.
+	 */
+	if (atomic_read(&zenith_v4l2_active_fds) > 0) {
+		z_policy->camera_auto_match = true;
+		z_policy->camera_cache_stamp_ns = now;
+		return true;
+	}
 
 	if (z_policy->camera_cache_stamp_ns &&
 	    now - z_policy->camera_cache_stamp_ns < ZENITH_CAMERA_CACHE_TTL_NS)
