@@ -1976,6 +1976,23 @@ bool drm_handle_vblank(struct drm_device *dev, unsigned int pipe)
 
 	spin_unlock_irqrestore(&dev->event_lock, irqflags);
 
+	/* Notify the zenith cpufreq governor of this vblank tick.  K3
+	 * frame-overrun rescue compares the gap between consecutive
+	 * ticks against the panel period published by
+	 * zenith_set_drm_vblank_us() and lifts a recovery floor when
+	 * the gap exceeds the slack budget.  Stubs out via the
+	 * linux/cpufreq_zenith.h header when zenith is not built;
+	 * otherwise the call is lock-free and safe from any context
+	 * (single atomic_set, no allocator, no sleep).
+	 *
+	 * On multi-CRTC devices every pipe's vblank funnels through
+	 * here, so the governor sees ticks at the union frequency of
+	 * all active displays; the overrun detection effectively
+	 * tracks the fastest active panel.  Phones with one panel
+	 * (the primary K3 target) observe exactly one tick per vblank.
+	 */
+	zenith_drm_vblank_event();
+
 	if (disable_irq)
 		vblank_disable_fn(&vblank->disable_timer);
 
