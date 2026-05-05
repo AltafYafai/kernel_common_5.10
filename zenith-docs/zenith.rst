@@ -1189,11 +1189,39 @@ Per-profile defaults:
    frame_overrun_window_ms    60    50   0     0  (ms)
    frame_overrun_floor_pct    90    80   0     0  (%)
 
-**Wiring requirement:** ``zenith_drm_vblank_event()`` is exported
-but no panel driver in this tree calls it.  Until a follow-up
-patch in ``drivers/gpu/drm/...`` wires it (typically next to the
-existing ``drm_vblank_handle_event()`` or vendor equivalent) K3 is
-a no-op -- same fail-safe shape as ``zenith_set_drm_vblank_us()``.
+**Wiring (in-tree, V4):** ``zenith_drm_vblank_event()`` is wired
+from the generic drm core in ``drivers/gpu/drm/drm_vblank.c``,
+inside ``drm_handle_vblank()`` (the function both legacy and
+KMS vblank IRQs funnel through).  Every in-tree drm driver
+inherits the producer hook for free; no per-driver wiring is
+required.  Out-of-tree vendor display stacks that call into a
+custom vblank-IRQ path (rather than ``drm_handle_vblank()``)
+should call ``zenith_drm_vblank_event()`` from there to enable
+K3.  The header stub is a ``static inline`` no-op when
+``CONFIG_CPU_FREQ_GOV_ZENITH=n``, so callers can stay
+unconditional.
+
+**Wiring (vblank period publish, V3):** The companion API
+``zenith_set_drm_vblank_us(unsigned int us)`` is wired from
+``drm_calc_timestamping_constants()`` (every panel mode-set, every
+refresh-rate switch) so the K3 deadline math has an accurate
+period without explicit per-driver code.  Out-of-tree drivers
+that call ``drm_calc_timestamping_constants()`` get this for
+free; out-of-tree drivers that don't may publish the period
+manually:
+
+.. code-block:: c
+
+    /* Inside the vendor mode-set / vblank-period change handler.  */
+    zenith_set_drm_vblank_us(framedur_ns / NSEC_PER_USEC);
+
+When neither hook is wired and ``frame_budget_us_auto=1``, K3 falls
+back to the userspace-set ``frame_budget_us``; if THAT is also
+zero, K3 stays disarmed cleanly (same fail-safe as the rest of
+the auto-tune scenario overlay).  Diagnose with the read-only
+``drm_vblank_us`` sysfs: a non-zero value confirms the publish
+path is live; ``zenith_stats`` shows a non-zero
+``frame_overrun_count`` when the producer is actually firing.
 
 Read-only diagnostics
 ---------------------
