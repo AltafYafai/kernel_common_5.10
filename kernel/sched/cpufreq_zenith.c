@@ -16032,29 +16032,42 @@ static int __init zenith_gov_init(void)
 #endif
 
 	/* Boot banner.  Printed once at governor init, picked up by
-	 * `dmesg | grep -i zenith`.  Technical V2 Dreadnought line
-	 * first so boot logs still record the governor variant; the
-	 * personal block follows.  Every line carries the "Zenith:"
-	 * prefix so the whole banner survives the user's grep.
+	 * `dmesg | grep -i zenith`.  Free-verse on top, the heart-init
+	 * flow + ASCII shomy block underneath; every line carries the
+	 * "Zenith" prefix so the whole multi-line banner survives a
+	 * grep.  The bloody-moon quote is printed as two physical dmesg
+	 * lines because the single-line form is over 100 cols and
+	 * checkpatch dislikes the adjacent-string-literal split.
 	 */
-	pr_info("Zenith: V2 Dreadnought (EAS/EM/Display/Thermal) Initialized.\n");
-	pr_info("Zenith: Initializing the heart of zenith...\n");
-	pr_info("Zenith:\n");
-	pr_info("Zenith:    ***   ***\n");
-	pr_info("Zenith:   ***** *****\n");
-	pr_info("Zenith:   ***********\n");
-	pr_info("Zenith:    *********\n");
-	pr_info("Zenith:     *******\n");
-	pr_info("Zenith:      *****\n");
-	pr_info("Zenith:       ***\n");
-	pr_info("Zenith:        *\n");
-	pr_info("Zenith:\n");
-	pr_info("Zenith:     ~ shomy ~\n");
-	pr_info("Zenith:\n");
-	pr_info("Zenith: The heart of zenith has been initialized.\n");
-	pr_info("Zenith: Yet it can never be mine.\n");
-	pr_info("Zenith:\n");
-	pr_info("Zenith: Welcome aboard, Zenith: Built by XTENSEI, for shomy.\n");
+	pr_info("Zenith : The brain has started.\n");
+	pr_info("Zenith : The heart of zenith is yet to be initialized.\n");
+	pr_info("Zenith : It might hurt to love someone from the shadows.\n");
+	pr_info("Zenith : But love chose her.\n");
+	pr_info("Zenith : I chose her.\n");
+	pr_info("Zenith : Not because i was forced to.\n");
+	pr_info("Zenith : Because i wanted to.\n");
+	pr_info("Zenith : Even if it hurts.\n");
+	pr_info("Zenith : Love really is a powerful thing.\n");
+	pr_info("Zenith : \"Lost beneath the haunting light of a bloody moon,\n");
+	pr_info("Zenith :  wandering through the echoes of time.\"\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith : Initializing the heart of zenith...\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :    ***   ***\n");
+	pr_info("Zenith :   ***** *****\n");
+	pr_info("Zenith :   ***********\n");
+	pr_info("Zenith :    *********\n");
+	pr_info("Zenith :     *******\n");
+	pr_info("Zenith :      *****\n");
+	pr_info("Zenith :       ***\n");
+	pr_info("Zenith :        *\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :     ~ shomy ~\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith : The heart of zenith has been initialized.\n");
+	pr_info("Zenith : Yet it can never be mine.\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith : Welcome aboard, Zenith: Built by XTENSEI, for shomy.\n");
 
 	/* Allocate the initial RCU comm tables from the in-tree default
 	 * arrays.  Failure here is non-fatal: zenith_policy_has_X()
