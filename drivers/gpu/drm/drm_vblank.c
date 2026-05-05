@@ -2039,10 +2039,11 @@ bool drm_handle_vblank(struct drm_device *dev, unsigned int pipe)
 					zenith_k6_period_ema_ns = gap;
 
 				if (++zenith_k6_publish_ctr >= 16) {
+					unsigned int period_us =
+						zenith_k6_period_ema_ns / 1000;
+
 					zenith_k6_publish_ctr = 0;
-					zenith_set_drm_vblank_us(
-					    (unsigned int)
-					    (zenith_k6_period_ema_ns / 1000));
+					zenith_set_drm_vblank_us(period_us);
 				}
 			}
 		}

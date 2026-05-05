@@ -11713,15 +11713,16 @@ static struct governor_attr auto_tune_v2_var_promote_thresh =
  * ZENITH_DEFAULT_AT_UTIL_RISING_THRESH_PCT comment block for
  * semantics.  0 disables the signal cleanly.
  */
-static ssize_t auto_tune_util_rising_thresh_pct_show(
-	struct gov_attr_set *attr_set, char *buf)
+static ssize_t auto_tune_util_rising_thresh_pct_show(struct gov_attr_set *attr_set,
+						     char *buf)
 {
 	return sprintf(buf, "%u\n",
 		to_zenith_tunables(attr_set)->auto_tune_util_rising_thresh_pct);
 }
 
-static ssize_t auto_tune_util_rising_thresh_pct_store(
-	struct gov_attr_set *attr_set, const char *buf, size_t count)
+static ssize_t auto_tune_util_rising_thresh_pct_store(struct gov_attr_set *attr_set,
+						      const char *buf,
+						      size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
@@ -11732,6 +11733,7 @@ static ssize_t auto_tune_util_rising_thresh_pct_store(
 	t->auto_tune_util_rising_thresh_pct = val;
 	return count;
 }
+
 static struct governor_attr auto_tune_util_rising_thresh_pct =
 	__ATTR_RW(auto_tune_util_rising_thresh_pct);
 
