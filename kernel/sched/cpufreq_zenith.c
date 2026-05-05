@@ -497,6 +497,61 @@
 #define ZENITH_DEFAULT_PSI_CPU_FLOOR_THRESH		0
 #define ZENITH_PSI_CPU_FLOOR_THRESH_MAX			100
 
+/* frame_overrun_slack_us / frame_overrun_window_ms /
+ * frame_overrun_floor_pct (defaults 0 / 50 / 80,
+ * [Stage 4 / Patch K3]):
+ *
+ * Frame-budget overrun rescue.  Companion to the existing
+ * frame_pace_floor tier (Stage 3) -- frame_pace arms a floor
+ * sized to fit one frame in the budget, this tier corrects
+ * after a frame missed.
+ *
+ * Detection runs in zenith_drm_vblank_event(), a new exported
+ * symbol the panel driver / display HAL is expected to call on
+ * every vblank.  The first call after governor attach (or after
+ * the screen-state stale guard fires) just records the timestamp
+ * and returns.  On subsequent calls the elapsed wall-clock delta
+ * is compared against (zenith_drm_vblank_us + slack_us); if the
+ * gap is wider, the renderer missed the budget.  Stamp a
+ * deadline frame_overrun_window_ms in the future on the file-
+ * scope zenith_frame_overrun_until_ns slot.  While the deadline
+ * holds, every cluster's eval lifts to a soft floor at
+ * frame_overrun_floor_pct of policy->max.
+ *
+ * Why a *new* exported function and not a reuse of
+ * zenith_set_drm_vblank_us(): the existing setter takes the
+ * vblank *period* in microseconds and is only called on
+ * refresh-rate transitions (60 Hz <-> 120 Hz).  This patch needs
+ * a *per-vblank* event, which is a different concept.  Decoupled
+ * so a panel driver can wire up either, both, or neither
+ * depending on what it knows.  When the panel driver does not
+ * call zenith_drm_vblank_event(), the entire detection path is
+ * a no-op (the deadline is never stamped) and the rest of the
+ * governor behaves exactly as before -- same fail-safe shape as
+ * the existing zenith_set_drm_vblank_us() path.
+ *
+ * frame_overrun_slack_us == 0 disables stamping (the producer
+ * still updates last_vblank_ns so the next 0 -> non-zero
+ * configuration change starts cleanly).
+ * frame_overrun_floor_pct == 0 leaves stamping but suppresses
+ * the floor.
+ *
+ * Cold-boot default for slack_us is 0 (off).  Per-profile
+ * values turn it on: BALANCED uses 4000 us, which is roughly a
+ * third of a 60 Hz vblank period (16667 us).  Smaller and
+ * routine driver / scheduler jitter trips the detector; larger
+ * and an actual single missed frame (16667 us late) doesn't
+ * trip it.  Window 50 ms covers about three 60 Hz frames or six
+ * 120 Hz frames -- enough recovery time after a single miss
+ * without holding a high-freq pin past a brief stall.
+ */
+#define ZENITH_DEFAULT_FRAME_OVERRUN_SLACK_US		0
+#define ZENITH_FRAME_OVERRUN_SLACK_US_MAX		16667
+#define ZENITH_DEFAULT_FRAME_OVERRUN_WINDOW_MS		50
+#define ZENITH_FRAME_OVERRUN_WINDOW_MS_MAX		200
+#define ZENITH_DEFAULT_FRAME_OVERRUN_FLOOR_PCT		80
+#define ZENITH_FRAME_OVERRUN_FLOOR_PCT_MAX		100
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -2231,6 +2286,16 @@ struct zenith_tunables {
 	 */
 	unsigned int		psi_cpu_floor_thresh;
 
+	/* See the frame_overrun_* macro block (Patch K3).
+	 * slack_us == 0 disables stamping (no overrun event ever
+	 * arms a deadline); floor_pct == 0 leaves stamping in
+	 * place but suppresses the floor.  All three are READ_ONCE
+	 * on the eval / vblank-event paths.
+	 */
+	unsigned int		frame_overrun_slack_us;
+	unsigned int		frame_overrun_window_ms;
+	unsigned int		frame_overrun_floor_pct;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -2802,6 +2867,30 @@ static atomic64_t zenith_input_last_event_ns = ATOMIC64_INIT(0);
 static atomic64_t zenith_peer_ramp_until_ns_big   = ATOMIC64_INIT(0);
 static atomic64_t zenith_peer_ramp_until_ns_prime = ATOMIC64_INIT(0);
 
+/* Frame-overrun rescue (Patch K3) -- file-scope atomics.
+ *
+ * zenith_last_vblank_ns: timestamp of the previous
+ * zenith_drm_vblank_event() call.  0 means "no previous call",
+ * which the producer treats as "first vblank, just record and
+ * return".  Cleared (set back to 0) by the screen-state stale
+ * guard so a sleep / blank period doesn't leave a stale
+ * timestamp that would look like a multi-second overrun on
+ * resume.
+ *
+ * zenith_frame_overrun_until_ns: deadline.  Stamped by the
+ * producer when an overrun is detected, read by every cluster's
+ * floor tier in zenith_get_next_freq() to apply a soft floor.
+ * Self-disarms by deadline; ktime_get_ns() advancing past the
+ * value is the disarm.
+ *
+ * Both are governor-wide (not per-policy) because frame
+ * overruns are observed at the display layer, which sits above
+ * the cpufreq policy partitioning -- a missed frame benefits
+ * from lifting both BIG and PRIME, not just one.
+ */
+static atomic64_t zenith_last_vblank_ns          = ATOMIC64_INIT(0);
+static atomic64_t zenith_frame_overrun_until_ns  = ATOMIC64_INIT(0);
+
 /*
  * Cached drm-panel vblank period, in microseconds.  Producer:
  * display drivers / panel bridges call zenith_set_drm_vblank_us()
@@ -2892,6 +2981,76 @@ void zenith_set_drm_vblank_us(unsigned int us)
 	atomic_set(&zenith_drm_vblank_us, (int)us);
 }
 EXPORT_SYMBOL_GPL(zenith_set_drm_vblank_us);
+
+/* Governor-wide caches for the frame-overrun knobs (Patch K3).
+ * The producer (zenith_drm_vblank_event()) runs from the display
+ * driver context with no struct zenith_policy in scope; if the
+ * arming logic needed a tunables lookup it would have to walk
+ * the policy list.  Mirror the active values into file-scope
+ * unsigned ints instead, written by sysfs store and
+ * zenith_apply_profile(); same shape as
+ * zenith_input_boost_active_ms above.
+ *
+ * Multiple policies sharing one governor-wide cache is fine
+ * because the per-policy frame_overrun_slack_us /
+ * frame_overrun_window_ms values are expected to be uniform
+ * across clusters -- they describe a property of the display,
+ * not of a specific cluster.
+ */
+static unsigned int zenith_frame_overrun_slack_us_cache =
+	ZENITH_DEFAULT_FRAME_OVERRUN_SLACK_US;
+static unsigned int zenith_frame_overrun_window_ms_cache =
+	ZENITH_DEFAULT_FRAME_OVERRUN_WINDOW_MS;
+
+/**
+ * zenith_drm_vblank_event - notify zenith of a panel vblank
+ *
+ * Display drivers / drm-panel bridges call this from the per-
+ * vblank IRQ handler so the governor can detect frame budget
+ * overruns -- e.g. compositor + render thread missed a frame
+ * and the next vblank arrives a full extra period late.
+ *
+ * Lock-free; safe to call from any context including IRQ.  When
+ * the panel driver does not call this, the entire detection
+ * path is a no-op (the deadline atomic stays at 0 and the
+ * floor tier never fires).  Same fail-safe shape as
+ * zenith_set_drm_vblank_us().
+ *
+ * The first call after policy attach (or after the screen-
+ * state stale guard clears zenith_last_vblank_ns) just records
+ * the timestamp and returns.  On every subsequent call the
+ * elapsed wall-clock delta is compared against the cached
+ * vblank period plus tunables->frame_overrun_slack_us; if the
+ * gap is wider, the renderer missed the frame budget and a
+ * deadline is stamped on zenith_frame_overrun_until_ns.
+ */
+void zenith_drm_vblank_event(void)
+{
+	unsigned int slack_us =
+		READ_ONCE(zenith_frame_overrun_slack_us_cache);
+	unsigned int window_ms;
+	unsigned int period_us;
+	u64 now_ns = ktime_get_ns();
+	u64 last_ns = (u64)atomic64_read(&zenith_last_vblank_ns);
+	u64 delta_ns;
+
+	atomic64_set(&zenith_last_vblank_ns, (s64)now_ns);
+	if (!slack_us || !last_ns || now_ns <= last_ns)
+		return;
+	period_us = (unsigned int)atomic_read(&zenith_drm_vblank_us);
+	if (!period_us)
+		return;
+	delta_ns = now_ns - last_ns;
+	if (delta_ns <= ((u64)period_us + slack_us) * NSEC_PER_USEC)
+		return;
+	window_ms = READ_ONCE(zenith_frame_overrun_window_ms_cache);
+	if (!window_ms)
+		return;
+	atomic64_set(&zenith_frame_overrun_until_ns,
+		     (s64)(now_ns + (u64)window_ms * NSEC_PER_MSEC));
+}
+EXPORT_SYMBOL_GPL(zenith_drm_vblank_event);
+
 static unsigned int zenith_input_boost_active_ms = ZENITH_DEFAULT_INPUT_BOOST_MS;
 
 /* Governor-wide cache for the touchdown-extra knob (Patch C).
@@ -2984,6 +3143,7 @@ enum zenith_stat_idx {
 	ZENITH_STAT_PEER_RAMP,		/* peer_ramp (Patch D) */
 	ZENITH_STAT_MIGRATION_FLOOR,	/* migration_floor (Patch K1) */
 	ZENITH_STAT_PSI_CPU_FLOOR,	/* psi_cpu_floor (Patch K2) */
+	ZENITH_STAT_FRAME_OVERRUN,	/* frame_overrun (Patch K3) */
 	ZENITH_STAT_NR
 };
 
@@ -5066,6 +5226,8 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
 		return ZENITH_STAT_MIGRATION_FLOOR;
 	if (!strcmp(path, "psi_cpu_floor"))
 		return ZENITH_STAT_PSI_CPU_FLOOR;
+	if (!strcmp(path, "frame_overrun"))
+		return ZENITH_STAT_FRAME_OVERRUN;
 	return ZENITH_STAT_OTHER;
 }
 
@@ -5404,6 +5566,17 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 			z_policy->screen_off_arm_ns = ktime_get_ns();
 		else if (!z_policy->screen_state_last && cur_screen)
 			z_policy->screen_off_arm_ns = 0;
+		/* Patch K3 stale guard: clear any cached vblank
+		 * timestamp on either edge so a multi-second sleep
+		 * doesn't make the first event after resume look
+		 * like a giant overrun.  Cheap unconditional store on
+		 * a transition (rare, observable as a tunable flip),
+		 * and harmless even when frame_overrun_slack_us is 0
+		 * since the producer treats last_ns == 0 as "first
+		 * event".
+		 */
+		if (z_policy->screen_state_last != cur_screen)
+			atomic64_set(&zenith_last_vblank_ns, 0);
 		z_policy->screen_state_last = cur_screen;
 	}
 
@@ -6777,6 +6950,43 @@ brutal_entry_deferred:
 			if (floor && freq < floor) {
 				freq = floor;
 				tp_path = "psi_cpu_floor";
+			}
+		}
+	}
+
+	/* 3c''''''''. Frame-overrun rescue (Patch K3).
+	 *
+	 * If zenith_drm_vblank_event() observed a vblank gap wider
+	 * than the configured budget, it stamped the governor-wide
+	 * zenith_frame_overrun_until_ns deadline.  While that
+	 * deadline holds, every cluster's eval lifts to a soft
+	 * floor at frame_overrun_floor_pct of policy->max.
+	 *
+	 * Symmetric to peer_ramp -- the producer is governor-wide
+	 * (frame events are observed at the display layer above
+	 * the cluster partition), the read happens on every
+	 * cluster's eval, and either of the per-policy knobs being
+	 * 0 short-circuits the read.  The slack_us cache being 0
+	 * means no overrun event ever stamped the deadline, so the
+	 * read is effectively a no-op anyway -- the explicit
+	 * floor_pct gate just avoids the atomic_read in that case.
+	 */
+	if (!pin_to_target && policy->max &&
+	    z_policy->tunables->frame_overrun_slack_us &&
+	    z_policy->tunables->frame_overrun_floor_pct) {
+		u64 until = (u64)atomic64_read(&zenith_frame_overrun_until_ns);
+
+		if (until && ktime_get_ns() < until) {
+			unsigned int floor =
+				(policy->max *
+				 z_policy->tunables->frame_overrun_floor_pct) /
+				100;
+
+			if (floor > policy->max)
+				floor = policy->max;
+			if (freq < floor) {
+				freq = floor;
+				tp_path = "frame_overrun";
 			}
 		}
 	}
@@ -8705,6 +8915,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int migration_floor_window_ms;
 		unsigned int migration_floor_pct;
 		unsigned int psi_cpu_floor_thresh;
+		unsigned int frame_overrun_slack_us;
+		unsigned int frame_overrun_window_ms;
+		unsigned int frame_overrun_floor_pct;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -8832,6 +9045,18 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * what aggregate util is saying.
 			 */
 			.psi_cpu_floor_thresh = 40,
+			/* Stage 4 / Patch K3: PERFORMANCE tightens
+			 * the slack to 3000 us (~18%% of a 60 Hz
+			 * frame) so smaller misses still trip the
+			 * floor, and lifts the floor to 90%% of
+			 * policy->max over a 60 ms window.  PERF is
+			 * the profile where chasing missed frames is
+			 * actually useful; energy spent on a recovery
+			 * floor is justified.
+			 */
+			.frame_overrun_slack_us = 3000,
+			.frame_overrun_window_ms = 60,
+			.frame_overrun_floor_pct = 90,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -8962,6 +9187,19 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.psi_cpu_floor_thresh =
 				ZENITH_DEFAULT_PSI_CPU_FLOOR_THRESH,
+			/* Stage 4 / Patch K3: BALANCED arms the
+			 * frame-overrun rescue with 4000 us slack
+			 * (~24%% of a 60 Hz frame), 50 ms window,
+			 * 80%% floor.  Mid-range slack catches
+			 * actual misses without tripping on routine
+			 * driver jitter; mid-range floor balances
+			 * recovery latency against energy cost.
+			 */
+			.frame_overrun_slack_us = 4000,
+			.frame_overrun_window_ms =
+				ZENITH_DEFAULT_FRAME_OVERRUN_WINDOW_MS,
+			.frame_overrun_floor_pct =
+				ZENITH_DEFAULT_FRAME_OVERRUN_FLOOR_PCT,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -9091,6 +9329,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * the price of running at conservative freq.
 			 */
 			.psi_cpu_floor_thresh = 0,
+			/* Stage 4 / Patch K3: BATTERY disables the
+			 * frame-overrun rescue.  Same trade as
+			 * peer-ramp / migration-arrival above:
+			 * recovery freq is exactly the cost the
+			 * user is opting out of when picking BATTERY.
+			 */
+			.frame_overrun_slack_us = 0,
+			.frame_overrun_window_ms = 0,
+			.frame_overrun_floor_pct = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -9206,6 +9453,14 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * that.
 			 */
 			.psi_cpu_floor_thresh = 0,
+			/* Stage 4 / Patch K3: LEGACY disables the
+			 * frame-overrun rescue.  Pre-Stage-1 governor
+			 * had no display-layer awareness; LEGACY
+			 * preserves that.
+			 */
+			.frame_overrun_slack_us = 0,
+			.frame_overrun_window_ms = 0,
+			.frame_overrun_floor_pct = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -9280,6 +9535,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   p->migration_floor_window_ms);
 	WRITE_ONCE(t->migration_floor_pct, p->migration_floor_pct);
 	WRITE_ONCE(t->psi_cpu_floor_thresh, p->psi_cpu_floor_thresh);
+	WRITE_ONCE(t->frame_overrun_slack_us, p->frame_overrun_slack_us);
+	WRITE_ONCE(t->frame_overrun_window_ms,
+		   p->frame_overrun_window_ms);
+	WRITE_ONCE(t->frame_overrun_floor_pct,
+		   p->frame_overrun_floor_pct);
+	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
+		   p->frame_overrun_slack_us);
+	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
+		   p->frame_overrun_window_ms);
 
 	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
 	 * the governor-wide caches used by the input handler fast
@@ -10496,6 +10760,7 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 		[ZENITH_STAT_PEER_RAMP]		= "peer_ramp",
 		[ZENITH_STAT_MIGRATION_FLOOR]	= "migration_floor",
 		[ZENITH_STAT_PSI_CPU_FLOOR]	= "psi_cpu_floor",
+		[ZENITH_STAT_FRAME_OVERRUN]	= "frame_overrun",
 	};
 	unsigned long sum[ZENITH_STAT_NR] = { 0 };
 	struct zenith_policy *z_pol;
@@ -12324,6 +12589,98 @@ psi_cpu_floor_thresh_store(struct gov_attr_set *attr_set,
 static struct governor_attr psi_cpu_floor_thresh =
 	__ATTR_RW(psi_cpu_floor_thresh);
 
+/* frame_overrun_slack_us (Patch K3).  Range 0..16667 us.
+ * Tolerance beyond the cached vblank period before treating a
+ * gap as an overrun.  0 disables stamping (the producer still
+ * updates last_vblank_ns).  Mirrored into the governor-wide
+ * cache so the producer can read it without a tunables lookup.
+ */
+static ssize_t
+frame_overrun_slack_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->frame_overrun_slack_us);
+}
+
+static ssize_t
+frame_overrun_slack_us_store(struct gov_attr_set *attr_set,
+			     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_FRAME_OVERRUN_SLACK_US_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->frame_overrun_slack_us, val);
+	WRITE_ONCE(zenith_frame_overrun_slack_us_cache, val);
+	return count;
+}
+
+static struct governor_attr frame_overrun_slack_us =
+	__ATTR_RW(frame_overrun_slack_us);
+
+/* frame_overrun_window_ms (Patch K3).  Range 0..200 ms.  How
+ * long the soft floor holds after an overrun is detected.  0
+ * suppresses stamping but still updates last_vblank_ns.  Also
+ * mirrored to the governor-wide cache.
+ */
+static ssize_t
+frame_overrun_window_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+		       frame_overrun_window_ms);
+}
+
+static ssize_t
+frame_overrun_window_ms_store(struct gov_attr_set *attr_set,
+			      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_FRAME_OVERRUN_WINDOW_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->frame_overrun_window_ms, val);
+	WRITE_ONCE(zenith_frame_overrun_window_ms_cache, val);
+	return count;
+}
+
+static struct governor_attr frame_overrun_window_ms =
+	__ATTR_RW(frame_overrun_window_ms);
+
+/* frame_overrun_floor_pct (Patch K3).  Range 0..100.  Soft
+ * floor as a percent of policy->max while the overrun deadline
+ * is active.  0 leaves stamping in place but suppresses the
+ * floor.
+ */
+static ssize_t
+frame_overrun_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+		       frame_overrun_floor_pct);
+}
+
+static ssize_t
+frame_overrun_floor_pct_store(struct gov_attr_set *attr_set,
+			      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_FRAME_OVERRUN_FLOOR_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->frame_overrun_floor_pct, val);
+	return count;
+}
+
+static struct governor_attr frame_overrun_floor_pct =
+	__ATTR_RW(frame_overrun_floor_pct);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -13512,6 +13869,9 @@ static struct attribute *zenith_attrs[] = {
 	&migration_floor_window_ms.attr,
 	&migration_floor_pct.attr,
 	&psi_cpu_floor_thresh.attr,
+	&frame_overrun_slack_us.attr,
+	&frame_overrun_window_ms.attr,
+	&frame_overrun_floor_pct.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -13772,6 +14132,12 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_MIGRATION_FLOOR_PCT;
 	tunables->psi_cpu_floor_thresh	=
 		ZENITH_DEFAULT_PSI_CPU_FLOOR_THRESH;
+	tunables->frame_overrun_slack_us =
+		ZENITH_DEFAULT_FRAME_OVERRUN_SLACK_US;
+	tunables->frame_overrun_window_ms =
+		ZENITH_DEFAULT_FRAME_OVERRUN_WINDOW_MS;
+	tunables->frame_overrun_floor_pct =
+		ZENITH_DEFAULT_FRAME_OVERRUN_FLOOR_PCT;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
