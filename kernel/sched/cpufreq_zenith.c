@@ -417,6 +417,31 @@
 #define ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT		60
 #define ZENITH_PEER_RAMP_FLOOR_PCT_MAX			100
 
+/* peer_ramp_window_off_ms (default 0, [Stage 5 / Patch M3]):
+ *
+ * Screen-state-aware override of peer_ramp_window_ms.  When the
+ * screen is off the cross-cluster IPC chains peer_ramp exists to
+ * accelerate are mostly absent: there is no compositor, no app
+ * render thread, no input handler.  Pre-arming a peer cluster in
+ * that regime burns idle big-cluster freq for nothing.
+ *
+ * Same shape as screen_off_glide_ms: when tunables->screen_state
+ * is 0 the peer-ramp arming and floor-eval paths use this value
+ * in place of peer_ramp_window_ms.  Default 0 means peer_ramp is
+ * fully suppressed while the screen is off (no arm writes, no
+ * floor reads).  Set equal to peer_ramp_window_ms to restore the
+ * pre-Stage-5 always-on behaviour byte-identically.  Range
+ * 0..ZENITH_PEER_RAMP_WINDOW_MS_MAX, same upper bound as the
+ * screen-on knob since the off variant is just a different value
+ * for the same physical timer.
+ *
+ * Energy-only refinement: cannot raise the peer-ramp floor higher
+ * than the screen-on path already does, so this knob can never
+ * hurt responsiveness; it can only stop spending energy on a
+ * cluster the user is not looking at.
+ */
+#define ZENITH_DEFAULT_PEER_RAMP_WINDOW_OFF_MS		0
+
 /* migration_jump_pct / migration_floor_window_ms / migration_floor_pct
  * (defaults 20 / 30 / 60, [Stage 4 / Patch K1]):
  *
@@ -2361,6 +2386,15 @@ struct zenith_tunables {
 	 */
 	unsigned int		peer_ramp_window_ms;
 	unsigned int		peer_ramp_floor_pct;
+
+	/* See ZENITH_DEFAULT_PEER_RAMP_WINDOW_OFF_MS (Patch M3).
+	 * Screen-state-aware shadow of peer_ramp_window_ms.  Read
+	 * via READ_ONCE in zenith_peer_ramp_effective_window_ms()
+	 * whenever the arm path or the floor-eval path needs the
+	 * effective window length; written via WRITE_ONCE from sysfs
+	 * and zenith_apply_profile().
+	 */
+	unsigned int		peer_ramp_window_off_ms;
 
 	/* See the migration_* macro block (Patch K1).  jump_pct == 0
 	 * disables both sides; floor_pct == 0 suppresses the floor
@@ -5537,6 +5571,29 @@ zenith_peer_ramp_self_atomic(unsigned int cluster_class)
 	}
 }
 
+/* Effective peer_ramp window length, accounting for screen state
+ * (Patch M3).  When the screen is on, the legacy peer_ramp_window_ms
+ * applies.  When the screen is off, the shadow knob takes over.
+ * Both reads are READ_ONCE so a concurrent sysfs write cannot tear
+ * the value across the arming and floor-reading paths even though
+ * those paths run on different CPUs.
+ *
+ * Returning 0 disables peer_ramp on the calling path: the arm
+ * function bails on a 0 window; the floor-eval site treats 0 as
+ * "no floor" via the existing tunable->peer_ramp_window_ms == 0
+ * short-circuit (replaced here by the same check on the effective
+ * value).  This is the design lever that makes peer_ramp_window_off_ms
+ * == 0 fully suppress peer_ramp while the screen is off without
+ * touching the existing screen-on path.
+ */
+static unsigned int
+zenith_peer_ramp_effective_window_ms(const struct zenith_tunables *t)
+{
+	if (READ_ONCE(t->screen_state))
+		return READ_ONCE(t->peer_ramp_window_ms);
+	return READ_ONCE(t->peer_ramp_window_off_ms);
+}
+
 /* Stamp a deadline on the peer cluster's slot.  Called from the
  * three peak tiers (predict_up, peak_prearm, peak_rescue) right
  * after they decide to lift the cluster.  Cheap: one tunable
@@ -5545,14 +5602,17 @@ zenith_peer_ramp_self_atomic(unsigned int cluster_class)
  * (e.g. predict_up on tick N then peak_prearm on tick N+1) end
  * up with the latest deadline winning, which is what we want.
  *
- * Gated entirely on peer_ramp_window_ms.  Set to 0 and this
- * function is a couple of branches and a return.
+ * Gated entirely on the effective window length: when screen is
+ * on this is peer_ramp_window_ms, when screen is off it is
+ * peer_ramp_window_off_ms (default 0, so screen-off arms are
+ * suppressed by default).  Either way, set the relevant knob to
+ * 0 and this function is a couple of branches and a return.
  */
 static void
 zenith_peer_ramp_arm(struct zenith_policy *z_policy, u64 now_ns)
 {
 	unsigned int window_ms =
-		READ_ONCE(z_policy->tunables->peer_ramp_window_ms);
+		zenith_peer_ramp_effective_window_ms(z_policy->tunables);
 	atomic64_t *peer;
 
 	if (!window_ms)
@@ -6978,7 +7038,7 @@ brutal_entry_deferred:
 	 * cluster.
 	 */
 	if (!pin_to_target && policy->max &&
-	    z_policy->tunables->peer_ramp_window_ms &&
+	    zenith_peer_ramp_effective_window_ms(z_policy->tunables) &&
 	    z_policy->tunables->peer_ramp_floor_pct) {
 		atomic64_t *self =
 			zenith_peer_ramp_self_atomic(z_policy->cluster_class);
@@ -9193,6 +9253,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int sleeper_tail_pct;
 		unsigned int peer_ramp_window_ms;
 		unsigned int peer_ramp_floor_pct;
+		unsigned int peer_ramp_window_off_ms;
 		unsigned int migration_jump_pct;
 		unsigned int migration_floor_window_ms;
 		unsigned int migration_floor_pct;
@@ -9303,6 +9364,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.peer_ramp_window_ms = 40,
 			.peer_ramp_floor_pct = 70,
+			/* Stage 5 / Patch M3: PERFORMANCE suppresses
+			 * peer_ramp once the screen is off.  The IPC
+			 * chains the screen-on PERF override widens for
+			 * (compositor / render / input) are inactive
+			 * with the display blanked, so even the most
+			 * aggressive profile gives back the screen-off
+			 * energy.  Set non-zero by sysfs to keep peer-
+			 * arming warm during e.g. audio playback.
+			 */
+			.peer_ramp_window_off_ms = 0,
 			/* Stage 4 / Patch K1: PERFORMANCE drops the
 			 * jump threshold to 15%% (one of every six
 			 * util-percent points instead of every five)
@@ -9447,6 +9518,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PEER_RAMP_WINDOW_MS,
 			.peer_ramp_floor_pct =
 				ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT,
+			/* Stage 5 / Patch M3: BALANCED takes the cold-
+			 * boot screen-off default (suppress peer_ramp).
+			 * BALANCED is the all-day profile and the screen
+			 * spends most of that day off.
+			 */
+			.peer_ramp_window_off_ms =
+				ZENITH_DEFAULT_PEER_RAMP_WINDOW_OFF_MS,
 			/* Stage 4 / Patch K1: BALANCED matches cold-
 			 * boot defaults (20%% jump, 30 ms window, 60%%
 			 * floor).  Sensible middle ground: catches the
@@ -9595,6 +9673,14 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.peer_ramp_window_ms = 0,
 			.peer_ramp_floor_pct = 0,
+			/* Stage 5 / Patch M3: BATTERY mirrors the
+			 * peer_ramp_window_ms = 0 stance for the screen-
+			 * off path; redundant given peer_ramp is already
+			 * off, but kept explicit so a sysfs tweak that
+			 * lifts peer_ramp_window_ms in this profile does
+			 * not silently un-suppress the screen-off arm.
+			 */
+			.peer_ramp_window_off_ms = 0,
 			/* Stage 4 / Patch K1: BATTERY disables the
 			 * migration-arrival floor for the same reason
 			 * peer-ramp is off here.  PELT warm-up
@@ -9721,6 +9807,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.peer_ramp_window_ms = 0,
 			.peer_ramp_floor_pct = 0,
+			/* Stage 5 / Patch M3: LEGACY likewise leaves the
+			 * screen-off shadow at 0.  Pre-Stage-1 governor
+			 * had no peer_ramp at all, screen-on or screen-
+			 * off, so this preserves that absence end-to-
+			 * end.
+			 */
+			.peer_ramp_window_off_ms = 0,
 			/* Stage 4 / Patch K1: LEGACY disables the
 			 * migration-arrival floor.  Pre-Stage-1
 			 * governor had no PELT-warm-up compensation;
@@ -9812,6 +9905,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->sleeper_tail_pct, p->sleeper_tail_pct);
 	WRITE_ONCE(t->peer_ramp_window_ms, p->peer_ramp_window_ms);
 	WRITE_ONCE(t->peer_ramp_floor_pct, p->peer_ramp_floor_pct);
+	WRITE_ONCE(t->peer_ramp_window_off_ms,
+		   p->peer_ramp_window_off_ms);
 	WRITE_ONCE(t->migration_jump_pct, p->migration_jump_pct);
 	WRITE_ONCE(t->migration_floor_window_ms,
 		   p->migration_floor_window_ms);
@@ -12767,6 +12862,38 @@ peer_ramp_window_ms_store(struct gov_attr_set *attr_set,
 static struct governor_attr peer_ramp_window_ms =
 	__ATTR_RW(peer_ramp_window_ms);
 
+/* peer_ramp_window_off_ms sysfs knob (Patch M3).
+ * Range 0..ZENITH_PEER_RAMP_WINDOW_MS_MAX (100).  Screen-state-
+ * aware shadow of peer_ramp_window_ms: when tunables->screen_state
+ * is 0 the peer-ramp arming and floor-eval paths use this value
+ * instead.  0 (default) suppresses peer_ramp entirely while the
+ * screen is off.  Set equal to peer_ramp_window_ms to restore the
+ * pre-Stage-5 always-on behaviour byte-identically.
+ */
+static ssize_t
+peer_ramp_window_off_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->peer_ramp_window_off_ms);
+}
+
+static ssize_t
+peer_ramp_window_off_ms_store(struct gov_attr_set *attr_set,
+			      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PEER_RAMP_WINDOW_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->peer_ramp_window_off_ms, val);
+	return count;
+}
+
+static struct governor_attr peer_ramp_window_off_ms =
+	__ATTR_RW(peer_ramp_window_off_ms);
+
 /* peer_ramp_floor_pct sysfs knob (Patch D).
  * Range 0..ZENITH_PEER_RAMP_FLOOR_PCT_MAX (100).  Soft floor as
  * a percent of policy->max applied while a peer-ramp deadline
@@ -14197,6 +14324,7 @@ static struct attribute *zenith_attrs[] = {
 	&sleeper_tail_pct.attr,
 	&peer_ramp_window_ms.attr,
 	&peer_ramp_floor_pct.attr,
+	&peer_ramp_window_off_ms.attr,
 	&migration_jump_pct.attr,
 	&migration_floor_window_ms.attr,
 	&migration_floor_pct.attr,
@@ -14457,6 +14585,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PEER_RAMP_WINDOW_MS;
 	tunables->peer_ramp_floor_pct	=
 		ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT;
+	tunables->peer_ramp_window_off_ms =
+		ZENITH_DEFAULT_PEER_RAMP_WINDOW_OFF_MS;
 	tunables->migration_jump_pct	=
 		ZENITH_DEFAULT_MIGRATION_JUMP_PCT;
 	tunables->migration_floor_window_ms =
