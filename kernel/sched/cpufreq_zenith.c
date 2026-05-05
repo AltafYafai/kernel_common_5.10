@@ -3509,6 +3509,18 @@ EXPORT_SYMBOL_GPL(zenith_set_drm_vblank_us);
  */
 struct video_device;
 
+/* Tentative declarations of the K4/K5 refcount atomics.  Their
+ * defining declarations (with ATOMIC_INIT(0)) live further down the
+ * file next to the rest of the auto-tune state; the function bodies
+ * below were originally written assuming forward visibility, which
+ * the C tentative-definition rule grants only when the file-scope
+ * tentative is visible at first use.  These two lines provide that
+ * tentative visibility so the open / release notify functions
+ * compile cleanly under CONFIG_CPU_FREQ_GOV_ZENITH=y.
+ */
+static atomic_t zenith_v4l2_active_fds;
+static atomic_t zenith_alsa_active_fds;
+
 void zenith_v4l2_open_notify(struct video_device *vdev)
 {
 	(void)vdev;	/* unused; we don't filter by vfl_type yet */
