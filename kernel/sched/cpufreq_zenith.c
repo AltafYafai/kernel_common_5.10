@@ -417,6 +417,55 @@
 #define ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT		60
 #define ZENITH_PEER_RAMP_FLOOR_PCT_MAX			100
 
+/* migration_jump_pct / migration_floor_window_ms / migration_floor_pct
+ * (defaults 20 / 30 / 60, [Stage 4 / Patch K1]):
+ *
+ * Migration-arrival soft floor.  When a high-util task migrates
+ * between CPUs, the source CPU's util drops on the next sample
+ * (the task is gone) but the destination's util takes ~32 ms
+ * (one PELT half-life) to fully reflect the new load.  In that
+ * gap, the destination cluster's eval can pick a freq based on
+ * stale-low aggregate util.
+ *
+ * On every per-CPU update_util tick the governor compares the
+ * current util to the value seen on the previous tick.  If the
+ * sample-to-sample jump exceeds migration_jump_pct of the CPU's
+ * max_capacity, treat it as evidence that a new task just landed
+ * here and stamp a deadline on this policy's
+ * migration_in_until_ns slot.  While that deadline holds, the
+ * eval applies a soft floor at migration_floor_pct of
+ * policy->max so the cluster is not running at idle freq for
+ * the first half of the new task's PELT warm-up.
+ *
+ * Per-policy, not class-level: this tracks "task arrived here"
+ * regardless of which cluster the task came from.  Composes
+ * cleanly with peer_ramp (Patch D) which is the cross-cluster
+ * IPC case; peer_ramp arms the *peer* of a ramping cluster,
+ * migration_floor arms the *self* of an arrival.  No conflict.
+ *
+ * Self-disarms by deadline.  Re-armings just bump the deadline
+ * forward.  Single-CPU policies (1+1+1 topologies, etc.) work
+ * the same way: a task moving onto the only CPU in the policy
+ * still triggers a util jump on that CPU.
+ *
+ * migration_jump_pct == 0 disables both sides (no arming
+ * writes, no floor reads).  migration_floor_pct == 0 leaves the
+ * stamping in place but suppresses the floor.
+ *
+ * The default jump threshold is 20%, which is the boundary
+ * where empirically (a) PELT half-life dynamics + 4-CPU
+ * averaging start producing visible per-CPU spikes from a
+ * single task, and (b) routine util oscillation (sched_yield
+ * loops, 1-tick-on-1-tick-off micro-bursts) tends to stay
+ * below.  Window 30 ms covers most of one PELT half-life.
+ */
+#define ZENITH_DEFAULT_MIGRATION_JUMP_PCT		20
+#define ZENITH_MIGRATION_JUMP_PCT_MAX			100
+#define ZENITH_DEFAULT_MIGRATION_FLOOR_WINDOW_MS	30
+#define ZENITH_MIGRATION_FLOOR_WINDOW_MS_MAX		100
+#define ZENITH_DEFAULT_MIGRATION_FLOOR_PCT		60
+#define ZENITH_MIGRATION_FLOOR_PCT_MAX			100
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -2136,6 +2185,15 @@ struct zenith_tunables {
 	unsigned int		peer_ramp_window_ms;
 	unsigned int		peer_ramp_floor_pct;
 
+	/* See the migration_* macro block (Patch K1).  jump_pct == 0
+	 * disables both sides; floor_pct == 0 suppresses the floor
+	 * while leaving the per-CPU stamping in place.  All three
+	 * are READ_ONCE on the eval / per-CPU update_util paths.
+	 */
+	unsigned int		migration_jump_pct;
+	unsigned int		migration_floor_window_ms;
+	unsigned int		migration_floor_pct;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -2887,6 +2945,7 @@ enum zenith_stat_idx {
 	ZENITH_STAT_PEAK_RESCUE,	/* peak_rescue */
 	ZENITH_STAT_PEAK_HYST,		/* peak_hyst (Patch E) */
 	ZENITH_STAT_PEER_RAMP,		/* peer_ramp (Patch D) */
+	ZENITH_STAT_MIGRATION_FLOOR,	/* migration_floor (Patch K1) */
 	ZENITH_STAT_NR
 };
 
@@ -3011,6 +3070,22 @@ struct zenith_policy {
 	 * rescue event.  Cleared (set to 0) at policy init.
 	 */
 	u64			peak_rescue_until_ns;
+
+	/* Migration-arrival soft-floor deadline (Patch K1).  Stamped
+	 * by the per-CPU update_util callback whenever any CPU in
+	 * this policy sees a sample-to-sample util jump exceeding
+	 * tunables->migration_jump_pct of its max_capacity.  Read by
+	 * the migration_floor tier in zenith_get_next_freq() to
+	 * decide whether to apply the soft floor.  Self-disarms by
+	 * deadline; ktime_get_ns() advancing past the value is the
+	 * disarm.  Cleared (set to 0) at policy init.  Updated under
+	 * the per-policy update_lock by the shared callback;
+	 * unlocked but ordered by raw_spin_lock acquire/release in
+	 * the single-CPU callback.  No torn-write hazard either way:
+	 * a 64-bit write on a 64-bit kernel is atomic, and the field
+	 * is only ever monotonic-forward written.
+	 */
+	u64			migration_in_until_ns;
 
 	/* Util-trend ring for the predictive up-shift tier (2a').  The
 	 * tail of zenith_get_next_freq() pushes the current sample's
@@ -3408,6 +3483,18 @@ struct zenith_cpu {
 	 */
 	unsigned long		wakeup_prev_util;
 	u8			wakeup_boost_ticks;
+
+	/* Previous post-iowait_apply util on this CPU, used by the
+	 * migration-arrival detector (Patch K1).  Independent from
+	 * wakeup_prev_util because that field is only updated when
+	 * tunables->wakeup_boost is set, and the migration detector
+	 * needs to run regardless.  Zero-initialised by zenith_start()'s
+	 * memset, which means the very first tick after policy attach
+	 * looks like a "jump from 0" -- harmless: the migration tier
+	 * disarms by 30 ms (default) wall-clock and any cluster
+	 * starting from idle benefits from a brief floor anyway.
+	 */
+	unsigned long		migration_prev_util;
 
 	/* Deadline mirror of wakeup_boost_ticks.  0 means no
 	 * wall-clock-based bypass armed; non-zero is an absolute
@@ -4937,6 +5024,8 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
 		return ZENITH_STAT_PEAK_HYST;
 	if (!strcmp(path, "peer_ramp"))
 		return ZENITH_STAT_PEER_RAMP;
+	if (!strcmp(path, "migration_floor"))
+		return ZENITH_STAT_MIGRATION_FLOOR;
 	return ZENITH_STAT_OTHER;
 }
 
@@ -5146,6 +5235,48 @@ zenith_peer_ramp_arm(struct zenith_policy *z_policy, u64 now_ns)
 	if (!peer)
 		return;
 	atomic64_set(peer, now_ns + (u64)window_ms * NSEC_PER_MSEC);
+}
+
+/* Migration-arrival detector (Patch K1).  Called once per CPU per
+ * update_util tick, after iowait_apply has folded its boost into
+ * util but before kcpustat_blend or the wakeup-boost detector run.
+ *
+ * Compares util against the previous tick's value on the same CPU.
+ * If the upward jump exceeds tunables->migration_jump_pct of
+ * max_cap, treat it as evidence a task just landed here and stamp
+ * z_policy->migration_in_until_ns with a deadline N ms in the
+ * future.  N == migration_floor_window_ms.
+ *
+ * Always updates migration_prev_util so the next tick has a fresh
+ * comparison baseline regardless of whether the threshold tripped.
+ *
+ * No-op when migration_jump_pct == 0 or max_cap == 0 (impossible
+ * but cheap to guard).  Caller is responsible for whatever
+ * locking the surrounding update_util path needs; this helper
+ * does not take any.
+ */
+static void
+zenith_migration_arrival_check(struct zenith_cpu *z_cpu,
+			       unsigned long util, unsigned long max_cap,
+			       struct zenith_policy *z_policy)
+{
+	unsigned int jump_pct =
+		READ_ONCE(z_policy->tunables->migration_jump_pct);
+	unsigned int window_ms;
+	unsigned long prev = z_cpu->migration_prev_util;
+
+	z_cpu->migration_prev_util = util;
+	if (!jump_pct || !max_cap)
+		return;
+	if (util <= prev)
+		return;
+	if ((util - prev) * 100 < (unsigned long)jump_pct * max_cap)
+		return;
+	window_ms = READ_ONCE(z_policy->tunables->migration_floor_window_ms);
+	if (!window_ms)
+		return;
+	z_policy->migration_in_until_ns =
+		ktime_get_ns() + (u64)window_ms * NSEC_PER_MSEC;
 }
 
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
@@ -6535,6 +6666,44 @@ brutal_entry_deferred:
 		}
 	}
 
+	/* 3c''''''. Migration-arrival soft floor (Patch K1).
+	 *
+	 * If a per-CPU update_util tick observed a util jump
+	 * exceeding migration_jump_pct of max_capacity, it stamped a
+	 * deadline on this policy's migration_in_until_ns.  While
+	 * that deadline has not expired, hold a soft floor at
+	 * migration_floor_pct of policy->max so the destination
+	 * cluster runs at a sensible freq during the inbound task's
+	 * PELT warm-up rather than picking idle freq from the
+	 * stale-low aggregate util signal.
+	 *
+	 * Same pin_to_target bypass as peer_ramp: input_boost /
+	 * brutality already pin freq higher, so layering a soft
+	 * floor under them is wasted arithmetic.  Both knobs
+	 * short-circuit when 0 (jump_pct == 0 means stamping is also
+	 * off; floor_pct == 0 keeps stamping but suppresses the
+	 * floor here so userspace can correlate stats vs. effect).
+	 */
+	if (!pin_to_target && policy->max &&
+	    z_policy->tunables->migration_jump_pct &&
+	    z_policy->tunables->migration_floor_pct) {
+		u64 until = z_policy->migration_in_until_ns;
+
+		if (until && ktime_get_ns() < until) {
+			unsigned int floor =
+				(policy->max *
+				 z_policy->tunables->migration_floor_pct) /
+				100;
+
+			if (floor > policy->max)
+				floor = policy->max;
+			if (freq < floor) {
+				freq = floor;
+				tp_path = "migration_floor";
+			}
+		}
+	}
+
 	/* 3c'''. Audio low-jitter cap.  Companion to the audio floor
 	 * tier above: when audio_aware=1, an audio thread is enqueued
 	 * on the policy, and audio_cap_pct > 0, cap freq at
@@ -7009,6 +7178,7 @@ static void zenith_update_single(struct update_util_data *hook, u64 time, unsign
 	max_cap = z_cpu->max_capacity;
 	
 	util = zenith_iowait_apply(z_cpu, time, util, max_cap);
+	zenith_migration_arrival_check(z_cpu, util, max_cap, z_policy);
 	if (READ_ONCE(tunables->wakeup_boost) && max_cap) {
 		unsigned int cur_pct = (unsigned int)((util * 100) / max_cap);
 		unsigned int prev_pct = z_cpu->wakeup_prev_util ?
@@ -7081,6 +7251,8 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 			j_util = zenith_get_util(j_z_cpu);
 			j_max = j_z_cpu->max_capacity;
 			j_util = zenith_iowait_apply(j_z_cpu, time, j_util, j_max);
+			zenith_migration_arrival_check(j_z_cpu, j_util,
+						       j_max, z_policy);
 			if (READ_ONCE(tunables->wakeup_boost) && j_max) {
 				unsigned int cur_pct =
 					(unsigned int)((j_util * 100) / j_max);
@@ -8452,6 +8624,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int sleeper_tail_pct;
 		unsigned int peer_ramp_window_ms;
 		unsigned int peer_ramp_floor_pct;
+		unsigned int migration_jump_pct;
+		unsigned int migration_floor_window_ms;
+		unsigned int migration_floor_pct;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -8555,6 +8730,21 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.peer_ramp_window_ms = 40,
 			.peer_ramp_floor_pct = 70,
+			/* Stage 4 / Patch K1: PERFORMANCE drops the
+			 * jump threshold to 15%% (one of every six
+			 * util-percent points instead of every five)
+			 * so smaller migration arrivals still trip the
+			 * floor, and widens the floor to 70%% over a
+			 * 35 ms window.  Symmetric reasoning to the
+			 * peer-ramp PERF override above: latency-
+			 * sensitive workloads benefit more from
+			 * absorbing the PELT-warm-up cost than from
+			 * the small energy saving of letting the freq
+			 * drift down.
+			 */
+			.migration_jump_pct = 15,
+			.migration_floor_window_ms = 35,
+			.migration_floor_pct = 70,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -8663,6 +8853,18 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PEER_RAMP_WINDOW_MS,
 			.peer_ramp_floor_pct =
 				ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT,
+			/* Stage 4 / Patch K1: BALANCED matches cold-
+			 * boot defaults (20%% jump, 30 ms window, 60%%
+			 * floor).  Sensible middle ground: catches the
+			 * common one-task-arrived migration without
+			 * over-firing on routine util oscillation.
+			 */
+			.migration_jump_pct =
+				ZENITH_DEFAULT_MIGRATION_JUMP_PCT,
+			.migration_floor_window_ms =
+				ZENITH_DEFAULT_MIGRATION_FLOOR_WINDOW_MS,
+			.migration_floor_pct =
+				ZENITH_DEFAULT_MIGRATION_FLOOR_PCT,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -8776,6 +8978,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.peer_ramp_window_ms = 0,
 			.peer_ramp_floor_pct = 0,
+			/* Stage 4 / Patch K1: BATTERY disables the
+			 * migration-arrival floor for the same reason
+			 * peer-ramp is off here.  PELT warm-up
+			 * latency is exactly the cost the user is
+			 * trading away when picking this profile.
+			 */
+			.migration_jump_pct = 0,
+			.migration_floor_window_ms = 0,
+			.migration_floor_pct = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -8877,6 +9088,14 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.peer_ramp_window_ms = 0,
 			.peer_ramp_floor_pct = 0,
+			/* Stage 4 / Patch K1: LEGACY disables the
+			 * migration-arrival floor.  Pre-Stage-1
+			 * governor had no PELT-warm-up compensation;
+			 * LEGACY preserves that.
+			 */
+			.migration_jump_pct = 0,
+			.migration_floor_window_ms = 0,
+			.migration_floor_pct = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -8946,6 +9165,10 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->sleeper_tail_pct, p->sleeper_tail_pct);
 	WRITE_ONCE(t->peer_ramp_window_ms, p->peer_ramp_window_ms);
 	WRITE_ONCE(t->peer_ramp_floor_pct, p->peer_ramp_floor_pct);
+	WRITE_ONCE(t->migration_jump_pct, p->migration_jump_pct);
+	WRITE_ONCE(t->migration_floor_window_ms,
+		   p->migration_floor_window_ms);
+	WRITE_ONCE(t->migration_floor_pct, p->migration_floor_pct);
 
 	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
 	 * the governor-wide caches used by the input handler fast
@@ -10160,6 +10383,7 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 		[ZENITH_STAT_PEAK_RESCUE]	= "peak_rescue",
 		[ZENITH_STAT_PEAK_HYST]		= "peak_hyst",
 		[ZENITH_STAT_PEER_RAMP]		= "peer_ramp",
+		[ZENITH_STAT_MIGRATION_FLOOR]	= "migration_floor",
 	};
 	unsigned long sum[ZENITH_STAT_NR] = { 0 };
 	struct zenith_policy *z_pol;
@@ -11871,6 +12095,92 @@ peer_ramp_floor_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr peer_ramp_floor_pct =
 	__ATTR_RW(peer_ramp_floor_pct);
 
+/* migration_jump_pct (Patch K1).  Range 0..100.  0 disables both
+ * the per-CPU stamping and the floor read.
+ */
+static ssize_t
+migration_jump_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->migration_jump_pct);
+}
+
+static ssize_t
+migration_jump_pct_store(struct gov_attr_set *attr_set,
+			 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_MIGRATION_JUMP_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->migration_jump_pct, val);
+	return count;
+}
+
+static struct governor_attr migration_jump_pct =
+	__ATTR_RW(migration_jump_pct);
+
+/* migration_floor_window_ms (Patch K1).  Range 0..100.  Length of
+ * the post-arrival window in milliseconds.  0 disables the
+ * stamping (the detector still updates migration_prev_util but
+ * does not arm a deadline).
+ */
+static ssize_t
+migration_floor_window_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+		       migration_floor_window_ms);
+}
+
+static ssize_t
+migration_floor_window_ms_store(struct gov_attr_set *attr_set,
+				const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_MIGRATION_FLOOR_WINDOW_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->migration_floor_window_ms, val);
+	return count;
+}
+
+static struct governor_attr migration_floor_window_ms =
+	__ATTR_RW(migration_floor_window_ms);
+
+/* migration_floor_pct (Patch K1).  Range 0..100.  Soft floor as
+ * a percent of policy->max while a migration deadline is active.
+ * 0 leaves the deadline arming visible to stats / trace but
+ * suppresses the freq adjustment.
+ */
+static ssize_t
+migration_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->migration_floor_pct);
+}
+
+static ssize_t
+migration_floor_pct_store(struct gov_attr_set *attr_set,
+			  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_MIGRATION_FLOOR_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->migration_floor_pct, val);
+	return count;
+}
+
+static struct governor_attr migration_floor_pct =
+	__ATTR_RW(migration_floor_pct);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -13055,6 +13365,9 @@ static struct attribute *zenith_attrs[] = {
 	&sleeper_tail_pct.attr,
 	&peer_ramp_window_ms.attr,
 	&peer_ramp_floor_pct.attr,
+	&migration_jump_pct.attr,
+	&migration_floor_window_ms.attr,
+	&migration_floor_pct.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -13307,6 +13620,12 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PEER_RAMP_WINDOW_MS;
 	tunables->peer_ramp_floor_pct	=
 		ZENITH_DEFAULT_PEER_RAMP_FLOOR_PCT;
+	tunables->migration_jump_pct	=
+		ZENITH_DEFAULT_MIGRATION_JUMP_PCT;
+	tunables->migration_floor_window_ms =
+		ZENITH_DEFAULT_MIGRATION_FLOOR_WINDOW_MS;
+	tunables->migration_floor_pct	=
+		ZENITH_DEFAULT_MIGRATION_FLOOR_PCT;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
