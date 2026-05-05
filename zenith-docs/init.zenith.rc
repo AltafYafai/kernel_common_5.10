@@ -98,6 +98,17 @@ on init
     # knobs back to their per-knob defaults (legacy hard cliffs).
     write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_v2_glides 1
 
+    # ----- Auto-tune V2 tiers (Stage 4 follow-up) -----
+    # Master gate for V2-driven arming of the Stage-4 K1 / K2 / K3
+    # floor tiers (migration_*, psi_cpu_floor_thresh,
+    # frame_overrun_*).  Defaults to 1 in-kernel so the V2 classifier
+    # shapes those tiers per state out of the box; we write it here
+    # explicitly so re-flashing onto an older kernel does not
+    # silently revert the behaviour.  Set to 0 to lock all three
+    # tiers back to pure profile-driven behaviour without disabling
+    # V2 for the seven legacy glide knobs above.
+    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_v2_tiers 1
+
     # ----- Smoothness tunables (V3) -----
     # Frequency stability margin: hold current freq when the new target
     # is within this % of policy->max below current.  Prevents tiny
@@ -313,10 +324,11 @@ on property:sys.boot_completed=1
 # Auto-tune V2 (V3, smart state machine)
 #   auto_tune_v2               = 1       (wave-1 default; 0=legacy classifier path)
 #   auto_tune_v2_glides        = 1       (V2-driven defaults for round-U-z10 knobs)
+#   auto_tune_v2_tiers         = 1       (Stage-4 default; V2-driven arming of K1/K2/K3 floors)
 #   auto_tune_hysteresis_windows = 2     (windows before committing state)
 #   auto_tune_cooldown_windows = 1       (quiet windows after state change)
 #   auto_tune_reset_overrides  = WO      (write 1 to clear user-override mask)
-#   auto_tune_status           = RO      (diagnostic: state, reason, signals)
+#   auto_tune_status           = RO      (diagnostic: state, reason, signals, tiers=)
 #   at_log                     = RO      (round-U-z10: ringbuf of last 16 V2 transitions)
 #   stats_reset                = WO      (round-U-z10: write any value to clear stats + at_log)
 #
@@ -364,3 +376,87 @@ on property:sys.boot_completed=1
 #   frame_budget_us            = 0       (vblank period; 0=disabled)
 #   frame_budget_us_per_policy = (none)  (CSV per-policy override)
 #   frame_pace_floor_pct       = 0
+#
+# Stage 4 floor tiers (Patches A through L, layered above the
+# legacy decision chain; all default to off / 0 on BATTERY and
+# LEGACY profiles, on by default on PERFORMANCE / BALANCED;
+# auto_tune_v2_tiers gates V2-driven per-state arming of K1/K2/K3
+# on top of the per-profile baseline)
+#
+# Patch A   Predictive up-shift via util trend ridge:
+#   predict_up_enable          = 1       (0=disabled)
+#   predict_up_ridge_pct       = 5       (% of util/window slope to arm)
+#   predict_up_target_pct      = 75      (% of policy->max on arm)
+#   predict_up_window_ms       = 20      (deadline length)
+#
+# Patch B   Render-thread floor debounce:
+#   render_floor_debounce_ms   = 80      (0=cliff)
+#
+# Patch I   Stats taxonomy:
+#   zenith_stats               = RO      (per-tier counters, see above)
+#
+# Patch C   Touchdown vs coordinate-stream input:
+#   input_touchdown_ms         = 60      (key-down / button-down pulse)
+#   input_stream_ms            = 200     (drag / scroll window)
+#
+# Patch E   Peak-return hysteresis:
+#   peak_hysteresis_ms         = 30
+#   peak_hysteresis_pct        = 80      (hold floor at this % of max)
+#
+# Patch F   Boost early-exit on persistent idle:
+#   boost_idle_exit_ms         = 40
+#   boost_idle_exit_util_pct   = 12
+#
+# Patch G   Background-task util scaling:
+#   bg_util_share_pct          = 60      (% of util kept on bg tasks)
+#   bg_util_comms              = (default seed list)
+#
+# Patch H   Sleeper-tail shaving:
+#   sleeper_tail_threshold_ms  = 250
+#   sleeper_tail_shave_pct     = 25
+#
+# Patch J   Per-policy last_decision_path:
+#   last_decision_path         = RO      (per-policy bucket name)
+#
+# Patch D   Multi-cluster pre-arm coordination (peer_ramp_*):
+#   peer_ramp_window_ms        = 25      (PERF 40 / BAL 25 / BAT 0 / LEG 0)
+#   peer_ramp_floor_pct        = 60      (PERF 70 / BAL 60 / BAT 0 / LEG 0)
+#
+# Patch K1  Migration-arrival soft floor (migration_*):
+#   migration_jump_pct         = 20      (PERF 15 / BAL 20 / BAT 0 / LEG 0)
+#   migration_floor_window_ms  = 30      (PERF 35 / BAL 30 / BAT 0 / LEG 0)
+#   migration_floor_pct        = 60      (PERF 70 / BAL 60 / BAT 0 / LEG 0)
+#
+# Patch K2  PSI-CPU sustained-pressure floor:
+#   psi_cpu_floor_thresh       = 0       (PERF 40 / BAL 0 / BAT 0 / LEG 0)
+#                                          gated on psi_aware=1
+#
+# Patch K3  Frame-overrun rescue (frame_overrun_*):
+#   frame_overrun_slack_us     = 0       (PERF 3000 / BAL 4000 / BAT 0 / LEG 0)
+#   frame_overrun_window_ms    = 50      (PERF 60   / BAL 50   / BAT 0 / LEG 0)
+#   frame_overrun_floor_pct    = 80      (PERF 90   / BAL 80   / BAT 0 / LEG 0)
+#                                          requires panel-driver wiring of
+#                                          zenith_drm_vblank_event() to fire
+#
+# Patch L   auto_tune_v2 tier-classifier wiring (gate written above):
+#   auto_tune_v2_tiers         = 1       (Stage-4 default; per-state arming
+#                                          of K1/K2/K3 on top of profiles)
+#
+# K1/K2/K3 read order at the floor sites:
+#   1. user sysfs override -> tunable wins (override_mask bit set)
+#   2. auto_tune_v2_tiers=0 -> tunable verbatim (V2 wiring off)
+#   3. V2 worker not run yet -> tunable verbatim
+#   4. V2 disarmed this tier -> 0 (off for this V2 window)
+#   5. V2 armed this tier -> tunable (profile-set value comes through)
+#
+# Per-state arm map (auto_tune_v2_tiers=1):
+#   LATENCY              -> arm K1 (migration), K2 (psi_cpu_floor)
+#   FRAME / GAME flags   -> arm K1 (migration), K3 (frame_overrun)
+#   EFFICIENCY/BALANCED  -> disarm all three
+#   THERMAL_RECOVERY     -> disarm all three
+#   SUSTAINED_PERF       -> disarm all three
+#
+# (The detector / producer paths -- migration jump detector,
+# zenith_drm_vblank_event() -- always fire regardless of V2 gating;
+# only the consumer side at the floor read is gated, so cross-cluster
+# state disagreements resolve correctly.)
