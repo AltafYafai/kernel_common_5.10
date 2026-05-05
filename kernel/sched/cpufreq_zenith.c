@@ -6163,6 +6163,34 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 		 */
 		if (z_policy->screen_state_last != cur_screen)
 			atomic64_set(&zenith_last_vblank_ns, 0);
+		/* Audit fix M7: on the 0 -> 1 (resume) edge, reset the
+		 * V1 classifier counters and the V2 pending-window
+		 * accumulator.  Without this, the first auto_tune window
+		 * after a long suspend / blank would aggregate samples
+		 * collected pre-suspend (when the screen was on and the
+		 * workload was real) with a window-sized post-resume
+		 * gap (where the device had been idle), producing a
+		 * misleadingly low sat_pct and biasing V1 toward
+		 * EFFICIENCY for one extra window after resume.
+		 *
+		 * Treat resume as a fresh measurement: clear the atomic
+		 * sample counters and the pending-window state, leaving
+		 * at_last_state / at_last_applied_state untouched (so
+		 * the just-restored state survives the reset and the
+		 * cooldown timer continues to gate further moves).
+		 *
+		 * Cheap: 4 atomic_sets and 1 unsigned-int store, only on
+		 * a transition (not every tick).  No effect on the
+		 * 1 -> 0 (suspend) edge -- those samples are still
+		 * useful for the screen-off glide path.
+		 */
+		if (!z_policy->screen_state_last && cur_screen) {
+			atomic_set(&z_policy->at_samples_total, 0);
+			atomic_set(&z_policy->at_samples_saturated, 0);
+			z_policy->at_last_events =
+				atomic64_read(&zenith_auto_input_events);
+			z_policy->at_pending_windows = 0;
+		}
 		z_policy->screen_state_last = cur_screen;
 	}
 
