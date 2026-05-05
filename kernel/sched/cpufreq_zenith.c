@@ -3526,6 +3526,25 @@ static unsigned int zenith_input_boost_touchdown_extra_ms_cache =
 static atomic64_t zenith_auto_input_events = ATOMIC64_INIT(0);
 #define ZENITH_AUTO_TUNE_PERIOD_MS	10000	/* classify every 10s  */
 
+/* Audit fix F1: scenario-active classifier window.
+ *
+ * When any scenario flag (camera, render, frame, game, memstall,
+ * thermal_slope, psi_cpu) is set, drop the V1 classifier reschedule
+ * cadence from the default 10 s down to ~1.5 s.  Real-world bursty
+ * workloads (camera open, app launch, scroll) finish in 1-3 s on
+ * modern phone-class hardware; the 10 s default means V1 runs
+ * exactly once during the burst, sees a half-saturated window, and
+ * picks BALANCED -- making LATENCY commit only after the burst is
+ * already over.
+ *
+ * This faster window only applies to the *V1 reschedule* cadence;
+ * the V2 hysteresis windows continue to count in the same units (so
+ * a 2-window hysteresis is now ~3 s instead of ~20 s).  V3
+ * calibration interval is unchanged because V3 already has its own
+ * timer (auto_tune_v3_interval_ms).
+ */
+#define ZENITH_AUTO_TUNE_FAST_PERIOD_MS	1500
+
 /* Stage 4 / Patch I -- governor-wide input observability counters.
  *
  * Each counter is a monotonic atomic64; readers get a snapshot via
@@ -11267,8 +11286,32 @@ rearm:
 			zenith_at_v3_calibrate(z_policy, v3_mode);
 	}
 
-	schedule_delayed_work(&z_policy->at_work,
-			      msecs_to_jiffies(ZENITH_AUTO_TUNE_PERIOD_MS));
+	{
+		/* F1: pick the faster reschedule cadence whenever a
+		 * scenario flag is active in the just-completed window.
+		 * The check uses at_last_flags (set above by the
+		 * decision path), so a scenario that ended IN this
+		 * window still gets one fast follow-up window before
+		 * we settle back to the slow cadence -- catches the
+		 * case where the burst leaves residual variance worth
+		 * a quick re-eval.
+		 */
+		const unsigned int fast_mask =
+			ZENITH_AT_FLAG_CAMERA |
+			ZENITH_AT_FLAG_RENDER |
+			ZENITH_AT_FLAG_FRAME  |
+			ZENITH_AT_FLAG_GAME   |
+			ZENITH_AT_FLAG_MEMSTALL |
+			ZENITH_AT_FLAG_THERMAL_SLOPE |
+			ZENITH_AT_FLAG_PSI_CPU;
+		unsigned int period =
+			(z_policy->at_last_flags & fast_mask) ?
+			ZENITH_AUTO_TUNE_FAST_PERIOD_MS :
+			ZENITH_AUTO_TUNE_PERIOD_MS;
+
+		schedule_delayed_work(&z_policy->at_work,
+				      msecs_to_jiffies(period));
+	}
 }
 
 static ssize_t auto_tune_show(struct gov_attr_set *attr_set, char *buf)
