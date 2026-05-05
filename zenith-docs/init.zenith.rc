@@ -1,4 +1,4 @@
-# init.zenith.rc — Zenith governor runtime tunables (Zenithed-V3)
+# init.zenith.rc — Zenith governor runtime tunables (Zenithed-V4)
 #
 # Drop in /vendor/etc/init/init.zenith.rc on the device, then merge into
 # your existing init.mtxxxx.rc init scripts.  Path globs (`*`) require Android 10+ init.
@@ -32,13 +32,13 @@ on init
     # knobs back to your taste.  Leave commented to keep cmdline /
     # built-in CUSTOM defaults.
     #
-    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/profile balanced
+    # write /sys/devices/system/cpu/cpufreq/zenith/profile balanced
 
     # ----- Boot boost (one-shot, decays past deadline) -----
     # Pin freq to policy->max for this many ms after kernel boot.
     # 0 disables.  Recommended 30000 (30s).  Gated by screen_state and
     # input_boost_big_only — small clusters skip if big_only=1.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/boot_boost_ms 30000
+    write /sys/devices/system/cpu/cpufreq/zenith/boot_boost_ms 30000
 
     # ----- Auto-tune -----
     # Worker classifies workload every 10s and switches profiles based on
@@ -51,8 +51,8 @@ on init
     # write them here explicitly so the boot config is self-documenting
     # and so re-flashing an older kernel does not silently revert the
     # behaviour.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune 1
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_scenario 1
+    write /sys/devices/system/cpu/cpufreq/zenith/auto_tune 1
+    write /sys/devices/system/cpu/cpufreq/zenith/auto_tune_scenario 1
 
     # ----- Auto-tune V2 (smart scenario-driven tuning) -----
     # V2 state machine: classifies into efficiency/balanced/latency/
@@ -70,9 +70,9 @@ on init
     # before committing a state change.  Prevents mode thrashing.
     # Cooldown: quiet period (in windows) after a state change before
     # another change is allowed.  Thermal/sustained_perf bypass this.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_v2 1
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_hysteresis_windows 2
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_cooldown_windows 1
+    write /sys/devices/system/cpu/cpufreq/zenith/auto_tune_v2 1
+    write /sys/devices/system/cpu/cpufreq/zenith/auto_tune_hysteresis_windows 2
+    write /sys/devices/system/cpu/cpufreq/zenith/auto_tune_cooldown_windows 1
 
     # ----- prefer_silver coordination -----
     # When CONFIG_SCHED_PREFER_SILVER=y, the auto-tune classifier
@@ -85,7 +85,7 @@ on init
     # defaults to 1 in-kernel (see ZENITH_DEFAULT_PREFER_SILVER_AWARE
     # in cpufreq_zenith.c).  On builds without CONFIG_SCHED_PREFER_SILVER
     # the runtime path is a no-op.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/prefer_silver_aware 1
+    write /sys/devices/system/cpu/cpufreq/zenith/prefer_silver_aware 1
 
     # ----- Auto-tune V2 glides (round-U-z10 follow-up) -----
     # Master gate for V2-driven population of the round-U-z10 glide /
@@ -96,7 +96,7 @@ on init
     # write it here explicitly so the intent is visible to anyone
     # auditing the boot config.  Set to 0 to lock all seven glide
     # knobs back to their per-knob defaults (legacy hard cliffs).
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_v2_glides 1
+    write /sys/devices/system/cpu/cpufreq/zenith/auto_tune_v2_glides 1
 
     # ----- Auto-tune V2 tiers (Stage 4 follow-up) -----
     # Master gate for V2-driven arming of the Stage-4 K1 / K2 / K3
@@ -107,30 +107,30 @@ on init
     # silently revert the behaviour.  Set to 0 to lock all three
     # tiers back to pure profile-driven behaviour without disabling
     # V2 for the seven legacy glide knobs above.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/auto_tune_v2_tiers 1
+    write /sys/devices/system/cpu/cpufreq/zenith/auto_tune_v2_tiers 1
 
     # ----- Smoothness tunables (V3) -----
     # Frequency stability margin: hold current freq when the new target
     # is within this % of policy->max below current.  Prevents tiny
     # oscillations at OPP boundaries.  0=disabled, max 10.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/freq_stability_margin_pct 3
+    write /sys/devices/system/cpu/cpufreq/zenith/freq_stability_margin_pct 3
 
     # Adaptive down-rate: bursty workloads automatically get up to 2x
     # the normal down-rate delay, keeping freq elevated between bursts.
     # 0=fixed delay (legacy), 1=adaptive.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/down_rate_adaptive 1
+    write /sys/devices/system/cpu/cpufreq/zenith/down_rate_adaptive 1
 
     # Wakeup boost: brief up-rate bypass on idle-to-busy transitions.
     # 0=disabled, 1=enabled.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/wakeup_boost 1
+    write /sys/devices/system/cpu/cpufreq/zenith/wakeup_boost 1
 
     # Adaptive down-threshold: bursty load variance widens the brutality
     # exit threshold by up to this %.  0=disabled.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/down_threshold_adaptive 5
+    write /sys/devices/system/cpu/cpufreq/zenith/down_threshold_adaptive 5
 
     # Per-cluster asymmetric rate limits: little clusters use tighter
     # up/down delays.  0=uniform, 1=asymmetric.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/rate_limit_cluster_scale 1
+    write /sys/devices/system/cpu/cpufreq/zenith/rate_limit_cluster_scale 1
 
     # ----- Awareness flags -----
     # render_aware / audio_aware are flipped to default 1 in the
@@ -148,15 +148,15 @@ on init
     #
     # audio_aware: audio_floor_pct and audio_cap_pct stay at 0, so
     # the runtime impact is just the comm walk + V2 scenario flag.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/render_aware 1
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/audio_aware 1
+    write /sys/devices/system/cpu/cpufreq/zenith/render_aware 1
+    write /sys/devices/system/cpu/cpufreq/zenith/audio_aware 1
 
     # camera_aware / game_mode / psi_aware are still opt-in.  Leave
     # commented unless you have an init script that toggles them
     # based on the running app.
-    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/camera_aware 1
-    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/game_mode 0
-    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/psi_aware 1
+    # write /sys/devices/system/cpu/cpufreq/zenith/camera_aware 1
+    # write /sys/devices/system/cpu/cpufreq/zenith/game_mode 0
+    # write /sys/devices/system/cpu/cpufreq/zenith/psi_aware 1
 
     # ----- Predicted util (mild two-tap predictor) -----
     # predict_util_pct=10 + predict_util_smooth=1 default in-kernel
@@ -164,8 +164,8 @@ on init
     # averages two slope taps so single-sample outliers cannot
     # produce a full-strength prediction on the next tick.  Set
     # predict_util_pct=0 to disable the predictor entirely.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/predict_util_pct 10
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/predict_util_smooth 1
+    write /sys/devices/system/cpu/cpufreq/zenith/predict_util_pct 10
+    write /sys/devices/system/cpu/cpufreq/zenith/predict_util_smooth 1
 
     # ----- Continuous thermal pressure ramp -----
     # thermal_pressure_continuous defaults to 1 in-kernel (wave-2
@@ -174,7 +174,7 @@ on init
     # up_threshold (at 0% pressure) to 90% (at 100% pressure), using
     # the same arch_scale_thermal_pressure() reading the V2
     # classifier consumes.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/thermal_pressure_continuous 1
+    write /sys/devices/system/cpu/cpufreq/zenith/thermal_pressure_continuous 1
 
     # ----- Frame pace floor (adaptive 60/90/120/144 Hz) -----
     # Userspace writes the current vblank period in microseconds whenever
@@ -182,8 +182,8 @@ on init
     # 120Hz=8333, 144Hz=6944.  Pair with frame_pace_floor_pct (0..100,
     # default 0 = disabled) — typical 50.
     #
-    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/frame_budget_us 8333
-    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/frame_pace_floor_pct 50
+    # write /sys/devices/system/cpu/cpufreq/zenith/frame_budget_us 8333
+    # write /sys/devices/system/cpu/cpufreq/zenith/frame_pace_floor_pct 50
 
     # ----- Permissions for runtime userspace tweaks -----
     # Open the knobs you want HALs / app-aware daemons to write to.
@@ -221,7 +221,7 @@ on property:sys.boot_completed=1
     # Optional: switch to balanced profile once boot finishes.  Boot
     # boost above already auto-decays at deadline so this is mostly
     # a tidy-up.
-    # write /sys/devices/system/cpu/cpufreq/policy*/zenith/profile balanced
+    # write /sys/devices/system/cpu/cpufreq/zenith/profile balanced
 
     # Raise the boot_complete latch (wave-3).  This snaps the
     # boot_boost deadline forward to "now" so the cluster transitions
@@ -233,7 +233,7 @@ on property:sys.boot_completed=1
     # streak (boot_complete_auto=1 by default), so this write is
     # belt-and-braces -- if init runs first, great; if the kernel
     # latches first, this write is a no-op.
-    write /sys/devices/system/cpu/cpufreq/policy*/zenith/boot_complete 1
+    write /sys/devices/system/cpu/cpufreq/zenith/boot_complete 1
 
 # ----- Reference: every Zenith knob, defaults shown -----
 # (Listed for grep / discovery.  Do not uncomment unless you actually
