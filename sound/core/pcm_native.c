@@ -2802,8 +2802,8 @@ static int snd_pcm_open_file(struct file *file,
 /* Forward decl for K5 hook -- the open paths set the refcount on
  * success; the bodies are below the snd_pcm_open() definition.
  */
-extern void zenith_alsa_pcm_open_notify(int stream) __attribute__((weak));
-extern void zenith_alsa_pcm_release_notify(int stream) __attribute__((weak));
+extern void zenith_alsa_pcm_open_notify(int stream) __weak;
+extern void zenith_alsa_pcm_release_notify(int stream) __weak;
 
 static int snd_pcm_playback_open(struct inode *inode, struct file *file)
 {

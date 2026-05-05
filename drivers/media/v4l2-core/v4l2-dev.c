@@ -420,8 +420,8 @@ static int v4l2_mmap(struct file *filp, struct vm_area_struct *vm)
  * The hook is called only on a successful open / unconditional
  * release, so the refcount is invariant under failed-open paths.
  */
-__attribute__((weak)) void zenith_v4l2_open_notify(struct video_device *vdev);
-__attribute__((weak)) void zenith_v4l2_release_notify(struct video_device *vdev);
+void zenith_v4l2_open_notify(struct video_device *vdev) __weak;
+void zenith_v4l2_release_notify(struct video_device *vdev) __weak;
 
 /* Override for the open function */
 static int v4l2_open(struct inode *inode, struct file *filp)
