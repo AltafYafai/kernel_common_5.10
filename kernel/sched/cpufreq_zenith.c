@@ -9676,6 +9676,29 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 } \
 static struct governor_attr _name = __ATTR_RW(_name)
 
+/* Audit fix M6.  Bounded variant of ZENITH_TUNABLE_UINT.  Max value
+ * is taken from a user-supplied compile-time constant so the cap is
+ * documented in the same place the macro is invoked.  Compare to
+ * the open-coded "kstrtouint(...) || val > FOO" pattern used by
+ * iowait_boost_min, iowait_stack_pct, etc.
+ */
+#define ZENITH_TUNABLE_UINT_MAX(_name, _max) \
+static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
+{ \
+	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
+	return sprintf(buf, "%u\n", t->_name); \
+} \
+static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
+{ \
+	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
+	unsigned int val; \
+	if (kstrtouint(buf, 10, &val) || val > (_max)) \
+		return -EINVAL; \
+	t->_name = val; \
+	return count; \
+} \
+static struct governor_attr _name = __ATTR_RW(_name)
+
 /* Same as ZENITH_TUNABLE_UINT but invalidates the per-policy freq
  * cache after the write so the new value takes effect on the next
  * scheduler tick. Use this for fields that feed into the
@@ -9698,7 +9721,32 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 } \
 static struct governor_attr _name = __ATTR_RW(_name)
 
-ZENITH_TUNABLE_UINT_INVAL(io_is_busy);
+/* Audit fix M6.  Bounded variant of ZENITH_TUNABLE_UINT_INVAL for
+ * boolean-style tunables (0 or 1 only).  Without the bound the
+ * previous template would happily store UINT_MAX into a "screen on?"
+ * field; downstream code uses the value with `if (t->screen_state)`
+ * so any nonzero won the test, but writing a large number out via
+ * the show() path then re-reading produced a confusing audit trail.
+ */
+#define ZENITH_TUNABLE_UINT_BOOL_INVAL(_name) \
+static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
+{ \
+	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
+	return sprintf(buf, "%u\n", t->_name); \
+} \
+static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
+{ \
+	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
+	unsigned int val; \
+	if (kstrtouint(buf, 10, &val) || val > 1) \
+		return -EINVAL; \
+	t->_name = val; \
+	zenith_invalidate_cache(attr_set); \
+	return count; \
+} \
+static struct governor_attr _name = __ATTR_RW(_name)
+
+ZENITH_TUNABLE_UINT_BOOL_INVAL(io_is_busy);
 
 static ssize_t iowait_boost_min_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -11694,8 +11742,14 @@ ZENITH_AT_PCT_TUNABLE(auto_tune_sat_load_pct);
 ZENITH_AT_PCT_TUNABLE(auto_tune_hi_sat_pct);
 ZENITH_AT_PCT_TUNABLE(auto_tune_lo_sat_pct);
 
-ZENITH_TUNABLE_UINT(auto_tune_hi_events_x2);
-ZENITH_TUNABLE_UINT(auto_tune_lo_events_x2);
+/* Input event rate thresholds, doubled.  Practical max in normal
+ * use is a few hundred (touch event stream is 50-200 / s, doubled
+ * gives 100-400); 65535 is a generous upper bound that still keeps
+ * the field well inside u16 range so future packing into the V2
+ * status struct stays free.
+ */
+ZENITH_TUNABLE_UINT_MAX(auto_tune_hi_events_x2, 65535);
+ZENITH_TUNABLE_UINT_MAX(auto_tune_lo_events_x2, 65535);
 
 /* auto_tune_scenario sysfs knob.  Strict 0/1 boolean; non-zero
  * values normalised to 1 on store.  Effective only when auto_tune=1.
@@ -12279,7 +12333,7 @@ static ssize_t last_decision_path_show(struct gov_attr_set *attr_set,
 static struct governor_attr last_decision_path =
 	__ATTR_RO(last_decision_path);
 
-ZENITH_TUNABLE_UINT_INVAL(screen_state);
+ZENITH_TUNABLE_UINT_BOOL_INVAL(screen_state);
 
 /* screen_off_glide_ms sysfs knob.  Range
  * 0..ZENITH_SCREEN_OFF_GLIDE_MS_MAX.  See struct zenith_tunables for
@@ -12327,7 +12381,7 @@ static ssize_t screen_auto_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr screen_auto = __ATTR_RW(screen_auto);
-ZENITH_TUNABLE_UINT_INVAL(thermal_state);
+ZENITH_TUNABLE_UINT_BOOL_INVAL(thermal_state);
 
 static ssize_t thermal_auto_show(struct gov_attr_set *attr_set, char *buf)
 {
