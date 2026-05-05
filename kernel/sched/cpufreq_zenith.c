@@ -577,6 +577,53 @@
 #define ZENITH_DEFAULT_FRAME_OVERRUN_FLOOR_PCT		80
 #define ZENITH_FRAME_OVERRUN_FLOOR_PCT_MAX		100
 
+/* frame_overrun_deep_streak / frame_overrun_deep_floor_pct
+ * (defaults 0 / 100, [Stage 5 / Patch M5]):
+ *
+ * Sub-knob inside K3.  A single overrun is plausibly a one-shot
+ * scheduler / GC / page-fault hiccup; the standard K3 floor at
+ * frame_overrun_floor_pct (typ. 80%) is sized for that case.  N
+ * consecutive overruns at the same panel period is qualitatively
+ * different -- something is sustained-overloaded -- and the
+ * recovery floor should escalate.
+ *
+ * Implementation: the producer (zenith_drm_vblank_event())
+ * already detects per-vblank overruns and stamps a deadline.
+ * Track a governor-wide consecutive-overrun streak: bump on
+ * each overrun, reset on each within-budget vblank.  In the
+ * consumer (the K3 read site in zenith_get_next_freq()), once
+ * the streak crosses frame_overrun_deep_streak the floor lifts
+ * from frame_overrun_floor_pct to frame_overrun_deep_floor_pct.
+ *
+ * frame_overrun_deep_streak == 0 disables the deep tier
+ * entirely (the consumer never reads the streak atomic).  The
+ * default of 0 keeps Stage 4 K3 byte-identical for users who
+ * don't opt in.  PERFORMANCE profile arms it at 2 / 100% --
+ * two consecutive misses at 60 Hz is ~33 ms of stutter, well
+ * outside any plausible jitter explanation, and the user has
+ * already opted into the energy / responsiveness trade by
+ * picking PERFORMANCE.  All other profiles ship at 0.
+ *
+ * Capped at 16 to keep streak overflow a non-issue (atomic_t
+ * is 31 bits but practically the read-site comparison only
+ * cares about reaching the threshold; once past, the streak
+ * keeps bumping until reset and the comparison stays true).
+ * deep_floor_pct is capped at 100 (anything higher is just
+ * policy->max again) and lower-bounded by the read site at
+ * the existing frame_overrun_floor_pct -- the deep tier never
+ * produces a *lower* floor than the standard K3 floor.
+ *
+ * Sits inside K3's V2 arming gate: if V2 has disarmed K3 for
+ * this state (eff_floor_pct == 0), the deep tier is also
+ * inactive because the read-site short-circuit fires before
+ * the streak comparison.  No new V2 tier bit; this is an
+ * amplification of K3, not a separate tier.
+ */
+#define ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_STREAK	0
+#define ZENITH_FRAME_OVERRUN_DEEP_STREAK_MAX		16
+#define ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_FLOOR_PCT	100
+#define ZENITH_FRAME_OVERRUN_DEEP_FLOOR_PCT_MAX	100
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -2421,6 +2468,18 @@ struct zenith_tunables {
 	unsigned int		frame_overrun_window_ms;
 	unsigned int		frame_overrun_floor_pct;
 
+	/* See ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_STREAK /
+	 * ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_FLOOR_PCT (Patch M5).
+	 * Sub-knob inside K3.  deep_streak == 0 disables the deep
+	 * tier (consumer never reads the streak atomic).  When
+	 * armed, the deep tier amplifies an active K3 floor on
+	 * sustained overrun runs.  Reads via READ_ONCE on the eval
+	 * hot path; writes via WRITE_ONCE from sysfs and
+	 * zenith_apply_profile().
+	 */
+	unsigned int		frame_overrun_deep_streak;
+	unsigned int		frame_overrun_deep_floor_pct;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -3033,6 +3092,24 @@ static atomic64_t zenith_peer_ramp_until_ns_prime = ATOMIC64_INIT(0);
 static atomic64_t zenith_last_vblank_ns          = ATOMIC64_INIT(0);
 static atomic64_t zenith_frame_overrun_until_ns  = ATOMIC64_INIT(0);
 
+/* Frame-overrun deep tier (Patch M5) -- governor-wide streak
+ * counter.  Bumped by zenith_drm_vblank_event() each time a
+ * vblank gap exceeds the budget; reset to 0 when a vblank
+ * arrives within budget.  Read by the K3 block in
+ * zenith_get_next_freq() and compared against the per-policy
+ * frame_overrun_deep_streak knob.  Same governor-wide-vs-per-
+ * policy reasoning as the deadline atomic above: frame events
+ * sit at the display layer above cluster partitioning, and a
+ * sustained-overrun signal benefits both clusters.
+ *
+ * Initialised to 0; a fresh policy attach therefore starts in
+ * the non-deep-tier state regardless of any previous policy's
+ * history, which is the conservative default.  Never decrements
+ * other than the within-budget reset, so no torn-read protection
+ * needed beyond atomic_t's natural alignment guarantee.
+ */
+static atomic_t zenith_frame_overrun_streak       = ATOMIC_INIT(0);
+
 /*
  * Cached drm-panel vblank period, in microseconds.  Producer:
  * display drivers / panel bridges call zenith_set_drm_vblank_us()
@@ -3183,13 +3260,27 @@ void zenith_drm_vblank_event(void)
 	if (!period_us)
 		return;
 	delta_ns = now_ns - last_ns;
-	if (delta_ns <= ((u64)period_us + slack_us) * NSEC_PER_USEC)
+	if (delta_ns <= ((u64)period_us + slack_us) * NSEC_PER_USEC) {
+		/* Within budget -- reset the deep-tier streak (Patch M5).
+		 * A single good frame breaks any "sustained" pattern the
+		 * deep tier was tracking, so the deep floor should
+		 * back off on the very next eval.
+		 */
+		atomic_set(&zenith_frame_overrun_streak, 0);
 		return;
+	}
 	window_ms = READ_ONCE(zenith_frame_overrun_window_ms_cache);
 	if (!window_ms)
 		return;
 	atomic64_set(&zenith_frame_overrun_until_ns,
 		     (s64)(now_ns + (u64)window_ms * NSEC_PER_MSEC));
+	/* Track consecutive overruns for the deep-tier consumer in
+	 * zenith_get_next_freq() (Patch M5).  Bumping is post-stamp
+	 * so window_ms == 0 (K3 floor suppressed but stamping still
+	 * occurs) does not feed the deep tier either: deep is an
+	 * amplification of K3 and inherits its arming gate.
+	 */
+	atomic_inc(&zenith_frame_overrun_streak);
 }
 EXPORT_SYMBOL_GPL(zenith_drm_vblank_event);
 
@@ -7210,9 +7301,31 @@ brutal_entry_deferred:
 			      (u64)atomic64_read(&zenith_frame_overrun_until_ns);
 
 			if (until && ktime_get_ns() < until) {
-				unsigned int floor =
-					(policy->max * eff_floor_pct) / 100;
+				unsigned int floor_pct = eff_floor_pct;
+				unsigned int deep_streak =
+					READ_ONCE(z_policy->tunables->frame_overrun_deep_streak);
+				unsigned int floor;
 
+				/* Patch M5: deep tier.  After deep_streak
+				 * consecutive overruns the floor escalates
+				 * to frame_overrun_deep_floor_pct (default
+				 * 100%).  deep_streak == 0 short-circuits
+				 * the comparison and the streak atomic is
+				 * never read.  The lower bound of max(...)
+				 * with eff_floor_pct guarantees the deep
+				 * tier never produces a *lower* floor than
+				 * the standard K3 floor would.
+				 */
+				if (deep_streak &&
+				    (unsigned int)atomic_read(&zenith_frame_overrun_streak) >=
+				    deep_streak) {
+					unsigned int deep_pct = READ_ONCE(
+						z_policy->tunables->frame_overrun_deep_floor_pct);
+
+					if (deep_pct > floor_pct)
+						floor_pct = deep_pct;
+				}
+				floor = (policy->max * floor_pct) / 100;
 				if (floor > policy->max)
 					floor = policy->max;
 				if (freq < floor) {
@@ -9261,6 +9374,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int frame_overrun_slack_us;
 		unsigned int frame_overrun_window_ms;
 		unsigned int frame_overrun_floor_pct;
+		unsigned int frame_overrun_deep_streak;
+		unsigned int frame_overrun_deep_floor_pct;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -9410,6 +9525,18 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.frame_overrun_slack_us = 3000,
 			.frame_overrun_window_ms = 60,
 			.frame_overrun_floor_pct = 90,
+			/* Stage 5 / Patch M5: PERFORMANCE arms the K3
+			 * deep tier at 2 / 100%%.  Two consecutive
+			 * 60 Hz vblank gaps wider than 3 ms slack is
+			 * ~33 ms of stutter -- well outside any
+			 * plausible single-shot jitter explanation.
+			 * Lifting the floor to 100%% of policy->max
+			 * for the recovery window is the right
+			 * trade for a profile the user has explicitly
+			 * picked for max responsiveness.
+			 */
+			.frame_overrun_deep_streak = 2,
+			.frame_overrun_deep_floor_pct = 100,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -9560,6 +9687,17 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_FRAME_OVERRUN_WINDOW_MS,
 			.frame_overrun_floor_pct =
 				ZENITH_DEFAULT_FRAME_OVERRUN_FLOOR_PCT,
+			/* Stage 5 / Patch M5: BALANCED keeps the deep
+			 * tier at the cold-boot off default.  K3 alone
+			 * is sufficient for the BALANCED energy /
+			 * latency trade-off; users who want the deep
+			 * escalation can opt in via sysfs without
+			 * switching to PERFORMANCE.
+			 */
+			.frame_overrun_deep_streak =
+				ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_STREAK,
+			.frame_overrun_deep_floor_pct =
+				ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_FLOOR_PCT,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -9706,6 +9844,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.frame_overrun_slack_us = 0,
 			.frame_overrun_window_ms = 0,
 			.frame_overrun_floor_pct = 0,
+			/* Stage 5 / Patch M5: BATTERY keeps the deep
+			 * tier off for the same reason K3 itself is
+			 * off here.  Redundant given K3's outer gate
+			 * already short-circuits, but kept explicit so
+			 * a sysfs tweak that lifts frame_overrun_*
+			 * does not silently bring deep along.
+			 */
+			.frame_overrun_deep_streak = 0,
+			.frame_overrun_deep_floor_pct = 100,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -9836,6 +9983,14 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.frame_overrun_slack_us = 0,
 			.frame_overrun_window_ms = 0,
 			.frame_overrun_floor_pct = 0,
+			/* Stage 5 / Patch M5: LEGACY mirrors the K3
+			 * disable for the deep tier.  Pre-Stage-1
+			 * governor had no concept of consecutive-
+			 * overrun amplification; LEGACY preserves that
+			 * absence end-to-end.
+			 */
+			.frame_overrun_deep_streak = 0,
+			.frame_overrun_deep_floor_pct = 100,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -9917,6 +10072,10 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   p->frame_overrun_window_ms);
 	WRITE_ONCE(t->frame_overrun_floor_pct,
 		   p->frame_overrun_floor_pct);
+	WRITE_ONCE(t->frame_overrun_deep_streak,
+		   p->frame_overrun_deep_streak);
+	WRITE_ONCE(t->frame_overrun_deep_floor_pct,
+		   p->frame_overrun_deep_floor_pct);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
@@ -13140,6 +13299,72 @@ frame_overrun_floor_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr frame_overrun_floor_pct =
 	__ATTR_RW(frame_overrun_floor_pct);
 
+/* frame_overrun_deep_streak sysfs knob (Patch M5).  Range
+ * 0..ZENITH_FRAME_OVERRUN_DEEP_STREAK_MAX (16).  When non-zero,
+ * after this many consecutive overruns the K3 floor escalates
+ * from frame_overrun_floor_pct to frame_overrun_deep_floor_pct.
+ * 0 disables the deep tier (the consumer never reads the streak
+ * atomic).  See the macro block above struct zenith_tunables
+ * for the full design rationale.
+ */
+static ssize_t
+frame_overrun_deep_streak_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+		       frame_overrun_deep_streak);
+}
+
+static ssize_t
+frame_overrun_deep_streak_store(struct gov_attr_set *attr_set,
+				const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_FRAME_OVERRUN_DEEP_STREAK_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->frame_overrun_deep_streak, val);
+	return count;
+}
+
+static struct governor_attr frame_overrun_deep_streak =
+	__ATTR_RW(frame_overrun_deep_streak);
+
+/* frame_overrun_deep_floor_pct sysfs knob (Patch M5).  Range
+ * 0..ZENITH_FRAME_OVERRUN_DEEP_FLOOR_PCT_MAX (100).  Floor as a
+ * percent of policy->max applied while the K3 deadline is active
+ * AND the consecutive-overrun streak has crossed
+ * frame_overrun_deep_streak.  Effective floor is
+ * max(deep_floor_pct, frame_overrun_floor_pct) so the deep tier
+ * never produces a lower floor than the standard K3 floor.
+ */
+static ssize_t
+frame_overrun_deep_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+		       frame_overrun_deep_floor_pct);
+}
+
+static ssize_t
+frame_overrun_deep_floor_pct_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_FRAME_OVERRUN_DEEP_FLOOR_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->frame_overrun_deep_floor_pct, val);
+	return count;
+}
+
+static struct governor_attr frame_overrun_deep_floor_pct =
+	__ATTR_RW(frame_overrun_deep_floor_pct);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -14332,6 +14557,8 @@ static struct attribute *zenith_attrs[] = {
 	&frame_overrun_slack_us.attr,
 	&frame_overrun_window_ms.attr,
 	&frame_overrun_floor_pct.attr,
+	&frame_overrun_deep_streak.attr,
+	&frame_overrun_deep_floor_pct.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -14601,6 +14828,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_FRAME_OVERRUN_WINDOW_MS;
 	tunables->frame_overrun_floor_pct =
 		ZENITH_DEFAULT_FRAME_OVERRUN_FLOOR_PCT;
+	tunables->frame_overrun_deep_streak =
+		ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_STREAK;
+	tunables->frame_overrun_deep_floor_pct =
+		ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_FLOOR_PCT;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
