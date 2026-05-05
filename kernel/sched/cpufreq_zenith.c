@@ -3872,6 +3872,19 @@ struct zenith_policy {
 	unsigned int		at_last_events_rate_x2;
 	unsigned int		at_last_target;
 	unsigned int		at_last_state;
+	/* at_last_applied_state is the V2 state AFTER the cluster-aware
+	 * demotion path runs.  When auto_tune_cluster_aware = 1 the
+	 * little cluster takes LATENCY/SUSTAINED_PERF -> BALANCED and the
+	 * prime cluster takes BALANCED -> LATENCY; the at_last_state
+	 * field holds the pre-demotion V2 state (so V3 / hysteresis /
+	 * cooldown all see the canonical decision), and this field
+	 * holds what was actually applied via zenith_at_apply_actions().
+	 * Surfaced through auto_tune_status as applied_state= so an
+	 * operator reading the file can tell at-a-glance which cluster
+	 * was demoted vs the V2 logical state.  When cluster_aware is
+	 * off, applied_state == at_last_state.
+	 */
+	unsigned int		at_last_applied_state;
 	unsigned int		at_pending_state;
 	unsigned int		at_pending_windows;
 	unsigned int		at_cooldown_left;
@@ -10965,6 +10978,17 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		}
 		z_policy->at_last_reason = reason;
 		zenith_at_apply_actions(z_policy, state);
+		/* Record the cluster-aware-demoted state for telemetry.
+		 * applied_state mirrors at_last_state when cluster_aware
+		 * is off, but reflects the LATENCY->BALANCED / BALANCED->
+		 * LATENCY demotions when on.  Same expression the action
+		 * picker uses internally (zenith_at_profile_for_state),
+		 * mapped back via zenith_profile_to_at_state so the field
+		 * is a state ID rather than a profile ID.
+		 */
+		z_policy->at_last_applied_state =
+			zenith_profile_to_at_state(
+				zenith_at_profile_for_state(z_policy, state));
 		/* Populate the round-U-z10 glide knobs (brutal_decay_ms,
 		 * wakeup_boost_ms, ...) from the just-resolved V2 state
 		 * when auto_tune_v2_glides is on.  Cheap; gated so it
@@ -11608,6 +11632,7 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 	list_for_each_entry(z_policy, &attr_set->policy_list, tunables_hook) {
 		zenith_reset_local_actions(z_policy);
 		z_policy->at_last_state = ZENITH_AT_STATE_BALANCED;
+		z_policy->at_last_applied_state = ZENITH_AT_STATE_BALANCED;
 		z_policy->at_pending_state = ZENITH_AT_STATE_BALANCED;
 		z_policy->at_pending_windows = 0;
 		z_policy->at_cooldown_left = 0;
@@ -11660,10 +11685,11 @@ static ssize_t auto_tune_status_show(struct gov_attr_set *attr_set, char *buf)
 			 "override_mask=0x%lx\n", t->auto_tune_override_mask);
 	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
 		len += scnprintf(buf + len, PAGE_SIZE - len,
-				 "policy%u(%s): state=%s pending=%s pending_windows=%u cooldown=%u reason=%s target=%s samples=%u saturated=%u sat_pct=%u events_x2=%u flags=0x%x var_x256=%u psi=%u/%u/%u thermal=%u+%u frame_us=%u local=%u eff_rate=%u/%u eff_thresh=%u/%u eff_boost=%u/%u eff_frame=%u eff_game=%u\n",
+				 "policy%u(%s): state=%s applied_state=%s pending=%s pending_windows=%u cooldown=%u reason=%s target=%s samples=%u saturated=%u sat_pct=%u events_x2=%u flags=0x%x var_x256=%u psi=%u/%u/%u thermal=%u+%u frame_us=%u local=%u eff_rate=%u/%u eff_thresh=%u/%u eff_boost=%u/%u eff_frame=%u eff_game=%u\n",
 				 z_pol->policy->cpu,
 				 zenith_at_cluster_name(z_pol->cluster_class),
 				 zenith_at_state_name(z_pol->at_last_state),
+				 zenith_at_state_name(z_pol->at_last_applied_state),
 				 zenith_at_state_name(z_pol->at_pending_state),
 				 z_pol->at_pending_windows,
 				 z_pol->at_cooldown_left,
