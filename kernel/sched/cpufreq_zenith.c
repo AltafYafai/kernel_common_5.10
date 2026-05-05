@@ -1516,6 +1516,14 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_AT_V2_VAR_PROMOTE_THRESH	768
 #define ZENITH_AT_V2_VAR_PROMOTE_THRESH_MAX	65535U
 
+/* F2: PELT util-rising trend default.  25% window-to-window growth
+ * is conservative -- a cold app launch typically pushes 50-100%, a
+ * web first-paint 30-60%.  Setting to 0 disables the signal cleanly
+ * (the V1 worker computes the delta but never raises the flag).
+ */
+#define ZENITH_DEFAULT_AT_UTIL_RISING_THRESH_PCT	25
+#define ZENITH_AT_UTIL_RISING_THRESH_PCT_MAX	200U
+
 /* auto_tune_v3 (default 2, apply):
  *
  * Self-calibrating layer on top of V2.  Reads the per-policy at_log
@@ -1721,6 +1729,22 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * and would race with the existing thermal / PSI / frame triggers).
  */
 #define ZENITH_AT_FLAG_PREFER_SILVER_HOT	(1U << 12)
+/* Audit fix F2: PELT-derived util-rising trend signal.
+ *
+ * Set by the V1 auto-tune worker when the policy-wide util average
+ * delta between this window and the last window exceeded
+ * t->auto_tune_util_rising_thresh_pct.  Used by V2 to bias toward
+ * LATENCY when load is rapidly ramping (e.g. cold app launch, web
+ * page first-paint, game scene transition) before sat_pct fully
+ * crosses the hi_sat_pct threshold.
+ *
+ * Read-only flag like THERMAL_SLOPE and PREFER_SILVER_HOT; the
+ * actual state-machine consumption happens in zenith_v2_propose()
+ * (specifically the BALANCED -> LATENCY edge).  Bit chosen to
+ * leave the LSB nibble for stable scenario flags (camera/audio/
+ * render/etc.) and the next nibble for environmental signals.
+ */
+#define ZENITH_AT_FLAG_UTIL_RISING		(1U << 13)
 
 #define ZENITH_AT_OVERRIDE_UP_RATE		(1UL << 0)
 #define ZENITH_AT_OVERRIDE_DOWN_RATE		(1UL << 1)
@@ -3044,6 +3068,15 @@ struct zenith_tunables {
 	unsigned int		auto_tune_lo_sat_pct;
 	unsigned int		auto_tune_hi_events_x2;
 	unsigned int		auto_tune_lo_events_x2;
+	/* F2: util-rising trend threshold, percent.  When the policy-
+	 * wide PELT util sum grows by more than this percentage between
+	 * consecutive V1 windows, the worker raises ZENITH_AT_FLAG_
+	 * UTIL_RISING.  Default 25 (i.e. >=25% increase in window-to-
+	 * window mean util).  Setting to 0 disables the signal entirely
+	 * (the flag never fires) without removing it from the surface.
+	 * Range: 0..200.
+	 */
+	unsigned int		auto_tune_util_rising_thresh_pct;
 
 	/* See ZENITH_DEFAULT_AUTO_TUNE_V2.  V2 keeps auto-tune bounded by
 	 * profile guardrails, hysteresis/cooldown and user override masks.
@@ -4008,6 +4041,15 @@ struct zenith_policy {
 	unsigned int		at_last_events_rate_x2;
 	unsigned int		at_last_target;
 	unsigned int		at_last_state;
+	/* F2: PELT-derived util tracking.  Sum of per-cpu rq->cfs.avg
+	 * .util_avg across this policy, sampled at every V1 work tick.
+	 * Compared against the previous window's value to detect a
+	 * rising-load trend before sat_pct fully saturates.  Stored
+	 * as raw util sum (1024 * num_cpus capacity scale); rising
+	 * threshold is normalised to a percentage in
+	 * t->auto_tune_util_rising_thresh_pct.
+	 */
+	unsigned long		at_last_util_sum;
 	/* M1: time-in-state accounting.  at_state_residency_ns[s] is the
 	 * cumulative wall-clock time spent in V2 state s since governor
 	 * start (or since the last reset).  Updated lazily at every V2
@@ -11013,6 +11055,40 @@ static void zenith_auto_tune_work(struct work_struct *w)
 				       events_rate_x2, t->active_profile,
 				       target);
 
+	/* Audit fix F2: PELT util-rising trend.  Sum per-cpu PELT
+	 * util_avg across this policy and compare against the previous
+	 * window's value.  Raise ZENITH_AT_FLAG_UTIL_RISING when the
+	 * delta exceeds the configured percentage.  Done above the V2
+	 * signal block so the flag is available to the state machine.
+	 *
+	 * Math: pct_growth = ((cur - prev) * 100) / max(prev, 1).
+	 * Zero out the previous-sample on the first window after init
+	 * so the first comparison doesn't see 100% growth from 0->N.
+	 */
+	{
+		unsigned int cpu;
+		unsigned long util_sum = 0;
+
+		for_each_cpu(cpu, z_policy->policy->cpus) {
+			struct rq *rq = cpu_rq(cpu);
+
+			util_sum += READ_ONCE(rq->cfs.avg.util_avg);
+		}
+
+		if (z_policy->at_last_util_sum &&
+		    t->auto_tune_util_rising_thresh_pct) {
+			unsigned long prev = z_policy->at_last_util_sum;
+			unsigned long delta = util_sum > prev ?
+				util_sum - prev : 0;
+			unsigned int pct = prev ?
+				(unsigned int)((delta * 100) / prev) : 0;
+
+			if (pct >= t->auto_tune_util_rising_thresh_pct)
+				flags |= ZENITH_AT_FLAG_UTIL_RISING;
+		}
+		z_policy->at_last_util_sum = util_sum;
+	}
+
 	if (t->auto_tune_v2 && t->auto_tune_v2_signals) {
 		unsigned int anchor = cpumask_first(z_policy->policy->cpus);
 
@@ -11630,6 +11706,34 @@ static ssize_t auto_tune_v2_var_promote_thresh_store(struct gov_attr_set *attr_s
 
 static struct governor_attr auto_tune_v2_var_promote_thresh =
 	__ATTR_RW(auto_tune_v2_var_promote_thresh);
+
+/* Audit fix F2: PELT util-rising trend threshold sysfs knob.
+ *
+ * Read-only show / write-with-clamp store.  See the
+ * ZENITH_DEFAULT_AT_UTIL_RISING_THRESH_PCT comment block for
+ * semantics.  0 disables the signal cleanly.
+ */
+static ssize_t auto_tune_util_rising_thresh_pct_show(
+	struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->auto_tune_util_rising_thresh_pct);
+}
+
+static ssize_t auto_tune_util_rising_thresh_pct_store(
+	struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_AT_UTIL_RISING_THRESH_PCT_MAX)
+		return -EINVAL;
+	t->auto_tune_util_rising_thresh_pct = val;
+	return count;
+}
+static struct governor_attr auto_tune_util_rising_thresh_pct =
+	__ATTR_RW(auto_tune_util_rising_thresh_pct);
 
 /* auto_tune_v3 sysfs knob (RW).  See ZENITH_DEFAULT_AUTO_TUNE_V3
  * comment block for full semantics.  Three accepted values:
@@ -15722,6 +15826,7 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_hysteresis_windows.attr,
 	&auto_tune_cooldown_windows.attr,
 	&auto_tune_v2_var_promote_thresh.attr,
+	&auto_tune_util_rising_thresh_pct.attr,
 	&auto_tune_v3.attr,
 	&auto_tune_v3_interval_ms.attr,
 	&auto_tune_v3_state.attr,
@@ -16003,6 +16108,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_AT_COOLDOWN_WINDOWS;
 	tunables->auto_tune_v2_var_promote_thresh =
 		ZENITH_DEFAULT_AT_V2_VAR_PROMOTE_THRESH;
+	tunables->auto_tune_util_rising_thresh_pct =
+		ZENITH_DEFAULT_AT_UTIL_RISING_THRESH_PCT;
 	tunables->auto_tune_v3 = ZENITH_DEFAULT_AUTO_TUNE_V3;
 	tunables->auto_tune_v3_interval_ms =
 		ZENITH_DEFAULT_AT_V3_INTERVAL_MS;
