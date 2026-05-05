@@ -1524,6 +1524,36 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_AT_UTIL_RISING_THRESH_PCT	25
 #define ZENITH_AT_UTIL_RISING_THRESH_PCT_MAX	200U
 
+/* F3: render-thread RT-priority floor (per-policy uclamp-min-style).
+ *
+ * When auto_tune_render_rt_floor_pct > 0 AND the V2 state machine
+ * has committed to LATENCY or SUSTAINED_PERF AND ZENITH_AT_FLAG_RENDER
+ * is currently active in at_last_flags, raise the freq floor to
+ * (policy->max * auto_tune_render_rt_floor_pct / 100).  This is the
+ * lower-risk variant of the original F3 design: instead of touching
+ * task->sched_class via sched_setscheduler_nocheck() (which would
+ * collide with audio_server's RT-priority inheritance trees), we
+ * publish a per-policy uclamp-min-style hint that simply guarantees
+ * RenderThread / surfaceflinger sees enough freq headroom to run
+ * uninterrupted by background CFS tasks while V2 says the workload
+ * is responsiveness-critical.
+ *
+ * Difference from render_floor_pct: render_floor_pct fires whenever
+ * a render thread is observed running, regardless of V2 state.  The
+ * F3 floor fires only after V2 has *already* committed to LATENCY
+ * or SUSTAINED_PERF, so the user has signalled "this is jank-
+ * sensitive workload".  In that regime, even a single CFS preemption
+ * of a RenderThread is visible as a frame stutter; the floor adds
+ * the headroom that makes the preemption window survivable.
+ *
+ * Default 0 (off, conservative).  Range 0..100; 0 disables the floor
+ * cleanly.  Recommended user value if enabling: 85..95.  The floor
+ * is OR-ed with (max of) the existing render_floor_pct floor; if
+ * F3 is on and conditions fire, F3 always wins.
+ */
+#define ZENITH_DEFAULT_AT_RENDER_RT_FLOOR_PCT	0
+#define ZENITH_AT_RENDER_RT_FLOOR_PCT_MAX	100U
+
 /* auto_tune_v3 (default 2, apply):
  *
  * Self-calibrating layer on top of V2.  Reads the per-policy at_log
@@ -3077,6 +3107,7 @@ struct zenith_tunables {
 	 * Range: 0..200.
 	 */
 	unsigned int		auto_tune_util_rising_thresh_pct;
+	unsigned int		auto_tune_render_rt_floor_pct;
 
 	/* See ZENITH_DEFAULT_AUTO_TUNE_V2.  V2 keeps auto-tune bounded by
 	 * profile guardrails, hysteresis/cooldown and user override masks.
@@ -7637,6 +7668,38 @@ brutal_entry_deferred:
 		}
 	}
 
+	/* Audit fix F3: V2-gated render-thread RT-priority floor.
+	 *
+	 * Per-policy uclamp-min-style boost.  When the tunable is enabled
+	 * AND ZENITH_AT_FLAG_RENDER is currently active AND V2 has already
+	 * committed to LATENCY or SUSTAINED_PERF, raise the freq floor to
+	 * (policy->max * auto_tune_render_rt_floor_pct / 100).
+	 *
+	 * Logically a stricter sibling of render_floor_pct that fires only
+	 * in the V2 states where a single CFS preemption of RenderThread
+	 * is user-visible as a frame stutter.  See the
+	 * ZENITH_DEFAULT_AT_RENDER_RT_FLOOR_PCT comment block for full
+	 * semantics.  Default tunable is 0 (off); when enabled, this floor
+	 * always wins over render_floor_pct because it is applied last in
+	 * the floor chain.
+	 */
+	if (z_policy->tunables->auto_tune_render_rt_floor_pct &&
+	    (z_policy->at_last_flags & ZENITH_AT_FLAG_RENDER) &&
+	    (z_policy->at_last_state == ZENITH_AT_STATE_LATENCY ||
+	     z_policy->at_last_state == ZENITH_AT_STATE_SUSTAINED_PERF)) {
+		unsigned int rrf =
+			(policy->max *
+			 z_policy->tunables->auto_tune_render_rt_floor_pct) /
+			100;
+
+		if (rrf > policy->max)
+			rrf = policy->max;
+		if (freq < rrf) {
+			freq = rrf;
+			tp_path = "render_rt_floor";
+		}
+	}
+
 	/* 3c''''. Camera capture-pipeline floor.  When camera_aware=1
 	 * and either (camera_active=force-on) or (camera_active=auto
 	 * && comm walk finds a known camera HAL/framework thread on
@@ -11737,6 +11800,34 @@ static ssize_t auto_tune_util_rising_thresh_pct_store(struct gov_attr_set *attr_
 static struct governor_attr auto_tune_util_rising_thresh_pct =
 	__ATTR_RW(auto_tune_util_rising_thresh_pct);
 
+/* Audit fix F3: render-thread RT-priority floor (uclamp-min-style)
+ * sysfs knob.  Range 0..100; 0 disables the floor cleanly.  See the
+ * ZENITH_DEFAULT_AT_RENDER_RT_FLOOR_PCT comment block for semantics.
+ */
+static ssize_t auto_tune_render_rt_floor_pct_show(struct gov_attr_set *attr_set,
+						  char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->auto_tune_render_rt_floor_pct);
+}
+
+static ssize_t auto_tune_render_rt_floor_pct_store(struct gov_attr_set *attr_set,
+						   const char *buf,
+						   size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_AT_RENDER_RT_FLOOR_PCT_MAX)
+		return -EINVAL;
+	t->auto_tune_render_rt_floor_pct = val;
+	return count;
+}
+
+static struct governor_attr auto_tune_render_rt_floor_pct =
+	__ATTR_RW(auto_tune_render_rt_floor_pct);
+
 /* auto_tune_v3 sysfs knob (RW).  See ZENITH_DEFAULT_AUTO_TUNE_V3
  * comment block for full semantics.  Three accepted values:
  *
@@ -15829,6 +15920,7 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_cooldown_windows.attr,
 	&auto_tune_v2_var_promote_thresh.attr,
 	&auto_tune_util_rising_thresh_pct.attr,
+	&auto_tune_render_rt_floor_pct.attr,
 	&auto_tune_v3.attr,
 	&auto_tune_v3_interval_ms.attr,
 	&auto_tune_v3_state.attr,
@@ -16112,6 +16204,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_AT_V2_VAR_PROMOTE_THRESH;
 	tunables->auto_tune_util_rising_thresh_pct =
 		ZENITH_DEFAULT_AT_UTIL_RISING_THRESH_PCT;
+	tunables->auto_tune_render_rt_floor_pct =
+		ZENITH_DEFAULT_AT_RENDER_RT_FLOOR_PCT;
 	tunables->auto_tune_v3 = ZENITH_DEFAULT_AUTO_TUNE_V3;
 	tunables->auto_tune_v3_interval_ms =
 		ZENITH_DEFAULT_AT_V3_INTERVAL_MS;
