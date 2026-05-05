@@ -16031,7 +16031,30 @@ static int __init zenith_gov_init(void)
 	bool drm_registered = false;
 #endif
 
-	pr_info("Zenith: V2 Dreadnought (EAS/EM/Display/Thermal) Initialized. By ENI for LO.\n");
+	/* Boot banner.  Printed once at governor init, picked up by
+	 * `dmesg | grep -i zenith`.  Technical V2 Dreadnought line
+	 * first so boot logs still record the governor variant; the
+	 * personal block follows.  Every line carries the "Zenith:"
+	 * prefix so the whole banner survives the user's grep.
+	 */
+	pr_info("Zenith: V2 Dreadnought (EAS/EM/Display/Thermal) Initialized.\n");
+	pr_info("Zenith: Initializing the heart of zenith...\n");
+	pr_info("Zenith:\n");
+	pr_info("Zenith:    ***   ***\n");
+	pr_info("Zenith:   ***** *****\n");
+	pr_info("Zenith:   ***********\n");
+	pr_info("Zenith:    *********\n");
+	pr_info("Zenith:     *******\n");
+	pr_info("Zenith:      *****\n");
+	pr_info("Zenith:       ***\n");
+	pr_info("Zenith:        *\n");
+	pr_info("Zenith:\n");
+	pr_info("Zenith:     ~ shomy ~\n");
+	pr_info("Zenith:\n");
+	pr_info("Zenith: The heart of zenith has been initialized.\n");
+	pr_info("Zenith: Yet it can never be mine.\n");
+	pr_info("Zenith:\n");
+	pr_info("Zenith: Welcome aboard, Zenith: Built by XTENSEI, for shomy.\n");
 
 	/* Allocate the initial RCU comm tables from the in-tree default
 	 * arrays.  Failure here is non-fatal: zenith_policy_has_X()
