@@ -843,6 +843,15 @@
  */
 #define ZENITH_AT_LOG_NR			16
 
+/* M2 V2 state-transition history ring depth.  32 entries = 512 B per
+ * policy (16 B / entry, see struct zenith_policy::at_history).  Sized
+ * to span ~30 s of typical phone-class bursty workloads (camera open,
+ * scroll, app launch) so a userspace triager reading the file can see
+ * the last interesting cluster of state changes without round-tripping
+ * to dmesg / perfetto.
+ */
+#define ZENITH_AT_HISTORY_NR			32
+
 #define ZENITH_CLIMB_MODE_SNAP			0	/* default */
 #define ZENITH_CLIMB_MODE_STEP			1
 #define ZENITH_PROFILE_CUSTOM			0	/* default */
@@ -3872,6 +3881,38 @@ struct zenith_policy {
 	unsigned int		at_last_events_rate_x2;
 	unsigned int		at_last_target;
 	unsigned int		at_last_state;
+	/* M1: time-in-state accounting.  at_state_residency_ns[s] is the
+	 * cumulative wall-clock time spent in V2 state s since governor
+	 * start (or since the last reset).  Updated lazily at every V2
+	 * commit point: on transition from old to new, accumulate the
+	 * (now - last_change_ns) delta into residency[old_state] and
+	 * stamp last_change_ns := now.  Cheap (one ktime_get + 5 u64
+	 * stores per actual transition, NOT per tick).  Surfaced
+	 * read-only via auto_tune_state_residency sysfs as a CSV that
+	 * userspace tools can sample at low frequency to compute
+	 * percent-time-in-state.
+	 */
+	u64			at_state_residency_ns[5];
+	u64			at_state_last_change_ns;
+	/* M2: V2 state transition history ring.  Last
+	 * ZENITH_AT_HISTORY_NR commits per policy, expressed as
+	 * { ts_boottime_ns, from_state, to_state, reason, flags }
+	 * tuples.  Surfaced read-only via auto_tune_state_history
+	 * sysfs as one line per entry, most recent first.
+	 *
+	 * Each entry is 16 bytes; 32 entries = 512 B per policy
+	 * (typically 2 policies = 1 KB total).  Cheap.
+	 */
+	struct {
+		u64		ts_ns;
+		u32		flags;
+		u8		from;
+		u8		to;
+		u8		reason;
+		u8		_pad;
+	}			at_history[ZENITH_AT_HISTORY_NR];
+	unsigned int		at_history_head;
+	unsigned int		at_history_count;
 	/* at_last_applied_state is the V2 state AFTER the cluster-aware
 	 * demotion path runs.  When auto_tune_cluster_aware = 1 the
 	 * little cluster takes LATENCY/SUSTAINED_PERF -> BALANCED and the
@@ -11020,6 +11061,41 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		}
 		if (state != z_policy->at_last_state) {
 			unsigned int old_state = z_policy->at_last_state;
+			u64 now_ns = ktime_get_ns();
+			unsigned int hslot;
+
+			/* M1: accumulate residency for the outgoing
+			 * state.  The denominator can be 0 on the very
+			 * first transition (last_change_ns hasn't been
+			 * stamped yet) -- guard against that, otherwise
+			 * a u64 underflow would inject ~146 years into
+			 * residency[old_state].
+			 */
+			if (z_policy->at_state_last_change_ns &&
+			    now_ns > z_policy->at_state_last_change_ns &&
+			    old_state < ARRAY_SIZE(z_policy->at_state_residency_ns))
+				z_policy->at_state_residency_ns[old_state] +=
+					now_ns - z_policy->at_state_last_change_ns;
+			z_policy->at_state_last_change_ns = now_ns;
+
+			/* M2: push a history entry.  Lock-free single-
+			 * writer ring (the V2 worker is the only writer
+			 * for a given z_policy), reader (sysfs show)
+			 * tolerates one entry of tearing on wrap which
+			 * is acceptable for a diagnostic surface.
+			 */
+			hslot = z_policy->at_history_head;
+			if (hslot >= ZENITH_AT_HISTORY_NR)
+				hslot = 0;
+			z_policy->at_history[hslot].ts_ns = now_ns;
+			z_policy->at_history[hslot].flags = flags;
+			z_policy->at_history[hslot].from = (u8)old_state;
+			z_policy->at_history[hslot].to = (u8)state;
+			z_policy->at_history[hslot].reason = (u8)reason;
+			z_policy->at_history_head =
+				(hslot + 1) % ZENITH_AT_HISTORY_NR;
+			if (z_policy->at_history_count < ZENITH_AT_HISTORY_NR)
+				z_policy->at_history_count++;
 
 			z_policy->at_last_state = state;
 			z_policy->at_cooldown_left =
@@ -11786,6 +11862,104 @@ static ssize_t auto_tune_status_show(struct gov_attr_set *attr_set, char *buf)
 	return len;
 }
 static struct governor_attr auto_tune_status = __ATTR_RO(auto_tune_status);
+
+/* M1: time-in-state RO sysfs.  Format: one line per (policy, state)
+ * tuple:
+ *
+ *   policy<cpu>(<cluster>) state=<state> residency_ns=<ns>
+ *
+ * Values are cumulative nanoseconds since governor start.  The
+ * still-current state's counter is "live" -- it does not include
+ * the time elapsed since the last commit (that delta is implicit
+ * in the difference between sum-of-counters and uptime).
+ * Userspace tools should treat this as monotonically non-decreasing
+ * and compute differences across two reads to derive percent-time-
+ * in-state for an arbitrary window.
+ *
+ * One line per state keeps each scnprintf() narrow enough to fit
+ * in 100 columns and matches the at_log / state_history layout that
+ * other zenith RO surfaces use, so awk / cut pipelines can be
+ * reused.
+ *
+ * No reset hook -- a fresh boot zeroes the values, and
+ * profile_store() does not zap residency (so cross-profile
+ * comparisons stay legible).
+ */
+static ssize_t auto_tune_state_residency_show(struct gov_attr_set *attr_set,
+					      char *buf)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	struct zenith_policy *z_pol;
+	ssize_t len = 0;
+	unsigned int s;
+
+	list_for_each_entry(z_pol, &t->attr_set.policy_list, tunables_hook) {
+		for (s = 0; s < ARRAY_SIZE(z_pol->at_state_residency_ns); s++) {
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+					 "policy%u(%s) state=%s residency_ns=%llu\n",
+					 z_pol->policy->cpu,
+					 zenith_at_cluster_name(
+						z_pol->cluster_class),
+					 zenith_at_state_name(s),
+					 z_pol->at_state_residency_ns[s]);
+			if (len >= PAGE_SIZE)
+				return len;
+		}
+	}
+	return len;
+}
+
+static struct governor_attr auto_tune_state_residency =
+	__ATTR_RO(auto_tune_state_residency);
+
+/* M2: V2 state-transition history RO sysfs.  One line per recorded
+ * transition, most recent first, format:
+ *
+ *   policy<cpu>(<cluster>) ts=<ns> from=<state> to=<state> reason=<r> flags=0x<f>
+ *
+ * Bounded to ZENITH_AT_HISTORY_NR entries per policy.  The output
+ * may exceed PAGE_SIZE on a fully-populated 8-cluster system; the
+ * scnprintf early-out below truncates cleanly.
+ *
+ * Lock-free single-writer ring (V2 worker), reader (this show) may
+ * see one torn entry on wrap.  Acceptable for diagnostics.
+ */
+static ssize_t auto_tune_state_history_show(struct gov_attr_set *attr_set,
+					    char *buf)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	struct zenith_policy *z_pol;
+	ssize_t len = 0;
+	unsigned int i, slot, head, count;
+
+	list_for_each_entry(z_pol, &t->attr_set.policy_list, tunables_hook) {
+		head = z_pol->at_history_head;
+		count = z_pol->at_history_count;
+		for (i = 0; i < count; i++) {
+			/* Walk newest -> oldest.  Newest entry is at
+			 * (head - 1) mod NR; subtract i more to step
+			 * back through the ring.
+			 */
+			slot = (head + ZENITH_AT_HISTORY_NR - 1 - i) %
+			       ZENITH_AT_HISTORY_NR;
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+					 "policy%u(%s) ts=%llu from=%s to=%s reason=%s flags=0x%x\n",
+					 z_pol->policy->cpu,
+					 zenith_at_cluster_name(z_pol->cluster_class),
+					 z_pol->at_history[slot].ts_ns,
+					 zenith_at_state_name(z_pol->at_history[slot].from),
+					 zenith_at_state_name(z_pol->at_history[slot].to),
+					 zenith_at_reason_name(z_pol->at_history[slot].reason),
+					 z_pol->at_history[slot].flags);
+			if (len >= PAGE_SIZE)
+				return len;
+		}
+	}
+	return len;
+}
+
+static struct governor_attr auto_tune_state_history =
+	__ATTR_RO(auto_tune_state_history);
 
 static ssize_t auto_tune_reset_overrides_store(struct gov_attr_set *attr_set,
 					       const char *buf, size_t count)
@@ -15309,6 +15483,8 @@ static struct attribute *zenith_attrs[] = {
 	&at_log.attr,
 	&last_decision_path.attr,
 	&auto_tune_status.attr,
+	&auto_tune_state_residency.attr,
+	&auto_tune_state_history.attr,
 	&auto_tune_reset_overrides.attr,
 	&auto_tune.attr,
 	&auto_tune_v2.attr,
