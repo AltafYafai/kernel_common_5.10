@@ -10964,6 +10964,38 @@ static void zenith_auto_tune_work(struct work_struct *w)
 						t->auto_tune_hysteresis_windows);
 		bool emergency = state == ZENITH_AT_STATE_THERMAL_RECOVERY ||
 				 state == ZENITH_AT_STATE_SUSTAINED_PERF;
+		/* Audit fix M3: rising-edge fast-path commit.
+		 *
+		 * Compute the bits that turned ON in this window's flag
+		 * bitmap (~at_last_flags & flags).  If any of the
+		 * UI-perceptible / urgent scenarios just-armed -- camera,
+		 * render, frame, thermal_slope, game, psi_cpu, memstall --
+		 * treat the resulting V2 state as emergency for both the
+		 * cooldown bypass and the hysteresis gate.  Without this,
+		 * a 2-window default hysteresis means a camera flag that
+		 * fires at t=0 has to wait until t=2*1.25 s = 2.5 s before
+		 * V2 actually commits the new state, which is visible to
+		 * users (camera open feels sluggish for the first second).
+		 *
+		 * The mask is intentionally narrow.  Plain saturation /
+		 * variance promotions are NOT fast-pathed because those
+		 * are exactly the workloads where stable hysteresis pays
+		 * off (avoid bouncing between LATENCY and SUSTAINED_PERF
+		 * on a single-tick spike).  Only signals from explicit
+		 * producers (input, drm, scenario detectors, PSI) get the
+		 * fast lane.
+		 */
+		unsigned int rising = flags & ~z_policy->at_last_flags;
+		const unsigned int fastpath_mask =
+			ZENITH_AT_FLAG_CAMERA |
+			ZENITH_AT_FLAG_RENDER |
+			ZENITH_AT_FLAG_FRAME  |
+			ZENITH_AT_FLAG_THERMAL_SLOPE |
+			ZENITH_AT_FLAG_GAME   |
+			ZENITH_AT_FLAG_PSI_CPU |
+			ZENITH_AT_FLAG_MEMSTALL;
+		bool rising_fastpath = (rising & fastpath_mask) &&
+			state != z_policy->at_last_state;
 
 		if (need > ZENITH_AT_HYSTERESIS_WINDOWS_MAX)
 			need = ZENITH_AT_HYSTERESIS_WINDOWS_MAX;
@@ -10972,6 +11004,10 @@ static void zenith_auto_tune_work(struct work_struct *w)
 			z_policy->at_pending_windows = 1;
 		} else if (z_policy->at_pending_windows < need) {
 			z_policy->at_pending_windows++;
+		}
+		if (rising_fastpath) {
+			emergency = true;
+			z_policy->at_pending_windows = need;
 		}
 		if (!emergency && z_policy->at_cooldown_left) {
 			z_policy->at_cooldown_left--;
