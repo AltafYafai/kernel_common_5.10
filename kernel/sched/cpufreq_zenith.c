@@ -5963,6 +5963,20 @@ zenith_migration_arrival_check(struct zenith_cpu *z_cpu,
 		ktime_get_ns() + (u64)window_ms * NSEC_PER_MSEC;
 }
 
+/* Forward decl: zenith_tier_value() is the V2 tier-classifier
+ * accessor, defined later in the file alongside the rest of the
+ * auto_tune_v2 worker.  zenith_get_next_freq() (and a handful of
+ * its sub-blocks below) read knobs through it, so we need the
+ * prototype visible here.  Definition lives near the V2 worker so
+ * the override-mask / tier-bit semantics are documented in one
+ * place; the declaration just exposes the symbol earlier without
+ * hoisting the whole body up out of context.
+ */
+static unsigned int zenith_tier_value(struct zenith_policy *z_policy,
+				      unsigned int tunable,
+				      unsigned long override_bit,
+				      unsigned long tier_bit);
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
