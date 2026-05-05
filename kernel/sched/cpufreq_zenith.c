@@ -10802,14 +10802,22 @@ static void zenith_auto_tune_work(struct work_struct *w)
 			flags |= ZENITH_AT_FLAG_AUDIO;
 		if (memstall)
 			flags |= ZENITH_AT_FLAG_MEMSTALL;
-		if (target != prev) {
-			if (camera || render)
-				reason = ZENITH_AT_REASON_CAMERA_RENDER;
-			else if (memstall)
-				reason = ZENITH_AT_REASON_MEMSTALL;
-			else if (audio)
-				reason = ZENITH_AT_REASON_AUDIO;
-		}
+		/* Reason reflects the strongest currently active scenario
+		 * signal, not just the cause of the last target change.
+		 * Without this, a long-held scenario (e.g. camera viewfinder
+		 * pinned at PERFORMANCE for 30s) would show reason=classifier
+		 * because the target stayed steady; that is misleading for
+		 * post-hoc telemetry.  Severity order matches the target
+		 * picker above (camera/render > memstall > audio).  Thermal,
+		 * PSI, frame, screen, variance still override below; this
+		 * is only the scenario-block default.
+		 */
+		if (camera || render)
+			reason = ZENITH_AT_REASON_CAMERA_RENDER;
+		else if (memstall)
+			reason = ZENITH_AT_REASON_MEMSTALL;
+		else if (audio)
+			reason = ZENITH_AT_REASON_AUDIO;
 		if (!(t->auto_tune_v2 && t->auto_tune_sustained_gaming &&
 		      state == ZENITH_AT_STATE_SUSTAINED_PERF))
 			state = zenith_profile_to_at_state(target);
