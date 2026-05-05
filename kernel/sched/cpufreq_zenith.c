@@ -1389,6 +1389,45 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  */
 #define ZENITH_DEFAULT_AUTO_TUNE_V2_GLIDES	1
 
+/* auto_tune_v2_tiers (default 1, on) -- Patch L:
+ *
+ * Sibling of auto_tune_v2_glides for the Stage 4 K1 / K2 / K3
+ * floor tiers.  Same pattern, different consumer set:
+ *
+ *   K1 -> migration_jump_pct, migration_floor_window_ms,
+ *         migration_floor_pct
+ *   K2 -> psi_cpu_floor_thresh
+ *   K3 -> frame_overrun_slack_us, frame_overrun_window_ms,
+ *         frame_overrun_floor_pct
+ *
+ * Difference from glides: these are *floor / lift* knobs, not
+ * shape knobs.  Cold-boot defaults are non-zero on some profiles
+ * (e.g. PERFORMANCE arms migration with jump=15) so the glide
+ * accessor's "user value wins if non-zero" rule would let the
+ * profile-set value defeat V2 every time.  Patch L instead uses
+ * an *armed-mask* model: the V2 worker writes a bitmask of which
+ * tiers should be active for the current state / flag set, and
+ * the read site returns the profile-set tunable value if armed,
+ * 0 (off) if disarmed.  User sysfs writes set per-knob bits in
+ * tunables->auto_tune_override_mask which lock the read to the
+ * tunable value regardless of V2.
+ *
+ * State / flag -> armed tiers mapping (also documented inline at
+ * the ZENITH_AT_TIER_* defines):
+ *
+ *   LATENCY              -> migration + psi_cpu_floor
+ *   FRAME flag           -> migration + frame_overrun
+ *   GAME flag            -> migration + frame_overrun
+ *   anything else        -> all disarmed
+ *
+ * Set auto_tune_v2_tiers to 0 to lock all three back to pure
+ * profile-driven behaviour (the post-K3, pre-Patch-L state).
+ *
+ * Costs nothing on auto_tune_v2=0 systems: zenith_at_apply_tiers()
+ * is only called from the V2 worker path.
+ */
+#define ZENITH_DEFAULT_AUTO_TUNE_V2_TIERS	1
+
 /* Effective values applied by zenith_at_apply_glides() per state.
  * Picked to match the round-U-z10 doc recommendations and keep all
  * seven knobs inside their documented sysfs ranges.
@@ -1451,6 +1490,58 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_OVERRIDE_DOWN_THRESH_ADAPTIVE	(1UL << 7)
 #define ZENITH_AT_OVERRIDE_FRAME_PACE		(1UL << 8)
 #define ZENITH_AT_OVERRIDE_GAME_MODE		(1UL << 9)
+
+/* Patch L: V2-classifier "tier" override bits.
+ *
+ * The Stage 4 K1 / K2 / K3 floor tiers are profile-driven knobs --
+ * the user picks PERFORMANCE / BALANCED / BATTERY / LEGACY and
+ * zenith_apply_profile() writes the per-knob value.  Patch L lets
+ * the V2 state classifier *additionally* arm or disarm those
+ * tiers per-state (e.g. arm migration_floor in LATENCY, disarm it
+ * in EFFICIENCY) without disturbing the profile-set values.
+ *
+ * Each bit, when set in tunables->auto_tune_override_mask, locks
+ * the matching knob to whatever the user wrote via sysfs -- the
+ * V2 worker stops touching it.  Profile changes clear the entire
+ * mask in zenith_apply_profile() (existing behaviour), so a
+ * profile flip rearms V2 as if the user had never overridden.
+ *
+ * (Bits 0..9 are the existing V2 actions overrides; bits 10..16
+ * are the new tier overrides.)
+ */
+#define ZENITH_AT_OVERRIDE_MIGRATION_JUMP	BIT(10)
+#define ZENITH_AT_OVERRIDE_MIGRATION_FLOOR_WIN	BIT(11)
+#define ZENITH_AT_OVERRIDE_MIGRATION_FLOOR_PCT	BIT(12)
+#define ZENITH_AT_OVERRIDE_PSI_CPU_FLOOR	BIT(13)
+#define ZENITH_AT_OVERRIDE_FRAME_OVR_SLACK	BIT(14)
+#define ZENITH_AT_OVERRIDE_FRAME_OVR_WINDOW	BIT(15)
+#define ZENITH_AT_OVERRIDE_FRAME_OVR_FLOOR	BIT(16)
+
+/* Patch L: V2-classifier tier-armed bitmask.
+ *
+ * Written by zenith_at_apply_tiers() per V2 worker pass; read by
+ * the K1 / K2 / K3 reading sites in zenith_get_next_freq() via
+ * zenith_tier_value().  Mapping (state / flag -> armed tiers):
+ *
+ *   LATENCY              -> migration + psi_cpu_floor
+ *   FRAME flag (any)     -> migration + frame_overrun
+ *   GAME flag (any)      -> migration + frame_overrun
+ *   EFFICIENCY/BALANCED  -> none
+ *   THERMAL_RECOVERY     -> none
+ *   SUSTAINED_PERF       -> none (intentional: SUSTAINED_PERF
+ *                          already pins via the actions path,
+ *                          adding tier floors on top is double-
+ *                          counting)
+ *
+ * A bit being clear means the tier is *disarmed* and the read
+ * site treats the knob as 0 (off) for the duration of the V2
+ * window, regardless of the profile-set value.  When the user
+ * overrides via sysfs the override mask gates first and the tier
+ * mask is irrelevant for that knob.
+ */
+#define ZENITH_AT_TIER_MIGRATION		BIT(0)
+#define ZENITH_AT_TIER_PSI_CPU_FLOOR		BIT(1)
+#define ZENITH_AT_TIER_FRAME_OVERRUN		BIT(2)
 
 #define ZENITH_CLUSTER_LITTLE			0
 #define ZENITH_CLUSTER_BIG			1
@@ -2680,6 +2771,23 @@ struct zenith_tunables {
 	 */
 	unsigned int		auto_tune_v2_glides;
 
+	/* See ZENITH_DEFAULT_AUTO_TUNE_V2_TIERS comment block (Patch L).
+	 * When 1 (default), the V2 worker writes a per-policy bitmask
+	 * of *armed* Stage-4 floor tiers (K1 / K2 / K3) based on the
+	 * just-resolved V2 state plus the FRAME / GAME flags.  K1/K2/K3
+	 * read sites consult the bitmask via zenith_tier_value() and
+	 * treat the underlying tunable as 0 (off) when the matching
+	 * tier bit is clear.  User sysfs writes to any of the seven
+	 * tier knobs set per-knob bits in auto_tune_override_mask;
+	 * those bits suppress the V2 gating and the read returns the
+	 * tunable value directly (Profile changes clear the entire
+	 * mask, the existing zenith_apply_profile() behaviour, so a
+	 * profile flip rearms V2).  Set to 0 to revert all three tiers
+	 * to pure profile-driven behaviour.  Ignored unless
+	 * auto_tune_v2 is also 1.
+	 */
+	unsigned int		auto_tune_v2_tiers;
+
 	/* See ZENITH_DEFAULT_AUTO_TUNE_SCENARIO comment block.  Master
 	 * gate for the scenario overlay applied on top of the vanilla
 	 * load + input-rate classifier in zenith_auto_tune_work().
@@ -3480,6 +3588,22 @@ struct zenith_policy {
 	unsigned int		at_local_thermal_pressure_continuous;
 	unsigned int		at_local_prefer_silver_aware;
 	unsigned int		at_local_frame_budget_us_auto;
+
+	/* Patch L: Stage-4 K1/K2/K3 tier-armed bitmask, written by
+	 * zenith_at_apply_tiers() per V2 worker pass.  See the
+	 * ZENITH_AT_TIER_* comment block.  Read by zenith_tier_value()
+	 * from the K1/K2/K3 read sites in zenith_get_next_freq().
+	 *
+	 * at_local_tiers_active gates the read: false (cleared on V2
+	 * disable, profile change, or auto_tune_v2_tiers=0) means the
+	 * K1/K2/K3 reads return the underlying tunable verbatim, the
+	 * pre-Patch-L behaviour.  true means consult the armed mask.
+	 *
+	 * Single-writer (V2 worker) / single-reader (eval path under
+	 * update_lock); staleness is bounded by ZENITH_AUTO_TUNE_PERIOD_MS.
+	 */
+	bool			at_local_tiers_active;
+	unsigned long		at_local_tier_armed_mask;
 	struct delayed_work	at_work;
 
 	/* Auto-tune classifier ring buffer.  Single-writer (the
@@ -6897,22 +7021,39 @@ brutal_entry_deferred:
 	 * off; floor_pct == 0 keeps stamping but suppresses the
 	 * floor here so userspace can correlate stats vs. effect).
 	 */
-	if (!pin_to_target && policy->max &&
-	    z_policy->tunables->migration_jump_pct &&
-	    z_policy->tunables->migration_floor_pct) {
-		u64 until = z_policy->migration_in_until_ns;
+	{
+		/* Patch L: gate the K1 read through the V2 tier
+		 * accessor.  In LATENCY / FRAME / GAME states the
+		 * tier mask returns the profile-set jump_pct /
+		 * floor_pct unchanged; in EFFICIENCY / BALANCED /
+		 * THERMAL_RECOVERY states the V2 worker has cleared
+		 * the migration tier bit and the accessor returns 0,
+		 * which short-circuits the floor below.  User sysfs
+		 * overrides bypass the V2 gate per zenith_tier_value().
+		 */
+		unsigned int eff_jump = zenith_tier_value(z_policy,
+				z_policy->tunables->migration_jump_pct,
+				ZENITH_AT_OVERRIDE_MIGRATION_JUMP,
+				ZENITH_AT_TIER_MIGRATION);
+		unsigned int eff_floor_pct = zenith_tier_value(z_policy,
+				z_policy->tunables->migration_floor_pct,
+				ZENITH_AT_OVERRIDE_MIGRATION_FLOOR_PCT,
+				ZENITH_AT_TIER_MIGRATION);
 
-		if (until && ktime_get_ns() < until) {
-			unsigned int floor =
-				(policy->max *
-				 z_policy->tunables->migration_floor_pct) /
-				100;
+		if (!pin_to_target && policy->max && eff_jump &&
+		    eff_floor_pct) {
+			u64 until = z_policy->migration_in_until_ns;
 
-			if (floor > policy->max)
-				floor = policy->max;
-			if (freq < floor) {
-				freq = floor;
-				tp_path = "migration_floor";
+			if (until && ktime_get_ns() < until) {
+				unsigned int floor =
+					(policy->max * eff_floor_pct) / 100;
+
+				if (floor > policy->max)
+					floor = policy->max;
+				if (freq < floor) {
+					freq = floor;
+					tp_path = "migration_floor";
+				}
 			}
 		}
 	}
@@ -6937,19 +7078,32 @@ brutal_entry_deferred:
 	 * predict_up / peak_rescue cover the sub-second case;
 	 * this tier covers the steady-state queueing case.
 	 */
-	if (!pin_to_target &&
-	    ZENITH_FEATURE_ENABLED(psi_aware) &&
-	    z_policy->tunables->psi_cpu_floor_thresh) {
-		if (zenith_psi_cpu_some_pct() >=
-		    z_policy->tunables->psi_cpu_floor_thresh) {
-			unsigned int floor =
-				zenith_eff_hispeed_freq(z_policy);
+	{
+		/* Patch L: V2-gated K2 read.  Armed in LATENCY only
+		 * (queueing during latency-sensitive workloads is
+		 * exactly the case the floor was designed for); not
+		 * armed during FRAME / GAME because the 10s EWMA
+		 * smoothing would be a cross-talk signal during
+		 * gameplay.
+		 */
+		unsigned int eff_thresh = zenith_tier_value(z_policy,
+				z_policy->tunables->psi_cpu_floor_thresh,
+				ZENITH_AT_OVERRIDE_PSI_CPU_FLOOR,
+				ZENITH_AT_TIER_PSI_CPU_FLOOR);
 
-			if (floor && floor > policy->max)
-				floor = policy->max;
-			if (floor && freq < floor) {
-				freq = floor;
-				tp_path = "psi_cpu_floor";
+		if (!pin_to_target &&
+		    ZENITH_FEATURE_ENABLED(psi_aware) &&
+		    eff_thresh) {
+			if (zenith_psi_cpu_some_pct() >= eff_thresh) {
+				unsigned int floor =
+					zenith_eff_hispeed_freq(z_policy);
+
+				if (floor && floor > policy->max)
+					floor = policy->max;
+				if (floor && freq < floor) {
+					freq = floor;
+					tp_path = "psi_cpu_floor";
+				}
 			}
 		}
 	}
@@ -6971,22 +7125,40 @@ brutal_entry_deferred:
 	 * read is effectively a no-op anyway -- the explicit
 	 * floor_pct gate just avoids the atomic_read in that case.
 	 */
-	if (!pin_to_target && policy->max &&
-	    z_policy->tunables->frame_overrun_slack_us &&
-	    z_policy->tunables->frame_overrun_floor_pct) {
-		u64 until = (u64)atomic64_read(&zenith_frame_overrun_until_ns);
+	{
+		/* Patch L: V2-gated K3 read.  Armed in FRAME / GAME
+		 * states (where vblank-driven floors actually make
+		 * sense); disarmed elsewhere.  Note the producer
+		 * (zenith_drm_vblank_event()) is governor-wide and
+		 * keeps stamping the deadline regardless -- the V2
+		 * gate is only on the consumer side.  An overrun
+		 * stamped during a non-FRAME state simply does not
+		 * lift this cluster's freq for the deadline window.
+		 */
+		unsigned int eff_slack = zenith_tier_value(z_policy,
+				z_policy->tunables->frame_overrun_slack_us,
+				ZENITH_AT_OVERRIDE_FRAME_OVR_SLACK,
+				ZENITH_AT_TIER_FRAME_OVERRUN);
+		unsigned int eff_floor_pct = zenith_tier_value(z_policy,
+				z_policy->tunables->frame_overrun_floor_pct,
+				ZENITH_AT_OVERRIDE_FRAME_OVR_FLOOR,
+				ZENITH_AT_TIER_FRAME_OVERRUN);
 
-		if (until && ktime_get_ns() < until) {
-			unsigned int floor =
-				(policy->max *
-				 z_policy->tunables->frame_overrun_floor_pct) /
-				100;
+		if (!pin_to_target && policy->max && eff_slack &&
+		    eff_floor_pct) {
+			u64 until =
+			      (u64)atomic64_read(&zenith_frame_overrun_until_ns);
 
-			if (floor > policy->max)
-				floor = policy->max;
-			if (freq < floor) {
-				freq = floor;
-				tp_path = "frame_overrun";
+			if (until && ktime_get_ns() < until) {
+				unsigned int floor =
+					(policy->max * eff_floor_pct) / 100;
+
+				if (floor > policy->max)
+					floor = policy->max;
+				if (freq < floor) {
+					freq = floor;
+					tp_path = "frame_overrun";
+				}
 			}
 		}
 	}
@@ -8046,6 +8218,7 @@ static void zenith_reset_local_actions(struct zenith_policy *z_policy)
 	z_policy->at_effective_game_mode = z_policy->tunables->game_mode;
 	z_policy->at_local_actions = false;
 	z_policy->at_local_glides_active = false;
+	z_policy->at_local_tiers_active = false;
 	zenith_update_rate_delay_ns(z_policy);
 }
 
@@ -8385,6 +8558,48 @@ static unsigned int zenith_glide_value(struct zenith_policy *z_policy,
 	return 0;
 }
 
+/* zenith_tier_value - V2 tier-classifier accessor for Patch L knobs.
+ *
+ * Different shape from zenith_glide_value():
+ *
+ *   1. User sysfs override always wins.  When the matching bit is
+ *      set in tunables->auto_tune_override_mask the read returns
+ *      the tunable value verbatim and skips all V2 logic.  Profile
+ *      changes clear the entire mask (zenith_apply_profile() at
+ *      line ~10630), so a profile flip rearms V2 even after the
+ *      user has poked individual tiers.
+ *
+ *   2. When auto_tune_v2_tiers is 0 OR at_local_tiers_active is
+ *      false the read returns the tunable verbatim -- this is the
+ *      pre-Patch-L code path, byte-identical.
+ *
+ *   3. Otherwise (V2 active, tier mask current) the read returns
+ *      the tunable iff the matching tier bit is set in the V2's
+ *      armed mask, else 0.  "Disarmed" means "treat as off for
+ *      this V2 window" -- a knob the user enabled via profile but
+ *      that V2 has decided is not appropriate for the current
+ *      classified state.
+ *
+ * Read in the eval hot path; the override-mask short-circuit is
+ * one branch + one load on the common case (no override).
+ */
+static unsigned int zenith_tier_value(struct zenith_policy *z_policy,
+				      unsigned int tunable,
+				      unsigned long override_bit,
+				      unsigned long tier_bit)
+{
+	struct zenith_tunables *t = z_policy->tunables;
+
+	if (t->auto_tune_override_mask & override_bit)
+		return tunable;
+	if (!READ_ONCE(t->auto_tune_v2_tiers))
+		return tunable;
+	if (!z_policy->at_local_tiers_active)
+		return tunable;
+	return (z_policy->at_local_tier_armed_mask & tier_bit) ?
+		tunable : 0;
+}
+
 static void zenith_at_write_effective(struct zenith_policy *z_policy,
 				      struct zenith_at_guardrails *g,
 				      unsigned int up_rate,
@@ -8715,6 +8930,73 @@ static void zenith_at_apply_glides(struct zenith_policy *z_policy,
 	z_policy->at_local_prefer_silver_aware = prefer_silver_aware_v;
 	z_policy->at_local_frame_budget_us_auto = frame_auto_v;
 	z_policy->at_local_glides_active = true;
+}
+
+/* Patch L: V2-classifier tier-armer.  Sibling of
+ * zenith_at_apply_glides().  Computes which Stage-4 K1/K2/K3
+ * floor tiers should be armed for the current state / flag set
+ * and stamps the result into z_policy->at_local_tier_armed_mask.
+ *
+ * Mapping rationale (also documented at the ZENITH_AT_TIER_*
+ * defines, kept in sync with zenith_at_apply_glides()'s state
+ * switch):
+ *
+ *   LATENCY: this is the "we want fast wakeups" V2 state.  K1
+ *   compensates PELT migration lag on inbound tasks; K2 lifts
+ *   to hispeed when sustained CPU pressure says queueing is
+ *   real.  Both are fits.  K3 needs vblank events that LATENCY
+ *   doesn't necessarily imply -- gated separately on the FRAME
+ *   flag below.
+ *
+ *   FRAME / GAME flags (independent of state): K1 catches the
+ *   render-thread scheduling shuffle that scaling between
+ *   clusters tends to trigger; K3 catches missed frames once
+ *   the panel driver wires zenith_drm_vblank_event().  K2 is
+ *   intentionally NOT armed here -- frame work doesn't
+ *   correlate with sustained PSI pressure, and the 10s EWMA
+ *   would be a cross-talk signal we don't want during gameplay.
+ *
+ *   EFFICIENCY / BALANCED: the "be conservative on freq" V2
+ *   states.  Disarming all three tiers preserves the user's
+ *   intent (battery / mid-line behaviour) even when the
+ *   profile selected was PERFORMANCE/BALANCED.
+ *
+ *   THERMAL_RECOVERY: the V2 actions path already pulls down
+ *   freq with thermal_pressure_continuous; layering K1/K2/K3
+ *   floors on top would fight that.  Disarmed.
+ *
+ *   SUSTAINED_PERF: the V2 actions path already pins freq
+ *   high; K1/K2/K3 floors on top are double-counting (the
+ *   resolved freq is already at-or-above any of the floor_pct
+ *   ceilings).  Disarmed -- not because it would be wrong but
+ *   because it would be redundant.
+ *
+ * Cheap: O(1), one bitmask write under the policy lock.  Single
+ * writer (V2 worker), single reader (eval path under
+ * update_lock).
+ */
+static void zenith_at_apply_tiers(struct zenith_policy *z_policy,
+				  unsigned int state)
+{
+	unsigned int flags = z_policy->at_last_flags;
+	unsigned long armed = 0;
+
+	switch (state) {
+	case ZENITH_AT_STATE_LATENCY:
+		armed |= ZENITH_AT_TIER_MIGRATION;
+		armed |= ZENITH_AT_TIER_PSI_CPU_FLOOR;
+		break;
+	default:
+		break;
+	}
+
+	if (flags & (ZENITH_AT_FLAG_FRAME | ZENITH_AT_FLAG_GAME)) {
+		armed |= ZENITH_AT_TIER_MIGRATION;
+		armed |= ZENITH_AT_TIER_FRAME_OVERRUN;
+	}
+
+	z_policy->at_local_tier_armed_mask = armed;
+	z_policy->at_local_tiers_active = true;
 }
 
 #define ZENITH_TUNABLE_UINT(_name) \
@@ -9972,6 +10254,16 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		else
 			z_policy->at_local_glides_active = false;
 
+		/* Patch L: arm / disarm Stage-4 K1/K2/K3 tiers based on
+		 * the just-resolved V2 state and flag set.  Same gating
+		 * shape as the glides above -- the tunable is its own
+		 * master switch separate from auto_tune_v2.
+		 */
+		if (READ_ONCE(t->auto_tune_v2_tiers))
+			zenith_at_apply_tiers(z_policy, state);
+		else
+			z_policy->at_local_tiers_active = false;
+
 		/* Boot-complete calm detector.  Only runs while the
 		 * latch is still down and the auto arm is enabled.
 		 * Counts consecutive committed-EFFICIENCY windows on
@@ -10008,6 +10300,7 @@ static void zenith_auto_tune_work(struct work_struct *w)
 		t->active_profile = target;
 		z_policy->at_local_actions = false;
 		z_policy->at_local_glides_active = false;
+		z_policy->at_local_tiers_active = false;
 		/* Profile mutated tunables->{up,down}_rate_limit_us;
 		 * refresh the per-policy rate-delay cache for *this*
 		 * policy so the new limits take effect on the next tick.
@@ -10128,6 +10421,37 @@ static ssize_t auto_tune_v2_glides_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr auto_tune_v2_glides =
 	__ATTR_RW(auto_tune_v2_glides);
+
+/* auto_tune_v2_tiers sysfs knob (Patch L).  Boolean (0/1).  See
+ * ZENITH_DEFAULT_AUTO_TUNE_V2_TIERS.  Master gate for V2-driven
+ * arming of the Stage-4 K1/K2/K3 floor tiers; defaults to 1 so
+ * the V2 classifier shapes those tiers per state out of the box.
+ * Set to 0 to lock all three tiers back to pure profile-driven
+ * behaviour without disabling the rest of the V2 classifier.
+ * Per-knob user sysfs writes still take precedence either way
+ * (via the auto_tune_override_mask path).
+ */
+static ssize_t auto_tune_v2_tiers_show(struct gov_attr_set *attr_set,
+				       char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_tune_v2_tiers);
+}
+
+static ssize_t auto_tune_v2_tiers_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->auto_tune_v2_tiers = val;
+	return count;
+}
+
+static struct governor_attr auto_tune_v2_tiers =
+	__ATTR_RW(auto_tune_v2_tiers);
 
 static ssize_t auto_tune_hysteresis_windows_show(struct gov_attr_set *attr_set,
 						 char *buf)
@@ -10565,8 +10889,9 @@ static ssize_t auto_tune_status_show(struct gov_attr_set *attr_set, char *buf)
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "auto_tune=%u\n", t->auto_tune);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
-			 "auto_tune_v2=%u glides=%u\n",
-			 t->auto_tune_v2, t->auto_tune_v2_glides);
+			 "auto_tune_v2=%u glides=%u tiers=%u\n",
+			 t->auto_tune_v2, t->auto_tune_v2_glides,
+			 t->auto_tune_v2_tiers);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "v2_knobs=cluster:%u signals:%u thermal_slope:%u frame:%u gaming:%u\n",
 			 t->auto_tune_cluster_aware,
@@ -12493,6 +12818,7 @@ migration_jump_pct_store(struct gov_attr_set *attr_set,
 	    val > ZENITH_MIGRATION_JUMP_PCT_MAX)
 		return -EINVAL;
 	WRITE_ONCE(t->migration_jump_pct, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_MIGRATION_JUMP);
 	return count;
 }
 
@@ -12523,6 +12849,7 @@ migration_floor_window_ms_store(struct gov_attr_set *attr_set,
 	    val > ZENITH_MIGRATION_FLOOR_WINDOW_MS_MAX)
 		return -EINVAL;
 	WRITE_ONCE(t->migration_floor_window_ms, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_MIGRATION_FLOOR_WIN);
 	return count;
 }
 
@@ -12552,6 +12879,7 @@ migration_floor_pct_store(struct gov_attr_set *attr_set,
 	    val > ZENITH_MIGRATION_FLOOR_PCT_MAX)
 		return -EINVAL;
 	WRITE_ONCE(t->migration_floor_pct, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_MIGRATION_FLOOR_PCT);
 	return count;
 }
 
@@ -12583,6 +12911,7 @@ psi_cpu_floor_thresh_store(struct gov_attr_set *attr_set,
 	    val > ZENITH_PSI_CPU_FLOOR_THRESH_MAX)
 		return -EINVAL;
 	WRITE_ONCE(t->psi_cpu_floor_thresh, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_PSI_CPU_FLOOR);
 	return count;
 }
 
@@ -12614,6 +12943,7 @@ frame_overrun_slack_us_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 	WRITE_ONCE(t->frame_overrun_slack_us, val);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_FRAME_OVR_SLACK);
 	return count;
 }
 
@@ -12645,6 +12975,7 @@ frame_overrun_window_ms_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 	WRITE_ONCE(t->frame_overrun_window_ms, val);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_FRAME_OVR_WINDOW);
 	return count;
 }
 
@@ -12675,6 +13006,7 @@ frame_overrun_floor_pct_store(struct gov_attr_set *attr_set,
 	    val > ZENITH_FRAME_OVERRUN_FLOOR_PCT_MAX)
 		return -EINVAL;
 	WRITE_ONCE(t->frame_overrun_floor_pct, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_FRAME_OVR_FLOOR);
 	return count;
 }
 
@@ -13888,6 +14220,7 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune.attr,
 	&auto_tune_v2.attr,
 	&auto_tune_v2_glides.attr,
+	&auto_tune_v2_tiers.attr,
 	&auto_tune_hysteresis_windows.attr,
 	&auto_tune_cooldown_windows.attr,
 	&auto_tune_v3.attr,
@@ -14150,6 +14483,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->auto_tune_lo_events_x2 = ZENITH_DEFAULT_AT_LO_EVENTS_X2;
 	tunables->auto_tune_v2		= ZENITH_DEFAULT_AUTO_TUNE_V2;
 	tunables->auto_tune_v2_glides	= ZENITH_DEFAULT_AUTO_TUNE_V2_GLIDES;
+	tunables->auto_tune_v2_tiers	= ZENITH_DEFAULT_AUTO_TUNE_V2_TIERS;
 	tunables->auto_tune_hysteresis_windows =
 		ZENITH_DEFAULT_AT_HYSTERESIS_WINDOWS;
 	tunables->auto_tune_cooldown_windows =
