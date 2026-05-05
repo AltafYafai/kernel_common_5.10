@@ -624,6 +624,40 @@
 #define ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_FLOOR_PCT	100
 #define ZENITH_FRAME_OVERRUN_DEEP_FLOOR_PCT_MAX	100
 
+/* peer_ramp_uclamp_min_respect / migration_floor_uclamp_min_respect
+ * (defaults 1 / 1, [Stage 5 / Patch M2]):
+ *
+ * Per-tier sub-gates that let the peer_ramp (Patch D) and
+ * migration_floor (Patch K1) floors respect a task's
+ * uclamp_min hint.  Independent of the existing
+ * uclamp_min_respect master gate (which controls the
+ * *final-freq* floor at line ~6811): these gates only affect
+ * the per-tier intermediate floors.
+ *
+ * Effective floor at each site becomes:
+ *   max(static_floor_pct, uclamp_min_as_pct_of_max)
+ *
+ * When the inbound / on-policy task has uclamp_min == 0 (the
+ * common case) the max() is a no-op and behaviour is byte-
+ * identical to Stage 4.  When the task has an explicit ADPF-
+ * driven uclamp_min, the new path lifts the floor *up* toward
+ * what the scheduler already owes the task -- this can never
+ * produce a *lower* floor than the static knob alone.
+ *
+ * Why two bools and not one: peer_ramp and migration_floor
+ * are independently configurable in the existing per-profile
+ * presets; some profiles arm one without the other (e.g.
+ * BATTERY disables migration_floor but a future profile might
+ * keep peer_ramp at non-zero).  Two bools keep the matrix
+ * clean.
+ *
+ * Default 1 because the uclamp-respecting path is strictly a
+ * floor-raise, never a floor-lower.  Set 0 to revert to the
+ * pre-Stage-5 byte-identical behaviour for that specific tier.
+ */
+#define ZENITH_DEFAULT_PEER_RAMP_UCLAMP_MIN_RESPECT		1
+#define ZENITH_DEFAULT_MIGRATION_FLOOR_UCLAMP_MIN_RESPECT	1
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -2479,6 +2513,20 @@ struct zenith_tunables {
 	 */
 	unsigned int		frame_overrun_deep_streak;
 	unsigned int		frame_overrun_deep_floor_pct;
+
+	/* See ZENITH_DEFAULT_PEER_RAMP_UCLAMP_MIN_RESPECT /
+	 * ZENITH_DEFAULT_MIGRATION_FLOOR_UCLAMP_MIN_RESPECT
+	 * (Patch M2).  Independent per-tier sub-gates: when set,
+	 * the peer_ramp / migration_floor read sites compute their
+	 * effective floor as max(static_pct, uclamp_min_pct).
+	 * Default 1 because the uclamp path is a floor-raise; set
+	 * 0 to revert to the static-pct-only Stage 4 behaviour for
+	 * that specific tier without touching the master
+	 * uclamp_min_respect gate.  Reads via READ_ONCE on the
+	 * eval hot path; writes via WRITE_ONCE from sysfs.
+	 */
+	unsigned int		peer_ramp_uclamp_min_respect;
+	unsigned int		migration_floor_uclamp_min_respect;
 
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
@@ -5662,6 +5710,39 @@ zenith_peer_ramp_self_atomic(unsigned int cluster_class)
 	}
 }
 
+/* uclamp_min expressed as a percent of policy->max, suitable for
+ * folding into the existing static-pct floors via max() at the
+ * peer_ramp / migration_floor read sites (Patch M2).  Returns 0
+ * when the policy has no uclamp_min set or when uclamp is not
+ * compiled in (zenith_policy_uclamp_min() handles both cases),
+ * which keeps the max() call a no-op.
+ *
+ * Independent of the master uclamp_min_respect knob; the new
+ * per-tier bools at the call sites are gated separately.  Cheap:
+ * one cache read, one mul + div.  Computed per call site rather
+ * than once per zenith_get_next_freq() because both sites are
+ * already short-circuited by their static-pct == 0 guard, and
+ * the helper itself is called from inside an existing if-guard.
+ */
+static unsigned int
+zenith_uclamp_min_pct_of_max(struct zenith_policy *z_policy)
+{
+	struct cpufreq_policy *policy = z_policy->policy;
+	unsigned long umin = zenith_policy_uclamp_min(z_policy);
+	unsigned int max_cap;
+	unsigned int umin_freq;
+
+	if (!umin || !policy || !policy->max)
+		return 0;
+	max_cap = arch_scale_cpu_capacity(cpumask_first(policy->cpus));
+	if (!max_cap)
+		return 0;
+	umin_freq = map_util_freq(umin, policy->cpuinfo.max_freq, max_cap);
+	if (!umin_freq)
+		return 0;
+	return (umin_freq * 100U) / policy->max;
+}
+
 /* Effective peer_ramp window length, accounting for screen state
  * (Patch M3).  When the screen is on, the legacy peer_ramp_window_ms
  * applies.  When the screen is off, the shadow knob takes over.
@@ -7139,11 +7220,23 @@ brutal_entry_deferred:
 			u64 now_ns = ktime_get_ns();
 
 			if (now_ns < until) {
-				unsigned int floor =
-					(policy->max *
-					 z_policy->tunables->peer_ramp_floor_pct) /
-					100;
+				struct zenith_tunables *t = z_policy->tunables;
+				unsigned int eff_pct = t->peer_ramp_floor_pct;
+				unsigned int floor;
 
+				/* Patch M2: optionally fold uclamp_min
+				 * into the peer_ramp floor.  Helper returns
+				 * 0 when no task has uclamp_min set, so
+				 * the max() is a no-op in the common case.
+				 */
+				if (READ_ONCE(t->peer_ramp_uclamp_min_respect)) {
+					unsigned int umin_pct =
+						zenith_uclamp_min_pct_of_max(z_policy);
+
+					if (umin_pct > eff_pct)
+						eff_pct = umin_pct;
+				}
+				floor = (policy->max * eff_pct) / 100;
 				if (floor > policy->max)
 					floor = policy->max;
 				if (freq < floor) {
@@ -7196,9 +7289,24 @@ brutal_entry_deferred:
 			u64 until = z_policy->migration_in_until_ns;
 
 			if (until && ktime_get_ns() < until) {
-				unsigned int floor =
-					(policy->max * eff_floor_pct) / 100;
+				struct zenith_tunables *t = z_policy->tunables;
+				unsigned int eff_pct = eff_floor_pct;
+				unsigned int floor;
 
+				/* Patch M2: optionally fold uclamp_min into
+				 * the migration_floor.  Same shape as the
+				 * peer_ramp variant above; the helper
+				 * returns 0 when no task on the policy has
+				 * uclamp_min set, so max() is a no-op.
+				 */
+				if (READ_ONCE(t->migration_floor_uclamp_min_respect)) {
+					unsigned int umin_pct =
+						zenith_uclamp_min_pct_of_max(z_policy);
+
+					if (umin_pct > eff_pct)
+						eff_pct = umin_pct;
+				}
+				floor = (policy->max * eff_pct) / 100;
 				if (floor > policy->max)
 					floor = policy->max;
 				if (freq < floor) {
@@ -14494,6 +14602,66 @@ static ssize_t uclamp_min_respect_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr uclamp_min_respect = __ATTR_RW(uclamp_min_respect);
 
+/* peer_ramp_uclamp_min_respect sysfs knob (Patch M2).  Range
+ * 0..1.  When set, the peer_ramp floor is computed as
+ * max(peer_ramp_floor_pct, uclamp_min_pct).  When 0, the
+ * floor uses peer_ramp_floor_pct verbatim (Stage 4 behaviour).
+ * Independent of the master uclamp_min_respect knob.
+ */
+static ssize_t
+peer_ramp_uclamp_min_respect_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+		       peer_ramp_uclamp_min_respect);
+}
+
+static ssize_t
+peer_ramp_uclamp_min_respect_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->peer_ramp_uclamp_min_respect, val);
+	return count;
+}
+
+static struct governor_attr peer_ramp_uclamp_min_respect =
+	__ATTR_RW(peer_ramp_uclamp_min_respect);
+
+/* migration_floor_uclamp_min_respect sysfs knob (Patch M2).
+ * Range 0..1.  Same shape as peer_ramp_uclamp_min_respect above
+ * but for the migration_floor read site.  Independent of both
+ * the master uclamp_min_respect knob and the peer_ramp variant.
+ */
+static ssize_t
+migration_floor_uclamp_min_respect_show(struct gov_attr_set *attr_set,
+					char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+		       migration_floor_uclamp_min_respect);
+}
+
+static ssize_t
+migration_floor_uclamp_min_respect_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->migration_floor_uclamp_min_respect, val);
+	return count;
+}
+
+static struct governor_attr migration_floor_uclamp_min_respect =
+	__ATTR_RW(migration_floor_uclamp_min_respect);
+
 /*
  * uclamp_max_respect sysfs knob.  See the ZENITH_DEFAULT_UCLAMP_MAX_RESPECT
  * comment block at the top of this file for full semantics.  Normalised to
@@ -14638,6 +14806,8 @@ static struct attribute *zenith_attrs[] = {
 	&kcpustat_hispeed_enable.attr,
 	&util_math_v2.attr,
 	&uclamp_min_respect.attr,
+	&peer_ramp_uclamp_min_respect.attr,
+	&migration_floor_uclamp_min_respect.attr,
 	&uclamp_max_respect.attr,
 	&predict_util_pct.attr,
 	&predict_util_smooth.attr,
@@ -14917,6 +15087,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->kcpustat_hispeed_enable = ZENITH_DEFAULT_KCPUSTAT_HISPEED_ENABLE;
 	tunables->util_math_v2		= ZENITH_DEFAULT_UTIL_MATH_V2;
 	tunables->uclamp_min_respect	= ZENITH_DEFAULT_UCLAMP_MIN_RESPECT;
+	tunables->peer_ramp_uclamp_min_respect =
+		ZENITH_DEFAULT_PEER_RAMP_UCLAMP_MIN_RESPECT;
+	tunables->migration_floor_uclamp_min_respect =
+		ZENITH_DEFAULT_MIGRATION_FLOOR_UCLAMP_MIN_RESPECT;
 	tunables->uclamp_max_respect	= ZENITH_DEFAULT_UCLAMP_MAX_RESPECT;
 	tunables->predict_util_pct	= ZENITH_DEFAULT_PREDICT_UTIL_PCT;
 	tunables->predict_util_smooth	= ZENITH_DEFAULT_PREDICT_UTIL_SMOOTH;
