@@ -3463,6 +3463,31 @@ void zenith_v4l2_release_notify(struct video_device *vdev)
 }
 EXPORT_SYMBOL_GPL(zenith_v4l2_release_notify);
 
+/* K5: ALSA pcm-open / pcm-release notify hooks.  Same shape as K4.
+ * The `stream` parameter is the SNDRV_PCM_STREAM_PLAYBACK / CAPTURE
+ * direction; we don't currently distinguish them (any active
+ * stream counts), but the parameter is preserved for forward
+ * compatibility (a future patch could split capture vs playback
+ * for capture-only audio scenarios like voice memos).
+ */
+void zenith_alsa_pcm_open_notify(int stream)
+{
+	(void)stream;
+	atomic_inc(&zenith_alsa_active_fds);
+}
+EXPORT_SYMBOL_GPL(zenith_alsa_pcm_open_notify);
+
+void zenith_alsa_pcm_release_notify(int stream)
+{
+	int v;
+
+	(void)stream;
+	v = atomic_dec_return(&zenith_alsa_active_fds);
+	if (unlikely(v < 0))
+		atomic_set(&zenith_alsa_active_fds, 0);
+}
+EXPORT_SYMBOL_GPL(zenith_alsa_pcm_release_notify);
+
 /* Governor-wide caches for the frame-overrun knobs (Patch K3).
  * The producer (zenith_drm_vblank_event()) runs from the display
  * driver context with no struct zenith_policy in scope; if the
@@ -3588,6 +3613,25 @@ static atomic64_t zenith_auto_input_events = ATOMIC64_INIT(0);
  * "false positive" actually does the right thing.
  */
 static atomic_t zenith_v4l2_active_fds = ATOMIC_INIT(0);
+
+/* Audit fix K5: deterministic audio detection via ALSA pcm-open hook.
+ *
+ * Sibling to K4 -- same atomic refcount pattern, drives the audio
+ * scenario flag.  See zenith_alsa_pcm_open_notify() below for the
+ * exported strong symbols, and sound/core/pcm_native.c for the
+ * weak symbols that hook into snd_pcm_*_open / snd_pcm_release.
+ *
+ * Why bother when audio_server already lights up the comm-walk
+ * reliably:
+ *   - first window after open: audio_server may not have started
+ *     mixing yet, comm-walk misses, audio flag stays 0 for a full
+ *     V1 window.
+ *   - last window after close: audio_server already drained, but
+ *     V1 doesn't know the stream is gone until the next walk.
+ *
+ * K5 closes both edges to single-tick precision.
+ */
+static atomic_t zenith_alsa_active_fds = ATOMIC_INIT(0);
 #define ZENITH_AUTO_TUNE_PERIOD_MS	10000	/* classify every 10s  */
 
 /* Audit fix F1: scenario-active classifier window.
@@ -5554,6 +5598,17 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
 	struct cpufreq_policy *policy = z_policy->policy;
 	unsigned int cpu;
 	bool match = false;
+
+	/* Audit fix K5: deterministic short-circuit on any open ALSA
+	 * pcm fd.  Same pattern as K4: bypass the comm-walk and the
+	 * cache TTL because the refcount is event-driven and always
+	 * fresh.
+	 */
+	if (atomic_read(&zenith_alsa_active_fds) > 0) {
+		z_policy->audio_active = true;
+		z_policy->audio_cache_stamp_ns = now;
+		return true;
+	}
 
 	if (z_policy->audio_cache_stamp_ns &&
 	    now - z_policy->audio_cache_stamp_ns < ZENITH_AUDIO_CACHE_TTL_NS)

@@ -2799,6 +2799,12 @@ static int snd_pcm_open_file(struct file *file,
 	return 0;
 }
 
+/* Forward decl for K5 hook -- the open paths set the refcount on
+ * success; the bodies are below the snd_pcm_open() definition.
+ */
+extern void zenith_alsa_pcm_open_notify(int stream) __attribute__((weak));
+extern void zenith_alsa_pcm_release_notify(int stream) __attribute__((weak));
+
 static int snd_pcm_playback_open(struct inode *inode, struct file *file)
 {
 	struct snd_pcm *pcm;
@@ -2810,6 +2816,8 @@ static int snd_pcm_playback_open(struct inode *inode, struct file *file)
 	err = snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_PLAYBACK);
 	if (pcm)
 		snd_card_unref(pcm->card);
+	if (!err && zenith_alsa_pcm_open_notify)
+		zenith_alsa_pcm_open_notify(SNDRV_PCM_STREAM_PLAYBACK);
 	return err;
 }
 
@@ -2824,6 +2832,8 @@ static int snd_pcm_capture_open(struct inode *inode, struct file *file)
 	err = snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_CAPTURE);
 	if (pcm)
 		snd_card_unref(pcm->card);
+	if (!err && zenith_alsa_pcm_open_notify)
+		zenith_alsa_pcm_open_notify(SNDRV_PCM_STREAM_CAPTURE);
 	return err;
 }
 
@@ -2889,12 +2899,14 @@ static int snd_pcm_release(struct inode *inode, struct file *file)
 	struct snd_pcm *pcm;
 	struct snd_pcm_substream *substream;
 	struct snd_pcm_file *pcm_file;
+	int stream;
 
 	pcm_file = file->private_data;
 	substream = pcm_file->substream;
 	if (snd_BUG_ON(!substream))
 		return -ENXIO;
 	pcm = substream->pcm;
+	stream = substream->stream;
 	mutex_lock(&pcm->open_mutex);
 	snd_pcm_release_substream(substream);
 	kfree(pcm_file);
@@ -2902,6 +2914,8 @@ static int snd_pcm_release(struct inode *inode, struct file *file)
 	wake_up(&pcm->open_wait);
 	module_put(pcm->card->module);
 	snd_card_file_remove(pcm->card, file);
+	if (zenith_alsa_pcm_release_notify)
+		zenith_alsa_pcm_release_notify(stream);
 	return 0;
 }
 
