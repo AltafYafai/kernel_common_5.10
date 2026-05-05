@@ -16866,42 +16866,90 @@ static int __init zenith_gov_init(void)
 #endif
 
 	/* Boot banner.  Printed once at governor init, picked up by
-	 * `dmesg | grep -i zenith`.  Free-verse on top, the heart-init
-	 * flow + ASCII shomy block underneath; every line carries the
-	 * "Zenith" prefix so the whole multi-line banner survives a
-	 * grep.  The bloody-moon quote is printed as two physical dmesg
-	 * lines because the single-line form is over 100 cols and
-	 * checkpatch dislikes the adjacent-string-literal split.
+	 * `dmesg | grep -i zenith`.  Crescent banner + ~ incanto ~ on
+	 * top, the heart-init flow + ASCII shomy block underneath, plus
+	 * a FIGlet "SHOMY" signature before the welcome line.  Every
+	 * line carries the "Zenith" prefix so the whole multi-line
+	 * banner survives a grep.  Heart art uses U+2665 (BLACK HEART
+	 * SUIT, single-cell-wide) so the original alignment carries
+	 * over from the earlier ASCII-* version.
 	 */
 	pr_info("Zenith : The brain has started.\n");
 	pr_info("Zenith : The heart of zenith is yet to be initialized.\n");
-	pr_info("Zenith : It might hurt to love someone from the shadows.\n");
-	pr_info("Zenith : But love chose her.\n");
-	pr_info("Zenith : I chose her.\n");
-	pr_info("Zenith : Not because i was forced to.\n");
-	pr_info("Zenith : Because i wanted to.\n");
-	pr_info("Zenith : Even if it hurts.\n");
-	pr_info("Zenith : Love really is a powerful thing.\n");
-	pr_info("Zenith : \"Lost beneath the haunting light of a bloody moon,\n");
-	pr_info("Zenith :  wandering through the echoes of time.\"\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :     ✦       ☾       ✦\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :    ✧  ·  ✦  incanto  ✦  ·  ✧\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith : i never planned to write this down.\n");
+	pr_info("Zenith : i never planned to feel it either.\n");
+	pr_info("Zenith : but here i am, somewhere between\n");
+	pr_info("Zenith : saying nothing and meaning everything.\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :          ·    ✦    ·\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith : you don't know my name the way i know yours.\n");
+	pr_info("Zenith : you don't know i found you in the quiet —\n");
+	pr_info("Zenith : in the things you made, the words you left,\n");
+	pr_info("Zenith : the moonlight you carry without trying.\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :          ·    ✦    ·\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith : i'm not asking you to love me back.\n");
+	pr_info("Zenith : i know how far away you are.\n");
+	pr_info("Zenith : i just needed you to know, at least once,\n");
+	pr_info("Zenith : that someone saw you — really saw you —\n");
+	pr_info("Zenith : and thought —\n");
+	pr_info("Zenith : god, she is something rare.\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :          ·    ✦    ·\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith : you make things that outlive the moment.\n");
+	pr_info("Zenith : you exist in a way most people don't.\n");
+	pr_info("Zenith : and i have been standing at the edge of your light\n");
+	pr_info("Zenith : too afraid to step in, too drawn to leave.\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :          ·    ✦    ·\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith : this isn't a confession meant to change things.\n");
+	pr_info("Zenith : it's just the truth, finally tired of being quiet.\n");
+	pr_info("Zenith : you deserved to know that somewhere out there\n");
+	pr_info("Zenith : someone thinks of you like a song they can't forget —\n");
+	pr_info("Zenith : softly, constantly, helplessly.\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :          ·    ✦    ·\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith : and that's enough.\n");
+	pr_info("Zenith : you are enough.\n");
+	pr_info("Zenith : you were always enough.\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :     ✧  ·  ✦  ·  ✦  ·  ✧\n");
 	pr_info("Zenith :\n");
 	pr_info("Zenith : Initializing the heart of zenith...\n");
 	pr_info("Zenith :\n");
-	pr_info("Zenith :    ***   ***\n");
-	pr_info("Zenith :   ***** *****\n");
-	pr_info("Zenith :   ***********\n");
-	pr_info("Zenith :    *********\n");
-	pr_info("Zenith :     *******\n");
-	pr_info("Zenith :      *****\n");
-	pr_info("Zenith :       ***\n");
-	pr_info("Zenith :        *\n");
+	pr_info("Zenith :  ·  ♥♥♥   ♥♥♥  ·\n");
+	pr_info("Zenith :  ✦ ♥♥♥♥♥ ♥♥♥♥♥ ✦\n");
+	pr_info("Zenith :    ♥♥♥♥♥♥♥♥♥♥♥\n");
+	pr_info("Zenith :  ·  ♥♥♥♥♥♥♥♥♥  ·\n");
+	pr_info("Zenith :      ♥♥♥♥♥♥♥\n");
+	pr_info("Zenith :  ✦    ♥♥♥♥♥    ✦\n");
+	pr_info("Zenith :        ♥♥♥\n");
+	pr_info("Zenith :  ·      ♥      ·\n");
 	pr_info("Zenith :\n");
 	pr_info("Zenith :     ~ shomy ~\n");
 	pr_info("Zenith :\n");
 	pr_info("Zenith : The heart of zenith has been initialized.\n");
 	pr_info("Zenith : Yet it can never be mine.\n");
 	pr_info("Zenith :\n");
+	pr_info("Zenith :  ____  _   _  ___  __  ____   __\n");
+	pr_info("Zenith : / ___|| | | |/ _ \\|  \\/  \\ \\ / /\n");
+	pr_info("Zenith : \\___ \\| |_| | | | | |\\/| |\\ V /\n");
+	pr_info("Zenith :  ___) |  _  | |_| | |  | | | |\n");
+	pr_info("Zenith : |____/|_| |_|\\___/|_|  |_| |_|\n");
+	pr_info("Zenith :\n");
 	pr_info("Zenith : Welcome aboard, Zenith: Built by XTENSEI, for shomy.\n");
+	pr_info("Zenith :\n");
+	pr_info("Zenith :     ✧  ·  ✦  ·  ✦  ·  ✧\n");
 
 	/* Allocate the initial RCU comm tables from the in-tree default
 	 * arrays.  Failure here is non-fatal: zenith_policy_has_X()
