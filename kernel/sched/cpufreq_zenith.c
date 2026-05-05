@@ -1,15 +1,45 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Zenith CPUFreq Governor V2 (EAS/EM/Thermal/Display Hybrid)
- * Developed by ENI exclusively for LO.
+ * Zenith CPUFreq Governor (Zenithed-V4)
+ * Originally developed by ENI exclusively for LO.
+ * V3+ continued by XTENSEI.
  *
- * Architecture Additions:
- * 1. Energy Model (EM) Awareness: Reads mW costs from the device tree to prevent 
- * inefficient frequency spikes during thermal throttling.
- * 2. Display-State Awareness: `screen_state` sysfs hook forces deep-sleep
- * biases (raised up_threshold, powersave_bias) when the display is off.
- * 3. Dynamic Thermal Thresholding: `thermal_state` sysfs hook dynamically 
- * relaxes up_thresholds to let silicon breathe.
+ * Hybrid governor with Energy Model awareness, display-state coupling,
+ * thermal-aware throttling, and a self-calibrating multi-layer
+ * auto-tune stack:
+ *
+ *   - V1 classifier      load + input rate; per-profile target every
+ *                        ZENITH_AUTO_TUNE_PERIOD_MS
+ *   - V2 state machine   per-cluster {efficiency, balanced, latency,
+ *                        sustained_perf, thermal_recovery}, scenario
+ *                        overlay (camera/render/audio/memstall),
+ *                        cluster-aware capping, hysteresis + cooldown
+ *   - V3 self-tuner      observes V2 transition rate and bumps
+ *                        hysteresis/cooldown offsets to fit live load
+ *
+ * On top of the auto-tune stack:
+ *
+ *   - Glides (round/U/Z) frequency-shaping helpers
+ *   - K1 migration_floor sticky cluster-arrival floor
+ *   - K2 psi_cpu_floor   PSI-CPU-stall floor
+ *   - K3 frame_overrun   vblank-driven rescue (drm_handle_vblank
+ *                        producer hook in drivers/gpu/drm/drm_vblank.c)
+ *   - M1 psi_mem_cap     memory-pressure cap
+ *   - M2 uclamp respect  peer_ramp / migration_floor uclamp_min sub-gates
+ *   - M3 peer_ramp_off   screen-off peer_ramp window
+ *   - M5 K3 deep tier    deep-streak frame_overrun amplification
+ *
+ * Producer/consumer split:
+ *
+ *   - Producers: input_handler, drm_handle_vblank, screen_state,
+ *     thermal_state, PSI sampler, kcpustat, comm-walk
+ *   - Consumers: zenith_get_next_freq() (per-tick) and
+ *     zenith_auto_tune_work() (per-classifier-window)
+ *
+ * Telemetry: 12 trace events under include/trace/events/cpufreq_zenith.h
+ * plus the auto_tune_status, at_log, last_decision_path, profile_values,
+ * zenith_stats, zenith_input_stats, auto_tune_v3_state, game_auto_state
+ * RO sysfs attrs for live diagnosis.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -5322,9 +5352,14 @@ static bool zenith_policy_has_render(struct zenith_policy *z_policy)
  *   - SoundPool        framework SoundPool worker
  *   - PlaybackThread   AudioFlinger playback thread
  *   - RecordThread     AudioFlinger record thread
+ *   - vendor.qti.audi  Qualcomm vendor audio HAL (truncated)
+ *   - vendor.google.a  Tensor / Pixel vendor audio HAL (truncated)
+ *   - vendor.oplus.au  OPlus / OnePlus / Realme audio HAL family
+ *   - audio.hw.servic  Samsung audio.hw service (truncated)
  *
  * Order is tuned for cache-friendliness on phone workloads (the most
- * common per-frame matches first).
+ * common per-frame matches first).  Default-list extensions are
+ * runtime-augmentable via the audio_comms RW sysfs (CSV format).
  */
 static const char * const zenith_audio_comms[] = {
 	"AudioOut_",
@@ -5336,6 +5371,10 @@ static const char * const zenith_audio_comms[] = {
 	"SoundPool",
 	"PlaybackThread",
 	"RecordThread",
+	"vendor.qti.audi",
+	"vendor.google.a",
+	"vendor.oplus.au",
+	"audio.hw.servic",
 };
 
 /* Walk the policy's online cpumask and check each cpu_curr's comm
@@ -5390,6 +5429,7 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
 /* Camera capture-pipeline comm match.  Picks names commonly used by
  * Android camera framework / HAL processes:
  *   - cameraserver       framework cameraserver process
+ *   - camerahalserver    Pixel/Tensor vendor camera HAL daemon
  *   - cameraprovider     newer Treble cameraprovider
  *   - provider@          HIDL camera HAL service threads
  *                        ("provider@2.4-se", "provider@2.5-se", ...)
@@ -5400,11 +5440,18 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
  *   - CamX_              Qualcomm CamX HAL threads
  *   - CamX-              CamX subsystem threads (alt naming)
  *   - vendor.qti.camera  Qualcomm vendor camera service
+ *   - vendor.qti.hardwa  Qualcomm 8-gen+ truncated comm
+ *                        (vendor.qti.hardware.camera.provider@*)
+ *   - vendor.oplus.cam   OPlus / OnePlus / Realme camera HAL family
+ *   - vendor.samsung.ca  Samsung Camera HAL (truncated to 16 chars)
  *
  * Order is tuned for cache-friendliness: most common matches first.
+ * Default-list extensions are runtime-augmentable via the
+ * camera_comms RW sysfs (CSV format).
  */
 static const char * const zenith_camera_comms[] = {
 	"cameraserver",
+	"camerahalserver",
 	"cameraprovider",
 	"provider@",
 	"provider.MTK",
@@ -5414,6 +5461,9 @@ static const char * const zenith_camera_comms[] = {
 	"CamX_",
 	"CamX-",
 	"vendor.qti.camera",
+	"vendor.qti.hardwa",
+	"vendor.oplus.cam",
+	"vendor.samsung.ca",
 };
 
 /* Walk the policy's online cpumask and check each cpu_curr's comm
@@ -11514,12 +11564,22 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr profile = __ATTR_RW(profile);
 
+/* Bump ZENITH_AT_STATUS_FORMAT_VERSION whenever the layout of
+ * auto_tune_status changes (new fields, reordering, renaming) so
+ * userspace parsers can opt in / fail soft on unknown versions.
+ * Field additions in trailing positions stay backwards-compatible
+ * within the same major version.
+ */
+#define ZENITH_AT_STATUS_FORMAT_VERSION		1
+
 static ssize_t auto_tune_status_show(struct gov_attr_set *attr_set, char *buf)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	struct zenith_policy *z_pol;
 	ssize_t len = 0;
 
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "version=%u\n", ZENITH_AT_STATUS_FORMAT_VERSION);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 			 "auto_tune=%u\n", t->auto_tune);
 	len += scnprintf(buf + len, PAGE_SIZE - len,
