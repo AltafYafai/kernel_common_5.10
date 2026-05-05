@@ -466,6 +466,37 @@
 #define ZENITH_DEFAULT_MIGRATION_FLOOR_PCT		60
 #define ZENITH_MIGRATION_FLOOR_PCT_MAX			100
 
+/* psi_cpu_floor_thresh (default 0, off, [Stage 4 / Patch K2]):
+ *
+ * PSI-CPU-aware sustained-pressure floor.  Mirror of the existing
+ * psi_cpu_thresh cap but pointing the other direction.  When
+ * zenith_psi_cpu_some_pct() (the 10s-EWMA of system-wide CPU
+ * stall %) is at or above psi_cpu_floor_thresh, lift freq to
+ * zenith_eff_hispeed_freq().
+ *
+ * Why this sits next to psi_cpu_thresh and not next to predict_up
+ * or peak_rescue: PSI's 10 s smoothing window is too slow for
+ * sub-second decisions, so this tier is by design only useful
+ * for *sustained* CPU pressure -- gaming + background sync,
+ * screen-record + foreground app, multi-app multitasking with a
+ * background compile, etc.  Predict_up / peak_rescue / peak_prearm
+ * cover the sub-second up-decisions; this tier covers the
+ * "we've been queueing for 10+ seconds and util is still under
+ * hispeed entry threshold" case where the existing tiers don't
+ * fire because aggregate util doesn't capture queueing pressure
+ * cleanly.
+ *
+ * Conservative default (0, off): the user has to opt in.  Set
+ * via the per-profile mirror in zenith_apply_profile() so PERF
+ * gets a moderate threshold automatically and BAT/LEG keep it
+ * disabled.  When set, only fires when zenith_eff_hispeed_freq()
+ * is non-zero; if hispeed is unconfigured the tier no-ops rather
+ * than fall back to policy->max (which would be too aggressive
+ * for what is, after all, a smoothed-pressure signal).
+ */
+#define ZENITH_DEFAULT_PSI_CPU_FLOOR_THRESH		0
+#define ZENITH_PSI_CPU_FLOOR_THRESH_MAX			100
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -2194,6 +2225,12 @@ struct zenith_tunables {
 	unsigned int		migration_floor_window_ms;
 	unsigned int		migration_floor_pct;
 
+	/* See ZENITH_DEFAULT_PSI_CPU_FLOOR_THRESH (Patch K2).  0
+	 * disables the tier.  Read once on the eval path; written
+	 * via WRITE_ONCE from sysfs and zenith_apply_profile().
+	 */
+	unsigned int		psi_cpu_floor_thresh;
+
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
 	 * behaviour: the moment load_pct drops below the (possibly
@@ -2946,6 +2983,7 @@ enum zenith_stat_idx {
 	ZENITH_STAT_PEAK_HYST,		/* peak_hyst (Patch E) */
 	ZENITH_STAT_PEER_RAMP,		/* peer_ramp (Patch D) */
 	ZENITH_STAT_MIGRATION_FLOOR,	/* migration_floor (Patch K1) */
+	ZENITH_STAT_PSI_CPU_FLOOR,	/* psi_cpu_floor (Patch K2) */
 	ZENITH_STAT_NR
 };
 
@@ -5026,6 +5064,8 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
 		return ZENITH_STAT_PEER_RAMP;
 	if (!strcmp(path, "migration_floor"))
 		return ZENITH_STAT_MIGRATION_FLOOR;
+	if (!strcmp(path, "psi_cpu_floor"))
+		return ZENITH_STAT_PSI_CPU_FLOOR;
 	return ZENITH_STAT_OTHER;
 }
 
@@ -6700,6 +6740,43 @@ brutal_entry_deferred:
 			if (freq < floor) {
 				freq = floor;
 				tp_path = "migration_floor";
+			}
+		}
+	}
+
+	/* 3c'''''''. PSI-CPU sustained-pressure floor (Patch K2).
+	 *
+	 * When the system-wide PSI_CPU_SOME 10s EWMA is at or above
+	 * tunables->psi_cpu_floor_thresh and a hispeed freq is
+	 * configured, lift to it.  This addresses the workload class
+	 * where aggregate util sits below hispeed-entry threshold
+	 * but PSI shows lots of queueing -- multi-app multitasking,
+	 * gaming + background sync, screen-record + foreground app
+	 * -- which the existing util-driven tiers don't catch
+	 * because util is "just running" rather than "running with
+	 * waiters".
+	 *
+	 * Tier short-circuits in three places: feature-gate off,
+	 * tunable == 0, eff_hispeed_freq() == 0.  pin_to_target
+	 * paths bypass for the same reason as the other floor tiers
+	 * (input_boost / brutality already pin higher).  The
+	 * 10s-EWMA smoothing of the underlying signal is by design:
+	 * predict_up / peak_rescue cover the sub-second case;
+	 * this tier covers the steady-state queueing case.
+	 */
+	if (!pin_to_target &&
+	    ZENITH_FEATURE_ENABLED(psi_aware) &&
+	    z_policy->tunables->psi_cpu_floor_thresh) {
+		if (zenith_psi_cpu_some_pct() >=
+		    z_policy->tunables->psi_cpu_floor_thresh) {
+			unsigned int floor =
+				zenith_eff_hispeed_freq(z_policy);
+
+			if (floor && floor > policy->max)
+				floor = policy->max;
+			if (floor && freq < floor) {
+				freq = floor;
+				tp_path = "psi_cpu_floor";
 			}
 		}
 	}
@@ -8627,6 +8704,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int migration_jump_pct;
 		unsigned int migration_floor_window_ms;
 		unsigned int migration_floor_pct;
+		unsigned int psi_cpu_floor_thresh;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -8745,6 +8823,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.migration_jump_pct = 15,
 			.migration_floor_window_ms = 35,
 			.migration_floor_pct = 70,
+			/* Stage 4 / Patch K2: PERFORMANCE arms the
+			 * PSI-CPU sustained-pressure floor at 40%%.
+			 * The 10s EWMA at 40+%% means the system has
+			 * been queueing for a sustained stretch -- on
+			 * a PERF profile that is unambiguously a sign
+			 * we should be at hispeed regardless of
+			 * what aggregate util is saying.
+			 */
+			.psi_cpu_floor_thresh = 40,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -8865,6 +8952,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_MIGRATION_FLOOR_WINDOW_MS,
 			.migration_floor_pct =
 				ZENITH_DEFAULT_MIGRATION_FLOOR_PCT,
+			/* Stage 4 / Patch K2: BALANCED leaves the
+			 * PSI-CPU floor disabled (the cold-boot
+			 * default).  The energy cost of a hispeed pin
+			 * triggered by a smoothed signal isn't worth
+			 * paying on the everyday profile -- predict_up
+			 * and the existing peak tiers cover the cases
+			 * a balanced workload actually needs.
+			 */
+			.psi_cpu_floor_thresh =
+				ZENITH_DEFAULT_PSI_CPU_FLOOR_THRESH,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -8987,6 +9084,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.migration_jump_pct = 0,
 			.migration_floor_window_ms = 0,
 			.migration_floor_pct = 0,
+			/* Stage 4 / Patch K2: BATTERY keeps the PSI-CPU
+			 * floor disabled.  Sustained pressure under
+			 * BATTERY is exactly when the user wants the
+			 * governor to *not* lift -- the queueing is
+			 * the price of running at conservative freq.
+			 */
+			.psi_cpu_floor_thresh = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -9096,6 +9200,12 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.migration_jump_pct = 0,
 			.migration_floor_window_ms = 0,
 			.migration_floor_pct = 0,
+			/* Stage 4 / Patch K2: LEGACY disables the
+			 * PSI-CPU floor.  Pre-Stage-1 governor had no
+			 * pressure-aware lifts.  LEGACY preserves
+			 * that.
+			 */
+			.psi_cpu_floor_thresh = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -9169,6 +9279,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->migration_floor_window_ms,
 		   p->migration_floor_window_ms);
 	WRITE_ONCE(t->migration_floor_pct, p->migration_floor_pct);
+	WRITE_ONCE(t->psi_cpu_floor_thresh, p->psi_cpu_floor_thresh);
 
 	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
 	 * the governor-wide caches used by the input handler fast
@@ -10384,6 +10495,7 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 		[ZENITH_STAT_PEAK_HYST]		= "peak_hyst",
 		[ZENITH_STAT_PEER_RAMP]		= "peer_ramp",
 		[ZENITH_STAT_MIGRATION_FLOOR]	= "migration_floor",
+		[ZENITH_STAT_PSI_CPU_FLOOR]	= "psi_cpu_floor",
 	};
 	unsigned long sum[ZENITH_STAT_NR] = { 0 };
 	struct zenith_policy *z_pol;
@@ -12181,6 +12293,37 @@ migration_floor_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr migration_floor_pct =
 	__ATTR_RW(migration_floor_pct);
 
+/* psi_cpu_floor_thresh (Patch K2).  Range 0..100.  0 disables.
+ * When >= this percent of system-wide PSI_CPU_SOME 10s EWMA is
+ * observed, the eval lifts to zenith_eff_hispeed_freq().  Mirror
+ * of psi_cpu_thresh on the floor side.  See the
+ * ZENITH_DEFAULT_PSI_CPU_FLOOR_THRESH comment block for the full
+ * rationale.
+ */
+static ssize_t
+psi_cpu_floor_thresh_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->psi_cpu_floor_thresh);
+}
+
+static ssize_t
+psi_cpu_floor_thresh_store(struct gov_attr_set *attr_set,
+			   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PSI_CPU_FLOOR_THRESH_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->psi_cpu_floor_thresh, val);
+	return count;
+}
+
+static struct governor_attr psi_cpu_floor_thresh =
+	__ATTR_RW(psi_cpu_floor_thresh);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -13368,6 +13511,7 @@ static struct attribute *zenith_attrs[] = {
 	&migration_jump_pct.attr,
 	&migration_floor_window_ms.attr,
 	&migration_floor_pct.attr,
+	&psi_cpu_floor_thresh.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -13626,6 +13770,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_MIGRATION_FLOOR_WINDOW_MS;
 	tunables->migration_floor_pct	=
 		ZENITH_DEFAULT_MIGRATION_FLOOR_PCT;
+	tunables->psi_cpu_floor_thresh	=
+		ZENITH_DEFAULT_PSI_CPU_FLOOR_THRESH;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
