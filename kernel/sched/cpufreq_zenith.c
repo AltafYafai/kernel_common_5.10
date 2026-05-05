@@ -658,6 +658,81 @@
 #define ZENITH_DEFAULT_PEER_RAMP_UCLAMP_MIN_RESPECT		1
 #define ZENITH_DEFAULT_MIGRATION_FLOOR_UCLAMP_MIN_RESPECT	1
 
+/* psi_mem_cap_thresh / psi_mem_cap_pct / psi_mem_cap_window_ms
+ * (defaults 0 / 80 / 1000, [Stage 5 / Patch M1]):
+ *
+ * Symmetric companion to the existing psi_mem_thresh predicate.
+ * The decision chain already gates the *up-push* on memstall via
+ * zenith_psi_mem_some_pct() >= psi_mem_thresh.  But the cap side
+ * (uclamp_max / light_cap / audio_cap / em_cap / existing
+ * psi-cap-at-hispeed) doesn't pull the *final* freq down when
+ * memstall climbs past a separate, lower threshold.  Pushing CPU
+ * into peak under heavy paging just deepens the stall: the CPU
+ * has nothing useful to do while it waits on mm.  This tier adds
+ * a final-freq cap that fires exactly there.
+ *
+ * Knob shape:
+ *   psi_mem_cap_thresh    (0..100, default 0 = off)
+ *   psi_mem_cap_pct       (50..100, default 80%)
+ *   psi_mem_cap_window_ms (100..5000, default 1000 ms)
+ *
+ * When psi_aware == 1 (master gate) AND psi_mem_cap_thresh > 0
+ * AND zenith_psi_mem_some_pct() >= psi_mem_cap_thresh, the eval
+ * path stamps z_policy->psi_mem_cap_until_ns with a deadline
+ * `now + psi_mem_cap_window_ms`.  While that deadline has not
+ * expired, the final freq is capped at psi_mem_cap_pct of
+ * policy->max.  Once the EWMA falls below thresh and the window
+ * lapses, the cap releases without further hysteresis.
+ *
+ * Defaults:
+ *   - psi_mem_cap_thresh = 0 (off) so the patch is fully inert
+ *     out of the box.  Users who opt into psi_aware = 1 already
+ *     accept the existing PSI cap above; this tier is a stricter
+ *     opt-in.
+ *   - psi_mem_cap_pct = 80% so the cap is meaningful but not
+ *     punitive (a healthy floor for browser / scrolling under
+ *     mild memstall).  PERFORMANCE bumps to 90% for the user
+ *     who has explicitly picked PERF.
+ *   - psi_mem_cap_window_ms = 1000 ms so the cap stays in place
+ *     long enough to absorb a full mmap_sem / kswapd burst
+ *     without flapping every tick.  Aligned with the 10s EWMA
+ *     timescale: the EWMA's natural reset-to-zero is glacial,
+ *     so the window is what governs cap release.
+ *
+ * Range max (5000 ms) caps the worst-case stuck-cap to 5 s, the
+ * order of magnitude where the user would notice "phone is slow"
+ * regardless of governor reasoning.
+ *
+ * V2 tier mapping:
+ *   ZENITH_AT_STATE_EFFICIENCY   -> arm  (back off on stall is
+ *                                  exactly the EFFICIENCY job)
+ *   ZENITH_AT_STATE_BALANCED     -> arm
+ *   ZENITH_AT_STATE_THERMAL_RECOVERY -> arm
+ *   ZENITH_AT_STATE_LATENCY      -> disarm (this is a cap, not
+ *                                  a floor; LATENCY does not
+ *                                  want any extra caps)
+ *   ZENITH_AT_STATE_SUSTAINED_PERF -> disarm (user has explicitly
+ *                                    asked for top-end)
+ *   FRAME / GAME flag bypass     -> disarm (frame-pacing and game
+ *                                  overrides need full headroom)
+ *
+ * Cannot regress at default: psi_mem_cap_thresh == 0 short-
+ * circuits before any read of the EWMA; psi_aware == 0 short-
+ * circuits a level higher; auto_tune_v2_tiers == 0 bypasses the
+ * tier bit entirely.  When the tier *is* armed and fires, the
+ * cap is bounded below by policy->min and above by policy->max,
+ * so a misconfigured psi_mem_cap_pct cannot drop the policy
+ * below its natural floor.
+ */
+#define ZENITH_DEFAULT_PSI_MEM_CAP_THRESH		0
+#define ZENITH_PSI_MEM_CAP_THRESH_MAX			100
+#define ZENITH_DEFAULT_PSI_MEM_CAP_PCT			80
+#define ZENITH_PSI_MEM_CAP_PCT_MIN			50
+#define ZENITH_PSI_MEM_CAP_PCT_MAX			100
+#define ZENITH_DEFAULT_PSI_MEM_CAP_WINDOW_MS		1000
+#define ZENITH_PSI_MEM_CAP_WINDOW_MS_MIN		100
+#define ZENITH_PSI_MEM_CAP_WINDOW_MS_MAX		5000
+
 /* up_threshold_adaptive (default 0, off):
  *
  * Variance-adaptive shaping of the brutality entry threshold.  The
@@ -1623,6 +1698,18 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_OVERRIDE_FRAME_OVR_WINDOW	BIT(15)
 #define ZENITH_AT_OVERRIDE_FRAME_OVR_FLOOR	BIT(16)
 
+/* Patch M1: PSI-mem light cap.  Three new override bits, sitting
+ * at the end of the existing tier-overrides bank.  Same shape as
+ * the K1/K2/K3 override bits above: a sysfs write to any of the
+ * three knobs ORs in its bit, and the V2 worker stops touching
+ * that specific knob until the next profile flip clears the
+ * mask.  Profile-flip-clears-mask is implemented in
+ * zenith_apply_profile() (existing code, no edit needed here).
+ */
+#define ZENITH_AT_OVERRIDE_PSI_MEM_CAP_THRESH	BIT(17)
+#define ZENITH_AT_OVERRIDE_PSI_MEM_CAP_PCT	BIT(18)
+#define ZENITH_AT_OVERRIDE_PSI_MEM_CAP_WINDOW	BIT(19)
+
 /* Patch L: V2-classifier tier-armed bitmask.
  *
  * Written by zenith_at_apply_tiers() per V2 worker pass; read by
@@ -1648,6 +1735,15 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_TIER_MIGRATION		BIT(0)
 #define ZENITH_AT_TIER_PSI_CPU_FLOOR		BIT(1)
 #define ZENITH_AT_TIER_FRAME_OVERRUN		BIT(2)
+/* Patch M1: PSI-mem cap tier.  Armed in EFFICIENCY / BALANCED /
+ * THERMAL_RECOVERY (states where backing off on memstall is the
+ * desired behaviour); disarmed in LATENCY / SUSTAINED_PERF and
+ * under the FRAME / GAME flag bypass.  Cap is final-freq, not a
+ * predicate; disarm here turns the read-site into a no-op for
+ * the duration of the V2 window regardless of the profile-set
+ * thresh value.
+ */
+#define ZENITH_AT_TIER_PSI_MEM_CAP		BIT(3)
 
 #define ZENITH_CLUSTER_LITTLE			0
 #define ZENITH_CLUSTER_BIG			1
@@ -2527,6 +2623,19 @@ struct zenith_tunables {
 	 */
 	unsigned int		peer_ramp_uclamp_min_respect;
 	unsigned int		migration_floor_uclamp_min_respect;
+
+	/* See ZENITH_DEFAULT_PSI_MEM_CAP_* (Patch M1).  Three-tunable
+	 * triple for the PSI-mem light cap tier.  All three reads
+	 * are gated behind the existing psi_aware master gate AND
+	 * the V2 PSI_MEM_CAP tier bit (via zenith_tier_value()).
+	 * thresh == 0 short-circuits before any EWMA read, keeping
+	 * the disabled path free.  Reads via READ_ONCE on the eval
+	 * hot path; writes via WRITE_ONCE from sysfs and
+	 * zenith_apply_profile().
+	 */
+	unsigned int		psi_mem_cap_thresh;
+	unsigned int		psi_mem_cap_pct;
+	unsigned int		psi_mem_cap_window_ms;
 
 	/* Tail-decay window for the brutal-hold cliff exit, in
 	 * milliseconds.  0 (default) preserves the historical hard-exit
@@ -3565,6 +3674,23 @@ struct zenith_policy {
 	 * is only ever monotonic-forward written.
 	 */
 	u64			migration_in_until_ns;
+
+	/* PSI-mem cap deadline (Patch M1).  Stamped by the eval path
+	 * when zenith_psi_mem_some_pct() crosses psi_mem_cap_thresh
+	 * (and master psi_aware + V2 PSI_MEM_CAP tier gates pass);
+	 * read by the same eval path one tier later as
+	 * `now < deadline -> cap fires`.  Same per-policy / single-
+	 * writer reasoning as migration_in_until_ns above: each
+	 * policy stamps its own deadline (so the BIG / PRIME caps
+	 * release independently), and the eval is serialized by
+	 * update_lock.
+	 *
+	 * Cleared (set to 0) at policy init by zenith_alloc_-
+	 * policy(); never decremented other than by the deadline
+	 * comparison expiring, so no torn-write hazard on a 64-bit
+	 * kernel and natural alignment guarantee on 32-bit.
+	 */
+	u64			psi_mem_cap_until_ns;
 
 	/* Util-trend ring for the predictive up-shift tier (2a').  The
 	 * tail of zenith_get_next_freq() pushes the current sample's
@@ -7496,6 +7622,68 @@ apply_uclamp_max_cap:
 		}
 	}
 
+	/* 3e'. PSI-mem light cap (Patch M1).  Sits one tier above the
+	 * existing PSI-cap-at-hispeed (3e below).  When psi_aware=1
+	 * AND the V2 PSI_MEM_CAP tier is armed (or the user has
+	 * sysfs-overridden the thresh) AND
+	 * zenith_psi_mem_some_pct() >= psi_mem_cap_thresh, stamp the
+	 * per-policy psi_mem_cap_until_ns deadline.  While the
+	 * deadline holds, cap final freq at psi_mem_cap_pct of
+	 * policy->max.  Once the EWMA falls and the window lapses,
+	 * the cap releases without further hysteresis.
+	 *
+	 * Cheap when off: psi_aware == 0 short-circuits via
+	 * ZENITH_FEATURE_ENABLED; eff_thresh == 0 from V2 disarm
+	 * short-circuits the EWMA read; pin_to_target paths skip
+	 * the entire block.  The deadline read is a single field
+	 * compare per eval, identical pattern to migration_floor.
+	 */
+	{
+		unsigned int eff_thresh = zenith_tier_value(z_policy,
+				z_policy->tunables->psi_mem_cap_thresh,
+				ZENITH_AT_OVERRIDE_PSI_MEM_CAP_THRESH,
+				ZENITH_AT_TIER_PSI_MEM_CAP);
+
+		if (!pin_to_target &&
+		    ZENITH_FEATURE_ENABLED(psi_aware) &&
+		    eff_thresh && policy->max) {
+			unsigned int cap_pct = READ_ONCE(
+				z_policy->tunables->psi_mem_cap_pct);
+			unsigned int win_ms = READ_ONCE(
+				z_policy->tunables->psi_mem_cap_window_ms);
+			u64 now_ns = ktime_get_ns();
+
+			/* Arm path: stamp the deadline whenever the
+			 * EWMA is currently above thresh.  Subsequent
+			 * ticks while the EWMA stays above thresh keep
+			 * pushing the deadline forward; once it drops,
+			 * the deadline holds the cap until win_ms has
+			 * lapsed.  Stamping before the cap apply means
+			 * a cap that just released and a new spike both
+			 * land cleanly.
+			 */
+			if (zenith_psi_mem_some_pct() >= eff_thresh)
+				z_policy->psi_mem_cap_until_ns =
+					now_ns + (u64)win_ms * NSEC_PER_MSEC;
+
+			if (cap_pct >= ZENITH_PSI_MEM_CAP_PCT_MIN &&
+			    z_policy->psi_mem_cap_until_ns &&
+			    now_ns < z_policy->psi_mem_cap_until_ns) {
+				unsigned int psi_cap =
+					(policy->max * cap_pct) / 100;
+
+				if (psi_cap < policy->min)
+					psi_cap = policy->min;
+				if (psi_cap > policy->max)
+					psi_cap = policy->max;
+				if (freq > psi_cap) {
+					freq = psi_cap;
+					tp_path = "psi_mem_cap_light";
+				}
+			}
+		}
+	}
+
 	/* 3e. PSI memory-pressure cap.  When psi_aware=1 and the system
 	 * is over the configured 10s memory-pressure threshold, cap the
 	 * final freq at the effective hispeed floor (or policy->max as
@@ -9267,6 +9455,17 @@ static void zenith_at_apply_tiers(struct zenith_policy *z_policy,
 		armed |= ZENITH_AT_TIER_MIGRATION;
 		armed |= ZENITH_AT_TIER_PSI_CPU_FLOOR;
 		break;
+	case ZENITH_AT_STATE_EFFICIENCY:
+	case ZENITH_AT_STATE_BALANCED:
+	case ZENITH_AT_STATE_THERMAL_RECOVERY:
+		/* Patch M1: PSI-mem light cap.  Three states where
+		 * "back off on memstall" is the policy's job, not a
+		 * regression: EFFICIENCY explicitly trades freq for
+		 * energy; BALANCED is the all-rounder default;
+		 * THERMAL_RECOVERY is already in cool-down.
+		 */
+		armed |= ZENITH_AT_TIER_PSI_MEM_CAP;
+		break;
 	default:
 		break;
 	}
@@ -9274,6 +9473,14 @@ static void zenith_at_apply_tiers(struct zenith_policy *z_policy,
 	if (flags & (ZENITH_AT_FLAG_FRAME | ZENITH_AT_FLAG_GAME)) {
 		armed |= ZENITH_AT_TIER_MIGRATION;
 		armed |= ZENITH_AT_TIER_FRAME_OVERRUN;
+		/* Patch M1: frame-pacing and game overrides need full
+		 * headroom on the cap side, so unconditionally clear
+		 * the PSI-mem cap bit even if the underlying state
+		 * had armed it.  (BALANCED + FRAME flag is the common
+		 * case here.)  An explicit clear, not a "reset armed",
+		 * so other tiers stay armed.
+		 */
+		armed &= ~ZENITH_AT_TIER_PSI_MEM_CAP;
 	}
 
 	z_policy->at_local_tier_armed_mask = armed;
@@ -9484,6 +9691,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int frame_overrun_floor_pct;
 		unsigned int frame_overrun_deep_streak;
 		unsigned int frame_overrun_deep_floor_pct;
+		unsigned int psi_mem_cap_thresh;
+		unsigned int psi_mem_cap_pct;
+		unsigned int psi_mem_cap_window_ms;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -9645,6 +9855,17 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.frame_overrun_deep_streak = 2,
 			.frame_overrun_deep_floor_pct = 100,
+			/* Stage 5 / Patch M1: PERFORMANCE keeps the
+			 * PSI-mem cap off (thresh = 0).  The whole
+			 * point of PERF is full headroom; backing off
+			 * on memstall is the wrong call here.  The
+			 * pct/window are populated with sane values
+			 * for forward compatibility if the user
+			 * overrides thresh via sysfs.
+			 */
+			.psi_mem_cap_thresh = 0,
+			.psi_mem_cap_pct = 90,
+			.psi_mem_cap_window_ms = 1000,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -9806,6 +10027,19 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_STREAK,
 			.frame_overrun_deep_floor_pct =
 				ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_FLOOR_PCT,
+			/* Stage 5 / Patch M1: BALANCED keeps the
+			 * PSI-mem cap at the cold-boot off default.
+			 * BALANCED's existing tier mapping arms the
+			 * tier bit, so a sysfs flip of thresh > 0 is
+			 * sufficient to opt in without flipping the
+			 * profile.
+			 */
+			.psi_mem_cap_thresh =
+				ZENITH_DEFAULT_PSI_MEM_CAP_THRESH,
+			.psi_mem_cap_pct =
+				ZENITH_DEFAULT_PSI_MEM_CAP_PCT,
+			.psi_mem_cap_window_ms =
+				ZENITH_DEFAULT_PSI_MEM_CAP_WINDOW_MS,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -9961,6 +10195,18 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.frame_overrun_deep_streak = 0,
 			.frame_overrun_deep_floor_pct = 100,
+			/* Stage 5 / Patch M1: BATTERY arms the PSI-
+			 * mem cap aggressively (thresh = 50%, cap to
+			 * 70% of policy->max for 1.5 s).  Battery is
+			 * the profile where backing off on memstall
+			 * matches the user's stated preference: spend
+			 * less power on cycles that would just stall
+			 * on mm.  The wider window captures full
+			 * kswapd / lowmem-killer bursts.
+			 */
+			.psi_mem_cap_thresh = 50,
+			.psi_mem_cap_pct = 70,
+			.psi_mem_cap_window_ms = 1500,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -10099,6 +10345,14 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.frame_overrun_deep_streak = 0,
 			.frame_overrun_deep_floor_pct = 100,
+			/* Stage 5 / Patch M1: LEGACY keeps the PSI-mem
+			 * cap fully off.  Pre-Stage-1 governor had no
+			 * concept of memstall-driven freq capping;
+			 * LEGACY preserves that.
+			 */
+			.psi_mem_cap_thresh = 0,
+			.psi_mem_cap_pct = 80,
+			.psi_mem_cap_window_ms = 1000,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -10184,6 +10438,10 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   p->frame_overrun_deep_streak);
 	WRITE_ONCE(t->frame_overrun_deep_floor_pct,
 		   p->frame_overrun_deep_floor_pct);
+	WRITE_ONCE(t->psi_mem_cap_thresh, p->psi_mem_cap_thresh);
+	WRITE_ONCE(t->psi_mem_cap_pct, p->psi_mem_cap_pct);
+	WRITE_ONCE(t->psi_mem_cap_window_ms,
+		   p->psi_mem_cap_window_ms);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
@@ -13473,6 +13731,90 @@ frame_overrun_deep_floor_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr frame_overrun_deep_floor_pct =
 	__ATTR_RW(frame_overrun_deep_floor_pct);
 
+/* psi_mem_cap_thresh / psi_mem_cap_pct / psi_mem_cap_window_ms
+ * sysfs knobs (Patch M1).  thresh ranges 0..100 (0 = off);
+ * pct ranges 50..100; window_ms ranges 100..5000.  All three
+ * mark their override bit on store so the V2 worker stops
+ * touching the value until the next profile flip clears the
+ * mask.  See the macro block above for the full design.
+ */
+static ssize_t
+psi_mem_cap_thresh_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->psi_mem_cap_thresh);
+}
+
+static ssize_t
+psi_mem_cap_thresh_store(struct gov_attr_set *attr_set,
+			 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PSI_MEM_CAP_THRESH_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->psi_mem_cap_thresh, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_PSI_MEM_CAP_THRESH);
+	return count;
+}
+
+static struct governor_attr psi_mem_cap_thresh =
+	__ATTR_RW(psi_mem_cap_thresh);
+
+static ssize_t
+psi_mem_cap_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->psi_mem_cap_pct);
+}
+
+static ssize_t
+psi_mem_cap_pct_store(struct gov_attr_set *attr_set,
+		      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val < ZENITH_PSI_MEM_CAP_PCT_MIN ||
+	    val > ZENITH_PSI_MEM_CAP_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->psi_mem_cap_pct, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_PSI_MEM_CAP_PCT);
+	return count;
+}
+
+static struct governor_attr psi_mem_cap_pct =
+	__ATTR_RW(psi_mem_cap_pct);
+
+static ssize_t
+psi_mem_cap_window_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->psi_mem_cap_window_ms);
+}
+
+static ssize_t
+psi_mem_cap_window_ms_store(struct gov_attr_set *attr_set,
+			    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val < ZENITH_PSI_MEM_CAP_WINDOW_MS_MIN ||
+	    val > ZENITH_PSI_MEM_CAP_WINDOW_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->psi_mem_cap_window_ms, val);
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_PSI_MEM_CAP_WINDOW);
+	return count;
+}
+
+static struct governor_attr psi_mem_cap_window_ms =
+	__ATTR_RW(psi_mem_cap_window_ms);
+
 /* brutal_decay_ms sysfs knob.  Range 0..ZENITH_BRUTAL_DECAY_MS_MAX.
  * 0 disables the tail-glide and restores the legacy hard cliff
  * exit; non-zero arms a linear ramp from policy->max down to the
@@ -14727,6 +15069,9 @@ static struct attribute *zenith_attrs[] = {
 	&frame_overrun_floor_pct.attr,
 	&frame_overrun_deep_streak.attr,
 	&frame_overrun_deep_floor_pct.attr,
+	&psi_mem_cap_thresh.attr,
+	&psi_mem_cap_pct.attr,
+	&psi_mem_cap_window_ms.attr,
 	&brutal_decay_ms.attr,
 	&climb_mode.attr,
 	&freq_step_pct.attr,
@@ -15002,6 +15347,12 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_STREAK;
 	tunables->frame_overrun_deep_floor_pct =
 		ZENITH_DEFAULT_FRAME_OVERRUN_DEEP_FLOOR_PCT;
+	tunables->psi_mem_cap_thresh =
+		ZENITH_DEFAULT_PSI_MEM_CAP_THRESH;
+	tunables->psi_mem_cap_pct =
+		ZENITH_DEFAULT_PSI_MEM_CAP_PCT;
+	tunables->psi_mem_cap_window_ms =
+		ZENITH_DEFAULT_PSI_MEM_CAP_WINDOW_MS;
 	tunables->climb_mode		= ZENITH_DEFAULT_CLIMB_MODE;
 	tunables->freq_step_pct		= ZENITH_DEFAULT_FREQ_STEP_PCT;
 	tunables->freq_step_adaptive	= ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE;
