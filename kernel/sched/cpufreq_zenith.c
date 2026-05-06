@@ -956,6 +956,7 @@
 #define ZENITH_PROFILE_BATTERY			3
 #define ZENITH_PROFILE_LEGACY			4
 #define ZENITH_PROFILE_GAMING			5
+#define ZENITH_PROFILE_AUDIO			6
 
 /* Profile selected via the zenith.profile= kernel cmdline. Parsed by
  * zenith_setup_profile() at early_param time and consumed on the
@@ -9625,6 +9626,8 @@ static const char *zenith_profile_name(unsigned int profile)
 		return "legacy";
 	case ZENITH_PROFILE_GAMING:
 		return "gaming";
+	case ZENITH_PROFILE_AUDIO:
+		return "audio";
 	case ZENITH_PROFILE_CUSTOM:
 	default:
 		return "custom";
@@ -9768,6 +9771,7 @@ static void zenith_at_get_guardrails(unsigned int profile,
 		break;
 	case ZENITH_PROFILE_CUSTOM:
 	case ZENITH_PROFILE_BALANCED:
+	case ZENITH_PROFILE_AUDIO:
 	default:
 		*g = (struct zenith_at_guardrails) {
 			.up_rate_min = 50, .up_rate_max = 500,
@@ -9841,6 +9845,7 @@ static unsigned int zenith_profile_to_at_state(unsigned int profile)
 		return ZENITH_AT_STATE_EFFICIENCY;
 	case ZENITH_PROFILE_BALANCED:
 	case ZENITH_PROFILE_LEGACY:
+	case ZENITH_PROFILE_AUDIO:
 	case ZENITH_PROFILE_CUSTOM:
 	default:
 		return ZENITH_AT_STATE_BALANCED;
@@ -11543,6 +11548,159 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_pct = 90,
 			.psi_mem_cap_window_ms = 1000,
 		},
+		{
+			/* Patch 4.2: AUDIO profile.
+			 *
+			 * Purpose: pinhole-tight wake-cadence guarantees
+			 * for ALSA / aaudio callback threads (typical
+			 * pcm period ~ 5..20 ms).  Branches from
+			 * BALANCED with the screen-off / sleeper-tail /
+			 * peer-ramp-off knobs all softened so the
+			 * cluster doesn't drift into states that cost
+			 * an audio underrun on the first wake of every
+			 * period.  Frame-overrun stays at BALANCED
+			 * (audio doesn't care about vblank).  Render
+			 * floor disabled (audio threads aren't
+			 * RENDER_PRIO).  PSI-mem cap stays off.
+			 *
+			 * Auto-tune state: BALANCED (mapped via
+			 * zenith_profile_to_at_state).  Guardrails:
+			 * shared with BALANCED / CUSTOM.
+			 */
+			.profile = ZENITH_PROFILE_AUDIO,
+			.up_rate_limit_us = 250,
+			.down_rate_limit_us = 8000,
+			.up_threshold = 70,
+			.down_threshold = 50,
+			.hispeed_freq_pct = ZENITH_DEFAULT_HISPEED_FREQ_PCT,
+			.hispeed_load = ZENITH_DEFAULT_HISPEED_LOAD,
+			.climb_mode = ZENITH_CLIMB_MODE_SNAP,
+			.freq_step_pct = ZENITH_DEFAULT_FREQ_STEP_PCT,
+			.powersave_bias = 30,
+			.bias_load_threshold = 45,
+			.ignore_nice_load = 1,
+			.input_boost_ms = 50,
+			.input_boost_decay_ms = 30,
+			.input_boost_cap_pct = 70,
+			.light_load_threshold = 18,
+			.sampling_down_factor = 4,
+			.thermal_auto = 1,
+			.screen_auto = 1,
+			.util_math_v2 = 1,
+			.kcpustat_hispeed_enable = 1,
+			.down_rate_adaptive = 1,
+			.wakeup_boost = 1,
+			.down_threshold_adaptive = 5,
+			.rate_limit_cluster_scale = 1,
+			/* Mild peak-headroom: lift the floor slightly
+			 * over BALANCED so the audio worker cluster
+			 * recovers fast on a brief peak, but keep
+			 * starve_load_pct higher so we don't fire on
+			 * routine cadence.
+			 */
+			.peak_headroom_rescue =
+				ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE,
+			.peak_headroom_prearm =
+				ZENITH_DEFAULT_PEAK_HEADROOM_PREARM,
+			.peak_headroom_starve_load_pct = 90,
+			.peak_headroom_freq_floor_pct = 75,
+			.peak_headroom_starve_streak = 3,
+			.peak_headroom_jump_pct = 100,
+			.peak_headroom_hold_ms = 30,
+			.batt_hold_scale_pct = 110,
+			.cluster_wake_pulse_ms =
+				ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS,
+			.cluster_wake_pulse_idle_ms =
+				ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_IDLE_MS,
+			.cluster_wake_pulse_floor_pct = 65,
+			.quiet_hours_cap_pct = 85,
+			.quiet_hours_screen_off_only = 1,
+			.fg_transition_pulse_ms =
+				ZENITH_DEFAULT_FG_TRANSITION_PULSE_MS,
+			.fg_transition_pulse_pct =
+				ZENITH_DEFAULT_FG_TRANSITION_PULSE_PCT,
+			.screen_on_bias_pct =
+				ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT,
+			.input_boost_down_rate_mult_pct =
+				ZENITH_DEFAULT_INPUT_BOOST_DOWN_RATE_MULT_PCT,
+			.predict_up_thresh =
+				ZENITH_DEFAULT_PREDICT_UP_THRESH,
+			.predict_up_window =
+				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			/* Render floor off: audio worker is not the
+			 * RENDER_PRIO thread that renderer-floor is
+			 * scoped to.  Keep the floor knob populated
+			 * for forward-compat in case sysfs flips it
+			 * during an audio + game session, but cold-
+			 * start the AUDIO profile with it off.
+			 */
+			.render_floor_pct = 0,
+			.render_floor_min_runtime_ms =
+				ZENITH_DEFAULT_RENDER_FLOOR_MIN_RUNTIME_MS,
+			.input_boost_touchdown_extra_ms = 30,
+			.peak_hysteresis_streak =
+				ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK,
+			.peak_step_down_pct =
+				ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT,
+			.boost_idle_thresh =
+				ZENITH_DEFAULT_BOOST_IDLE_THRESH,
+			.boost_idle_streak =
+				ZENITH_DEFAULT_BOOST_IDLE_STREAK,
+			/* Background-util scale stays high under AUDIO.
+			 * The ALSA / aaudio worker keeps running with
+			 * the screen off; trimming it to the BALANCED
+			 * 75%% bg_util_scale risks dropping the
+			 * cluster into a slower tier on the very
+			 * cadence the worker depends on.
+			 */
+			.bg_util_scale_pct = 90,
+			/* Sleeper-tail shaving disabled.  Audio
+			 * callbacks wake on a tight period; shaving
+			 * the wake-tick freq is exactly the kind of
+			 * micro-saving that turns into audible
+			 * underruns.
+			 */
+			.sleeper_tail_thresh_us = 0,
+			.sleeper_tail_pct = 100,
+			/* Peer-ramp: keep both windows armed.  Audio
+			 * worker often migrates LITTLE -> BIG on a
+			 * spike (resampler / mixer), and the IPC chain
+			 * to the audio HAL stays warm with the screen
+			 * off.  Suppressing peer_ramp_off here would
+			 * defeat the profile.
+			 */
+			.peer_ramp_window_ms =
+				ZENITH_DEFAULT_PEER_RAMP_WINDOW_MS,
+			.peer_ramp_floor_pct = 65,
+			.peer_ramp_window_off_ms = 25,
+			.migration_jump_pct =
+				ZENITH_DEFAULT_MIGRATION_JUMP_PCT,
+			.migration_floor_window_ms =
+				ZENITH_DEFAULT_MIGRATION_FLOOR_WINDOW_MS,
+			.migration_floor_pct =
+				ZENITH_DEFAULT_MIGRATION_FLOOR_PCT,
+			.psi_cpu_floor_thresh =
+				ZENITH_DEFAULT_PSI_CPU_FLOOR_THRESH,
+			/* Frame-overrun unchanged from BALANCED;
+			 * audio cadence is independent of vblank.
+			 */
+			.frame_overrun_slack_us = 4000,
+			.frame_overrun_window_ms =
+				ZENITH_DEFAULT_FRAME_OVERRUN_WINDOW_MS,
+			.frame_overrun_floor_pct =
+				ZENITH_DEFAULT_FRAME_OVERRUN_FLOOR_PCT,
+			.frame_overrun_deep_streak = 0,
+			.frame_overrun_deep_floor_pct = 100,
+			/* PSI-mem cap off: capping the cluster on
+			 * memstall risks underruns the same way
+			 * sleeper-tail shaving would.  pct/window
+			 * left at sensible defaults for forward
+			 * compat with sysfs overrides.
+			 */
+			.psi_mem_cap_thresh = 0,
+			.psi_mem_cap_pct = 80,
+			.psi_mem_cap_window_ms = 1000,
+		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
 	unsigned int i;
@@ -11675,6 +11833,8 @@ static int __init zenith_setup_profile(char *s)
 		zenith_cmdline_profile = ZENITH_PROFILE_LEGACY;
 	} else if (!strcmp(s, "gaming")) {
 		zenith_cmdline_profile = ZENITH_PROFILE_GAMING;
+	} else if (!strcmp(s, "audio")) {
+		zenith_cmdline_profile = ZENITH_PROFILE_AUDIO;
 	} else if (!strcmp(s, "custom")) {
 		zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 	} else {
@@ -11711,6 +11871,8 @@ static unsigned int __init zenith_parse_profile_name(const char *s)
 		return ZENITH_PROFILE_LEGACY;
 	if (!strcmp(s, "gaming"))
 		return ZENITH_PROFILE_GAMING;
+	if (!strcmp(s, "audio"))
+		return ZENITH_PROFILE_AUDIO;
 	if (!strcmp(s, "custom"))
 		return ZENITH_PROFILE_CUSTOM;
 	return ZENITH_PROFILE_CUSTOM;
@@ -12893,6 +13055,7 @@ static ssize_t profile_show(struct gov_attr_set *attr_set, char *buf)
 	case ZENITH_PROFILE_BATTERY:		return sprintf(buf, "battery\n");
 	case ZENITH_PROFILE_LEGACY:		return sprintf(buf, "legacy\n");
 	case ZENITH_PROFILE_GAMING:		return sprintf(buf, "gaming\n");
+	case ZENITH_PROFILE_AUDIO:		return sprintf(buf, "audio\n");
 	case ZENITH_PROFILE_CUSTOM:
 	default:				return sprintf(buf, "custom\n");
 	}
@@ -12916,6 +13079,8 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 		prof = ZENITH_PROFILE_LEGACY;
 	else if (sysfs_streq(buf, "gaming"))
 		prof = ZENITH_PROFILE_GAMING;
+	else if (sysfs_streq(buf, "audio"))
+		prof = ZENITH_PROFILE_AUDIO;
 	else if (sysfs_streq(buf, "custom"))
 		prof = ZENITH_PROFILE_CUSTOM;
 	else
