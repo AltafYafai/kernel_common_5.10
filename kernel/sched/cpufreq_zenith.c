@@ -53,6 +53,7 @@
 #include <linux/irq_work.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
+#include <linux/cgroup.h>
 #include <linux/energy_model.h>
 #include <linux/input.h>
 #include <linux/jump_label.h>
@@ -2621,6 +2622,32 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_PSI_CPU_THRESH		0
 #define ZENITH_DEFAULT_PSI_IO_THRESH		0
 
+/* psi_cgroup_path (default "" = use system-wide PSI):
+ *
+ * When non-empty, names a cgroup-v2 path (relative to the unified
+ * hierarchy root, e.g. "/foreground") whose per-cgroup PSI averages
+ * the zenith_psi_*_some_pct() consumers should read in place of
+ * psi_system.avg[][].  Resolved at sysfs-store and at
+ * zenith_apply_profile() time via cgroup_get_from_path(); the
+ * resolved cgroup pointer is cached in zenith_psi_cgroup (RCU-
+ * protected) so the hot-path read is still close to a single
+ * READ_ONCE on the EWMA word.
+ *
+ * Empty string is the safe default and reproduces the pre-B10
+ * behaviour exactly: the helpers fall back to &psi_system, which is
+ * what every existing call site read before this knob existed.
+ *
+ * Path resolution failures (cgroup-v2 not mounted, path missing,
+ * cgroup-v1-only system) are silently demoted to the empty/system-
+ * wide path; no -ENOENT to userspace.  This keeps profile-baked
+ * defaults safe across vendor cgroup naming variants.
+ *
+ * Path length cap is a generous compromise between cgroup hierarchy
+ * depth and inline-buffer cost (one buffer per attr_set, not per
+ * policy).
+ */
+#define ZENITH_PSI_CGROUP_PATH_MAX		128
+
 /* audio_aware (default 0, off) + audio_floor_pct (default 0) +
  * audio_cap_pct (default 0):
  *
@@ -3741,6 +3768,21 @@ struct zenith_tunables {
 	unsigned int		psi_mem_thresh;
 	unsigned int		psi_cpu_thresh;
 	unsigned int		psi_io_thresh;
+
+	/* See ZENITH_PSI_CGROUP_PATH_MAX (Patch B10-3).  Empty string =
+	 * use system-wide PSI (psi_system); non-empty cgroup-v2 path =
+	 * resolve via cgroup_get_from_path() at sysfs-store time and
+	 * cache the resolved cgroup in zenith_psi_cgroup for the three
+	 * zenith_psi_*_some_pct() helpers to read under rcu_read_lock().
+	 *
+	 * Buffer is inline (no kmalloc) so tunables free is unchanged
+	 * (kfree(t) handles it).  All cross-policy state (the cached
+	 * cgroup ref + the active_path no-op cache) lives in the file-
+	 * scope zenith_psi_cgroup_* statics.  Last-writer-wins across
+	 * policies; in practice all policies converge to the same path
+	 * via zenith_apply_profile().
+	 */
+	char			psi_cgroup_path[ZENITH_PSI_CGROUP_PATH_MAX];
 
 	/* See ZENITH_DEFAULT_AUDIO_AWARE / ZENITH_DEFAULT_AUDIO_FLOOR_PCT
 	 * / ZENITH_DEFAULT_AUDIO_CAP_PCT.  Both *_pct fields range 0..100;
@@ -5991,22 +6033,147 @@ static inline unsigned int zenith_eff_hispeed_freq(struct zenith_policy *z_polic
 	return eff;
 }
 
-/* Read the system-wide memory pressure 10s average from PSI as an
- * integer percentage (0..100).  Returns 0 when CONFIG_PSI is off, when
+/* B10-3: optional per-cgroup PSI source (see ZENITH_PSI_CGROUP_PATH_MAX
+ * and psi_cgroup_path).
+ *
+ * zenith_psi_cgroup is the resolved cgroup whose embedded psi_group
+ * (cgroup->psi) the three zenith_psi_*_some_pct() helpers below
+ * dereference under rcu_read_lock().  NULL means "use psi_system",
+ * which is the pre-B10 behaviour and the default at boot.
+ *
+ * Gated on CONFIG_PSI && CONFIG_CGROUPS.  Without CONFIG_CGROUPS the
+ * struct cgroup type is forward-declared only and cgroup_psi(),
+ * cgroup_get_from_path(), cgroup_put() are absent; the cached pointer
+ * and apply helper degrade to no-ops, the picker returns &psi_system
+ * unconditionally, and the sysfs store accepts (and silently
+ * discards) any path.
+ *
+ * Lifecycle:
+ *   - zenith_psi_cgroup_apply() is the only writer.  It serialises
+ *     mutators with zenith_psi_cgroup_lock, holds a refcount on the
+ *     cached cgroup (via cgroup_get_from_path), drops the previous
+ *     refcount with cgroup_put() after a synchronize_rcu() so the
+ *     readers below have left their grace period.
+ *   - zenith_psi_cgroup_active_path is the most-recently-applied path
+ *     string.  Identical-path stores are no-ops, so repeat profile-
+ *     bake or sysfs writes don't churn the cgroup ref.
+ *   - The cgroup ref lives as long as the path is set; zenith is
+ *     built-in (Kconfig: bool), so we never run a teardown path.
+ *
+ * Hot-path readers do a single rcu_read_lock() / rcu_dereference() /
+ * READ_ONCE() / rcu_read_unlock(); RCU read-side critical sections
+ * are essentially free under PREEMPT_RCU (no atomic, no memory
+ * barrier on the load side), so this stays cheap when the feature
+ * is on, and is identical to the pre-B10 read when the cached
+ * pointer is NULL.
+ */
+#if defined(CONFIG_PSI) && defined(CONFIG_CGROUPS)
+static struct cgroup __rcu *zenith_psi_cgroup;
+static DEFINE_MUTEX(zenith_psi_cgroup_lock);
+static char zenith_psi_cgroup_active_path[ZENITH_PSI_CGROUP_PATH_MAX];
+#endif
+
+/* Replace the cached zenith_psi_cgroup pointer to match @path.
+ *
+ *   path == ""    -> drop to NULL (system-wide PSI), the safe default.
+ *   path == X     -> resolve via cgroup_get_from_path(); on success
+ *                    swap the cached pointer and drop the old refcount;
+ *                    on failure (not mounted, missing, cgroup-v1-only)
+ *                    leave the cache as-is and clear active_path so a
+ *                    later identical-path store will retry.
+ *
+ * Caller is the sysfs store path or zenith_apply_profile().  Both run
+ * outside any hot path.  No-op on identical path matches and on
+ * !CONFIG_CGROUPS / !CONFIG_PSI builds.
+ */
+static void zenith_psi_cgroup_apply(const char *path)
+{
+#if defined(CONFIG_PSI) && defined(CONFIG_CGROUPS)
+	struct cgroup *new_cgrp = NULL;
+	struct cgroup *old_cgrp;
+
+	if (!path)
+		path = "";
+
+	mutex_lock(&zenith_psi_cgroup_lock);
+
+	if (!strncmp(zenith_psi_cgroup_active_path, path,
+		     ZENITH_PSI_CGROUP_PATH_MAX))
+		goto out_unlock;
+
+	if (path[0]) {
+		new_cgrp = cgroup_get_from_path(path);
+		if (IS_ERR(new_cgrp)) {
+			new_cgrp = NULL;
+			zenith_psi_cgroup_active_path[0] = '\0';
+			goto out_unlock;
+		}
+	}
+
+	old_cgrp = rcu_dereference_protected(zenith_psi_cgroup,
+			lockdep_is_held(&zenith_psi_cgroup_lock));
+	rcu_assign_pointer(zenith_psi_cgroup, new_cgrp);
+	strscpy(zenith_psi_cgroup_active_path, path,
+		sizeof(zenith_psi_cgroup_active_path));
+
+	if (old_cgrp) {
+		synchronize_rcu();
+		cgroup_put(old_cgrp);
+	}
+
+out_unlock:
+	mutex_unlock(&zenith_psi_cgroup_lock);
+#endif
+}
+
+/* Pick the psi_group the zenith_psi_*_some_pct() helpers should read
+ * from for the current call.  rcu_read_lock() must be held by the
+ * caller; the returned pointer is only valid for the duration of
+ * that read-side critical section.
+ *
+ * Falls back to &psi_system if the cgroup-v2 cached pointer is NULL
+ * (or if CONFIG_CGROUPS=n), which is the pre-B10 behaviour and the
+ * cold-boot default.
+ */
+#ifdef CONFIG_PSI
+static __always_inline struct psi_group *zenith_psi_pick_group(void)
+{
+#ifdef CONFIG_CGROUPS
+	struct cgroup *cgrp = rcu_dereference(zenith_psi_cgroup);
+
+	return cgrp ? &cgrp->psi : &psi_system;
+#else
+	return &psi_system;
+#endif
+}
+#endif
+
+/* Read the memory pressure 10s average from PSI as an integer
+ * percentage (0..100).  Returns 0 when CONFIG_PSI is off, when
  * psi_disabled is set, or when the value isn't yet populated (early
- * boot).  Lock-free single READ_ONCE -- the avgs_work aggregator is
- * what writes to psi_system.avg[][] and we tolerate up to 2 s of
- * staleness on the read.
+ * boot).
+ *
+ * Source psi_group is selected by zenith_psi_pick_group(): the
+ * B10-3 cached cgroup-v2 group when one is configured via
+ * psi_cgroup_path, otherwise psi_system (system-wide PSI, the
+ * pre-B10 behaviour).  Single READ_ONCE on the EWMA word inside a
+ * minimal rcu_read_lock() critical section -- the avgs_work
+ * aggregator is what writes to ->avg[][] and we tolerate up to 2 s
+ * of staleness on the read.
  */
 static inline unsigned int zenith_psi_mem_some_pct(void)
 {
 #ifdef CONFIG_PSI
+	struct psi_group *grp;
 	unsigned long avg;
 
 	if (static_branch_likely(&psi_disabled))
 		return 0;
 
-	avg = READ_ONCE(psi_system.avg[PSI_MEM_SOME][0]);
+	rcu_read_lock();
+	grp = zenith_psi_pick_group();
+	avg = READ_ONCE(grp->avg[PSI_MEM_SOME][0]);
+	rcu_read_unlock();
 	return (unsigned int)LOAD_INT(avg);
 #else
 	return 0;
@@ -6015,18 +6182,23 @@ static inline unsigned int zenith_psi_mem_some_pct(void)
 
 /* Same shape as zenith_psi_mem_some_pct() for the PSI_CPU_SOME and
  * PSI_IO_SOME dimensions.  See the psi_aware / psi_*_thresh comment
- * block for what each pressure source means.  Both helpers are
- * RCU-free, lock-free, and tolerate CONFIG_PSI=n at compile time.
+ * block for what each pressure source means.  Both helpers honour
+ * the same B10-3 cgroup-v2 cached pick, are lock-free outside the
+ * RCU read-side, and tolerate CONFIG_PSI=n at compile time.
  */
 static inline unsigned int zenith_psi_cpu_some_pct(void)
 {
 #ifdef CONFIG_PSI
+	struct psi_group *grp;
 	unsigned long avg;
 
 	if (static_branch_likely(&psi_disabled))
 		return 0;
 
-	avg = READ_ONCE(psi_system.avg[PSI_CPU_SOME][0]);
+	rcu_read_lock();
+	grp = zenith_psi_pick_group();
+	avg = READ_ONCE(grp->avg[PSI_CPU_SOME][0]);
+	rcu_read_unlock();
 	return (unsigned int)LOAD_INT(avg);
 #else
 	return 0;
@@ -6036,12 +6208,16 @@ static inline unsigned int zenith_psi_cpu_some_pct(void)
 static inline unsigned int zenith_psi_io_some_pct(void)
 {
 #ifdef CONFIG_PSI
+	struct psi_group *grp;
 	unsigned long avg;
 
 	if (static_branch_likely(&psi_disabled))
 		return 0;
 
-	avg = READ_ONCE(psi_system.avg[PSI_IO_SOME][0]);
+	rcu_read_lock();
+	grp = zenith_psi_pick_group();
+	avg = READ_ONCE(grp->avg[PSI_IO_SOME][0]);
+	rcu_read_unlock();
 	return (unsigned int)LOAD_INT(avg);
 #else
 	return 0;
@@ -11448,6 +11624,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int audio_hyst_ms;
 		unsigned int vh_arch_freq_scale_enable;
 		unsigned int vh_uclamp_observer_enable;
+		/* Patch B10-3: per-profile cgroup-v2 path the
+		 * zenith_psi_*_some_pct() helpers should read from.
+		 * NULL or "" means "use system-wide PSI" (the safe
+		 * default and the pre-B10 behaviour); a non-empty
+		 * cgroup-v2 path is resolved + cached at apply time
+		 * via zenith_psi_cgroup_apply().  Profile-bake here
+		 * is overridable per policy via the psi_cgroup_path
+		 * sysfs node.
+		 */
+		const char *psi_cgroup_path;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -12675,6 +12861,21 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
 		   p->frame_overrun_window_ms);
+	/* Patch B10-3: copy the profile's cgroup-v2 PSI path into
+	 * the per-tunables buffer (NULL bake -> empty string =
+	 * system-wide PSI = pre-B10 behaviour) and refresh the
+	 * file-scope cached cgroup pointer.  Identical-path
+	 * applies are no-ops inside zenith_psi_cgroup_apply() so
+	 * profile-bake from multiple policies doesn't churn the
+	 * cgroup ref.
+	 */
+	{
+		const char *cg_path = p->psi_cgroup_path ?: "";
+
+		strscpy(t->psi_cgroup_path, cg_path,
+			sizeof(t->psi_cgroup_path));
+		zenith_psi_cgroup_apply(cg_path);
+	}
 
 	/* Mirror input_boost_ms and input_boost_touchdown_extra_ms to
 	 * the governor-wide caches used by the input handler fast
@@ -18346,6 +18547,48 @@ static ssize_t psi_io_thresh_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr psi_io_thresh = __ATTR_RW(psi_io_thresh);
 
+/* psi_cgroup_path sysfs knob (Patch B10-3).
+ *
+ * Read returns the per-tunables psi_cgroup_path string (the path
+ * most recently stored on this attr_set, profile-baked or sysfs-
+ * written).  Newline-terminated, like every other zenith string knob.
+ *
+ * Write copies the supplied string into t->psi_cgroup_path (after
+ * stripping a trailing newline) and calls zenith_psi_cgroup_apply()
+ * to refresh the file-scope cached cgroup pointer.  Empty string
+ * (just "\n" or "") drops to NULL = system-wide PSI = pre-B10
+ * behaviour.  -EINVAL on a too-long path; resolution failures
+ * (cgroup-v2 not mounted, missing cgroup) are silently demoted to
+ * the empty/system-wide path inside zenith_psi_cgroup_apply().
+ */
+static ssize_t psi_cgroup_path_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%s\n",
+		       to_zenith_tunables(attr_set)->psi_cgroup_path);
+}
+
+static ssize_t psi_cgroup_path_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	char path[ZENITH_PSI_CGROUP_PATH_MAX];
+	ssize_t len;
+
+	len = strscpy(path, buf, sizeof(path));
+	if (len < 0)
+		return -EINVAL;
+
+	/* Strip trailing newline, if any. */
+	if (len > 0 && path[len - 1] == '\n')
+		path[len - 1] = '\0';
+
+	strscpy(t->psi_cgroup_path, path, sizeof(t->psi_cgroup_path));
+	zenith_psi_cgroup_apply(path);
+
+	return count;
+}
+static struct governor_attr psi_cgroup_path = __ATTR_RW(psi_cgroup_path);
+
 /* boot_boost_ms sysfs knob.  See ZENITH_DEFAULT_BOOT_BOOST_MS comment
  * block for semantics.  Range 0..ZENITH_BOOT_BOOST_MAX_MS;
  * out-of-range values rejected with EINVAL so userspace gets a clear
@@ -18941,6 +19184,7 @@ static struct attribute *zenith_attrs[] = {
 	&psi_mem_thresh.attr,
 	&psi_cpu_thresh.attr,
 	&psi_io_thresh.attr,
+	&psi_cgroup_path.attr,
 	&boot_boost_ms.attr,
 	&boot_boost_decay_ms.attr,
 	&boot_complete.attr,
