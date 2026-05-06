@@ -6352,6 +6352,31 @@ static unsigned int zenith_tier_value(struct zenith_policy *z_policy,
 				      unsigned long override_bit,
 				      unsigned long tier_bit);
 
+/* Reset the V1 sample counters and the V2 pending-window
+ * accumulator to a fresh-window starting point.  Used by the
+ * three call sites that all need the same fresh-classifier
+ * substrate:
+ *
+ *   - the screen 0 -> 1 (resume) edge in zenith_get_next_freq()
+ *     (audit fix M7 / M7b),
+ *   - auto_tune_store() on the disable -> enable transition,
+ *   - zenith_start() when auto_tune is enabled at policy bring-up.
+ *
+ * Leaves at_last_state / at_last_applied_state / at_cooldown_left
+ * untouched so the just-recorded classification and any pending
+ * post-transition cooldown survive the reset.  Callers that need
+ * a complete classifier reset (boot, sysfs disable->enable) clear
+ * at_cooldown_left themselves and reschedule at_work.
+ */
+static inline void zenith_at_v_reset_window(struct zenith_policy *z_policy)
+{
+	atomic_set(&z_policy->at_samples_total, 0);
+	atomic_set(&z_policy->at_samples_saturated, 0);
+	z_policy->at_last_events =
+		atomic64_read(&zenith_auto_input_events);
+	z_policy->at_pending_windows = 0;
+}
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 					 unsigned long util, unsigned long max_cap)
 {
@@ -6489,11 +6514,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 		 * glide path.
 		 */
 		if (!z_policy->screen_state_last && cur_screen) {
-			atomic_set(&z_policy->at_samples_total, 0);
-			atomic_set(&z_policy->at_samples_saturated, 0);
-			z_policy->at_last_events =
-				atomic64_read(&zenith_auto_input_events);
-			z_policy->at_pending_windows = 0;
+			zenith_at_v_reset_window(z_policy);
 			z_policy->peak_starve_count = 0;
 			z_policy->hispeed_entry_count = 0;
 			z_policy->brutal_entry_count = 0;
@@ -11657,11 +11678,7 @@ static ssize_t auto_tune_store(struct gov_attr_set *attr_set,
 
 	list_for_each_entry(z_policy, &t->attr_set.policy_list, tunables_hook) {
 		if (val) {
-			z_policy->at_last_events =
-				atomic64_read(&zenith_auto_input_events);
-			atomic_set(&z_policy->at_samples_total, 0);
-			atomic_set(&z_policy->at_samples_saturated, 0);
-			z_policy->at_pending_windows = 0;
+			zenith_at_v_reset_window(z_policy);
 			z_policy->at_cooldown_left = 0;
 			schedule_delayed_work(&z_policy->at_work,
 				msecs_to_jiffies(ZENITH_AUTO_TUNE_PERIOD_MS));
@@ -16546,11 +16563,7 @@ static int zenith_start(struct cpufreq_policy *policy)
 	 * auto_tune_store() so start-time and runtime behaviour agree.
 	 */
 	if (z_policy->tunables->auto_tune) {
-		z_policy->at_last_events =
-			atomic64_read(&zenith_auto_input_events);
-		atomic_set(&z_policy->at_samples_total, 0);
-		atomic_set(&z_policy->at_samples_saturated, 0);
-		z_policy->at_pending_windows = 0;
+		zenith_at_v_reset_window(z_policy);
 		z_policy->at_cooldown_left = 0;
 		schedule_delayed_work(&z_policy->at_work,
 			msecs_to_jiffies(ZENITH_AUTO_TUNE_PERIOD_MS));
