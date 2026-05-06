@@ -2413,6 +2413,8 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_AUDIO_FLOOR_PCT		0
 #define ZENITH_DEFAULT_AUDIO_CAP_PCT		0
 #define ZENITH_AUDIO_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
+#define ZENITH_DEFAULT_AUDIO_HYST_MS		250
+#define ZENITH_AUDIO_HYST_MS_MAX		2000
 
 /* camera_aware (default 0, off) + camera_active (default 0, auto)
  * + camera_floor_pct (default 0):
@@ -3389,6 +3391,7 @@ struct zenith_tunables {
 	unsigned int		audio_aware;
 	unsigned int		audio_floor_pct;
 	unsigned int		audio_cap_pct;
+	unsigned int		audio_hyst_ms;
 
 	/* See ZENITH_DEFAULT_CAMERA_AWARE / ZENITH_DEFAULT_CAMERA_ACTIVE
 	 * / ZENITH_DEFAULT_CAMERA_FLOOR_PCT.  camera_active is the
@@ -4491,6 +4494,17 @@ struct zenith_policy {
 	 */
 	bool			audio_active;
 	u64			audio_cache_stamp_ns;
+
+	/* Patch B7-1: sticky audio-active deadline.  When
+	 * zenith_policy_has_audio() observes a positive detection
+	 * (alsa fd > 0 or comm-walk match) we extend this deadline to
+	 * now + audio_hyst_ms.  While now < audio_sticky_until_ns the
+	 * helper returns true regardless of fresh signal, so a brief
+	 * gap between two pcm releases / re-opens does not flip the
+	 * cluster out of audio-aware mode.  audio_hyst_ms == 0
+	 * disables the hysteresis (legacy behaviour).
+	 */
+	u64			audio_sticky_until_ns;
 
 	/* Cached per-policy result of the camera-aware comm walk.
 	 * Holds the *raw* comm-match result, before the userspace
@@ -5886,6 +5900,8 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
 {
 	u64 now = ktime_get_ns();
 	struct cpufreq_policy *policy = z_policy->policy;
+	struct zenith_tunables *t_hyst = z_policy->tunables;
+	unsigned int hyst_ms = t_hyst ? t_hyst->audio_hyst_ms : 0;
 	unsigned int cpu;
 	bool match = false;
 
@@ -5897,7 +5913,22 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
 	if (atomic_read(&zenith_alsa_active_fds) > 0) {
 		z_policy->audio_active = true;
 		z_policy->audio_cache_stamp_ns = now;
+		if (hyst_ms)
+			WRITE_ONCE(z_policy->audio_sticky_until_ns,
+				   now + (u64)hyst_ms * NSEC_PER_MSEC);
 		return true;
+	}
+
+	/* Patch B7-1: sticky audio-active window.  After a fresh
+	 * positive detection the helper continues to report true for
+	 * audio_hyst_ms past the last hit.  Bypasses the cache TTL
+	 * (the sticky window is the strictly-longer guard).
+	 */
+	if (hyst_ms) {
+		u64 until = READ_ONCE(z_policy->audio_sticky_until_ns);
+
+		if (until && now < until)
+			return true;
 	}
 
 	if (z_policy->audio_cache_stamp_ns &&
@@ -5932,6 +5963,9 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
 
 	z_policy->audio_active = match;
 	z_policy->audio_cache_stamp_ns = now;
+	if (match && hyst_ms)
+		WRITE_ONCE(z_policy->audio_sticky_until_ns,
+			   now + (u64)hyst_ms * NSEC_PER_MSEC);
 	return match;
 }
 
@@ -10739,6 +10773,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int psi_mem_cap_thresh;
 		unsigned int psi_mem_cap_pct;
 		unsigned int psi_mem_cap_window_ms;
+		unsigned int audio_hyst_ms;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -10919,6 +10954,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_thresh = 0,
 			.psi_mem_cap_pct = 90,
 			.psi_mem_cap_window_ms = 1000,
+			.audio_hyst_ms = 250,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -11106,6 +11142,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PSI_MEM_CAP_PCT,
 			.psi_mem_cap_window_ms =
 				ZENITH_DEFAULT_PSI_MEM_CAP_WINDOW_MS,
+			.audio_hyst_ms = ZENITH_DEFAULT_AUDIO_HYST_MS,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -11281,6 +11318,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_thresh = 50,
 			.psi_mem_cap_pct = 70,
 			.psi_mem_cap_window_ms = 1500,
+			.audio_hyst_ms = 100,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -11435,6 +11473,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_thresh = 0,
 			.psi_mem_cap_pct = 80,
 			.psi_mem_cap_window_ms = 1000,
+			.audio_hyst_ms = 0,
 		},
 		{
 			/* Patch 4.1: GAMING profile.
@@ -11547,6 +11586,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_thresh = 0,
 			.psi_mem_cap_pct = 90,
 			.psi_mem_cap_window_ms = 1000,
+			.audio_hyst_ms = 250,
 		},
 		{
 			/* Patch 4.2: AUDIO profile.
@@ -11700,6 +11740,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_thresh = 0,
 			.psi_mem_cap_pct = 80,
 			.psi_mem_cap_window_ms = 1000,
+			.audio_hyst_ms = 750,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -11797,6 +11838,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->psi_mem_cap_pct, p->psi_mem_cap_pct);
 	WRITE_ONCE(t->psi_mem_cap_window_ms,
 		   p->psi_mem_cap_window_ms);
+	WRITE_ONCE(t->audio_hyst_ms, p->audio_hyst_ms);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
@@ -16377,6 +16419,33 @@ static ssize_t audio_cap_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr audio_cap_pct = __ATTR_RW(audio_cap_pct);
 
+/* Patch B7-1: audio_hyst_ms sysfs knob.  Range 0..2000 (capped via
+ * ZENITH_AUDIO_HYST_MS_MAX); 0 disables the sticky window so the
+ * helper falls back to the cache-TTL-only behaviour.  Profile-baked
+ * to a sane value per profile (PERFORMANCE/BALANCED/GAMING 250 ms,
+ * BATTERY 100 ms, AUDIO 750 ms, LEGACY 0).
+ */
+static ssize_t audio_hyst_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->audio_hyst_ms);
+}
+
+static ssize_t audio_hyst_ms_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > ZENITH_AUDIO_HYST_MS_MAX)
+		return -EINVAL;
+	t->audio_hyst_ms = val;
+	return count;
+}
+static struct governor_attr audio_hyst_ms = __ATTR_RW(audio_hyst_ms);
+
 /* camera_aware sysfs knob.  Strict 0/1 boolean; non-zero values
  * normalised to 1 on store.
  */
@@ -17253,6 +17322,7 @@ static struct attribute *zenith_attrs[] = {
 	&audio_comms.attr,
 	&audio_floor_pct.attr,
 	&audio_cap_pct.attr,
+	&audio_hyst_ms.attr,
 	&camera_aware.attr,
 	&camera_comms.attr,
 	&camera_active.attr,
@@ -17569,6 +17639,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->audio_aware		= ZENITH_DEFAULT_AUDIO_AWARE;
 	tunables->audio_floor_pct	= ZENITH_DEFAULT_AUDIO_FLOOR_PCT;
 	tunables->audio_cap_pct		= ZENITH_DEFAULT_AUDIO_CAP_PCT;
+	tunables->audio_hyst_ms		= ZENITH_DEFAULT_AUDIO_HYST_MS;
 	tunables->camera_aware		= ZENITH_DEFAULT_CAMERA_AWARE;
 	tunables->camera_active		= ZENITH_DEFAULT_CAMERA_ACTIVE;
 	tunables->camera_floor_pct	= ZENITH_DEFAULT_CAMERA_FLOOR_PCT;
