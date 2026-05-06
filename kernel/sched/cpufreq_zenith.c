@@ -380,6 +380,35 @@
 #define ZENITH_PREDICT_UP_WINDOW_MIN			2
 #define ZENITH_PREDICT_UP_WINDOW_MAX			8
 
+/* pelt_rising_edge_thresh (default 32) + pelt_rising_edge_min_pct
+ * (default 50): companion to predict_up that catches sharp single-
+ * sample slope-up events that the rolling-window delta dilutes.
+ *
+ * Rationale: predict_up integrates over predict_up_window samples
+ * (4 by default), so a workload that takes ~8 samples to reach the
+ * cumulative threshold will not lift until the half-way point.  A
+ * cold cluster wake-up or a freshly-foregrounded GUI task often
+ * shows the steepest util_avg slope on the *first* sample after
+ * the cluster left idle; the rolling window misses that with too-
+ * conservative thresholds.
+ *
+ * The rising-edge tier checks the slope between the two newest
+ * util_history samples ((newest - prev) * 256 / max_cap).  Crossing
+ * pelt_rising_edge_thresh AND newest >= pelt_rising_edge_min_pct *
+ * max_cap / 100 lifts the cluster to eff_hispeed_freq with
+ * tp_path "pelt_edge".  The min_pct gate prevents firing on
+ * tiny-base spikes (e.g. a 5%% util cluster jumping to 8%% in one
+ * sample looks steep on the slope but is not actionable).
+ *
+ * 0 disables the tier (legacy behaviour: only the rolling-window
+ * predict_up fires).  Max ZENITH_PELT_RISING_EDGE_THRESH_MAX (255)
+ * is the same domain as predict_up_thresh.
+ */
+#define ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH		32
+#define ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT		50
+#define ZENITH_PELT_RISING_EDGE_THRESH_MAX		255
+#define ZENITH_PELT_RISING_EDGE_MIN_PCT_MAX		100
+
 /* peak_hysteresis_streak / peak_step_down_pct
  * (defaults 3 / 95, [Stage 4 / Patch E]):
  *
@@ -2777,6 +2806,18 @@ struct zenith_tunables {
 	 * a cold attach.
 	 */
 	unsigned int		predict_up_window;
+
+	/* See ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH /
+	 * ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT (Patch C3).  Single-
+	 * sample slope tier that lifts to eff_hispeed_freq when the
+	 * delta between the two most-recent util_history samples
+	 * crosses pelt_rising_edge_thresh AND the newest sample is
+	 * already above pelt_rising_edge_min_pct of max_cap.  0 in
+	 * thresh disables the tier (legacy behaviour: only the
+	 * rolling-window predict_up fires).
+	 */
+	unsigned int		pelt_rising_edge_thresh;
+	unsigned int		pelt_rising_edge_min_pct;
 
 	/* See ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK /
 	 * ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT (Patch E).  Either at 0
@@ -7579,6 +7620,46 @@ brutal_entry_deferred:
 					zenith_peer_ramp_arm(z_policy, now_ns);
 				}
 			}
+
+			/* Patch C3: PELT rising-edge tier.  Catches a
+			 * sharp single-sample slope-up that the
+			 * rolling-window delta above dilutes.  Reuses
+			 * newest_idx (already computed) and pulls the
+			 * sample one position older so the slope is
+			 * (newest - prev) / max_cap.  Only fires if
+			 * predict_up did not already lift this tick
+			 * (freq still below eff_hispeed) AND the slope
+			 * test passes AND the absolute level guard
+			 * (pelt_rising_edge_min_pct) is satisfied so we
+			 * do not chase noise from a low base.
+			 */
+			if (freq < eff_hispeed &&
+			    z_policy->tunables->pelt_rising_edge_thresh) {
+				unsigned int prev_idx;
+				unsigned long prev;
+
+				prev_idx = (idx + ZENITH_PREDICT_UP_WINDOW_MAX - 2)
+					% ZENITH_PREDICT_UP_WINDOW_MAX;
+				prev = z_policy->util_history[prev_idx];
+
+				if (newest > prev) {
+					unsigned long edge = newest - prev;
+					unsigned int edge_x256 = (unsigned int)
+						((edge * 256) / max_cap);
+					unsigned int newest_pct = (unsigned int)
+						((newest * 100) / max_cap);
+
+					if (edge_x256 >=
+					    z_policy->tunables->pelt_rising_edge_thresh &&
+					    newest_pct >=
+					    z_policy->tunables->pelt_rising_edge_min_pct) {
+						freq = eff_hispeed;
+						tp_path = "pelt_edge";
+						zenith_peer_ramp_arm(z_policy,
+								     now_ns);
+					}
+				}
+			}
 		}
 	}
 
@@ -10802,6 +10883,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int input_boost_down_rate_mult_pct;
 		unsigned int predict_up_thresh;
 		unsigned int predict_up_window;
+		unsigned int pelt_rising_edge_thresh;
+		unsigned int pelt_rising_edge_min_pct;
 		unsigned int render_floor_pct;
 		unsigned int render_floor_min_runtime_ms;
 		unsigned int input_boost_touchdown_extra_ms;
@@ -10884,6 +10967,18 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.predict_up_thresh = 48,
 			.predict_up_window = 4,
+			/* Patch C3: PERFORMANCE wants the rising-edge
+			 * tier to fire on smaller per-sample slopes
+			 * (24 vs 32 default) and from a lower absolute
+			 * level (40%% of max_cap vs 50%% default), so
+			 * a fresh foreground task barely starts the
+			 * rise and we already have eff_hispeed under
+			 * it.  Effort budget: bigger battery hit if a
+			 * jitter sample fires the lift, but PERF is
+			 * the profile that pays that cost willingly.
+			 */
+			.pelt_rising_edge_thresh = 24,
+			.pelt_rising_edge_min_pct = 40,
 			/* Stage 4 / Patch B: PERFORMANCE keeps the
 			 * render floor strong (80%% of max, vs 70%%
 			 * default) and tightens the debounce to 20 ms
@@ -11080,6 +11175,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PREDICT_UP_THRESH,
 			.predict_up_window =
 				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			/* Patch C3: BALANCED matches cold-boot defaults
+			 * (32 thresh, 50%% level gate).
+			 */
+			.pelt_rising_edge_thresh =
+				ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH,
+			.pelt_rising_edge_min_pct =
+				ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT,
 			/* Stage 4 / Patch B: BALANCED matches cold-
 			 * boot defaults (70%% floor, 50 ms debounce).
 			 */
@@ -11261,6 +11363,14 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.predict_up_thresh = 0,
 			.predict_up_window =
 				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			/* Patch C3: BATTERY also disables the rising-
+			 * edge tier; same energy-frame argument as
+			 * predict_up.  The hispeed level tier alone is
+			 * the right speed/energy trade for this profile.
+			 */
+			.pelt_rising_edge_thresh = 0,
+			.pelt_rising_edge_min_pct =
+				ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT,
 			/* Stage 4 / Patch B: BATTERY softens the render
 			 * floor to 50%% and stretches the debounce to
 			 * 100 ms.  Render activity still floors the
@@ -11438,6 +11548,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.predict_up_thresh = 0,
 			.predict_up_window =
 				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			/* Patch C3: LEGACY disables the rising-edge
+			 * tier as well -- the historical-compat profile
+			 * keeps every Patch-C3-and-later tier dormant.
+			 */
+			.pelt_rising_edge_thresh = 0,
+			.pelt_rising_edge_min_pct =
+				ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT,
 			/* Stage 4 / Patch B: LEGACY disables the floor
 			 * outright (render_floor_pct=0) since the floor
 			 * is a Stage-1+ feature.  The debounce knob is
@@ -11597,6 +11714,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.input_boost_down_rate_mult_pct = 350,
 			.predict_up_thresh = 40,
 			.predict_up_window = 4,
+			/* Patch C3: GAMING is the most aggressive
+			 * profile for the rising-edge tier (20 / 35).
+			 * Slope as small as ~8%% per sample fires the
+			 * lift, and the level gate drops to 35%% of
+			 * max_cap so a freshly-foregrounded game frame
+			 * snaps to eff_hispeed before the level-trig
+			 * tier even sees it.
+			 */
+			.pelt_rising_edge_thresh = 20,
+			.pelt_rising_edge_min_pct = 35,
 			.render_floor_pct = 85,
 			.render_floor_min_runtime_ms = 15,
 			.input_boost_touchdown_extra_ms = 100,
@@ -11721,6 +11848,18 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PREDICT_UP_THRESH,
 			.predict_up_window =
 				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			/* Patch C3: AUDIO matches BALANCED defaults.
+			 * Audio worker bursts are predictable enough
+			 * that the rolling-window predict_up handles
+			 * them without the rising-edge tier needing to
+			 * over-react.  Keeping the knob default-armed
+			 * means a transient game/UI burst alongside
+			 * audio playback is still caught.
+			 */
+			.pelt_rising_edge_thresh =
+				ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH,
+			.pelt_rising_edge_min_pct =
+				ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT,
 			/* Render floor off: audio worker is not the
 			 * RENDER_PRIO thread that renderer-floor is
 			 * scoped to.  Keep the floor knob populated
@@ -11856,6 +11995,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		p->input_boost_down_rate_mult_pct;
 	WRITE_ONCE(t->predict_up_thresh, p->predict_up_thresh);
 	WRITE_ONCE(t->predict_up_window, p->predict_up_window);
+	WRITE_ONCE(t->pelt_rising_edge_thresh, p->pelt_rising_edge_thresh);
+	WRITE_ONCE(t->pelt_rising_edge_min_pct, p->pelt_rising_edge_min_pct);
 	t->render_floor_pct	= p->render_floor_pct;
 	WRITE_ONCE(t->render_floor_min_runtime_ms,
 		   p->render_floor_min_runtime_ms);
@@ -15376,6 +15517,64 @@ static ssize_t predict_up_window_store(struct gov_attr_set *attr_set,
 static struct governor_attr predict_up_window =
 	__ATTR_RW(predict_up_window);
 
+/* pelt_rising_edge_thresh sysfs knob (Patch C3).  See block
+ * comment above ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH for the
+ * full semantics.  0 disables the tier; max
+ * ZENITH_PELT_RISING_EDGE_THRESH_MAX (255).
+ */
+static ssize_t
+pelt_rising_edge_thresh_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->pelt_rising_edge_thresh);
+}
+
+static ssize_t
+pelt_rising_edge_thresh_store(struct gov_attr_set *attr_set,
+			      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PELT_RISING_EDGE_THRESH_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->pelt_rising_edge_thresh, val);
+	return count;
+}
+
+static struct governor_attr pelt_rising_edge_thresh =
+	__ATTR_RW(pelt_rising_edge_thresh);
+
+/* pelt_rising_edge_min_pct sysfs knob (Patch C3).  Absolute-level
+ * gate for the rising-edge tier; the tier only fires when the
+ * newest util sample is at least this percent of max_cap.  Range
+ * 0..ZENITH_PELT_RISING_EDGE_MIN_PCT_MAX (100).
+ */
+static ssize_t
+pelt_rising_edge_min_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->pelt_rising_edge_min_pct);
+}
+
+static ssize_t
+pelt_rising_edge_min_pct_store(struct gov_attr_set *attr_set,
+			       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_PELT_RISING_EDGE_MIN_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->pelt_rising_edge_min_pct, val);
+	return count;
+}
+
+static struct governor_attr pelt_rising_edge_min_pct =
+	__ATTR_RW(pelt_rising_edge_min_pct);
+
 /* peak_hysteresis_streak sysfs knob (Patch E).
  * Range 0..ZENITH_PEAK_HYSTERESIS_STREAK_MAX.  Number of
  * consecutive samples after a peak-class previous freq for
@@ -17313,6 +17512,8 @@ static struct attribute *zenith_attrs[] = {
 	&peak_headroom_prearm.attr,
 	&predict_up_thresh.attr,
 	&predict_up_window.attr,
+	&pelt_rising_edge_thresh.attr,
+	&pelt_rising_edge_min_pct.attr,
 	&peak_hysteresis_streak.attr,
 	&peak_step_down_pct.attr,
 	&boost_idle_thresh.attr,
@@ -17606,6 +17807,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_FG_TRANSITION_PULSE_PCT;
 	tunables->predict_up_thresh	= ZENITH_DEFAULT_PREDICT_UP_THRESH;
 	tunables->predict_up_window	= ZENITH_DEFAULT_PREDICT_UP_WINDOW;
+	tunables->pelt_rising_edge_thresh =
+		ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH;
+	tunables->pelt_rising_edge_min_pct =
+		ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT;
 	tunables->peak_hysteresis_streak =
 		ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK;
 	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
