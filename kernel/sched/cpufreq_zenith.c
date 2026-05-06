@@ -61,6 +61,7 @@
 #include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/notifier.h>
+#include <linux/power_supply.h>
 #include <linux/kernel_stat.h>
 
 /* linux/fb.h transitively pulls linux/acpi.h, which redefines the
@@ -227,6 +228,21 @@
 #define ZENITH_DEFAULT_PEAK_HEADROOM_PREARM		1
 #define ZENITH_PEAK_HEADROOM_STREAK_MAX			16
 #define ZENITH_PEAK_HEADROOM_HOLD_MS_MAX		1000
+
+/* Patch 1.2 batt_hold_scale_pct: percentage scale applied to
+ * peak-rescue / peak-prearm hold-down millisecond budgets when
+ * the system is running on battery.  Defaults to 100 (identity,
+ * preserves pre-1.2 behaviour) so a no-op for users on AC, lab
+ * boards, or hardware without a power_supply driver registered.
+ * Bounded to 50..300 (50 -> halve the hold, 300 -> triple it).
+ * Profile-baked via zenith_apply_profile() so users on PERFORMANCE
+ * never have hold extended on battery, BALANCED gets a 1.2x scale,
+ * BATTERY gets 1.8x to keep cores at floor longer when discharging,
+ * LEGACY stays at 100 (identity, pre-V4 hybrid behaviour).
+ */
+#define ZENITH_DEFAULT_BATT_HOLD_SCALE_PCT		100
+#define ZENITH_BATT_HOLD_SCALE_PCT_MIN			50
+#define ZENITH_BATT_HOLD_SCALE_PCT_MAX			300
 
 /* Predictive up-shift via util-trend ring (tier 2a').
  *
@@ -2577,6 +2593,15 @@ struct zenith_tunables {
 	unsigned int		peak_headroom_jump_pct;
 	unsigned int		peak_headroom_hold_ms;
 
+	/* Patch 1.2 batt_hold_scale_pct.  Defaults to 100 (identity).
+	 * When the AC-vs-battery cache reports zenith_on_battery == 1,
+	 * peak-rescue / peak-prearm hold deadlines are scaled by this
+	 * percentage before being applied.  Profile-baked; see the
+	 * comment block above zenith_apply_profile() for per-profile
+	 * values.  Bounded to ZENITH_BATT_HOLD_SCALE_PCT_{MIN,MAX}.
+	 */
+	unsigned int		batt_hold_scale_pct;
+
 	/* Pre-arm tier for the peak-headroom rescue.  When 1 (the
 	 * default), an early softer intervention fires while the
 	 * starvation streak is accumulating but has not yet crossed
@@ -3421,6 +3446,21 @@ static atomic_t zenith_drm_vblank_us = ATOMIC_INIT(0);
  */
 static atomic_t zenith_boot_complete = ATOMIC_INIT(0);
 static u64 zenith_boot_complete_ns;
+
+/* AC-vs-battery state cache (Patch 1.2).  Refreshed once per
+ * auto_tune window (ZENITH_AUTO_TUNE_PERIOD_MS, default 10 s) by
+ * zenith_auto_tune_work() via power_supply_is_system_supplied():
+ *   0  -> AC power, system-supplied (default)
+ *   1  -> running on battery
+ * Read lock-free from zenith_batt_scaled() in the peak-rescue and
+ * peak-prearm hot paths to scale hold-down deadlines when the
+ * batt_hold_scale_pct profile knob requests it.  When no power
+ * supply driver is registered the helper returns -ENODEV /
+ * -ENOSYS and the cache stays at 0 (AC), so the default path
+ * exactly preserves pre-1.2 behaviour on systems without a battery
+ * (laptops on a dock, lab boards, AVDs).
+ */
+static atomic_t zenith_on_battery = ATOMIC_INIT(0);
 
 /* In-kernel game detector global latch.  See the
  * ZENITH_DEFAULT_GAME_AUTO comment block.  Read lock-free via
@@ -6377,6 +6417,23 @@ static inline void zenith_at_v_reset_window(struct zenith_policy *z_policy)
 	z_policy->at_pending_windows = 0;
 }
 
+/* Scale a hold-down millisecond budget by batt_hold_scale_pct when
+ * the system is running on battery (Patch 1.2).  Returns @ms
+ * unchanged when on AC, when scale_pct is 100, or when scale_pct
+ * is 0 (treated as "no scaling configured" so an
+ * accidentally-zeroed knob does not silently disable hold).  The
+ * comparator (* / 100) keeps the math integer; saturating at
+ * UINT_MAX is a non-issue because scale_pct is bounded to 50..300
+ * and ms to ZENITH_PEAK_HEADROOM_HOLD_MS_MAX (a few hundred ms).
+ */
+static inline unsigned int zenith_batt_scaled(unsigned int ms,
+					      unsigned int scale_pct)
+{
+	if (!atomic_read(&zenith_on_battery) || scale_pct == 100 || !scale_pct)
+		return ms;
+	return (unsigned int)(((u64)ms * scale_pct) / 100U);
+}
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 					 unsigned long util, unsigned long max_cap)
 {
@@ -7382,7 +7439,9 @@ brutal_entry_deferred:
 		unsigned int jump_pct =
 			z_policy->tunables->peak_headroom_jump_pct;
 		unsigned int hold_ms =
-			z_policy->tunables->peak_headroom_hold_ms;
+			zenith_batt_scaled(
+				z_policy->tunables->peak_headroom_hold_ms,
+				z_policy->tunables->batt_hold_scale_pct);
 		unsigned int floor_freq =
 			(policy->max / 100) * floor_pct;
 		bool starving = (load_pct >= starve_load) &&
@@ -10285,6 +10344,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int peak_headroom_starve_streak;
 		unsigned int peak_headroom_jump_pct;
 		unsigned int peak_headroom_hold_ms;
+		unsigned int batt_hold_scale_pct;
 		unsigned int screen_on_bias_pct;
 		unsigned int input_boost_down_rate_mult_pct;
 		unsigned int predict_up_thresh;
@@ -10352,6 +10412,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_starve_streak = 2,
 			.peak_headroom_jump_pct = 100,
 			.peak_headroom_hold_ms = 25,
+			.batt_hold_scale_pct = 100,
 			.screen_on_bias_pct = 0,
 			.input_boost_down_rate_mult_pct = 300,
 			/* Stage 4 / Patch A: PERFORMANCE wants eager
@@ -10531,6 +10592,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PEAK_HEADROOM_JUMP_PCT,
 			.peak_headroom_hold_ms =
 				ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS,
+			.batt_hold_scale_pct = 120,
 			.screen_on_bias_pct =
 				ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT,
 			.input_boost_down_rate_mult_pct =
@@ -10705,6 +10767,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_starve_streak = 5,
 			.peak_headroom_jump_pct = 90,
 			.peak_headroom_hold_ms = 100,
+			.batt_hold_scale_pct = 180,
 			.screen_on_bias_pct = 80,
 			.input_boost_down_rate_mult_pct = 150,
 			/* Stage 4 / Patch A: BATTERY disables prediction.
@@ -10875,6 +10938,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_starve_streak = 16,
 			.peak_headroom_jump_pct = 100,
 			.peak_headroom_hold_ms = 200,
+			.batt_hold_scale_pct = 100,
 			.screen_on_bias_pct = 100,
 			.input_boost_down_rate_mult_pct = 100,
 			/* Stage 4 / Patch A: LEGACY disables prediction
@@ -11021,6 +11085,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		p->peak_headroom_starve_streak;
 	t->peak_headroom_jump_pct = p->peak_headroom_jump_pct;
 	t->peak_headroom_hold_ms = p->peak_headroom_hold_ms;
+	t->batt_hold_scale_pct	= p->batt_hold_scale_pct;
 	t->screen_on_bias_pct	= p->screen_on_bias_pct;
 	t->input_boost_down_rate_mult_pct =
 		p->input_boost_down_rate_mult_pct;
@@ -11229,6 +11294,23 @@ static void zenith_auto_tune_work(struct work_struct *w)
 
 	if (!t->auto_tune)
 		return;	/* tunable turned off; stop the chain */
+
+	/* Patch 1.2: refresh the AC-vs-battery cache once per
+	 * auto_tune window.  Cheap (a single power_supply iterator
+	 * walk per 10 s), keeps the hot path lock-free, and is the
+	 * earliest point in the periodic chain where it makes sense
+	 * to update -- the per-policy worker is the only periodic
+	 * timer in the governor and it already runs only when
+	 * auto_tune is on.  When no power supply driver is
+	 * registered the helper returns -ENODEV / -ENOSYS and the
+	 * cache stays at 0 (AC), so default behaviour is preserved.
+	 */
+	{
+		int psy = power_supply_is_system_supplied();
+
+		if (psy >= 0)
+			atomic_set(&zenith_on_battery, psy ? 0 : 1);
+	}
 
 	total = (unsigned int)atomic_xchg(&z_policy->at_samples_total, 0);
 	saturated = (unsigned int)atomic_xchg(&z_policy->at_samples_saturated, 0);
@@ -14035,6 +14117,50 @@ static ssize_t peak_headroom_hold_ms_store(struct gov_attr_set *attr_set,
 static struct governor_attr peak_headroom_hold_ms =
 	__ATTR_RW(peak_headroom_hold_ms);
 
+/* batt_hold_scale_pct sysfs knob (Patch 1.2).  Percentage applied
+ * to peak-rescue hold-down deadlines when the system is on
+ * battery (zenith_on_battery == 1).  Profile-baked: PERFORMANCE
+ * keeps 100 (no scaling), BALANCED extends to 120, BATTERY to
+ * 180, LEGACY 100.  Accepts 50..300.
+ */
+static ssize_t batt_hold_scale_pct_show(struct gov_attr_set *attr_set,
+					char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->batt_hold_scale_pct);
+}
+
+static ssize_t batt_hold_scale_pct_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val < ZENITH_BATT_HOLD_SCALE_PCT_MIN ||
+	    val > ZENITH_BATT_HOLD_SCALE_PCT_MAX)
+		return -EINVAL;
+	t->batt_hold_scale_pct = val;
+	return count;
+}
+
+static struct governor_attr batt_hold_scale_pct =
+	__ATTR_RW(batt_hold_scale_pct);
+
+/* on_battery sysfs read-only diagnostic (Patch 1.2).  Reports the
+ * current AC-vs-battery cache state (0 = AC / system-supplied, 1
+ * = on battery).  Updated lazily once per ZENITH_AUTO_TUNE_PERIOD
+ * by zenith_auto_tune_work().  Useful for an operator wondering
+ * why a battery-aware tunable is or isn't engaging.
+ */
+static ssize_t on_battery_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       (unsigned int)atomic_read(&zenith_on_battery));
+}
+
+static struct governor_attr on_battery = __ATTR_RO(on_battery);
+
 /* peak_headroom_prearm sysfs knob.  Boolean gate for the soft early
  * intervention tier (2b') that lifts the cluster to eff_hispeed_freq
  * while the starvation streak is accumulating but has not yet
@@ -16014,6 +16140,8 @@ static struct attribute *zenith_attrs[] = {
 	&peak_headroom_starve_streak.attr,
 	&peak_headroom_jump_pct.attr,
 	&peak_headroom_hold_ms.attr,
+	&batt_hold_scale_pct.attr,
+	&on_battery.attr,
 	&peak_headroom_prearm.attr,
 	&predict_up_thresh.attr,
 	&predict_up_window.attr,
@@ -16286,6 +16414,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS;
 	tunables->peak_headroom_prearm =
 		ZENITH_DEFAULT_PEAK_HEADROOM_PREARM;
+	tunables->batt_hold_scale_pct =
+		ZENITH_DEFAULT_BATT_HOLD_SCALE_PCT;
 	tunables->predict_up_thresh	= ZENITH_DEFAULT_PREDICT_UP_THRESH;
 	tunables->predict_up_window	= ZENITH_DEFAULT_PREDICT_UP_WINDOW;
 	tunables->peak_hysteresis_streak =
