@@ -4502,6 +4502,21 @@ struct zenith_policy {
 	 * unsigned long ++ is race-free.
 	 */
 	unsigned long		stats[ZENITH_STAT_NR];
+
+	/* Patch 1.4 decision-latency histogram.  4 unsigned-long
+	 * buckets covering the eval cost in nanoseconds:
+	 *   [0]   <  10 us
+	 *   [1]  10..< 50 us
+	 *   [2]  50..<100 us
+	 *   [3]  >=100 us
+	 *
+	 * Storage budget: 4 * sizeof(unsigned long) per policy.
+	 * Bumped at the same commit point as stats[]; the same
+	 * single-writer reasoning applies (per-policy serialised by
+	 * the cpufreq core).  Sysfs read via decision_latency_hist.
+	 * Reset to zero on zenith_start() alongside stats[].
+	 */
+	unsigned long		dec_lat_buckets[4];
 };
 
 struct zenith_cpu {
@@ -6579,6 +6594,13 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	 * tiers, not user-experience clips.
 	 */
 	bool pin_to_target = false;
+	/* Patch 1.4: eval-entry timestamp for the decision-latency
+	 * histogram.  Single ktime_get_ns() at function entry; the
+	 * bucketing arithmetic at commit is constant-time so the
+	 * total cost of the always-on histogram is one ktime read +
+	 * one subtract + one bucket increment per eval.
+	 */
+	u64 dec_eval_start_ns = ktime_get_ns();
 
 	/* Patch 1.3 cluster-wake-pulse arm.  Compute now_ns once at
 	 * the top of the eval and use it both for the gap measurement
@@ -6591,7 +6613,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	 * compile-time-shaped no-op when the profile disables it.
 	 */
 	{
-		u64 now_arm_ns = ktime_get_ns();
+		u64 now_arm_ns = dec_eval_start_ns;
 		u64 prev = z_policy->cluster_wake_last_eval_ns;
 		unsigned int pulse_ms =
 			z_policy->tunables->cluster_wake_pulse_ms;
@@ -8780,6 +8802,26 @@ apply_uclamp_max_cap:
 
 	z_policy->stats[ZENITH_STAT_DECISIONS]++;
 	z_policy->stats[zenith_path_to_bucket(tp_path)]++;
+
+	/* Patch 1.4: decision-latency histogram.  Single ktime read
+	 * + subtract + bucket increment.  3 fixed thresholds (10 us
+	 * / 50 us / 100 us) cover the practical range of zenith eval
+	 * costs on a 5.10 kernel; an eval that lands above 100 us is
+	 * already pathological and the >=100us bucket is intentionally
+	 * a fire-and-forget marker for those.
+	 */
+	{
+		u64 lat_ns = ktime_get_ns() - dec_eval_start_ns;
+
+		if (lat_ns < 10000ULL)
+			z_policy->dec_lat_buckets[0]++;
+		else if (lat_ns < 50000ULL)
+			z_policy->dec_lat_buckets[1]++;
+		else if (lat_ns < 100000ULL)
+			z_policy->dec_lat_buckets[2]++;
+		else
+			z_policy->dec_lat_buckets[3]++;
+	}
 	/* Patch J: stamp the per-policy last decision tag.  Pairs
 	 * with READ_ONCE in the last_decision_path sysfs handler.
 	 */
@@ -9442,6 +9484,8 @@ zenith_at_eff_cool_windows(struct zenith_policy *z_policy, unsigned int base)
 static void zenith_policy_observability_reset(struct zenith_policy *z_policy)
 {
 	memset(z_policy->stats, 0, sizeof(z_policy->stats));
+	memset(z_policy->dec_lat_buckets, 0,
+	       sizeof(z_policy->dec_lat_buckets));
 	memset(z_policy->at_log, 0, sizeof(z_policy->at_log));
 	z_policy->at_log_head = 0;
 	z_policy->at_log_count = 0;
@@ -14610,6 +14654,49 @@ static ssize_t quiet_hours_screen_off_only_store(struct gov_attr_set *attr_set,
 static struct governor_attr quiet_hours_screen_off_only =
 	__ATTR_RW(quiet_hours_screen_off_only);
 
+/* Patch 1.4: decision_latency_hist sysfs node.
+ *
+ * Read-only.  Prints four numbers separated by spaces, terminated
+ * with a newline:
+ *
+ *   <count_lt10us> <count_10_50us> <count_50_100us> <count_ge100us>
+ *
+ * Each count is the lifetime number of zenith_get_next_freq()
+ * evals whose end-to-end cost (from function entry to commit
+ * point) landed in the corresponding bucket on the policy that
+ * owns this attribute set.  Reset on policy attach (zenith_start),
+ * so the values reflect the current attach cycle only.
+ *
+ * Single-line space-separated format keeps userspace parsers
+ * trivial (awk '{print $1, $2, $3, $4}'); no need to walk a
+ * multi-line table.  A separate decisions counter (the existing
+ * stats[] / decisions_total node) lets userspace compute the per-
+ * eval cost distribution.
+ */
+static ssize_t decision_latency_hist_show(struct gov_attr_set *attr_set,
+					  char *buf)
+{
+	struct zenith_policy *z_policy;
+	unsigned long b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+
+	/* Same single-leader-cpu policy iteration pattern used by
+	 * the existing stats sysfs handlers (e.g. decisions_total).
+	 * The list is stable while the gov_attr_set is alive (held
+	 * by the sysfs read), so a plain list_for_each_entry without
+	 * an extra lock is correct.
+	 */
+	list_for_each_entry(z_policy, &attr_set->policy_list, tunables_hook) {
+		b0 += z_policy->dec_lat_buckets[0];
+		b1 += z_policy->dec_lat_buckets[1];
+		b2 += z_policy->dec_lat_buckets[2];
+		b3 += z_policy->dec_lat_buckets[3];
+	}
+	return sprintf(buf, "%lu %lu %lu %lu\n", b0, b1, b2, b3);
+}
+
+static struct governor_attr decision_latency_hist =
+	__ATTR_RO(decision_latency_hist);
+
 /* peak_headroom_prearm sysfs knob.  Boolean gate for the soft early
  * intervention tier (2b') that lifts the cluster to eff_hispeed_freq
  * while the starvation streak is accumulating but has not yet
@@ -16598,6 +16685,7 @@ static struct attribute *zenith_attrs[] = {
 	&quiet_hours_end_min.attr,
 	&quiet_hours_cap_pct.attr,
 	&quiet_hours_screen_off_only.attr,
+	&decision_latency_hist.attr,
 	&peak_headroom_prearm.attr,
 	&predict_up_thresh.attr,
 	&predict_up_window.attr,
@@ -17206,6 +17294,8 @@ static int zenith_start(struct cpufreq_policy *policy)
 	z_policy->uclamp_cache_stamp_ns = 0;
 
 	memset(z_policy->stats, 0, sizeof(z_policy->stats));
+	memset(z_policy->dec_lat_buckets, 0,
+	       sizeof(z_policy->dec_lat_buckets));
 	z_policy->at_last_state =
 		zenith_profile_to_at_state(z_policy->tunables->active_profile);
 	z_policy->at_pending_state = z_policy->at_last_state;
