@@ -14024,6 +14024,119 @@ static ssize_t decision_ring_show(struct gov_attr_set *attr_set, char *buf)
 
 static struct governor_attr decision_ring = __ATTR_RO(decision_ring);
 
+/* Patch C8: decision_confidence sysfs node.  Read-only.  Walks the
+ * per-policy dec_ring (ZENITH_DEC_RING_NR == 32 entries) and tallies
+ * how many of the last 32 evals were won by each tp_path.  Output
+ * is one line per distinct path actually seen, sorted by descending
+ * count, with absolute count and percent-of-window:
+ *
+ *   policy0(little):
+ *     hispeed       18 56%
+ *     predict_up     6 18%
+ *     pelt_edge      4 12%
+ *     dl_floor       2  6%
+ *     ...
+ *
+ * Useful for diagnosing which tier is doing the work in a given
+ * load profile -- e.g. confirming pelt_edge is firing on cold-wake
+ * scrolling, or checking that dl_floor is dormant on BALANCED.
+ *
+ * Cost: one PAGE_SIZE buffer pass per policy on read.  No locking
+ * (READ_ONCE on path; tally is on stack).  Pointer-compare is
+ * sufficient because tp_path is always a string literal -- gcc
+ * pools all literals so the same path always points to the same
+ * address; if a future tier writes a non-literal, strcmp would be
+ * needed but the existing dec_ring sample logic stores the literal
+ * pointer as well, so any path captured into the ring is also a
+ * literal.
+ */
+#define ZENITH_CONF_TALLY_MAX	16
+
+static ssize_t
+decision_confidence_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct zenith_policy *z_pol;
+	ssize_t len = 0;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
+		struct {
+			const char	*path;
+			unsigned int	count;
+		} tally[ZENITH_CONF_TALLY_MAX];
+		unsigned int n_tally = 0;
+		unsigned int total = 0;
+		unsigned int head = READ_ONCE(z_pol->dec_ring_head);
+		unsigned int i, j;
+
+		memset(tally, 0, sizeof(tally));
+
+		for (i = 0; i < ZENITH_DEC_RING_NR; i++) {
+			unsigned int idx =
+				(head - 1 - i) & ZENITH_DEC_RING_MASK;
+			const char *p = READ_ONCE(z_pol->dec_ring[idx].path);
+
+			if (!p)
+				continue;
+			total++;
+
+			for (j = 0; j < n_tally; j++) {
+				if (tally[j].path == p) {
+					tally[j].count++;
+					break;
+				}
+			}
+			if (j == n_tally && n_tally < ZENITH_CONF_TALLY_MAX) {
+				tally[n_tally].path = p;
+				tally[n_tally].count = 1;
+				n_tally++;
+			}
+		}
+
+		for (i = 0; i + 1 < n_tally; i++) {
+			unsigned int max_j = i;
+
+			for (j = i + 1; j < n_tally; j++) {
+				if (tally[j].count > tally[max_j].count)
+					max_j = j;
+			}
+			if (max_j != i) {
+				const char *tp = tally[i].path;
+				unsigned int tc = tally[i].count;
+
+				tally[i].path = tally[max_j].path;
+				tally[i].count = tally[max_j].count;
+				tally[max_j].path = tp;
+				tally[max_j].count = tc;
+			}
+		}
+
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "policy%u(%s) total=%u:\n",
+				 z_pol->policy->cpu,
+				 zenith_at_cluster_name(z_pol->cluster_class),
+				 total);
+		if (len >= PAGE_SIZE)
+			break;
+
+		for (i = 0; i < n_tally; i++) {
+			unsigned int pct = total ?
+				(tally[i].count * 100) / total : 0;
+
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+					 "  %-16s %3u %3u%%\n",
+					 tally[i].path, tally[i].count, pct);
+			if (len >= PAGE_SIZE)
+				break;
+		}
+		if (len >= PAGE_SIZE)
+			break;
+	}
+	return len;
+}
+
+static struct governor_attr decision_confidence =
+	__ATTR_RO(decision_confidence);
+
 ZENITH_TUNABLE_UINT_BOOL_INVAL(screen_state);
 
 /* screen_off_glide_ms sysfs knob.  Range
@@ -17699,6 +17812,7 @@ static struct attribute *zenith_attrs[] = {
 	&at_log.attr,
 	&last_decision_path.attr,
 	&decision_ring.attr,
+	&decision_confidence.attr,
 	&auto_tune_status.attr,
 	&auto_tune_state_residency.attr,
 	&auto_tune_state_history.attr,
