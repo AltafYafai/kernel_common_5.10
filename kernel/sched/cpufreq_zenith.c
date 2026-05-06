@@ -409,6 +409,36 @@
 #define ZENITH_PELT_RISING_EDGE_THRESH_MAX		255
 #define ZENITH_PELT_RISING_EDGE_MIN_PCT_MAX		100
 
+/* dl_task_floor_pct (default 0, range 0..100, [Patch C6]):
+ *
+ * SCHED_DEADLINE awareness floor.  When any CPU in the policy
+ * has a SCHED_DEADLINE task on its rq (rq->dl.dl_nr_running >
+ * 0), lift freq to (policy->max * dl_task_floor_pct / 100).
+ *
+ * Rationale: schedutil_cpu_util() already adds cpu_bw_dl() to
+ * the util signal so DL bandwidth requirements feed into the
+ * proportional math automatically.  That math guarantees
+ * *average* DL throughput, but a freshly-woken DL task takes
+ * roughly one PELT half-life (~32 ms) for its util_avg
+ * contribution to fully land, during which the proportional
+ * math runs against a stale picture and can miss the first
+ * deadline.  Lifting to a per-policy floor closes that
+ * responsiveness gap without forcing policy->max for every
+ * DL task in the system.
+ *
+ * 0 disables the tier (legacy behaviour: rely solely on the
+ * schedutil_cpu_util DL bandwidth contribution).  Max 100
+ * (== policy->max).  pin_to_target paths skip the floor
+ * because input_boost / brutality already pin higher.
+ *
+ * Profile bakes: PERFORMANCE=100, GAMING=100, AUDIO=80,
+ * BALANCED=0, BATTERY=0, LEGACY=0.  Cold-boot default 0 keeps
+ * legacy behaviour for CUSTOM users; flipping to a profile
+ * that enables it does not require any further sysfs work.
+ */
+#define ZENITH_DEFAULT_DL_TASK_FLOOR_PCT		0
+#define ZENITH_DL_TASK_FLOOR_PCT_MAX			100
+
 /* peak_hysteresis_streak / peak_step_down_pct
  * (defaults 3 / 95, [Stage 4 / Patch E]):
  *
@@ -2818,6 +2848,14 @@ struct zenith_tunables {
 	 */
 	unsigned int		pelt_rising_edge_thresh;
 	unsigned int		pelt_rising_edge_min_pct;
+
+	/* See ZENITH_DEFAULT_DL_TASK_FLOOR_PCT (Patch C6).  When a
+	 * SCHED_DEADLINE task is present on any CPU in the policy,
+	 * lift freq to (policy->max * dl_task_floor_pct / 100).  0
+	 * disables the floor; non-zero in 1..100 sets the
+	 * percentage of policy->max used as the floor.
+	 */
+	unsigned int		dl_task_floor_pct;
 
 	/* See ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK /
 	 * ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT (Patch E).  Either at 0
@@ -8232,6 +8270,45 @@ brutal_entry_deferred:
 		}
 	}
 
+	/* Patch C6: SCHED_DEADLINE awareness floor.  Walks the
+	 * policy CPU mask and looks for any rq with a non-zero
+	 * dl.dl_nr_running.  When found, lift freq to
+	 * (policy->max * dl_task_floor_pct / 100).  Race on
+	 * dl_nr_running is harmless: read is a single load,
+	 * decision is a heuristic responsiveness lift on top of
+	 * the bandwidth math that schedutil_cpu_util already does
+	 * for correctness.
+	 *
+	 * Tunable 0 (cold-boot default) disables; profile bakes
+	 * default it on for PERFORMANCE / GAMING (100) and AUDIO
+	 * (80).  pin_to_target skip avoids stacking under a
+	 * higher pin from input_boost / brutality.
+	 */
+	if (!pin_to_target && policy->max &&
+	    z_policy->tunables->dl_task_floor_pct) {
+		int cpu_iter;
+		bool dl_present = false;
+
+		for_each_cpu(cpu_iter, policy->cpus) {
+			if (READ_ONCE(cpu_rq(cpu_iter)->dl.dl_nr_running)) {
+				dl_present = true;
+				break;
+			}
+		}
+		if (dl_present) {
+			unsigned int dlf = (policy->max *
+					    z_policy->tunables->dl_task_floor_pct) /
+					   100;
+
+			if (dlf > policy->max)
+				dlf = policy->max;
+			if (freq < dlf) {
+				freq = dlf;
+				tp_path = "dl_floor";
+			}
+		}
+	}
+
 	/* 3c'''''. Peer-ramp soft floor (Patch D).
 	 *
 	 * If the peer cluster (BIG <-> PRIME) ramped to peak in the
@@ -10885,6 +10962,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int predict_up_window;
 		unsigned int pelt_rising_edge_thresh;
 		unsigned int pelt_rising_edge_min_pct;
+		unsigned int dl_task_floor_pct;
 		unsigned int render_floor_pct;
 		unsigned int render_floor_min_runtime_ms;
 		unsigned int input_boost_touchdown_extra_ms;
@@ -10979,6 +11057,14 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.pelt_rising_edge_thresh = 24,
 			.pelt_rising_edge_min_pct = 40,
+			/* Patch C6: PERFORMANCE pins to policy->max
+			 * the moment any DL task is detected.  Frame-
+			 * work / kernel timers using SCHED_DEADLINE
+			 * (e.g. PipeWire RT, V4L2 streamer threads on
+			 * the BIG cluster) get a hard freq floor so
+			 * the first wake doesn't miss its deadline.
+			 */
+			.dl_task_floor_pct = 100,
 			/* Stage 4 / Patch B: PERFORMANCE keeps the
 			 * render floor strong (80%% of max, vs 70%%
 			 * default) and tightens the debounce to 20 ms
@@ -11182,6 +11268,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH,
 			.pelt_rising_edge_min_pct =
 				ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT,
+			/* Patch C6: BALANCED matches cold-boot default
+			 * (off).  The DL bandwidth math via
+			 * schedutil_cpu_util() handles average-throughput
+			 * for DL tasks; the floor is an opt-in
+			 * responsiveness boost reserved for the
+			 * profiles that explicitly want it.
+			 */
+			.dl_task_floor_pct =
+				ZENITH_DEFAULT_DL_TASK_FLOOR_PCT,
 			/* Stage 4 / Patch B: BALANCED matches cold-
 			 * boot defaults (70%% floor, 50 ms debounce).
 			 */
@@ -11371,6 +11466,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.pelt_rising_edge_thresh = 0,
 			.pelt_rising_edge_min_pct =
 				ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT,
+			/* Patch C6: BATTERY keeps the floor off; DL
+			 * bandwidth math is sufficient for the energy
+			 * frame this profile targets.
+			 */
+			.dl_task_floor_pct = 0,
 			/* Stage 4 / Patch B: BATTERY softens the render
 			 * floor to 50%% and stretches the debounce to
 			 * 100 ms.  Render activity still floors the
@@ -11555,6 +11655,10 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.pelt_rising_edge_thresh = 0,
 			.pelt_rising_edge_min_pct =
 				ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT,
+			/* Patch C6: LEGACY also disables the DL floor
+			 * (historical-compat profile).
+			 */
+			.dl_task_floor_pct = 0,
 			/* Stage 4 / Patch B: LEGACY disables the floor
 			 * outright (render_floor_pct=0) since the floor
 			 * is a Stage-1+ feature.  The debounce knob is
@@ -11724,6 +11828,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.pelt_rising_edge_thresh = 20,
 			.pelt_rising_edge_min_pct = 35,
+			/* Patch C6: GAMING pins to policy->max on DL
+			 * task presence -- some game engines pin a
+			 * compositor-pacer thread to SCHED_DEADLINE
+			 * to lock vblank cadence; the floor guarantees
+			 * its first wake hits target frequency.
+			 */
+			.dl_task_floor_pct = 100,
 			.render_floor_pct = 85,
 			.render_floor_min_runtime_ms = 15,
 			.input_boost_touchdown_extra_ms = 100,
@@ -11860,6 +11971,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH,
 			.pelt_rising_edge_min_pct =
 				ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT,
+			/* Patch C6: AUDIO uses an 80%% DL floor.  ALSA
+			 * RT/DL paths and JACK-style audio servers
+			 * pin a per-period worker on SCHED_DEADLINE
+			 * with sub-ms periods; the 80%% floor gives
+			 * those threads guaranteed headroom without
+			 * pinning the cluster to absolute max for
+			 * everything else on the device.
+			 */
+			.dl_task_floor_pct = 80,
 			/* Render floor off: audio worker is not the
 			 * RENDER_PRIO thread that renderer-floor is
 			 * scoped to.  Keep the floor knob populated
@@ -11997,6 +12117,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->predict_up_window, p->predict_up_window);
 	WRITE_ONCE(t->pelt_rising_edge_thresh, p->pelt_rising_edge_thresh);
 	WRITE_ONCE(t->pelt_rising_edge_min_pct, p->pelt_rising_edge_min_pct);
+	WRITE_ONCE(t->dl_task_floor_pct, p->dl_task_floor_pct);
 	t->render_floor_pct	= p->render_floor_pct;
 	WRITE_ONCE(t->render_floor_min_runtime_ms,
 		   p->render_floor_min_runtime_ms);
@@ -15575,6 +15696,35 @@ pelt_rising_edge_min_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr pelt_rising_edge_min_pct =
 	__ATTR_RW(pelt_rising_edge_min_pct);
 
+/* dl_task_floor_pct sysfs knob (Patch C6).  Range 0..100.  When
+ * any CPU in the policy has a SCHED_DEADLINE task, lift freq to
+ * (policy->max * dl_task_floor_pct / 100).  0 disables the floor;
+ * see ZENITH_DEFAULT_DL_TASK_FLOOR_PCT for the full block comment.
+ */
+static ssize_t
+dl_task_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->dl_task_floor_pct);
+}
+
+static ssize_t
+dl_task_floor_pct_store(struct gov_attr_set *attr_set,
+			const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_DL_TASK_FLOOR_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->dl_task_floor_pct, val);
+	return count;
+}
+
+static struct governor_attr dl_task_floor_pct =
+	__ATTR_RW(dl_task_floor_pct);
+
 /* peak_hysteresis_streak sysfs knob (Patch E).
  * Range 0..ZENITH_PEAK_HYSTERESIS_STREAK_MAX.  Number of
  * consecutive samples after a peak-class previous freq for
@@ -17514,6 +17664,7 @@ static struct attribute *zenith_attrs[] = {
 	&predict_up_window.attr,
 	&pelt_rising_edge_thresh.attr,
 	&pelt_rising_edge_min_pct.attr,
+	&dl_task_floor_pct.attr,
 	&peak_hysteresis_streak.attr,
 	&peak_step_down_pct.attr,
 	&boost_idle_thresh.attr,
@@ -17811,6 +17962,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH;
 	tunables->pelt_rising_edge_min_pct =
 		ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT;
+	tunables->dl_task_floor_pct	= ZENITH_DEFAULT_DL_TASK_FLOOR_PCT;
 	tunables->peak_hysteresis_streak =
 		ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK;
 	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
