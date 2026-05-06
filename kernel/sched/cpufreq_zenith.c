@@ -229,6 +229,33 @@
 #define ZENITH_PEAK_HEADROOM_STREAK_MAX			16
 #define ZENITH_PEAK_HEADROOM_HOLD_MS_MAX		1000
 
+/* Patch 1.3 cluster-wake-pulse: when zenith_get_next_freq() is
+ * entered after a >= cluster_wake_pulse_idle_ms gap (the cluster
+ * was deeply idle), arm a soft floor at cluster_wake_pulse_floor_-
+ * pct of policy->max for cluster_wake_pulse_ms milliseconds.
+ *
+ * The floor absorbs the PELT warm-up cost: the first util sample
+ * after a long idle is by construction near zero and would normally
+ * pin freq at min, even when the workload that just woke needs the
+ * cluster (the EAS resolve catches up only on the second/third
+ * sample, by which point a frame deadline can already be at risk).
+ *
+ * Defaults: cluster_wake_pulse_ms = 40 (one-frame budget on a
+ * 60 Hz panel), cluster_wake_pulse_idle_ms = 80 (only fire after
+ * a "real" deep idle, not just a burst of two consecutive idle
+ * sample windows), cluster_wake_pulse_floor_pct = 55 (just above
+ * a typical hispeed-entry band).
+ *
+ * Disabled by setting cluster_wake_pulse_ms = 0; profile-baked so
+ * BATTERY and LEGACY hide the tier entirely while PERFORMANCE
+ * widens it.
+ */
+#define ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS		40
+#define ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_IDLE_MS	80
+#define ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_FLOOR_PCT	55
+#define ZENITH_CLUSTER_WAKE_PULSE_MS_MAX		200
+#define ZENITH_CLUSTER_WAKE_PULSE_IDLE_MS_MAX		1000
+
 /* Patch 1.2 batt_hold_scale_pct: percentage scale applied to
  * peak-rescue / peak-prearm hold-down millisecond budgets when
  * the system is running on battery.  Defaults to 100 (identity,
@@ -2602,6 +2629,16 @@ struct zenith_tunables {
 	 */
 	unsigned int		batt_hold_scale_pct;
 
+	/* Patch 1.3 cluster-wake-pulse.  See the comment block above
+	 * ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS for the full rationale.
+	 * cluster_wake_pulse_ms == 0 disables the tier entirely (so
+	 * BATTERY / LEGACY profiles short-circuit at no runtime cost).
+	 * All three knobs are profile-baked.
+	 */
+	unsigned int		cluster_wake_pulse_ms;
+	unsigned int		cluster_wake_pulse_idle_ms;
+	unsigned int		cluster_wake_pulse_floor_pct;
+
 	/* Pre-arm tier for the peak-headroom rescue.  When 1 (the
 	 * default), an early softer intervention fires while the
 	 * starvation streak is accumulating but has not yet crossed
@@ -3985,6 +4022,20 @@ struct zenith_policy {
 	 * is only ever monotonic-forward written.
 	 */
 	u64			migration_in_until_ns;
+
+	/* Cluster-wake-pulse (Patch 1.3) deadlines.  cluster_wake_-
+	 * pulse_until_ns is stamped at the top of zenith_get_next_-
+	 * freq() when (a) cluster_wake_pulse_ms is non-zero and
+	 * (b) the gap (now_ns - cluster_wake_last_eval_ns) is at
+	 * or above cluster_wake_pulse_idle_ms.  cluster_wake_last_-
+	 * eval_ns is updated on every eval (so a continuous active
+	 * stream simply keeps refreshing the timestamp without ever
+	 * arming the pulse).  Same single-writer-per-policy reason-
+	 * ing as migration_in_until_ns above: both fields are
+	 * touched only by the eval path under update_lock.
+	 */
+	u64			cluster_wake_pulse_until_ns;
+	u64			cluster_wake_last_eval_ns;
 
 	/* PSI-mem cap deadline (Patch M1).  Stamped by the eval path
 	 * when zenith_psi_mem_some_pct() crosses psi_mem_cap_thresh
@@ -6455,6 +6506,34 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	 */
 	bool pin_to_target = false;
 
+	/* Patch 1.3 cluster-wake-pulse arm.  Compute now_ns once at
+	 * the top of the eval and use it both for the gap measurement
+	 * and the deadline stamp.  Skip the very first eval after
+	 * policy bring-up (cluster_wake_last_eval_ns == 0) so a fresh
+	 * policy that has never sampled doesn't trip a spurious pulse
+	 * just because the field is zero.  cluster_wake_pulse_ms == 0
+	 * short-circuits the arm; the floor application below is also
+	 * gated by the deadline being non-zero, so the tier is a
+	 * compile-time-shaped no-op when the profile disables it.
+	 */
+	{
+		u64 now_arm_ns = ktime_get_ns();
+		u64 prev = z_policy->cluster_wake_last_eval_ns;
+		unsigned int pulse_ms =
+			z_policy->tunables->cluster_wake_pulse_ms;
+		unsigned int idle_ms =
+			z_policy->tunables->cluster_wake_pulse_idle_ms;
+
+		if (pulse_ms && prev &&
+		    now_arm_ns - prev >=
+			(u64)idle_ms * NSEC_PER_MSEC) {
+			z_policy->cluster_wake_pulse_until_ns =
+				now_arm_ns +
+				(u64)pulse_ms * NSEC_PER_MSEC;
+		}
+		z_policy->cluster_wake_last_eval_ns = now_arm_ns;
+	}
+
 	/* Dynamic Environment Overrides */
 	unsigned int dynamic_up_thresh = zenith_tunable_or_local(z_policy,
 		z_policy->tunables->up_threshold,
@@ -7922,6 +8001,42 @@ brutal_entry_deferred:
 					freq = floor;
 					tp_path = "peer_ramp";
 				}
+			}
+		}
+	}
+
+	/* 3c''''''-pre. Cluster-wake-pulse soft floor (Patch 1.3).
+	 *
+	 * Mirrors the migration_floor mechanic below: if the arm block
+	 * at the top of zenith_get_next_freq() detected a >= cluster_-
+	 * wake_pulse_idle_ms gap since the last eval, it stamped a
+	 * deadline on cluster_wake_pulse_until_ns.  While that
+	 * deadline has not expired, hold a soft floor at
+	 * cluster_wake_pulse_floor_pct of policy->max so the freshly-
+	 * woken cluster runs above PELT-cold-start freq for the
+	 * pulse window.
+	 *
+	 * Bypassed when pin_to_target (input_boost / brutality already
+	 * own freq above any plausible pulse floor) or when the floor
+	 * percentage is 0 (knob stamps but suppresses, mirroring
+	 * peer_ramp / migration_floor).  Runs before the migration_-
+	 * floor tier so a cluster that wakes AND receives an inbound
+	 * migrating task picks the higher of the two floors.
+	 */
+	if (!pin_to_target && policy->max &&
+	    z_policy->tunables->cluster_wake_pulse_floor_pct) {
+		u64 until = z_policy->cluster_wake_pulse_until_ns;
+
+		if (until && ktime_get_ns() < until) {
+			unsigned int floor =
+				(policy->max / 100) *
+				z_policy->tunables->cluster_wake_pulse_floor_pct;
+
+			if (floor > policy->max)
+				floor = policy->max;
+			if (freq < floor) {
+				freq = floor;
+				tp_path = "cluster_wake_pulse";
 			}
 		}
 	}
@@ -10345,6 +10460,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int peak_headroom_jump_pct;
 		unsigned int peak_headroom_hold_ms;
 		unsigned int batt_hold_scale_pct;
+		unsigned int cluster_wake_pulse_ms;
+		unsigned int cluster_wake_pulse_idle_ms;
+		unsigned int cluster_wake_pulse_floor_pct;
 		unsigned int screen_on_bias_pct;
 		unsigned int input_boost_down_rate_mult_pct;
 		unsigned int predict_up_thresh;
@@ -10413,6 +10531,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_jump_pct = 100,
 			.peak_headroom_hold_ms = 25,
 			.batt_hold_scale_pct = 100,
+			.cluster_wake_pulse_ms = 80,
+			.cluster_wake_pulse_idle_ms = 60,
+			.cluster_wake_pulse_floor_pct = 70,
 			.screen_on_bias_pct = 0,
 			.input_boost_down_rate_mult_pct = 300,
 			/* Stage 4 / Patch A: PERFORMANCE wants eager
@@ -10593,6 +10714,12 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_hold_ms =
 				ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS,
 			.batt_hold_scale_pct = 120,
+			.cluster_wake_pulse_ms =
+				ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS,
+			.cluster_wake_pulse_idle_ms =
+				ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_IDLE_MS,
+			.cluster_wake_pulse_floor_pct =
+				ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_FLOOR_PCT,
 			.screen_on_bias_pct =
 				ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT,
 			.input_boost_down_rate_mult_pct =
@@ -10768,6 +10895,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_jump_pct = 90,
 			.peak_headroom_hold_ms = 100,
 			.batt_hold_scale_pct = 180,
+			.cluster_wake_pulse_ms = 0,
+			.cluster_wake_pulse_idle_ms = 0,
+			.cluster_wake_pulse_floor_pct = 0,
 			.screen_on_bias_pct = 80,
 			.input_boost_down_rate_mult_pct = 150,
 			/* Stage 4 / Patch A: BATTERY disables prediction.
@@ -10939,6 +11069,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.peak_headroom_jump_pct = 100,
 			.peak_headroom_hold_ms = 200,
 			.batt_hold_scale_pct = 100,
+			.cluster_wake_pulse_ms = 0,
+			.cluster_wake_pulse_idle_ms = 0,
+			.cluster_wake_pulse_floor_pct = 0,
 			.screen_on_bias_pct = 100,
 			.input_boost_down_rate_mult_pct = 100,
 			/* Stage 4 / Patch A: LEGACY disables prediction
@@ -11086,6 +11219,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	t->peak_headroom_jump_pct = p->peak_headroom_jump_pct;
 	t->peak_headroom_hold_ms = p->peak_headroom_hold_ms;
 	t->batt_hold_scale_pct	= p->batt_hold_scale_pct;
+	t->cluster_wake_pulse_ms = p->cluster_wake_pulse_ms;
+	t->cluster_wake_pulse_idle_ms = p->cluster_wake_pulse_idle_ms;
+	t->cluster_wake_pulse_floor_pct = p->cluster_wake_pulse_floor_pct;
 	t->screen_on_bias_pct	= p->screen_on_bias_pct;
 	t->input_boost_down_rate_mult_pct =
 		p->input_boost_down_rate_mult_pct;
@@ -14161,6 +14297,92 @@ static ssize_t on_battery_show(struct gov_attr_set *attr_set, char *buf)
 
 static struct governor_attr on_battery = __ATTR_RO(on_battery);
 
+/* cluster_wake_pulse_ms sysfs knob (Patch 1.3).  Width of the soft
+ * floor armed when the cluster wakes from a >= cluster_wake_pulse_-
+ * idle_ms gap.  Accepts 0 (disable the tier) up to ZENITH_CLUSTER_-
+ * WAKE_PULSE_MS_MAX (200 ms).
+ */
+static ssize_t cluster_wake_pulse_ms_show(struct gov_attr_set *attr_set,
+					  char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->cluster_wake_pulse_ms);
+}
+
+static ssize_t cluster_wake_pulse_ms_store(struct gov_attr_set *attr_set,
+					   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_CLUSTER_WAKE_PULSE_MS_MAX)
+		return -EINVAL;
+	t->cluster_wake_pulse_ms = val;
+	return count;
+}
+
+static struct governor_attr cluster_wake_pulse_ms =
+	__ATTR_RW(cluster_wake_pulse_ms);
+
+/* cluster_wake_pulse_idle_ms sysfs knob.  Minimum gap between
+ * consecutive evals required before the wake-pulse arms.  Bounded
+ * to 0..ZENITH_CLUSTER_WAKE_PULSE_IDLE_MS_MAX (1000 ms).  0 means
+ * "any gap qualifies", which combined with cluster_wake_pulse_ms
+ * non-zero would arm the pulse on every eval; users wanting that
+ * effect should set both knobs explicitly.
+ */
+static ssize_t cluster_wake_pulse_idle_ms_show(struct gov_attr_set *attr_set,
+					       char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->cluster_wake_pulse_idle_ms);
+}
+
+static ssize_t cluster_wake_pulse_idle_ms_store(struct gov_attr_set *attr_set,
+						const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_CLUSTER_WAKE_PULSE_IDLE_MS_MAX)
+		return -EINVAL;
+	t->cluster_wake_pulse_idle_ms = val;
+	return count;
+}
+
+static struct governor_attr cluster_wake_pulse_idle_ms =
+	__ATTR_RW(cluster_wake_pulse_idle_ms);
+
+/* cluster_wake_pulse_floor_pct sysfs knob.  Floor as percentage of
+ * policy->max held for the wake-pulse window.  Accepts 0..100;
+ * 0 stamps the deadline but suppresses the floor application,
+ * mirroring the peer_ramp / migration_floor knob shape.
+ */
+static ssize_t cluster_wake_pulse_floor_pct_show(struct gov_attr_set *attr_set,
+						 char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->cluster_wake_pulse_floor_pct);
+}
+
+static ssize_t cluster_wake_pulse_floor_pct_store(struct gov_attr_set *attr_set,
+						  const char *buf,
+						  size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	t->cluster_wake_pulse_floor_pct = val;
+	return count;
+}
+
+static struct governor_attr cluster_wake_pulse_floor_pct =
+	__ATTR_RW(cluster_wake_pulse_floor_pct);
+
 /* peak_headroom_prearm sysfs knob.  Boolean gate for the soft early
  * intervention tier (2b') that lifts the cluster to eff_hispeed_freq
  * while the starvation streak is accumulating but has not yet
@@ -16142,6 +16364,9 @@ static struct attribute *zenith_attrs[] = {
 	&peak_headroom_hold_ms.attr,
 	&batt_hold_scale_pct.attr,
 	&on_battery.attr,
+	&cluster_wake_pulse_ms.attr,
+	&cluster_wake_pulse_idle_ms.attr,
+	&cluster_wake_pulse_floor_pct.attr,
 	&peak_headroom_prearm.attr,
 	&predict_up_thresh.attr,
 	&predict_up_window.attr,
@@ -16416,6 +16641,12 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PEAK_HEADROOM_PREARM;
 	tunables->batt_hold_scale_pct =
 		ZENITH_DEFAULT_BATT_HOLD_SCALE_PCT;
+	tunables->cluster_wake_pulse_ms =
+		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS;
+	tunables->cluster_wake_pulse_idle_ms =
+		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_IDLE_MS;
+	tunables->cluster_wake_pulse_floor_pct =
+		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_FLOOR_PCT;
 	tunables->predict_up_thresh	= ZENITH_DEFAULT_PREDICT_UP_THRESH;
 	tunables->predict_up_window	= ZENITH_DEFAULT_PREDICT_UP_WINDOW;
 	tunables->peak_hysteresis_streak =
