@@ -73,6 +73,18 @@ enum psi_states {
 	NR_PSI_STATES = 6,
 };
 
+/*
+ * Flag whether to re-arm avgs_work, see details in get_recent_times().
+ *
+ * Mainline (2fcd7bbae90a) defines this as (1 << (NR_PSI_STATES + 1)) to
+ * avoid colliding with PSI_ONCPU at (1 << NR_PSI_STATES). android12-5.10
+ * does not carry PSI_ONCPU (the kABI-safe MEMSTALL_RUNNING re-land tracks
+ * the "currently burning CPU on reclaim" signal via TSK_MEMSTALL_RUNNING
+ * in a parallel per-cpu counter rather than the mainline ONCPU machinery),
+ * so the (1 << NR_PSI_STATES) bit is free and we place the flag there.
+ */
+#define PSI_STATE_RESCHEDULE	(1 << NR_PSI_STATES)
+
 enum psi_aggregators {
 	PSI_AVGS = 0,
 	PSI_POLL,
