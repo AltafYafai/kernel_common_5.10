@@ -19365,6 +19365,47 @@ static int zenith_init(struct cpufreq_policy *policy)
 		if (chosen != ZENITH_PROFILE_CUSTOM) {
 			zenith_apply_profile(tunables, chosen);
 			tunables->active_profile = chosen;
+		} else {
+			/* Patch B-AUTO-5: cold-boot default = AUTO.
+			 *
+			 * No cmdline override and no per-policy
+			 * override pinned this tunables container,
+			 * so engage the auto-selector engine
+			 * immediately.  The BALANCED bake is already
+			 * in place from the kzalloc + tunables-init
+			 * defaults further up; we simply flip
+			 * active_profile to AUTO and stamp
+			 * auto_target so the engine sees a known
+			 * starting point.  schedule_delayed_work is
+			 * deferred until after attr_set publication
+			 * (below) -- the eval_work struct must be
+			 * fully initialised before it can be
+			 * scheduled, and zenith_tunables_alloc has
+			 * already INIT_DEFERRABLE_WORK'd it.
+			 *
+			 * Users who explicitly want manual control
+			 * still have every escape hatch:
+			 *   - boot with zenith.profile=balanced
+			 *     (cmdline override above wins)
+			 *   - boot with zenith.profile.policyN=...
+			 *     (per-policy override above wins)
+			 *   - echo balanced > .../zenith/profile
+			 *     (sysfs profile_store disengages auto)
+			 *   - echo custom > .../zenith/profile
+			 *     (CUSTOM is auto-immune by design)
+			 *
+			 * LEGACY and CUSTOM remain manual-only
+			 * targets: the classifier never picks them,
+			 * so a user's explicit "echo custom >
+			 * profile" is preserved across the eval
+			 * cadence.
+			 */
+			tunables->active_profile = ZENITH_PROFILE_AUTO;
+			WRITE_ONCE(tunables->auto_target,
+				   ZENITH_PROFILE_BALANCED);
+			tunables->auto_pending_target =
+				ZENITH_PROFILE_BALANCED;
+			tunables->auto_pending_first_seen_ns = 0;
 		}
 	}
 
@@ -19385,6 +19426,21 @@ static int zenith_init(struct cpufreq_policy *policy)
 	}
 
 	global_tunables = tunables;
+
+	/* Patch B-AUTO-5: arm the auto-selector worker if this fresh
+	 * tunables container booted into AUTO (cold-boot default,
+	 * see the chosen-selection block above).  schedule_delayed_-
+	 * work runs first eval after one auto_eval_ms window so the
+	 * device has time to settle on the BALANCED bake before the
+	 * classifier starts steering.  Subsequent policies that
+	 * attach to this tunables container do not re-schedule --
+	 * the worker is one-per-tunables.
+	 */
+	if (tunables->active_profile == ZENITH_PROFILE_AUTO)
+		schedule_delayed_work(&tunables->eval_work,
+				      msecs_to_jiffies(tunables->auto_eval_ms ?
+						       tunables->auto_eval_ms :
+						       ZENITH_DEFAULT_AUTO_EVAL_MS));
 
 out:
 	mutex_unlock(&global_tunables_lock);
