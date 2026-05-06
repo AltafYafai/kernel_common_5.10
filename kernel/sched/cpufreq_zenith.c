@@ -57,6 +57,7 @@
 #include <linux/input.h>
 #include <linux/jump_label.h>
 #include <linux/atomic.h>
+#include <linux/bits.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/notifier.h>
@@ -1738,18 +1739,18 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_REASON_GAME			11
 #define ZENITH_AT_REASON_THERMAL_SLOPE		12
 
-#define ZENITH_AT_FLAG_AUDIO			(1U << 0)
-#define ZENITH_AT_FLAG_CAMERA			(1U << 1)
-#define ZENITH_AT_FLAG_RENDER			(1U << 2)
-#define ZENITH_AT_FLAG_MEMSTALL			(1U << 3)
-#define ZENITH_AT_FLAG_THERMAL			(1U << 4)
-#define ZENITH_AT_FLAG_SCREEN_OFF		(1U << 5)
-#define ZENITH_AT_FLAG_PSI_CPU			(1U << 6)
-#define ZENITH_AT_FLAG_PSI_IO			(1U << 7)
-#define ZENITH_AT_FLAG_FRAME			(1U << 8)
-#define ZENITH_AT_FLAG_GAME			(1U << 9)
-#define ZENITH_AT_FLAG_THERMAL_SLOPE		(1U << 10)
-#define ZENITH_AT_FLAG_LOCAL_ACTIONS		(1U << 11)
+#define ZENITH_AT_FLAG_AUDIO			BIT(0)
+#define ZENITH_AT_FLAG_CAMERA			BIT(1)
+#define ZENITH_AT_FLAG_RENDER			BIT(2)
+#define ZENITH_AT_FLAG_MEMSTALL			BIT(3)
+#define ZENITH_AT_FLAG_THERMAL			BIT(4)
+#define ZENITH_AT_FLAG_SCREEN_OFF		BIT(5)
+#define ZENITH_AT_FLAG_PSI_CPU			BIT(6)
+#define ZENITH_AT_FLAG_PSI_IO			BIT(7)
+#define ZENITH_AT_FLAG_FRAME			BIT(8)
+#define ZENITH_AT_FLAG_GAME			BIT(9)
+#define ZENITH_AT_FLAG_THERMAL_SLOPE		BIT(10)
+#define ZENITH_AT_FLAG_LOCAL_ACTIONS		BIT(11)
 /* Set by the V1 classifier worker when prefer_silver_aware is on AND
  * the prefer_silver hit-rate over the last classifier window crossed
  * the prefer_silver_hot_threshold_pct cutoff.  Read-only signal; the
@@ -1758,7 +1759,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * machine because prefer_silver redistribution is workload-dependent
  * and would race with the existing thermal / PSI / frame triggers).
  */
-#define ZENITH_AT_FLAG_PREFER_SILVER_HOT	(1U << 12)
+#define ZENITH_AT_FLAG_PREFER_SILVER_HOT	BIT(12)
 /* Audit fix F2: PELT-derived util-rising trend signal.
  *
  * Set by the V1 auto-tune worker when the policy-wide util average
@@ -1774,18 +1775,18 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * leave the LSB nibble for stable scenario flags (camera/audio/
  * render/etc.) and the next nibble for environmental signals.
  */
-#define ZENITH_AT_FLAG_UTIL_RISING		(1U << 13)
+#define ZENITH_AT_FLAG_UTIL_RISING		BIT(13)
 
-#define ZENITH_AT_OVERRIDE_UP_RATE		(1UL << 0)
-#define ZENITH_AT_OVERRIDE_DOWN_RATE		(1UL << 1)
-#define ZENITH_AT_OVERRIDE_UP_THRESHOLD		(1UL << 2)
-#define ZENITH_AT_OVERRIDE_DOWN_THRESHOLD	(1UL << 3)
-#define ZENITH_AT_OVERRIDE_INPUT_BOOST_MS	(1UL << 4)
-#define ZENITH_AT_OVERRIDE_INPUT_BOOST_CAP	(1UL << 5)
-#define ZENITH_AT_OVERRIDE_DOWN_ADAPTIVE	(1UL << 6)
-#define ZENITH_AT_OVERRIDE_DOWN_THRESH_ADAPTIVE	(1UL << 7)
-#define ZENITH_AT_OVERRIDE_FRAME_PACE		(1UL << 8)
-#define ZENITH_AT_OVERRIDE_GAME_MODE		(1UL << 9)
+#define ZENITH_AT_OVERRIDE_UP_RATE		BIT(0)
+#define ZENITH_AT_OVERRIDE_DOWN_RATE		BIT(1)
+#define ZENITH_AT_OVERRIDE_UP_THRESHOLD		BIT(2)
+#define ZENITH_AT_OVERRIDE_DOWN_THRESHOLD	BIT(3)
+#define ZENITH_AT_OVERRIDE_INPUT_BOOST_MS	BIT(4)
+#define ZENITH_AT_OVERRIDE_INPUT_BOOST_CAP	BIT(5)
+#define ZENITH_AT_OVERRIDE_DOWN_ADAPTIVE	BIT(6)
+#define ZENITH_AT_OVERRIDE_DOWN_THRESH_ADAPTIVE	BIT(7)
+#define ZENITH_AT_OVERRIDE_FRAME_PACE		BIT(8)
+#define ZENITH_AT_OVERRIDE_GAME_MODE		BIT(9)
 
 /* Patch L: V2-classifier "tier" override bits.
  *
@@ -3843,6 +3844,7 @@ struct zenith_policy {
 
 	struct irq_work		irq_work;
 	struct kthread_work	work;
+	/* Serialises the slow-path kthread_work against teardown */
 	struct mutex		work_lock;
 	struct kthread_worker	worker;
 	struct task_struct	*thread;
@@ -4509,7 +4511,8 @@ static bool zenith_iowait_reset(struct zenith_cpu *z_cpu, u64 time, bool set_iow
 	return true;
 }
 
-static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time, unsigned int flags, unsigned int io_is_busy)
+static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time,
+				unsigned int flags, unsigned int io_is_busy)
 {
 	bool set_iowait_boost = (flags & SCHED_CPUFREQ_IOWAIT) && io_is_busy;
 
@@ -4552,7 +4555,8 @@ static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time, unsigned int
 	z_cpu->iowait_boost_first_ns = time;
 }
 
-static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, unsigned long util, unsigned long max_cap)
+static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time,
+					 unsigned long util, unsigned long max_cap)
 {
 	unsigned long boost;
 	unsigned int floor = zenith_iowait_floor(z_cpu);
@@ -4598,7 +4602,8 @@ static unsigned long zenith_iowait_apply(struct zenith_cpu *z_cpu, u64 time, uns
 	return boost;
 }
 
-static inline void zenith_ignore_dl_rate_limit(struct zenith_cpu *z_cpu, struct zenith_policy *z_policy)
+static inline void zenith_ignore_dl_rate_limit(struct zenith_cpu *z_cpu,
+					       struct zenith_policy *z_policy)
 {
 	if (cpu_bw_dl(cpu_rq(z_cpu->cpu)) > z_cpu->bw_dl)
 		WRITE_ONCE(z_policy->limits_changed, true);
@@ -5087,7 +5092,8 @@ static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned 
  */
 #define ZENITH_SPIKE_SHIFT	3	/* 1 << 3 = divide by 8 = 12.5% */
 
-static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time, unsigned int next_freq)
+static bool zenith_up_down_rate_limit(struct zenith_policy *z_policy, u64 time,
+				      unsigned int next_freq)
 {
 	s64 delta_ns = time - z_policy->last_freq_update_time;
 	struct zenith_tunables *tunables = z_policy->tunables;
@@ -6346,7 +6352,8 @@ static unsigned int zenith_tier_value(struct zenith_policy *z_policy,
 				      unsigned long override_bit,
 				      unsigned long tier_bit);
 
-static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigned long util, unsigned long max_cap)
+static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
+					 unsigned long util, unsigned long max_cap)
 {
 	struct cpufreq_policy *policy = z_policy->policy;
 	unsigned int freq, target_freq;
@@ -8494,7 +8501,8 @@ static void zenith_execute_switch(struct zenith_policy *z_policy, u64 time, unsi
 {
 	if (z_policy->need_freq_update) {
 		z_policy->need_freq_update = false;
-		if (z_policy->next_freq == next_freq && !cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
+		if (z_policy->next_freq == next_freq &&
+		    !cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
 			return;
 	} else if (z_policy->next_freq == next_freq) {
 		return;
@@ -8614,7 +8622,6 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 	zenith_ignore_dl_rate_limit(z_cpu, z_policy);
 
 	if (zenith_should_update_freq(z_policy, time)) {
-
 		unsigned int nice_pct_max = 0;
 
 		for_each_cpu(j, z_policy->policy->cpus) {
@@ -10967,17 +10974,17 @@ static int __init zenith_setup_profile(char *s)
 {
 	if (!s)
 		return 1;
-	if (!strcmp(s, "performance"))
+	if (!strcmp(s, "performance")) {
 		zenith_cmdline_profile = ZENITH_PROFILE_PERFORMANCE;
-	else if (!strcmp(s, "balanced"))
+	} else if (!strcmp(s, "balanced")) {
 		zenith_cmdline_profile = ZENITH_PROFILE_BALANCED;
-	else if (!strcmp(s, "battery"))
+	} else if (!strcmp(s, "battery")) {
 		zenith_cmdline_profile = ZENITH_PROFILE_BATTERY;
-	else if (!strcmp(s, "legacy"))
+	} else if (!strcmp(s, "legacy")) {
 		zenith_cmdline_profile = ZENITH_PROFILE_LEGACY;
-	else if (!strcmp(s, "custom"))
+	} else if (!strcmp(s, "custom")) {
 		zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
-	else {
+	} else {
 		/* Unknown preset.  Reset explicitly to CUSTOM so a
 		 * subsequent zenith.profile= on the cmdline (or a
 		 * future caller chaining into this routine) cannot
@@ -14823,7 +14830,8 @@ static ssize_t down_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->down_rate_limit_us);
 }
 
-static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
+static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	struct zenith_policy *z_pol;
@@ -16076,7 +16084,8 @@ static int zenith_kthread_create(struct zenith_policy *z_policy)
 
 	kthread_init_work(&z_policy->work, zenith_work);
 	kthread_init_worker(&z_policy->worker);
-	thread = kthread_create(kthread_worker_fn, &z_policy->worker, "zenith:%d", cpumask_first(z_policy->policy->related_cpus));
+	thread = kthread_create(kthread_worker_fn, &z_policy->worker, "zenith:%d",
+				cpumask_first(z_policy->policy->related_cpus));
 	if (IS_ERR(thread))
 		return PTR_ERR(thread);
 
