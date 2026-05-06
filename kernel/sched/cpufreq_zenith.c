@@ -6104,12 +6104,48 @@ zenith_store_comm_table(struct zenith_comm_table __rcu **slot,
  * zenith_render_table at zenith_gov_init() time and as the reset
  * target when the render_comms sysfs node is written empty; live
  * matching always reads the RCU table.
+ *
+ * Coverage rationale (B-AUTO-1 expansion -- entries are vendor-
+ * comprehensive so the zenith auto-profile selector cannot miss a
+ * render-thread context, and so manual render_aware mode catches
+ * non-AOSP graphics stacks too):
+ *   - RenderThread         AOSP libui per-app render thread ("RenderThread N")
+ *   - surfaceflinger       SurfaceFlinger main thread
+ *   - RenderEngine         SurfaceFlinger render engine worker
+ *   - mali-cmar-back       ARM Mali Bifrost / Valhall command-stream backend
+ *   - GLThread             SurfaceView Java GL thread ("GLThread N"; cocos2d, libgdx, ...)
+ *   - kgsl_worker_th       Qualcomm Adreno KGSL worker (truncated from kgsl_worker_thread)
+ *   - kgsl-3d0             Qualcomm Adreno KGSL device thread
+ *   - kbase_event          ARM Mali Bifrost / Valhall event-completion thread
+ *   - composer-servic      HWC2 composer HAL service (truncated from composer-service)
+ *   - vsync_thread         generic vsync producer thread
+ *   - Choreographer        Android frame Choreographer thread
+ *   - UnrealRenderTh       Unreal Engine render thread (truncated)
+ *   - Cocos2d-Render       Cocos2d-x render thread (truncated)
+ *   - CompositorThr        Chromium / WebView compositor thread (truncated)
+ *
+ * All entries are <= 15 chars to fit within task->comm[16] (the
+ * trailing NUL leaves 15 usable bytes); strncmp() compares only
+ * strlen(needle) bytes, so adding extra entries costs at most one
+ * cache-miss-bounded strncmp loop iteration per CPU.  The hot path
+ * is gated by ZENITH_RENDER_CACHE_TTL_NS so even a 14-entry walk
+ * runs at most a few times per second per policy.
  */
 static const char * const zenith_render_comms[] = {
 	"RenderThread",
 	"surfaceflinger",
 	"RenderEngine",
 	"mali-cmar-back",
+	"GLThread",
+	"kgsl_worker_th",
+	"kgsl-3d0",
+	"kbase_event",
+	"composer-servic",
+	"vsync_thread",
+	"Choreographer",
+	"UnrealRenderTh",
+	"Cocos2d-Render",
+	"CompositorThr",
 };
 
 /* Walk the policy's online cpumask and check each cpu_curr's comm
@@ -6180,6 +6216,16 @@ static bool zenith_policy_has_render(struct zenith_policy *z_policy)
  *   - vendor.oplus.au  OPlus / OnePlus / Realme audio HAL family
  *   - audio.hw.servic  Samsung audio.hw service (truncated)
  *
+ * B-AUTO-1 expansion (additions, all <= 15 chars to fit comm[16]):
+ *   - fast_mixer       AudioFlinger FastMixer thread (low-latency path)
+ *   - TrackBase        AudioFlinger TrackBase worker family
+ *   - AudioTrack       libaudioclient JNI AudioTrack thread
+ *   - AudioRecord      libaudioclient JNI AudioRecord thread
+ *   - audioPolicySrv   AudioPolicyService main thread
+ *   - audio.cb.thread  vendor audio callback thread (qcom / mtk family)
+ *   - audio_track_thr  vendor track-driver thread (truncated)
+ *   - vendor.mtk.audi  MediaTek vendor audio HAL (truncated)
+ *
  * Order is tuned for cache-friendliness on phone workloads (the most
  * common per-frame matches first).  Default-list extensions are
  * runtime-augmentable via the audio_comms RW sysfs (CSV format).
@@ -6198,6 +6244,14 @@ static const char * const zenith_audio_comms[] = {
 	"vendor.google.a",
 	"vendor.oplus.au",
 	"audio.hw.servic",
+	"fast_mixer",
+	"TrackBase",
+	"AudioTrack",
+	"AudioRecord",
+	"audioPolicySrv",
+	"audio.cb.thread",
+	"audio_track_thr",
+	"vendor.mtk.audi",
 };
 
 /* Walk the policy's online cpumask and check each cpu_curr's comm
@@ -6299,6 +6353,12 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
  *   - vendor.oplus.cam   OPlus / OnePlus / Realme camera HAL family
  *   - vendor.samsung.ca  Samsung Camera HAL (truncated to 16 chars)
  *
+ * B-AUTO-1 expansion (additions, all <= 15 chars):
+ *   - vendor.mtk.came  MediaTek camera HAL service (truncated)
+ *   - vendor.google.c  Pixel / Tensor vendor.google.camera (truncated)
+ *   - vendor.qti.imag  Qualcomm image processor service (truncated)
+ *   - C2DColorConver   Qualcomm camera color-space conversion thread
+ *
  * Order is tuned for cache-friendliness: most common matches first.
  * Default-list extensions are runtime-augmentable via the
  * camera_comms RW sysfs (CSV format).
@@ -6318,6 +6378,10 @@ static const char * const zenith_camera_comms[] = {
 	"vendor.qti.hardwa",
 	"vendor.oplus.cam",
 	"vendor.samsung.ca",
+	"vendor.mtk.came",
+	"vendor.google.c",
+	"vendor.qti.imag",
+	"C2DColorConver",
 };
 
 /* Walk the policy's online cpumask and check each cpu_curr's comm
@@ -6402,12 +6466,31 @@ static bool zenith_policy_has_camera(struct zenith_policy *z_policy)
  *                        cores only when an actual Unreal title is
  *                        running.  Userspace can drop it via the
  *                        game_auto_comms knob if it conflicts.
+ *
+ * B-AUTO-1 expansion (additions, all <= 15 chars, vendor-comprehensive
+ * so the auto-profile selector cannot miss a game-engine context):
+ *
+ *   - TaskGraphThr       Unreal Engine task-graph worker (truncated;
+ *                        UE4/UE5 spawn TaskGraphThread N for parallel
+ *                        engine tasks)
+ *   - RHIThread          Unreal Engine Render Hardware Interface thread
+ *                        (UE4/UE5; bridges renderer to GPU API backends)
+ *   - Cocos2dxRender     Cocos2d-x render thread (truncated; engine name
+ *                        used by many phone games shipped via cocos2d-x)
+ *   - Job.Worker         Unity Burst job system worker thread
+ *                        (DOTS / ECS / parallel-for jobs)
+ *   - EnlightenWork      Unity Enlighten realtime-GI worker
  */
 static const char * const zenith_game_auto_comms[] = {
 	"UnityMain",
 	"UnityGfxDeviceW",
 	"il2cpp",
 	"GameThread",
+	"TaskGraphThr",
+	"RHIThread",
+	"Cocos2dxRender",
+	"Job.Worker",
+	"EnlightenWork",
 };
 
 /* Hot-path comm walk used by the in-kernel game detector.  TTL'd
