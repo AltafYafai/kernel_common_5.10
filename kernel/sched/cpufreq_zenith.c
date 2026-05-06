@@ -6465,10 +6465,28 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 		 * the just-restored state survives the reset and the
 		 * cooldown timer continues to gate further moves).
 		 *
-		 * Cheap: 4 atomic_sets and 1 unsigned-int store, only on
-		 * a transition (not every tick).  No effect on the
-		 * 1 -> 0 (suspend) edge -- those samples are still
-		 * useful for the screen-off glide path.
+		 * Audit fix M7b extends the same reset edge to clear
+		 * the per-policy streak / hysteresis state that would
+		 * otherwise carry stale pre-suspend continuity into the
+		 * first post-resume sample window: peak_starve_count
+		 * (entry hysteresis for peak-headroom rescue),
+		 * hispeed_entry_count and hispeed_active (entry / sticky
+		 * state for the hispeed tier), brutal_entry_count and
+		 * brutal_active (the up_threshold streak hysteresis).
+		 * The deadline atomics in this family
+		 * (input_boost_until_ns, peer_ramp_until_ns_*,
+		 * frame_overrun_until_ns, peak_rescue_until_ns) already
+		 * self-disarm: their absolute ktime_get_ns() deadlines
+		 * are in the past after any non-trivial suspend, so a
+		 * subsequent atomic64_read() naturally evaluates the
+		 * boost as expired without an explicit clear.
+		 *
+		 * Cheap: 4 atomic_sets and 1 unsigned-int store on the
+		 * V1/V2 path, plus 5 plain stores for the streak/
+		 * hysteresis state, only on a transition (not every
+		 * tick).  No effect on the 1 -> 0 (suspend) edge --
+		 * those samples are still useful for the screen-off
+		 * glide path.
 		 */
 		if (!z_policy->screen_state_last && cur_screen) {
 			atomic_set(&z_policy->at_samples_total, 0);
@@ -6476,6 +6494,11 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 			z_policy->at_last_events =
 				atomic64_read(&zenith_auto_input_events);
 			z_policy->at_pending_windows = 0;
+			z_policy->peak_starve_count = 0;
+			z_policy->hispeed_entry_count = 0;
+			z_policy->brutal_entry_count = 0;
+			z_policy->hispeed_active = false;
+			z_policy->brutal_active = false;
 		}
 		z_policy->screen_state_last = cur_screen;
 	}
