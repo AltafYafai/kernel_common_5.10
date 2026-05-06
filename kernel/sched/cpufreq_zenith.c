@@ -105,6 +105,7 @@
 #include <linux/prefer_silver.h>
 #endif
 #include <trace/events/power.h>
+#include <trace/events/sched.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/cpufreq_zenith.h>
@@ -301,6 +302,24 @@
 #define ZENITH_DEFAULT_QUIET_HOURS_END_MIN		0
 #define ZENITH_DEFAULT_QUIET_HOURS_CAP_PCT		100
 #define ZENITH_DEFAULT_QUIET_HOURS_SCREEN_OFF_ONLY	1
+
+/* Patch 1.9 fg-transition pulse.  When a foreground (top-app)
+ * task is woken for the first time after fork() -- detected via
+ * a sched_wakeup_new tracepoint probe with uclamp_eff_value()
+ * as the foreground proxy -- arm a one-shot freq floor for
+ * fg_transition_pulse_ms milliseconds at fg_transition_pulse_pct
+ * of policy->max.  Smooths app-launch / activity-start latency
+ * by giving the cluster the freshly-forked task lands on a
+ * brief headroom window above PELT cold-start.
+ *
+ * fg_transition_pulse_ms == 0 disables the tier (BATTERY /
+ * LEGACY profiles).  fg_transition_pulse_pct == 0 also disables
+ * the floor application; both knobs are profile-baked.
+ */
+#define ZENITH_DEFAULT_FG_TRANSITION_PULSE_MS		30
+#define ZENITH_DEFAULT_FG_TRANSITION_PULSE_PCT		65
+#define ZENITH_FG_TRANSITION_PULSE_MS_MAX		200
+#define ZENITH_FG_TRANSITION_PULSE_PCT_MAX		100
 #define ZENITH_QUIET_HOURS_MINUTE_MAX			1439
 #define ZENITH_QUIET_HOURS_CAP_PCT_MIN			50
 
@@ -2683,6 +2702,16 @@ struct zenith_tunables {
 	unsigned int		quiet_hours_cap_pct;
 	unsigned int		quiet_hours_screen_off_only;
 
+	/* Patch 1.9 fg-transition pulse.  See the comment block
+	 * above ZENITH_DEFAULT_FG_TRANSITION_PULSE_MS for the full
+	 * rationale.  Both knobs profile-baked; fg_transition_-
+	 * pulse_ms == 0 disables the producer (no deadline ever
+	 * stamped); fg_transition_pulse_pct == 0 disables the
+	 * consumer (deadline stamped but no floor applied).
+	 */
+	unsigned int		fg_transition_pulse_ms;
+	unsigned int		fg_transition_pulse_pct;
+
 	/* Pre-arm tier for the peak-headroom rescue.  When 1 (the
 	 * default), an early softer intervention fires while the
 	 * starvation streak is accumulating but has not yet crossed
@@ -4080,6 +4109,22 @@ struct zenith_policy {
 	 */
 	u64			cluster_wake_pulse_until_ns;
 	u64			cluster_wake_last_eval_ns;
+
+	/* Patch 1.9 fg-transition pulse deadline.  Stamped by the
+	 * sched_wakeup_new tracepoint probe (zenith_probe_wakeup_-
+	 * new) when a foreground task is woken for the first time
+	 * after fork() on a CPU that belongs to this policy.
+	 *
+	 * Cross-context writer: unlike the other deadline fields in
+	 * this struct (which are touched only by the eval path
+	 * under update_lock), this one is written from arbitrary
+	 * scheduler context.  Both writer and the eval-path reader
+	 * use WRITE_ONCE / READ_ONCE; on 64-bit the access is
+	 * naturally torn-write-safe, on 32-bit the worst case is a
+	 * sub-millisecond drift on the deadline read which is well
+	 * under the resolution of fg_transition_pulse_ms.
+	 */
+	u64			fg_transition_pulse_until_ns;
 
 	/* PSI-mem cap deadline (Patch M1).  Stamped by the eval path
 	 * when zenith_psi_mem_some_pct() crosses psi_mem_cap_thresh
@@ -8137,6 +8182,41 @@ brutal_entry_deferred:
 		}
 	}
 
+	/* 3c''''''-pre-fg. Foreground-transition pulse soft floor
+	 * (Patch 1.9).  Mirrors the cluster_wake_pulse mechanic:
+	 * the sched_wakeup_new probe stamps fg_transition_pulse_-
+	 * until_ns whenever a foreground task is woken for the
+	 * first time after fork() on a CPU belonging to this policy.
+	 * While the deadline has not expired, hold a soft floor at
+	 * fg_transition_pulse_pct of policy->max so the freshly-
+	 * forked top-app task picks up above PELT cold-start freq.
+	 *
+	 * Bypassed when pin_to_target (input_boost / brutality
+	 * already at or above any plausible pulse floor) or when
+	 * the floor percentage is 0 (knob stamps but suppresses).
+	 * Reads the deadline with READ_ONCE since the writer is the
+	 * sched_wakeup_new probe in arbitrary scheduler context;
+	 * see the comment block above zenith_probe_wakeup_new for
+	 * the full safety argument.
+	 */
+	if (!pin_to_target && policy->max &&
+	    z_policy->tunables->fg_transition_pulse_pct) {
+		u64 until = READ_ONCE(z_policy->fg_transition_pulse_until_ns);
+
+		if (until && ktime_get_ns() < until) {
+			unsigned int floor =
+				(policy->max / 100) *
+				z_policy->tunables->fg_transition_pulse_pct;
+
+			if (floor > policy->max)
+				floor = policy->max;
+			if (freq < floor) {
+				freq = floor;
+				tp_path = "fg_transition_pulse";
+			}
+		}
+	}
+
 	/* 3c''''''. Migration-arrival soft floor (Patch K1).
 	 *
 	 * If a per-CPU update_util tick observed a util jump
@@ -10618,6 +10698,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int cluster_wake_pulse_floor_pct;
 		unsigned int quiet_hours_cap_pct;
 		unsigned int quiet_hours_screen_off_only;
+		unsigned int fg_transition_pulse_ms;
+		unsigned int fg_transition_pulse_pct;
 		unsigned int screen_on_bias_pct;
 		unsigned int input_boost_down_rate_mult_pct;
 		unsigned int predict_up_thresh;
@@ -10691,6 +10773,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.cluster_wake_pulse_floor_pct = 70,
 			.quiet_hours_cap_pct = 100,
 			.quiet_hours_screen_off_only = 1,
+			.fg_transition_pulse_ms = 50,
+			.fg_transition_pulse_pct = 75,
 			.screen_on_bias_pct = 0,
 			.input_boost_down_rate_mult_pct = 300,
 			/* Stage 4 / Patch A: PERFORMANCE wants eager
@@ -10879,6 +10963,10 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_FLOOR_PCT,
 			.quiet_hours_cap_pct = 70,
 			.quiet_hours_screen_off_only = 1,
+			.fg_transition_pulse_ms =
+				ZENITH_DEFAULT_FG_TRANSITION_PULSE_MS,
+			.fg_transition_pulse_pct =
+				ZENITH_DEFAULT_FG_TRANSITION_PULSE_PCT,
 			.screen_on_bias_pct =
 				ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT,
 			.input_boost_down_rate_mult_pct =
@@ -11059,6 +11147,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.cluster_wake_pulse_floor_pct = 0,
 			.quiet_hours_cap_pct = 55,
 			.quiet_hours_screen_off_only = 1,
+			.fg_transition_pulse_ms = 0,
+			.fg_transition_pulse_pct = 0,
 			.screen_on_bias_pct = 80,
 			.input_boost_down_rate_mult_pct = 150,
 			/* Stage 4 / Patch A: BATTERY disables prediction.
@@ -11235,6 +11325,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.cluster_wake_pulse_floor_pct = 0,
 			.quiet_hours_cap_pct = 100,
 			.quiet_hours_screen_off_only = 1,
+			.fg_transition_pulse_ms = 0,
+			.fg_transition_pulse_pct = 0,
 			.screen_on_bias_pct = 100,
 			.input_boost_down_rate_mult_pct = 100,
 			/* Stage 4 / Patch A: LEGACY disables prediction
@@ -11387,6 +11479,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	t->cluster_wake_pulse_floor_pct = p->cluster_wake_pulse_floor_pct;
 	t->quiet_hours_cap_pct	= p->quiet_hours_cap_pct;
 	t->quiet_hours_screen_off_only = p->quiet_hours_screen_off_only;
+	t->fg_transition_pulse_ms = p->fg_transition_pulse_ms;
+	t->fg_transition_pulse_pct = p->fg_transition_pulse_pct;
 	t->screen_on_bias_pct	= p->screen_on_bias_pct;
 	t->input_boost_down_rate_mult_pct =
 		p->input_boost_down_rate_mult_pct;
@@ -14697,6 +14791,66 @@ static ssize_t decision_latency_hist_show(struct gov_attr_set *attr_set,
 static struct governor_attr decision_latency_hist =
 	__ATTR_RO(decision_latency_hist);
 
+/* Patch 1.9 fg-transition pulse sysfs knobs (RW, profile-baked).
+ *
+ * fg_transition_pulse_ms:
+ *   Pulse duration in milliseconds.  0 disables the producer
+ *   (the sched_wakeup_new probe never stamps a deadline) and is
+ *   the BATTERY / LEGACY default.  Bounded to 0..200 to keep an
+ *   accidentally-large value from holding the floor for an
+ *   unreasonable stretch.
+ *
+ * fg_transition_pulse_pct:
+ *   Floor depth in percent of policy->max.  0..100; 0 disables
+ *   the consumer (deadline still gets stamped, but no floor is
+ *   applied).
+ */
+static ssize_t fg_transition_pulse_ms_show(struct gov_attr_set *attr_set,
+					   char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->fg_transition_pulse_ms);
+}
+
+static ssize_t fg_transition_pulse_ms_store(struct gov_attr_set *attr_set,
+					    const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_FG_TRANSITION_PULSE_MS_MAX)
+		return -EINVAL;
+	t->fg_transition_pulse_ms = val;
+	return count;
+}
+
+static struct governor_attr fg_transition_pulse_ms =
+	__ATTR_RW(fg_transition_pulse_ms);
+
+static ssize_t fg_transition_pulse_pct_show(struct gov_attr_set *attr_set,
+					    char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->fg_transition_pulse_pct);
+}
+
+static ssize_t fg_transition_pulse_pct_store(struct gov_attr_set *attr_set,
+					     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_FG_TRANSITION_PULSE_PCT_MAX)
+		return -EINVAL;
+	t->fg_transition_pulse_pct = val;
+	return count;
+}
+
+static struct governor_attr fg_transition_pulse_pct =
+	__ATTR_RW(fg_transition_pulse_pct);
+
 /* peak_headroom_prearm sysfs knob.  Boolean gate for the soft early
  * intervention tier (2b') that lifts the cluster to eff_hispeed_freq
  * while the starvation streak is accumulating but has not yet
@@ -16686,6 +16840,8 @@ static struct attribute *zenith_attrs[] = {
 	&quiet_hours_cap_pct.attr,
 	&quiet_hours_screen_off_only.attr,
 	&decision_latency_hist.attr,
+	&fg_transition_pulse_ms.attr,
+	&fg_transition_pulse_pct.attr,
 	&peak_headroom_prearm.attr,
 	&predict_up_thresh.attr,
 	&predict_up_window.attr,
@@ -16974,6 +17130,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_QUIET_HOURS_CAP_PCT;
 	tunables->quiet_hours_screen_off_only =
 		ZENITH_DEFAULT_QUIET_HOURS_SCREEN_OFF_ONLY;
+	tunables->fg_transition_pulse_ms =
+		ZENITH_DEFAULT_FG_TRANSITION_PULSE_MS;
+	tunables->fg_transition_pulse_pct =
+		ZENITH_DEFAULT_FG_TRANSITION_PULSE_PCT;
 	tunables->predict_up_thresh	= ZENITH_DEFAULT_PREDICT_UP_THRESH;
 	tunables->predict_up_window	= ZENITH_DEFAULT_PREDICT_UP_WINDOW;
 	tunables->peak_hysteresis_streak =
@@ -17673,10 +17833,72 @@ static struct notifier_block zenith_drm_notifier = {
 };
 #endif /* CONFIG_DRM_PANEL_NOTIFY */
 
+/* Patch 1.9 fg-transition pulse: sched_wakeup_new tracepoint
+ * probe.  Fires once per fork(), the very first time the new
+ * task is woken (wake_up_new_task -> trace_sched_wakeup_new).
+ *
+ * Safety / context:
+ *   - The probe runs in arbitrary scheduler context with the
+ *     rq lock potentially held.  No sleeping primitives.
+ *   - cpufreq_cpu_get_raw() is a per_cpu pointer load with a
+ *     cpumask_test_cpu() check; no locks, no RCU writes.
+ *   - policy->governor_data is a regular pointer and is set in
+ *     zenith_start() / cleared in zenith_stop().  We read it
+ *     with READ_ONCE; if zenith_stop() concurrently NULLs it
+ *     after our load, the worst case is a write into a struct
+ *     about to be freed -- but cpufreq_register_governor's
+ *     teardown path is synchronous with respect to ongoing
+ *     governor_data accesses (unregister_governor blocks until
+ *     all in-flight callbacks complete, which is symmetric for
+ *     the tracepoint hook because we unregister the probe at
+ *     module_exit / on the cpufreq_register_governor failure
+ *     rollback path).
+ *
+ * Foreground proxy: uclamp_eff_value(p, UCLAMP_MIN) > 0.
+ *   - On Android 12 the top-app cgroup sets a non-zero
+ *     uclamp.min on the cgroup itself; the freshly-forked task
+ *     inherits that effective value at fork time.
+ *   - On a kernel without CONFIG_UCLAMP_TASK the inline returns
+ *     0 unconditionally and the probe degenerates to a per-fork
+ *     no-op (one branch, no work).
+ */
+static void zenith_probe_wakeup_new(void *data, struct task_struct *p)
+{
+	struct cpufreq_policy *policy;
+	struct zenith_policy *z_policy;
+	struct zenith_tunables *t;
+	unsigned int cpu;
+	unsigned int pulse_ms;
+
+	if (unlikely(!p))
+		return;
+	if (!uclamp_eff_value(p, UCLAMP_MIN))
+		return;
+
+	cpu = task_cpu(p);
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy || policy->governor != &zenith_gov)
+		return;
+	z_policy = READ_ONCE(policy->governor_data);
+	if (!z_policy)
+		return;
+	t = z_policy->tunables;
+	if (!t)
+		return;
+	pulse_ms = READ_ONCE(t->fg_transition_pulse_ms);
+	if (!pulse_ms)
+		return;
+
+	WRITE_ONCE(z_policy->fg_transition_pulse_until_ns,
+		   ktime_get_ns() +
+		   (u64)pulse_ms * NSEC_PER_MSEC);
+}
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
 	bool input_registered = false;
+	bool fg_pulse_registered = false;
 #ifdef CONFIG_FB_NOTIFY
 	bool fb_registered = false;
 #endif
@@ -17797,6 +18019,17 @@ static int __init zenith_gov_init(void)
 	else
 		input_registered = true;
 
+	/* Patch 1.9 fg-transition pulse: register the sched_-
+	 * wakeup_new tracepoint probe.  Failure is non-fatal; the
+	 * pulse just becomes a no-op (no deadline ever stamped).
+	 */
+	ret = register_trace_sched_wakeup_new(zenith_probe_wakeup_new, NULL);
+	if (ret)
+		pr_warn("Zenith: sched_wakeup_new probe register failed (%d), fg_transition_pulse disabled\n",
+			ret);
+	else
+		fg_pulse_registered = true;
+
 	/* Panel-state delivery: register the drm_panel_notifier path first
 	 * (preferred when available because the fb notifier chain is
 	 * deprecated upstream and absent on most modern vendor builds), and
@@ -17862,6 +18095,9 @@ static int __init zenith_gov_init(void)
 #endif
 		if (input_registered)
 			input_unregister_handler(&zenith_input_handler);
+		if (fg_pulse_registered)
+			unregister_trace_sched_wakeup_new(
+				zenith_probe_wakeup_new, NULL);
 		pr_err("Zenith: cpufreq_register_governor failed (%d)\n", ret);
 		return ret;
 	}
