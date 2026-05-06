@@ -2416,6 +2416,14 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_AUDIO_HYST_MS		250
 #define ZENITH_AUDIO_HYST_MS_MAX		2000
 
+/* Patch B7-2: decision-ring depth.  Per-policy circular buffer of
+ * the last ZENITH_DEC_RING_NR (path, lat_ns) entries.  Power-of-two
+ * so head advance is a single AND.  Storage budget: 32 entries *
+ * sizeof(struct zenith_dec_ring_entry) per policy (~512 B).
+ */
+#define ZENITH_DEC_RING_NR			32
+#define ZENITH_DEC_RING_MASK			(ZENITH_DEC_RING_NR - 1)
+
 /* camera_aware (default 0, off) + camera_active (default 0, auto)
  * + camera_floor_pct (default 0):
  *
@@ -4231,6 +4239,23 @@ struct zenith_policy {
 	 * coherency with the eval-side WRITE_ONCE.
 	 */
 	const char		*last_decision_path;
+
+	/* Patch B7-2: decision-ring buffer.  Per-policy circular log
+	 * of the last ZENITH_DEC_RING_NR (path, lat_ns) entries,
+	 * paired so the sysfs reader can correlate which tier won
+	 * with how long the eval took.  Updated in lockstep with
+	 * dec_lat_buckets and last_decision_path at the end of every
+	 * eval; head advances under the policy update_lock so the
+	 * read side only needs READ_ONCE on path.  lat_ns is a 32-bit
+	 * value (eval cost is bounded by tens of microseconds; truncating
+	 * the high bits at u32_max ~= 4 s loses only pathological
+	 * outliers, and they get clamped, not wrapped).
+	 */
+	struct zenith_dec_ring_entry {
+		const char	*path;
+		u32		lat_ns;
+	} dec_ring[ZENITH_DEC_RING_NR];
+	unsigned int		dec_ring_head;
 
 	/* Time-bounded cache for the per-policy uclamp_{min,max}
 	 * aggregations.  Each walk is O(n_cpus_in_policy) rq reads
@@ -8925,9 +8950,15 @@ apply_uclamp_max_cap:
 	 * costs on a 5.10 kernel; an eval that lands above 100 us is
 	 * already pathological and the >=100us bucket is intentionally
 	 * a fire-and-forget marker for those.
+	 *
+	 * Patch B7-2 piggy-backs on the same lat_ns sample to feed
+	 * the decision-ring entry below; pulled out of the inner
+	 * scope so dec_ring stamping can reuse it without re-reading
+	 * ktime_get_ns().
 	 */
 	{
 		u64 lat_ns = ktime_get_ns() - dec_eval_start_ns;
+		unsigned int head;
 
 		if (lat_ns < 10000ULL)
 			z_policy->dec_lat_buckets[0]++;
@@ -8937,6 +8968,21 @@ apply_uclamp_max_cap:
 			z_policy->dec_lat_buckets[2]++;
 		else
 			z_policy->dec_lat_buckets[3]++;
+
+		/* Patch B7-2: append (path, lat_ns) to the per-policy
+		 * decision ring.  Clamp lat_ns to u32_max so the field
+		 * truncation matches the storage type without wrapping.
+		 * head advances under the same update_lock that gates
+		 * this whole tail; readers use READ_ONCE on path and
+		 * accept the corresponding lat_ns torn-write window
+		 * (worst case: a brief mismatch resolved on the next
+		 * read, perfectly fine for an observability ring).
+		 */
+		head = z_policy->dec_ring_head & ZENITH_DEC_RING_MASK;
+		z_policy->dec_ring[head].lat_ns =
+			(lat_ns > U32_MAX) ? U32_MAX : (u32)lat_ns;
+		WRITE_ONCE(z_policy->dec_ring[head].path, tp_path);
+		WRITE_ONCE(z_policy->dec_ring_head, head + 1);
 	}
 	/* Patch J: stamp the per-policy last decision tag.  Pairs
 	 * with READ_ONCE in the last_decision_path sysfs handler.
@@ -9605,6 +9651,14 @@ static void zenith_policy_observability_reset(struct zenith_policy *z_policy)
 	memset(z_policy->at_log, 0, sizeof(z_policy->at_log));
 	z_policy->at_log_head = 0;
 	z_policy->at_log_count = 0;
+	/* Patch B7-2: clear the per-policy decision ring on the same
+	 * sysfs reset path that clears stats / dec_lat_buckets.  Keeps
+	 * the three observability surfaces aligned so an operator can
+	 * "echo 1 > zenith_stats_reset" and read a clean baseline from
+	 * any of them on the next eval tick.
+	 */
+	memset(z_policy->dec_ring, 0, sizeof(z_policy->dec_ring));
+	z_policy->dec_ring_head = 0;
 }
 
 static void zenith_reset_local_actions(struct zenith_policy *z_policy)
@@ -13652,6 +13706,62 @@ static ssize_t last_decision_path_show(struct gov_attr_set *attr_set,
 static struct governor_attr last_decision_path =
 	__ATTR_RO(last_decision_path);
 
+/* Patch B7-2: decision_ring sysfs node.  Read-only.  Dumps the
+ * per-policy ring of the last ZENITH_DEC_RING_NR (path, lat_us)
+ * pairs newest-first.  Format:
+ *
+ *   policy<cpu>(<cluster>):
+ *     <tag> <lat_us>
+ *     ...
+ *
+ * The ring is a power-of-two circular buffer; entries with a NULL
+ * path are uninitialised (the ring has not yet wrapped through
+ * those slots since the policy was created) and are skipped.
+ *
+ * Reader is single-shot per sysfs read; the eval path keeps
+ * advancing concurrently, so the snapshot is best-effort.
+ * READ_ONCE on the path pointer makes the read torn-write-safe;
+ * lat_ns is sampled without strict ordering relative to path
+ * which can occasionally pair a path with the lat_ns from the
+ * neighbouring slot (tolerable for an observability dump).
+ */
+static ssize_t decision_ring_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct zenith_policy *z_pol;
+	ssize_t len = 0;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
+		unsigned int head = READ_ONCE(z_pol->dec_ring_head);
+		unsigned int i;
+
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "policy%u(%s):\n",
+				 z_pol->policy->cpu,
+				 zenith_at_cluster_name(z_pol->cluster_class));
+		if (len >= PAGE_SIZE)
+			break;
+
+		for (i = 0; i < ZENITH_DEC_RING_NR; i++) {
+			unsigned int idx =
+				(head - 1 - i) & ZENITH_DEC_RING_MASK;
+			const char *p = READ_ONCE(z_pol->dec_ring[idx].path);
+			u32 lat_ns = z_pol->dec_ring[idx].lat_ns;
+
+			if (!p)
+				continue;
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+					 "  %s %u\n", p, lat_ns / 1000);
+			if (len >= PAGE_SIZE)
+				break;
+		}
+		if (len >= PAGE_SIZE)
+			break;
+	}
+	return len;
+}
+
+static struct governor_attr decision_ring = __ATTR_RO(decision_ring);
+
 ZENITH_TUNABLE_UINT_BOOL_INVAL(screen_state);
 
 /* screen_off_glide_ms sysfs knob.  Range
@@ -17236,6 +17346,7 @@ static struct attribute *zenith_attrs[] = {
 	&zenith_input_stats.attr,
 	&at_log.attr,
 	&last_decision_path.attr,
+	&decision_ring.attr,
 	&auto_tune_status.attr,
 	&auto_tune_state_residency.attr,
 	&auto_tune_state_history.attr,
