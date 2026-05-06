@@ -955,6 +955,7 @@
 #define ZENITH_PROFILE_BALANCED			2
 #define ZENITH_PROFILE_BATTERY			3
 #define ZENITH_PROFILE_LEGACY			4
+#define ZENITH_PROFILE_GAMING			5
 
 /* Profile selected via the zenith.profile= kernel cmdline. Parsed by
  * zenith_setup_profile() at early_param time and consumed on the
@@ -9622,6 +9623,8 @@ static const char *zenith_profile_name(unsigned int profile)
 		return "battery";
 	case ZENITH_PROFILE_LEGACY:
 		return "legacy";
+	case ZENITH_PROFILE_GAMING:
+		return "gaming";
 	case ZENITH_PROFILE_CUSTOM:
 	default:
 		return "custom";
@@ -9718,6 +9721,7 @@ static void zenith_at_get_guardrails(unsigned int profile,
 {
 	switch (profile) {
 	case ZENITH_PROFILE_PERFORMANCE:
+	case ZENITH_PROFILE_GAMING:
 		*g = (struct zenith_at_guardrails) {
 			.up_rate_min = 0, .up_rate_max = 250,
 			.down_rate_min = 4000, .down_rate_max = 12000,
@@ -9831,6 +9835,7 @@ static unsigned int zenith_profile_to_at_state(unsigned int profile)
 {
 	switch (profile) {
 	case ZENITH_PROFILE_PERFORMANCE:
+	case ZENITH_PROFILE_GAMING:
 		return ZENITH_AT_STATE_LATENCY;
 	case ZENITH_PROFILE_BATTERY:
 		return ZENITH_AT_STATE_EFFICIENCY;
@@ -11426,6 +11431,118 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_pct = 80,
 			.psi_mem_cap_window_ms = 1000,
 		},
+		{
+			/* Patch 4.1: GAMING profile.
+			 *
+			 * Purpose: maximum frame stability under
+			 * sustained foreground game load.  Branches
+			 * from PERFORMANCE with stronger frame-overrun
+			 * tiering, deeper cluster-wake / fg pulses,
+			 * full screen-on background util, and AC-vs-
+			 * battery hold scaling pinned at identity (the
+			 * profile is for plugged-in / docked play; the
+			 * user explicitly opted into the energy cost).
+			 *
+			 * Auto-tune state: LATENCY (mapped via
+			 * zenith_profile_to_at_state).  Guardrails:
+			 * shared with PERFORMANCE (mapped via
+			 * zenith_at_get_guardrails).
+			 */
+			.profile = ZENITH_PROFILE_GAMING,
+			.up_rate_limit_us = 0,
+			.down_rate_limit_us = 8000,
+			.up_threshold = 60,
+			.down_threshold = 45,
+			.hispeed_freq_pct = 65,
+			.hispeed_load = 50,
+			.climb_mode = ZENITH_CLIMB_MODE_SNAP,
+			.freq_step_pct = 18,
+			.powersave_bias = 0,
+			.bias_load_threshold = 50,
+			.ignore_nice_load = 0,
+			.input_boost_ms = 180,
+			.input_boost_decay_ms = 60,
+			.input_boost_cap_pct = 0,
+			.light_load_threshold = 12,
+			.sampling_down_factor = 4,
+			.thermal_auto = 1,
+			.screen_auto = 1,
+			.util_math_v2 = 1,
+			.kcpustat_hispeed_enable = 1,
+			.down_rate_adaptive = 1,
+			.wakeup_boost = 1,
+			.down_threshold_adaptive = 12,
+			.rate_limit_cluster_scale = 1,
+			/* Aggressive peak-headroom: lower starve_load_-
+			 * pct (85 vs PERF 88), shorter streak (1 vs 2),
+			 * higher floor (90 vs PERF 80), longer hold
+			 * (35 ms vs PERF 25).  A single below-floor
+			 * sample inside a sustained game load is a
+			 * frame at risk; recover before EAS sees it.
+			 */
+			.peak_headroom_rescue = 1,
+			.peak_headroom_prearm = 1,
+			.peak_headroom_starve_load_pct = 85,
+			.peak_headroom_freq_floor_pct = 90,
+			.peak_headroom_starve_streak = 1,
+			.peak_headroom_jump_pct = 100,
+			.peak_headroom_hold_ms = 35,
+			.batt_hold_scale_pct = 100,
+			.cluster_wake_pulse_ms = 100,
+			.cluster_wake_pulse_idle_ms = 50,
+			.cluster_wake_pulse_floor_pct = 80,
+			.quiet_hours_cap_pct = 100,
+			.quiet_hours_screen_off_only = 1,
+			.fg_transition_pulse_ms = 60,
+			.fg_transition_pulse_pct = 80,
+			.screen_on_bias_pct = 0,
+			.input_boost_down_rate_mult_pct = 350,
+			.predict_up_thresh = 40,
+			.predict_up_window = 4,
+			.render_floor_pct = 85,
+			.render_floor_min_runtime_ms = 15,
+			.input_boost_touchdown_extra_ms = 100,
+			.peak_hysteresis_streak = 5,
+			.peak_step_down_pct = 98,
+			.boost_idle_thresh = 0,
+			.boost_idle_streak = 0,
+			.bg_util_scale_pct = 100,
+			.sleeper_tail_thresh_us = 0,
+			.sleeper_tail_pct = 100,
+			.peer_ramp_window_ms = 50,
+			.peer_ramp_floor_pct = 75,
+			/* Keep peer_ramp warm even with screen blanked.
+			 * Game-mode often suspends rendering briefly
+			 * (loading screens / menu transitions) where
+			 * the IPC chain is still active; suppressing
+			 * peer_ramp the moment the panel reports
+			 * screen-off would defeat the profile.
+			 */
+			.peer_ramp_window_off_ms = 30,
+			.migration_jump_pct = 12,
+			.migration_floor_window_ms = 40,
+			.migration_floor_pct = 75,
+			.psi_cpu_floor_thresh = 35,
+			/* Frame-overrun tiering tightened across the
+			 * board.  Slack 2500 us = ~15%% of a 60 Hz
+			 * frame; window 60 ms; floor 95%%.  Deep tier
+			 * arms on a single consecutive overrun (vs
+			 * PERF's 2) at full 100%%.
+			 */
+			.frame_overrun_slack_us = 2500,
+			.frame_overrun_window_ms = 60,
+			.frame_overrun_floor_pct = 95,
+			.frame_overrun_deep_streak = 1,
+			.frame_overrun_deep_floor_pct = 100,
+			/* PSI-mem cap stays off (same reasoning as
+			 * PERFORMANCE).  Forward-compatible defaults
+			 * for the pct/window if a sysfs override
+			 * arms thresh.
+			 */
+			.psi_mem_cap_thresh = 0,
+			.psi_mem_cap_pct = 90,
+			.psi_mem_cap_window_ms = 1000,
+		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
 	unsigned int i;
@@ -11556,6 +11673,8 @@ static int __init zenith_setup_profile(char *s)
 		zenith_cmdline_profile = ZENITH_PROFILE_BATTERY;
 	} else if (!strcmp(s, "legacy")) {
 		zenith_cmdline_profile = ZENITH_PROFILE_LEGACY;
+	} else if (!strcmp(s, "gaming")) {
+		zenith_cmdline_profile = ZENITH_PROFILE_GAMING;
 	} else if (!strcmp(s, "custom")) {
 		zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 	} else {
@@ -11590,6 +11709,8 @@ static unsigned int __init zenith_parse_profile_name(const char *s)
 		return ZENITH_PROFILE_BATTERY;
 	if (!strcmp(s, "legacy"))
 		return ZENITH_PROFILE_LEGACY;
+	if (!strcmp(s, "gaming"))
+		return ZENITH_PROFILE_GAMING;
 	if (!strcmp(s, "custom"))
 		return ZENITH_PROFILE_CUSTOM;
 	return ZENITH_PROFILE_CUSTOM;
@@ -12771,6 +12892,7 @@ static ssize_t profile_show(struct gov_attr_set *attr_set, char *buf)
 	case ZENITH_PROFILE_BALANCED:		return sprintf(buf, "balanced\n");
 	case ZENITH_PROFILE_BATTERY:		return sprintf(buf, "battery\n");
 	case ZENITH_PROFILE_LEGACY:		return sprintf(buf, "legacy\n");
+	case ZENITH_PROFILE_GAMING:		return sprintf(buf, "gaming\n");
 	case ZENITH_PROFILE_CUSTOM:
 	default:				return sprintf(buf, "custom\n");
 	}
@@ -12792,6 +12914,8 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 		prof = ZENITH_PROFILE_BATTERY;
 	else if (sysfs_streq(buf, "legacy"))
 		prof = ZENITH_PROFILE_LEGACY;
+	else if (sysfs_streq(buf, "gaming"))
+		prof = ZENITH_PROFILE_GAMING;
 	else if (sysfs_streq(buf, "custom"))
 		prof = ZENITH_PROFILE_CUSTOM;
 	else
