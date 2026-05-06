@@ -439,6 +439,46 @@
 #define ZENITH_DEFAULT_DL_TASK_FLOOR_PCT		0
 #define ZENITH_DL_TASK_FLOOR_PCT_MAX			100
 
+/* io_floor_hyst_ms / io_floor_hyst_pct
+ * (defaults 0 / 50, [Patch C9]):
+ *
+ * Sticky-floor hysteresis sibling for the iowait_boost path.
+ * iowait_boost starts at iowait_boost_min, doubles on each
+ * SCHED_CPUFREQ_IOWAIT flag, halves on idle samples; once the
+ * episode ends the boost decays to 0 within a few PELT periods,
+ * after which the freq drops back to the level signal.  For
+ * sustained block IO (file-system flush, sqlite WAL replay,
+ * media transcode) the level signal often does not pin a high
+ * freq because the worker thread is mostly D-state -- the boost
+ * was carrying the freq.  When the boost decays the freq drops,
+ * latency on the next IO batch jumps, and the boost has to ramp
+ * again.
+ *
+ * The hysteresis floor stamps a deadline 'now + io_floor_hyst_ms'
+ * on the policy whenever zenith_iowait_boost() arms a positive
+ * boost.  While that deadline has not expired, lift freq to
+ * (policy->max * io_floor_hyst_pct / 100), tp_path "io_floor".
+ *
+ * 0 ms disables the tier (legacy: rely solely on iowait_boost
+ * decay).  Max ZENITH_IO_FLOOR_HYST_MS_MAX (2000 ms; beyond that
+ * the floor would routinely outlive the IO episode).  pct in
+ * 0..100; 0 disables the floor effect even if window is set.
+ *
+ * Profile bakes (auto-tune):
+ *   PERFORMANCE:  500 ms / 70%%
+ *   BALANCED:     200 ms / 50%%
+ *   BATTERY:        0 ms /  0%%   (off, energy frame)
+ *   LEGACY:         0 ms /  0%%   (historical-compat)
+ *   GAMING:       300 ms / 60%%
+ *   AUDIO:        500 ms / 60%%   (sustained DAC ring writes)
+ *   CUSTOM:         0 ms / 50%%   (cold-boot off; pct populated
+ *                                  for forward-compat)
+ */
+#define ZENITH_DEFAULT_IO_FLOOR_HYST_MS			0
+#define ZENITH_DEFAULT_IO_FLOOR_HYST_PCT		50
+#define ZENITH_IO_FLOOR_HYST_MS_MAX			2000
+#define ZENITH_IO_FLOOR_HYST_PCT_MAX			100
+
 /* peak_hysteresis_streak / peak_step_down_pct
  * (defaults 3 / 95, [Stage 4 / Patch E]):
  *
@@ -2857,6 +2897,17 @@ struct zenith_tunables {
 	 */
 	unsigned int		dl_task_floor_pct;
 
+	/* See ZENITH_DEFAULT_IO_FLOOR_HYST_MS /
+	 * ZENITH_DEFAULT_IO_FLOOR_HYST_PCT (Patch C9).  Either at 0
+	 * disables the IO floor hysteresis tier.  Range checks:
+	 * io_floor_hyst_ms in 0..ZENITH_IO_FLOOR_HYST_MS_MAX,
+	 * io_floor_hyst_pct in 0..ZENITH_IO_FLOOR_HYST_PCT_MAX.
+	 * Read/write via READ_ONCE / WRITE_ONCE (no torn-write
+	 * hazard on word-sized scalars).
+	 */
+	unsigned int		io_floor_hyst_ms;
+	unsigned int		io_floor_hyst_pct;
+
 	/* See ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK /
 	 * ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT (Patch E).  Either at 0
 	 * disables the tier (legacy descent-from-peak).  Range
@@ -4235,6 +4286,16 @@ struct zenith_policy {
 	 */
 	u64			psi_mem_cap_until_ns;
 
+	/* Patch C9: io_floor_hyst sticky-deadline.  Stamped by
+	 * zenith_iowait_boost() on the 0->positive boost edge with
+	 * 'now + io_floor_hyst_ms * NSEC_PER_MSEC'.  Read by
+	 * zenith_get_next_freq() to gate the io_floor tier.  Same
+	 * writer reasoning as psi_mem_cap_until_ns above; reads are
+	 * naked u64 loads, harmless on a stale-by-one-tick read
+	 * because the floor is a heuristic.
+	 */
+	u64			io_floor_until_ns;
+
 	/* Util-trend ring for the predictive up-shift tier (2a').  The
 	 * tail of zenith_get_next_freq() pushes the current sample's
 	 * util into util_history[util_history_idx] and advances the
@@ -4830,6 +4891,23 @@ static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time,
 				unsigned int flags, unsigned int io_is_busy)
 {
 	bool set_iowait_boost = (flags & SCHED_CPUFREQ_IOWAIT) && io_is_busy;
+
+	/* Patch C9: stamp the io_floor hysteresis deadline on every
+	 * iowait sample where the boost path would arm.  Bumps a
+	 * sliding window forward; once the iowait_boost decays away,
+	 * the floor outlives it for io_floor_hyst_ms past the last
+	 * arming sample.  io_floor_hyst_ms == 0 stamps a 0 deadline,
+	 * which the read-side check in zenith_get_next_freq() treats
+	 * as no-floor (legacy behaviour).
+	 */
+	if (set_iowait_boost && z_cpu->z_policy) {
+		unsigned int hyst_ms =
+			z_cpu->z_policy->tunables->io_floor_hyst_ms;
+
+		if (hyst_ms)
+			z_cpu->z_policy->io_floor_until_ns = time +
+				(u64)hyst_ms * NSEC_PER_MSEC;
+	}
 
 	if (z_cpu->iowait_boost && zenith_iowait_reset(z_cpu, time, set_iowait_boost))
 		return;
@@ -8309,6 +8387,41 @@ brutal_entry_deferred:
 		}
 	}
 
+	/* Patch C9: io_floor hysteresis sticky-floor.  When the
+	 * iowait_boost path armed within the last io_floor_hyst_ms
+	 * (zenith_iowait_boost() stamped io_floor_until_ns), lift
+	 * freq to (policy->max * io_floor_hyst_pct / 100).  Both
+	 * tunables 0 disables; pin_to_target paths skip (already
+	 * pinned higher).
+	 *
+	 * Why this exists: iowait_boost decays to 0 within a few
+	 * PELT periods after the last SCHED_CPUFREQ_IOWAIT, but
+	 * sustained block IO (sqlite WAL replay, ext4 commit, media
+	 * transcode) often goes through a small idle gap and then
+	 * resumes; the boost has decayed and the level signal alone
+	 * pins a low freq because the worker is mostly D-state.
+	 * Holding the floor closes the gap.
+	 */
+	if (!pin_to_target && policy->max &&
+	    z_policy->tunables->io_floor_hyst_ms &&
+	    z_policy->tunables->io_floor_hyst_pct) {
+		u64 until = z_policy->io_floor_until_ns;
+		u64 now_ns = ktime_get_ns();
+
+		if (until && now_ns < until) {
+			unsigned int iof = (policy->max *
+					    z_policy->tunables->io_floor_hyst_pct) /
+					   100;
+
+			if (iof > policy->max)
+				iof = policy->max;
+			if (freq < iof) {
+				freq = iof;
+				tp_path = "io_floor";
+			}
+		}
+	}
+
 	/* 3c'''''. Peer-ramp soft floor (Patch D).
 	 *
 	 * If the peer cluster (BIG <-> PRIME) ramped to peak in the
@@ -10963,6 +11076,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int pelt_rising_edge_thresh;
 		unsigned int pelt_rising_edge_min_pct;
 		unsigned int dl_task_floor_pct;
+		unsigned int io_floor_hyst_ms;
+		unsigned int io_floor_hyst_pct;
 		unsigned int render_floor_pct;
 		unsigned int render_floor_min_runtime_ms;
 		unsigned int input_boost_touchdown_extra_ms;
@@ -11065,6 +11180,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * the first wake doesn't miss its deadline.
 			 */
 			.dl_task_floor_pct = 100,
+			/* Patch C9: PERFORMANCE holds a 70%% floor for
+			 * 500 ms past the last iowait sample.  Block
+			 * IO bursts on PERF (e.g. apt-update, large
+			 * file copies) carry the freq instead of
+			 * collapsing into the level signal between
+			 * batches.
+			 */
+			.io_floor_hyst_ms = 500,
+			.io_floor_hyst_pct = 70,
 			/* Stage 4 / Patch B: PERFORMANCE keeps the
 			 * render floor strong (80%% of max, vs 70%%
 			 * default) and tightens the debounce to 20 ms
@@ -11277,6 +11401,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.dl_task_floor_pct =
 				ZENITH_DEFAULT_DL_TASK_FLOOR_PCT,
+			/* Patch C9: BALANCED holds a 50%% floor for
+			 * 200 ms.  Default-magnitude responsiveness
+			 * for moderate IO without paying the energy
+			 * frame of PERFORMANCE.
+			 */
+			.io_floor_hyst_ms = 200,
+			.io_floor_hyst_pct = 50,
 			/* Stage 4 / Patch B: BALANCED matches cold-
 			 * boot defaults (70%% floor, 50 ms debounce).
 			 */
@@ -11471,6 +11602,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * frame this profile targets.
 			 */
 			.dl_task_floor_pct = 0,
+			/* Patch C9: BATTERY disables IO floor
+			 * hysteresis — energy frame.
+			 */
+			.io_floor_hyst_ms = 0,
+			.io_floor_hyst_pct = 0,
 			/* Stage 4 / Patch B: BATTERY softens the render
 			 * floor to 50%% and stretches the debounce to
 			 * 100 ms.  Render activity still floors the
@@ -11659,6 +11795,9 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * (historical-compat profile).
 			 */
 			.dl_task_floor_pct = 0,
+			/* Patch C9: LEGACY off (historical-compat). */
+			.io_floor_hyst_ms = 0,
+			.io_floor_hyst_pct = 0,
 			/* Stage 4 / Patch B: LEGACY disables the floor
 			 * outright (render_floor_pct=0) since the floor
 			 * is a Stage-1+ feature.  The debounce knob is
@@ -11835,6 +11974,12 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * its first wake hits target frequency.
 			 */
 			.dl_task_floor_pct = 100,
+			/* Patch C9: GAMING 300 ms / 60%% — game asset
+			 * loading and save/restore bursts keep the
+			 * freq elevated through batch gaps.
+			 */
+			.io_floor_hyst_ms = 300,
+			.io_floor_hyst_pct = 60,
 			.render_floor_pct = 85,
 			.render_floor_min_runtime_ms = 15,
 			.input_boost_touchdown_extra_ms = 100,
@@ -11980,6 +12125,13 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * everything else on the device.
 			 */
 			.dl_task_floor_pct = 80,
+			/* Patch C9: AUDIO 500 ms / 60%% — sustained
+			 * DAC ring-buffer writes are iowait-heavy but
+			 * util-light (D-state dominant); the floor
+			 * prevents freq drops between DMA periods.
+			 */
+			.io_floor_hyst_ms = 500,
+			.io_floor_hyst_pct = 60,
 			/* Render floor off: audio worker is not the
 			 * RENDER_PRIO thread that renderer-floor is
 			 * scoped to.  Keep the floor knob populated
@@ -12118,6 +12270,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->pelt_rising_edge_thresh, p->pelt_rising_edge_thresh);
 	WRITE_ONCE(t->pelt_rising_edge_min_pct, p->pelt_rising_edge_min_pct);
 	WRITE_ONCE(t->dl_task_floor_pct, p->dl_task_floor_pct);
+	WRITE_ONCE(t->io_floor_hyst_ms, p->io_floor_hyst_ms);
+	WRITE_ONCE(t->io_floor_hyst_pct, p->io_floor_hyst_pct);
 	t->render_floor_pct	= p->render_floor_pct;
 	WRITE_ONCE(t->render_floor_min_runtime_ms,
 		   p->render_floor_min_runtime_ms);
@@ -15838,6 +15992,65 @@ dl_task_floor_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr dl_task_floor_pct =
 	__ATTR_RW(dl_task_floor_pct);
 
+/* io_floor_hyst_ms sysfs knob (Patch C9).  Range 0..2000.  When
+ * non-zero, every iowait_boost arming stamps a deadline that
+ * keeps the io_floor tier active for io_floor_hyst_ms past the
+ * last arming sample.  See ZENITH_DEFAULT_IO_FLOOR_HYST_MS for
+ * the full block comment.
+ */
+static ssize_t
+io_floor_hyst_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->io_floor_hyst_ms);
+}
+
+static ssize_t
+io_floor_hyst_ms_store(struct gov_attr_set *attr_set,
+		       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_IO_FLOOR_HYST_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->io_floor_hyst_ms, val);
+	return count;
+}
+
+static struct governor_attr io_floor_hyst_ms =
+	__ATTR_RW(io_floor_hyst_ms);
+
+/* io_floor_hyst_pct sysfs knob (Patch C9).  Range 0..100.  Floor
+ * value as a percentage of policy->max while the io_floor_until_ns
+ * deadline has not expired.  0 disables the floor effect (a
+ * non-zero deadline still gets stamped but no lift happens).
+ */
+static ssize_t
+io_floor_hyst_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->io_floor_hyst_pct);
+}
+
+static ssize_t
+io_floor_hyst_pct_store(struct gov_attr_set *attr_set,
+			const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_IO_FLOOR_HYST_PCT_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->io_floor_hyst_pct, val);
+	return count;
+}
+
+static struct governor_attr io_floor_hyst_pct =
+	__ATTR_RW(io_floor_hyst_pct);
+
 /* peak_hysteresis_streak sysfs knob (Patch E).
  * Range 0..ZENITH_PEAK_HYSTERESIS_STREAK_MAX.  Number of
  * consecutive samples after a peak-class previous freq for
@@ -17778,6 +17991,8 @@ static struct attribute *zenith_attrs[] = {
 	&pelt_rising_edge_thresh.attr,
 	&pelt_rising_edge_min_pct.attr,
 	&dl_task_floor_pct.attr,
+	&io_floor_hyst_ms.attr,
+	&io_floor_hyst_pct.attr,
 	&peak_hysteresis_streak.attr,
 	&peak_step_down_pct.attr,
 	&boost_idle_thresh.attr,
@@ -18077,6 +18292,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->pelt_rising_edge_min_pct =
 		ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT;
 	tunables->dl_task_floor_pct	= ZENITH_DEFAULT_DL_TASK_FLOOR_PCT;
+	tunables->io_floor_hyst_ms	= ZENITH_DEFAULT_IO_FLOOR_HYST_MS;
+	tunables->io_floor_hyst_pct	= ZENITH_DEFAULT_IO_FLOOR_HYST_PCT;
 	tunables->peak_hysteresis_streak =
 		ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK;
 	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
