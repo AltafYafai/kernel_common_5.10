@@ -10172,6 +10172,76 @@ static struct governor_attr ignore_nice_load = __ATTR_RW(ignore_nice_load);
  * device-specific frequencies untouched because their correct values
  * depend on the SoC's actual freq table. The user can layer those on
  * top after picking a profile.
+ *
+ * Profile design intent (re-derived from the four preset tables
+ * below; all values that don't appear in the per-profile table fall
+ * back to the module-level ZENITH_DEFAULT_* values).  This block is
+ * the one place that documents each profile's stance per tier;
+ * individual tunable comments and tracepoints describe the mechanic,
+ * but the per-profile *values* belong here so a reader picking a
+ * profile can see the whole budget at once.
+ *
+ *   PERFORMANCE  Aggressive everywhere.  up_threshold=65, hispeed
+ *                tier engages at load 55, climb mode SNAP, freq_step
+ *                15 %% per tick, no powersave bias, input boost
+ *                150 ms with full decay tail, peak-headroom rescue
+ *                AND prearm both on, render-floor and frame-overrun
+ *                tiers tuned tighter, peer-ramp window 80 ms with
+ *                screen-off variant disabled, predictive up tier
+ *                tighter, PSI floors armed but with hispeed-headroom
+ *                guards.  Tradeoff: best burst latency, highest
+ *                steady-state power.  Preferred for scenario flips
+ *                triggered by camera_aware / render_aware / sustained
+ *                game-mode.
+ *
+ *   BALANCED     The default.  up_threshold ~75, hispeed tier at
+ *                load 65, climb mode SNAP, freq_step 10 %%, mild
+ *                powersave bias, input boost 100 ms with shorter
+ *                decay, peak-headroom rescue on but prearm gated by
+ *                hysteresis streak, peer-ramp window 50 ms with a
+ *                short screen-off variant, frame-overrun deep tier
+ *                gated by streak.  Tradeoff: best 95th-pct latency
+ *                while keeping idle power close to BATTERY.
+ *                Preferred for the audio-detect scenario flip.
+ *
+ *   BATTERY      Conservative everywhere it matters for residency.
+ *                up_threshold raised, climb mode STEP not SNAP,
+ *                freq_step ~5-7 %%, larger powersave bias, input
+ *                boost shorter, peak-headroom rescue off (only
+ *                prearm fires), render-floor gated by min runtime,
+ *                peer-ramp window ~30 ms (just long enough to catch
+ *                a real cluster wake without paying for noise),
+ *                frame-overrun off, PSI memstall cap armed
+ *                aggressively to throttle when memstall is the
+ *                bottleneck.  Tradeoff: lowest screen-off and idle
+ *                power, deeper drops on bursty foreground work.
+ *                Preferred for memstall-detected scenario flip
+ *                (audio + memstall + screen-off all push toward
+ *                BATTERY).
+ *
+ *   LEGACY       Bug-for-bug compatible with pre-V4 zenith.  All
+ *                post-V4 tiers (peak-headroom prearm, peer-ramp,
+ *                migration-floor, frame-overrun, PSI floors,
+ *                render-floor, predict-up) gated to 0 so the
+ *                runtime path matches the original schedutil-plus-
+ *                ondemand-plus-reflex hybrid.  Useful as a
+ *                regression baseline and for users who have an
+ *                existing tuning workflow that depends on the V4
+ *                tiers being silent.
+ *
+ *   CUSTOM       (not in this table)  No profile applied.  Every
+ *                tunable carries whatever sysfs left it at, which
+ *                in practice is the ZENITH_DEFAULT_* values from
+ *                the top of this file unless the user overwrote
+ *                them.  This is the value reported by the profile
+ *                sysfs node when no preset has ever been applied.
+ *
+ * Adding a new tunable that should track the profile: add a field
+ * to struct zenith_profile_defaults below, fill in the value in all
+ * four preset tables, and copy it from p->foo to t->foo at the end
+ * of this function.  Forgetting any of those three steps will leave
+ * the field at its module default for that profile, which is
+ * almost always wrong.
  */
 static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 {
