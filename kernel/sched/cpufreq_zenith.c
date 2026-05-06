@@ -125,6 +125,13 @@
  */
 #include <trace/hooks/topology.h>
 
+/* Patch B9-2: vendor hook on userspace uclamp writes (ADPF path).
+ * Sourced from sched_setattr() / sched_setscheduler() when userspace
+ * assigns SCHED_FLAG_KEEP_PARAMS | SCHED_FLAG_UTIL_CLAMP.  Same
+ * post-CREATE_TRACE_POINTS placement reasoning as topology.h above.
+ */
+#include <trace/hooks/sched.h>
+
 /* Constants & Defaults */
 /* Permille of SCHED_CAPACITY_SCALE at which iowait boost starts.
  * 125 == SCHED_CAPACITY_SCALE / 8, preserving the historical default.
@@ -528,6 +535,39 @@
  */
 #define ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE	0
 #define ZENITH_VH_ARCH_FREQ_SCALE_STEP			51
+
+/* vh_uclamp_observer_enable (default 0, [Patch B9-2]):
+ *
+ * Master 0/1 gate for the android_vh_setscheduler_uclamp vendor-hook
+ * observer.  When 1, every userspace uclamp_min raise (the path
+ * Android Dynamic Performance Framework -- ADPF -- uses to express
+ * "this thread needs more headroom") drops into
+ * zenith_probe_setscheduler_uclamp(), looks up the task's current
+ * CPU's policy, and -- if that CPU is in a zenith-driven policy --
+ * arms peer_ramp on that policy's peer cluster.  Synchronous
+ * peer-cluster pre-arm: previously zenith only saw the raised
+ * uclamp_min after PELT propagation moved task util upwards, which
+ * can take 4..32 ms on a hot game thread.  When 0 the probe is
+ * still installed (one branch on `enable`) but performs no work.
+ *
+ * Filtering inside the probe:
+ *   - clamp_id != UCLAMP_MIN -> ignore (uclamp_max raises do not
+ *     justify a peer-cluster arm; they only constrain the task's
+ *     own cluster downward).
+ *   - value == 0 -> ignore (a clear, not a raise).
+ *
+ * Profile bakes (auto-tune):
+ *   PERFORMANCE:  1   (synchronous ADPF response, no PELT lag)
+ *   BALANCED:     0   (cold-boot default; opt-in only)
+ *   BATTERY:      0   (extra cross-cluster wakes are not worth it)
+ *   LEGACY:       0   (historical-compat)
+ *   GAMING:       1   (tighten ADPF-triggered cluster coupling --
+ *                      this is the headline workload for the hook)
+ *   AUDIO:        0   (audio path benefits from steady cluster, not
+ *                      cross-cluster pre-arm)
+ *   CUSTOM:       0   (cold-boot opt-in)
+ */
+#define ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE	0
 
 /* peak_hysteresis_streak / peak_step_down_pct
  * (defaults 3 / 95, [Stage 4 / Patch E]):
@@ -3648,6 +3688,17 @@ struct zenith_tunables {
 	 * WRITE_ONCE from sysfs and from zenith_apply_profile().
 	 */
 	unsigned int		vh_arch_freq_scale_enable;
+
+	/* See ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE (Patch B9-2).
+	 * Master 0/1 gate for the android_vh_setscheduler_uclamp
+	 * vendor-hook observer.  When 0 the registered probe is a
+	 * single-branch no-op; when 1 a userspace uclamp_min raise on
+	 * a task running in a zenith-driven policy synchronously arms
+	 * peer_ramp on that policy's peer cluster (no PELT lag).
+	 * Read via READ_ONCE on the probe path; written via
+	 * WRITE_ONCE from sysfs and from zenith_apply_profile().
+	 */
+	unsigned int		vh_uclamp_observer_enable;
 };
 
 /*
@@ -11183,6 +11234,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int psi_mem_cap_window_ms;
 		unsigned int audio_hyst_ms;
 		unsigned int vh_arch_freq_scale_enable;
+		unsigned int vh_uclamp_observer_enable;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -11394,6 +11446,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_window_ms = 1000,
 			.audio_hyst_ms = 250,
 			.vh_arch_freq_scale_enable = 1,
+			.vh_uclamp_observer_enable = 1,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -11607,6 +11660,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.audio_hyst_ms = ZENITH_DEFAULT_AUDIO_HYST_MS,
 			.vh_arch_freq_scale_enable =
 				ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE,
+			.vh_uclamp_observer_enable =
+				ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -11802,6 +11857,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_window_ms = 1500,
 			.audio_hyst_ms = 100,
 			.vh_arch_freq_scale_enable = 0,
+			.vh_uclamp_observer_enable = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -11972,6 +12028,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_window_ms = 1000,
 			.audio_hyst_ms = 0,
 			.vh_arch_freq_scale_enable = 0,
+			.vh_uclamp_observer_enable = 0,
 		},
 		{
 			/* Patch 4.1: GAMING profile.
@@ -12109,6 +12166,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_window_ms = 1000,
 			.audio_hyst_ms = 250,
 			.vh_arch_freq_scale_enable = 1,
+			.vh_uclamp_observer_enable = 1,
 		},
 		{
 			/* Patch 4.2: AUDIO profile.
@@ -12292,6 +12350,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_window_ms = 1000,
 			.audio_hyst_ms = 750,
 			.vh_arch_freq_scale_enable = 0,
+			.vh_uclamp_observer_enable = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -12397,6 +12456,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->audio_hyst_ms, p->audio_hyst_ms);
 	WRITE_ONCE(t->vh_arch_freq_scale_enable,
 		   p->vh_arch_freq_scale_enable);
+	WRITE_ONCE(t->vh_uclamp_observer_enable,
+		   p->vh_uclamp_observer_enable);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
@@ -17348,6 +17409,35 @@ vh_arch_freq_scale_enable_store(struct gov_attr_set *attr_set,
 static struct governor_attr vh_arch_freq_scale_enable =
 	__ATTR_RW(vh_arch_freq_scale_enable);
 
+/* Patch B9-2: vh_uclamp_observer_enable sysfs knob.  Strict 0/1
+ * boolean; gates the android_vh_setscheduler_uclamp vendor-hook
+ * observer (see ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE for full
+ * semantics and profile bakes).  Stored via WRITE_ONCE; the probe
+ * reads it with READ_ONCE so a torn write would only delay the
+ * gate flip by one ADPF write.
+ */
+static ssize_t
+vh_uclamp_observer_enable_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->vh_uclamp_observer_enable);
+}
+
+static ssize_t
+vh_uclamp_observer_enable_store(struct gov_attr_set *attr_set,
+				const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->vh_uclamp_observer_enable, val);
+	return count;
+}
+static struct governor_attr vh_uclamp_observer_enable =
+	__ATTR_RW(vh_uclamp_observer_enable);
+
 /* camera_aware sysfs knob.  Strict 0/1 boolean; non-zero values
  * normalised to 1 on store.
  */
@@ -18233,6 +18323,7 @@ static struct attribute *zenith_attrs[] = {
 	&audio_cap_pct.attr,
 	&audio_hyst_ms.attr,
 	&vh_arch_freq_scale_enable.attr,
+	&vh_uclamp_observer_enable.attr,
 	&camera_aware.attr,
 	&camera_comms.attr,
 	&camera_active.attr,
@@ -18414,6 +18505,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->io_floor_hyst_pct	= ZENITH_DEFAULT_IO_FLOOR_HYST_PCT;
 	tunables->vh_arch_freq_scale_enable =
 		ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE;
+	tunables->vh_uclamp_observer_enable =
+		ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE;
 	tunables->peak_hysteresis_streak =
 		ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK;
 	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
@@ -19263,12 +19356,73 @@ zenith_probe_arch_set_freq_scale(void *data, const struct cpumask *cpus,
 		zenith_peer_ramp_arm(z_policy, ktime_get_ns());
 }
 
+/* Patch B9-2: android_vh_setscheduler_uclamp observer.
+ *
+ * Fires from sched_setattr() / sched_setscheduler() / set_user_-
+ * uclamp() when userspace assigns SCHED_FLAG_KEEP_PARAMS |
+ * SCHED_FLAG_UTIL_CLAMP for a task.  Android Dynamic Performance
+ * Framework (ADPF) uses this path heavily: a foreground game raises
+ * uclamp_min on its render-critical thread to express "this thread
+ * needs more headroom" which the cpufreq governor is supposed to
+ * respect.  Schedutil reads task uclamp at every eval and reacts;
+ * zenith reads task uclamp at every eval too -- but the *peer*
+ * cluster only sees the raise once PELT propagation pushes the
+ * clamped task's util upwards, which on a hot game thread can take
+ * 4..32 ms.
+ *
+ * This probe gives us a synchronous notification: the moment
+ * userspace writes the new uclamp_min, we look up the task's
+ * current CPU's policy and arm peer_ramp on its peer cluster.  No
+ * PELT lag.
+ *
+ * Use is opt-in via tunables->vh_uclamp_observer_enable (default
+ * 0).  When the gate is off the probe is a single READ_ONCE plus a
+ * branch.  The probe also short-circuits on:
+ *
+ *   - clamp_id != UCLAMP_MIN (uclamp_max raises do not justify a
+ *     peer-cluster arm; they only cap the task's own cluster).
+ *   - value == 0 (a clear, not a raise).
+ *   - tsk == NULL or task_cpu(tsk) out of range (defensive).
+ *
+ * Concurrency: same reasoning as zenith_probe_arch_set_freq_scale.
+ * Hook fires in arbitrary scheduler context; cpufreq_cpu_get_raw +
+ * READ_ONCE on governor_data is the established no-lock pattern;
+ * zenith_peer_ramp_arm is lock-free.
+ */
+static void
+zenith_probe_setscheduler_uclamp(void *data, struct task_struct *tsk,
+				 int clamp_id, unsigned int value)
+{
+	struct cpufreq_policy *policy;
+	struct zenith_policy *z_policy;
+	struct zenith_tunables *t;
+	unsigned int cpu;
+
+	if (!tsk || clamp_id != UCLAMP_MIN || !value)
+		return;
+	cpu = task_cpu(tsk);
+	if (cpu >= nr_cpu_ids)
+		return;
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy || policy->governor != &zenith_gov)
+		return;
+	z_policy = READ_ONCE(policy->governor_data);
+	if (!z_policy)
+		return;
+	t = z_policy->tunables;
+	if (!t || !READ_ONCE(t->vh_uclamp_observer_enable))
+		return;
+
+	zenith_peer_ramp_arm(z_policy, ktime_get_ns());
+}
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
 	bool input_registered = false;
 	bool fg_pulse_registered = false;
 	bool vh_arch_freq_scale_registered = false;
+	bool vh_uclamp_observer_registered = false;
 #ifdef CONFIG_FB_NOTIFY
 	bool fb_registered = false;
 #endif
@@ -19416,6 +19570,21 @@ static int __init zenith_gov_init(void)
 	else
 		vh_arch_freq_scale_registered = true;
 
+	/* Patch B9-2: register the android_vh_setscheduler_uclamp
+	 * vendor-hook probe.  Failure is non-fatal; the ADPF
+	 * synchronous-arm path simply remains silent and zenith falls
+	 * back to seeing the uclamp raise after PELT propagation
+	 * (existing behaviour).  The tunables->vh_uclamp_observer_-
+	 * enable gate is the runtime switch.
+	 */
+	ret = register_trace_android_vh_setscheduler_uclamp(
+		zenith_probe_setscheduler_uclamp, NULL);
+	if (ret)
+		pr_warn("Zenith: vh_setscheduler_uclamp probe register failed (%d), vh_uclamp_observer_enable will be a no-op\n",
+			ret);
+	else
+		vh_uclamp_observer_registered = true;
+
 	/* Panel-state delivery: register the drm_panel_notifier path first
 	 * (preferred when available because the fb notifier chain is
 	 * deprecated upstream and absent on most modern vendor builds), and
@@ -19487,6 +19656,9 @@ static int __init zenith_gov_init(void)
 		if (vh_arch_freq_scale_registered)
 			unregister_trace_android_vh_arch_set_freq_scale(
 				zenith_probe_arch_set_freq_scale, NULL);
+		if (vh_uclamp_observer_registered)
+			unregister_trace_android_vh_setscheduler_uclamp(
+				zenith_probe_setscheduler_uclamp, NULL);
 		pr_err("Zenith: cpufreq_register_governor failed (%d)\n", ret);
 		return ret;
 	}
