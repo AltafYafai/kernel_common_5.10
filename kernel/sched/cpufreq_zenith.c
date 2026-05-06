@@ -1147,6 +1147,34 @@
 #define ZENITH_PROFILE_GAMING			5
 #define ZENITH_PROFILE_AUDIO			6
 
+/* Patch B-AUTO-2: auto-profile selector meta-state.
+ *
+ * When active_profile == ZENITH_PROFILE_AUTO the auto-selector
+ * engine (B-AUTO-3 / B-AUTO-4) drives profile bakes from observed
+ * device state -- audio activity, game-engine threads, render-
+ * thread saturation, foreground input recency, screen state, and
+ * (B-AUTO-4) battery level / charging state.  The user sees a
+ * single sysfs knob ("echo auto > profile") and zenith picks the
+ * most appropriate concrete profile (BALANCED, PERFORMANCE,
+ * BATTERY, GAMING, or AUDIO) on a 500 ms cadence with 2000 ms
+ * hysteresis.
+ *
+ * AUTO is a *meta* profile: zenith_apply_profile(t, AUTO) is never
+ * called.  Instead the engine writes the chosen concrete target
+ * into tunables->auto_target and applies that.  active_profile
+ * stays at AUTO; auto_target reflects the engine's current pick.
+ *
+ * Manual profiles (PERFORMANCE / BALANCED / BATTERY / LEGACY /
+ * GAMING / AUDIO / CUSTOM) take precedence on write -- writing any
+ * concrete profile to the profile sysfs node disengages auto until
+ * the user explicitly writes "auto" again.
+ *
+ * LEGACY and CUSTOM are never auto-picked -- they are explicit
+ * opt-out paths reserved for advanced users who have layered their
+ * own per-knob tweaks on top.
+ */
+#define ZENITH_PROFILE_AUTO			7
+
 /* Profile selected via the zenith.profile= kernel cmdline. Parsed by
  * zenith_setup_profile() at early_param time and consumed on the
  * first-init branch of zenith_init() so the governor comes up on the
@@ -3168,6 +3196,22 @@ struct zenith_tunables {
 	 * which recipe they last applied.
 	 */
 	unsigned int		active_profile;
+
+	/* Patch B-AUTO-2: auto-selector meta-state.  See ZENITH_PROFILE_AUTO.
+	 *
+	 * auto_target: when active_profile == ZENITH_PROFILE_AUTO the
+	 * decision engine (B-AUTO-3 / B-AUTO-4) writes the most
+	 * recently picked concrete target here (BALANCED, PERFORMANCE,
+	 * BATTERY, GAMING, or AUDIO) and applies that profile via
+	 * zenith_apply_profile().  Default ZENITH_PROFILE_BALANCED so
+	 * cold boot is on a known-safe baseline before the first auto
+	 * eval lands.  When active_profile != AUTO this field is
+	 * stale; readers must check active_profile first.  Read via
+	 * READ_ONCE on any path that races with the auto worker;
+	 * written via WRITE_ONCE from the worker and from
+	 * profile_store on AUTO entry.
+	 */
+	unsigned int		auto_target;
 
 	/* Permille (0..1000) of SCHED_CAPACITY_SCALE at which
 	 * zenith_iowait_boost() arms and below which a doubling
@@ -13800,6 +13844,12 @@ static ssize_t profile_show(struct gov_attr_set *attr_set, char *buf)
 	case ZENITH_PROFILE_LEGACY:		return sprintf(buf, "legacy\n");
 	case ZENITH_PROFILE_GAMING:		return sprintf(buf, "gaming\n");
 	case ZENITH_PROFILE_AUDIO:		return sprintf(buf, "audio\n");
+	/* Patch B-AUTO-2: AUTO is the meta-profile that engages the
+	 * auto-selector engine.  Userspace sees "auto"; the concrete
+	 * profile the engine has applied is exposed separately via
+	 * the auto_target RO sysfs node.
+	 */
+	case ZENITH_PROFILE_AUTO:		return sprintf(buf, "auto\n");
 	case ZENITH_PROFILE_CUSTOM:
 	default:				return sprintf(buf, "custom\n");
 	}
@@ -13827,6 +13877,15 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 		prof = ZENITH_PROFILE_AUDIO;
 	else if (sysfs_streq(buf, "custom"))
 		prof = ZENITH_PROFILE_CUSTOM;
+	/* Patch B-AUTO-2: "auto" is the meta-profile that engages the
+	 * auto-selector engine (B-AUTO-3 / B-AUTO-4).  On entry we
+	 * apply the BALANCED bake immediately so the device runs on a
+	 * known-safe baseline until the engine's first eval lands;
+	 * active_profile then becomes AUTO so the engine knows it is
+	 * free to pick a concrete target.
+	 */
+	else if (sysfs_streq(buf, "auto"))
+		prof = ZENITH_PROFILE_AUTO;
 	else
 		return -EINVAL;
 
@@ -13841,7 +13900,20 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 	if (t->active_profile == prof)
 		return count;
 
-	zenith_apply_profile(t, prof);
+	/* Patch B-AUTO-2: AUTO is a meta-profile, not a tunables bake.
+	 * Apply the BALANCED preset immediately (so the device is on a
+	 * known-safe baseline before the auto-selector engine's first
+	 * eval lands), then mark active_profile = AUTO and stamp the
+	 * auto_target so the engine has a starting point.  The engine
+	 * itself (B-AUTO-3 / B-AUTO-4) will refine the target on its
+	 * 500 ms eval cadence with 2000 ms hysteresis.
+	 */
+	if (prof == ZENITH_PROFILE_AUTO) {
+		zenith_apply_profile(t, ZENITH_PROFILE_BALANCED);
+		WRITE_ONCE(t->auto_target, ZENITH_PROFILE_BALANCED);
+	} else {
+		zenith_apply_profile(t, prof);
+	}
 	t->active_profile = prof;
 	t->auto_tune_override_mask = 0;
 	list_for_each_entry(z_policy, &attr_set->policy_list, tunables_hook) {
@@ -13864,6 +13936,29 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr profile = __ATTR_RW(profile);
+
+/* Patch B-AUTO-2: auto_target RO sysfs.  When active_profile ==
+ * ZENITH_PROFILE_AUTO this prints the concrete profile the auto-
+ * selector engine has currently applied (BALANCED, PERFORMANCE,
+ * BATTERY, GAMING, AUDIO).  When active_profile != AUTO this still
+ * returns the last value the engine wrote -- it is a debug-only
+ * window into the engine state.  Read with READ_ONCE so a torn
+ * write from the engine worker cannot produce a malformed string.
+ */
+static ssize_t auto_target_show(struct gov_attr_set *attr_set, char *buf)
+{
+	unsigned int target = READ_ONCE(to_zenith_tunables(attr_set)->auto_target);
+
+	switch (target) {
+	case ZENITH_PROFILE_PERFORMANCE:	return sprintf(buf, "performance\n");
+	case ZENITH_PROFILE_BALANCED:		return sprintf(buf, "balanced\n");
+	case ZENITH_PROFILE_BATTERY:		return sprintf(buf, "battery\n");
+	case ZENITH_PROFILE_GAMING:		return sprintf(buf, "gaming\n");
+	case ZENITH_PROFILE_AUDIO:		return sprintf(buf, "audio\n");
+	default:				return sprintf(buf, "balanced\n");
+	}
+}
+static struct governor_attr auto_target = __ATTR_RO(auto_target);
 
 /* Bump ZENITH_AT_STATUS_FORMAT_VERSION whenever the layout of
  * auto_tune_status changes (new fields, reordering, renaming) so
@@ -18310,6 +18405,7 @@ static struct attribute *zenith_attrs[] = {
 	&freq_step_pct.attr,
 	&freq_step_adaptive.attr,
 	&profile.attr,
+	&auto_target.attr,
 	&profile_values.attr,
 	&zenith_stats.attr,
 	&zenith_stats_reset.attr,
@@ -18590,6 +18686,15 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE;
 	tunables->vh_uclamp_observer_enable =
 		ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE;
+	/* Patch B-AUTO-2: seed auto_target so the auto_target sysfs
+	 * node never reads 0 / "balanced" by accident on a fresh
+	 * tunables alloc.  The actual cold-boot active_profile flip to
+	 * ZENITH_PROFILE_AUTO lives in B-AUTO-5; here we just ensure
+	 * the meta-state field is well-defined when a user writes
+	 * "auto" to the profile sysfs node before any auto eval has
+	 * landed.
+	 */
+	tunables->auto_target		= ZENITH_PROFILE_BALANCED;
 	tunables->peak_hysteresis_streak =
 		ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK;
 	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
