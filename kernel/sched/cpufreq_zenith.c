@@ -4492,12 +4492,14 @@ static unsigned int zenith_glide_value(struct zenith_policy *z_policy,
 static inline unsigned int zenith_iowait_floor(struct zenith_cpu *z_cpu)
 {
 	unsigned int permille = z_cpu->z_policy->tunables->iowait_boost_min;
+
 	return (SCHED_CAPACITY_SCALE * permille) / 1000;
 }
 
 static bool zenith_iowait_reset(struct zenith_cpu *z_cpu, u64 time, bool set_iowait_boost)
 {
 	s64 delta_ns = time - z_cpu->last_update;
+
 	if (delta_ns <= TICK_NSEC)
 		return false;
 
@@ -5067,9 +5069,8 @@ static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned 
 			 * if it's the absolute highest state and we are throttling), cap it
 			 * to the previous state to save mW.
 			 */
-			if (i == pd->nr_perf_states - 1 && i > 0) {
+			if (i == pd->nr_perf_states - 1 && i > 0)
 				return pd->table[i - 1].frequency;
-			}
 			break;
 		}
 	}
@@ -6408,7 +6409,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy, unsigne
 	 * sustained match.  See the ZENITH_DEFAULT_GAME_AUTO comment
 	 * block.  Order: must follow the local declarations above and
 	 * precede any other executable code in this function so the
-	 * the latter is allowed to declare additional locals without
+	 * latter is allowed to declare additional locals without
 	 * tripping -Wdeclaration-after-statement.
 	 */
 	if (static_branch_unlikely(&zenith_game_auto_key) &&
@@ -8339,6 +8340,7 @@ apply_uclamp_max_cap:
 				}
 				{
 					int j;
+
 					for (j = i; j < nr; j++)
 						z_policy->eff_unlock_at_ns[j] = 0;
 				}
@@ -8383,6 +8385,7 @@ apply_uclamp_max_cap:
 	/* 6. Energy Model Validation */
 	{
 		unsigned int em_in = target_freq;
+
 		target_freq = zenith_em_cap_freq(z_policy, target_freq);
 		if (target_freq != em_in)
 			tp_path = "em_cap";
@@ -8664,6 +8667,7 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 
 			if (tunables->ignore_nice_load) {
 				unsigned int p = zenith_sample_nice_pct(j_z_cpu, time);
+
 				if (p > nice_pct_max)
 					nice_pct_max = p;
 			}
@@ -8704,6 +8708,7 @@ static void zenith_work(struct kthread_work *work)
 static void zenith_irq_work(struct irq_work *irq_work)
 {
 	struct zenith_policy *z_policy = container_of(irq_work, struct zenith_policy, irq_work);
+
 	kthread_queue_work(&z_policy->worker, &z_policy->work);
 }
 
@@ -16491,6 +16496,7 @@ static int zenith_start(struct cpufreq_policy *policy)
 
 	for_each_cpu(cpu, policy->cpus) {
 		struct zenith_cpu *z_cpu = &per_cpu(zenith_cpu, cpu);
+
 		memset(z_cpu, 0, sizeof(*z_cpu));
 		z_cpu->cpu = cpu;
 		z_cpu->z_policy = z_policy;
