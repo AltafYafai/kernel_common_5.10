@@ -12685,29 +12685,111 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   t->input_boost_touchdown_extra_ms);
 }
 
-/* Patch B-AUTO-3: auto-selector classifier stub.
+/* Patch B-AUTO-4: auto-selector classifier (priority cascade).
  *
  * Returns the concrete profile zenith should run while
- * active_profile == ZENITH_PROFILE_AUTO.  This patch ships a
- * BALANCED-only stub so the eval-work skeleton can be exercised
- * end-to-end (workqueue cadence, lock acquisition, hysteresis
- * window, profile commit path) without yet introducing the
- * priority-cascade logic.  B-AUTO-4 replaces the body with the
- * real audio / game / performance / battery / balanced cascade
- * fed by the existing comm-table detectors plus a battery
- * reader.
+ * active_profile == ZENITH_PROFILE_AUTO.  Reads governor-wide
+ * signals plus a per-policy walk of attr_set->policy_list and
+ * picks one of:
  *
- * Always-BALANCED is the safe choice for the skeleton patch: the
- * tunables already cold-boot to BALANCED bake values, so the
- * worker repeatedly classifies BALANCED, hysteresis is satisfied
- * trivially, and zenith_apply_profile(BALANCED) on top of the
- * already-BALANCED bake is idempotent.  The hysteresis machinery
- * is still exercised because the very first eval transitions
- * auto_pending_target from 0 (the cold-boot zero of an
- * uninitialised field) to BALANCED, and the commit path runs.
+ *   AUDIO       any process holds an open ALSA fd (atomic
+ *               refcount maintained by the snd_pcm_open /
+ *               snd_pcm_release vendor hooks).  Highest priority
+ *               -- audio glitches are the most user-visible
+ *               regression and AUDIO bake is the lowest-jitter
+ *               profile.
+ *   GAMING      any policy currently sees a game-engine thread
+ *               on a runqueue (Unity / Unreal / Cocos2d / etc;
+ *               see zenith_game_auto_comms[]) OR has render-
+ *               thread saturation while the v4l2 fd refcount is
+ *               zero (camera takes precedence over render via
+ *               PERFORMANCE).  Game profile prioritises sustained
+ *               throughput + frame-pacing over efficiency.
+ *   PERFORMANCE recent input event (< 1500 ms) AND screen on,
+ *               OR camera fd open (capture pipelines need
+ *               headroom but not the GAMING bake).
+ *   BATTERY     screen off AND running on battery.  Most
+ *               aggressive efficiency bake; safe because the
+ *               user is by definition not interacting.
+ *   BALANCED    fallback when no signal fires.  Sane default
+ *               that handles screen-on idle, charger-attached
+ *               idle, and any state the more specific
+ *               classifiers do not catch.
+ *
+ * LEGACY and CUSTOM are never picked -- they are explicit opt-
+ * out paths.
+ *
+ * The classifier is read-only with respect to tunables and z_-
+ * policy state (no field is mutated; no lock is taken beyond the
+ * list-walk RCU-equivalent under attr_set->update_lock that the
+ * caller already holds).  All atomic / shared-state reads are
+ * READ_ONCE / atomic_read / atomic64_read and racing values are
+ * tolerated -- the worst case is a single 500 ms eval window
+ * delayed pick, debounced again by auto_hysteresis_ms.
+ *
+ * Recency window for PERFORMANCE: 1500 ms.  Long enough to ride
+ * through a single scroll gesture's quiet phase, short enough
+ * that a finished interaction does not pin PERFORMANCE forever.
  */
+#define ZENITH_AUTO_INPUT_RECENT_NS	(1500ULL * NSEC_PER_MSEC)
+
 static unsigned int zenith_auto_classify(struct zenith_tunables *t)
 {
+	struct zenith_policy *z_policy;
+	bool audio;
+	bool camera;
+	bool game = false;
+	bool render = false;
+	bool input_recent;
+	bool screen_on;
+	bool on_battery;
+	u64 now_ns;
+	u64 last_input_ns;
+
+	audio = atomic_read(&zenith_alsa_active_fds) > 0;
+	if (audio)
+		return ZENITH_PROFILE_AUDIO;
+
+	camera = atomic_read(&zenith_v4l2_active_fds) > 0;
+	on_battery = atomic_read(&zenith_on_battery) > 0;
+	screen_on = READ_ONCE(t->screen_state) != 0;
+	now_ns = ktime_get_ns();
+	last_input_ns = atomic64_read(&zenith_input_last_event_ns);
+	input_recent = last_input_ns &&
+		       (now_ns - last_input_ns) < ZENITH_AUTO_INPUT_RECENT_NS;
+
+	/* Game / render walk over attr_set->policy_list.  The caller
+	 * (zenith_auto_eval_work_fn) holds attr_set->update_lock so
+	 * the policy_list is stable here; the per-policy detectors
+	 * are already cache-TTL'd so a 2 - 4 policy walk costs at
+	 * most one strncmp loop per per-policy cache miss (sub-second
+	 * window).  Render is OR'd into game when no camera fd is
+	 * open -- a saturated render thread without a camera capture
+	 * happening is dominated by the GAMING bake; with a camera
+	 * fd open the camera takes precedence and the cascade lands
+	 * on PERFORMANCE.
+	 */
+	list_for_each_entry(z_policy, &t->attr_set.policy_list,
+			    tunables_hook) {
+		if (zenith_policy_has_game_auto(z_policy)) {
+			game = true;
+			break;
+		}
+		if (!camera && zenith_policy_has_render(z_policy))
+			render = true;
+	}
+	if (game || render)
+		return ZENITH_PROFILE_GAMING;
+
+	if (camera)
+		return ZENITH_PROFILE_PERFORMANCE;
+
+	if (input_recent && screen_on)
+		return ZENITH_PROFILE_PERFORMANCE;
+
+	if (!screen_on && on_battery)
+		return ZENITH_PROFILE_BATTERY;
+
 	return ZENITH_PROFILE_BALANCED;
 }
 
