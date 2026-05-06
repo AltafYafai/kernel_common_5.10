@@ -110,6 +110,21 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/cpufreq_zenith.h>
 
+/* Patch B9-1: vendor hook on cluster freq-scale realisation.  Lets
+ * zenith observe the *realised* per-cluster freq scale (set by the
+ * scheduler from cpufreq_driver_fast_switch / arch_set_freq_scale)
+ * rather than relying on its own decision-time view.  Header is
+ * always pulled in -- the consumer is gated at runtime by
+ * tunables->vh_arch_freq_scale_enable, and the registration in
+ * zenith_gov_init() is a no-op when CONFIG_ANDROID_VENDOR_HOOKS=n
+ * because the trace_android_vh_* exports collapse to empty in that
+ * configuration.  Pulled in *after* CREATE_TRACE_POINTS so the
+ * TRACE_INCLUDE_PATH redefinition done by trace/hooks headers does
+ * not leak into trace/events/cpufreq_zenith.h's own define_trace.h
+ * re-include.
+ */
+#include <trace/hooks/topology.h>
+
 /* Constants & Defaults */
 /* Permille of SCHED_CAPACITY_SCALE at which iowait boost starts.
  * 125 == SCHED_CAPACITY_SCALE / 8, preserving the historical default.
@@ -478,6 +493,41 @@
 #define ZENITH_DEFAULT_IO_FLOOR_HYST_PCT		50
 #define ZENITH_IO_FLOOR_HYST_MS_MAX			2000
 #define ZENITH_IO_FLOOR_HYST_PCT_MAX			100
+
+/* vh_arch_freq_scale_enable (default 0, [Patch B9-1]):
+ *
+ * Master 0/1 gate for the android_vh_arch_set_freq_scale vendor-hook
+ * observer.  When 1, every realisation of a per-cluster
+ * frequency-scale change (the value the scheduler caches for capacity
+ * accounting) drops into zenith_probe_arch_set_freq_scale(), updates
+ * z_policy->vh_arch_freq_scale_last, and -- if the climb crossed
+ * ZENITH_VH_ARCH_FREQ_SCALE_STEP -- arms the peer cluster's
+ * peer_ramp window via zenith_peer_ramp_arm().  When 0 the probe is
+ * still installed (the cost is one branch on `enable`) but performs
+ * no work.
+ *
+ * Why default 0: the hook fires from arbitrary scheduler context and
+ * is purely additive on top of the existing decision-time peer_ramp
+ * arming.  Cold-boot users keep the historical timing; opting in is
+ * a single sysfs write or a profile flip.
+ *
+ * Profile bakes (auto-tune):
+ *   PERFORMANCE:  1   (track realisation; pre-arm peer aggressively)
+ *   BALANCED:     0   (cold-boot default; opt-in only)
+ *   BATTERY:      0   (extra cross-cluster wakes are not worth it)
+ *   LEGACY:       0   (historical-compat)
+ *   GAMING:       1   (tighten cross-cluster coupling for input/render)
+ *   AUDIO:        0   (audio path benefits from steady cluster, not
+ *                      cross-cluster pre-arm)
+ *   CUSTOM:       0   (cold-boot opt-in)
+ *
+ * ZENITH_VH_ARCH_FREQ_SCALE_STEP gates the peer-ramp arm: only a
+ * climb of >= 51/1024 of SCHED_CAPACITY_SCALE counts (~5%, which
+ * filters governor-noise re-evaluations of the same OPP without
+ * dropping real cluster ramps).
+ */
+#define ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE	0
+#define ZENITH_VH_ARCH_FREQ_SCALE_STEP			51
 
 /* peak_hysteresis_streak / peak_step_down_pct
  * (defaults 3 / 95, [Stage 4 / Patch E]):
@@ -3588,6 +3638,16 @@ struct zenith_tunables {
 	 */
 	unsigned int		frame_budget_us_per_policy[NR_CPUS];
 	unsigned int		frame_pace_floor_pct;
+
+	/* See ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE (Patch B9-1).
+	 * Master 0/1 gate for the android_vh_arch_set_freq_scale
+	 * vendor-hook observer.  When 0 the registered probe is a
+	 * single-branch no-op; when 1 it caches the realised cluster
+	 * freq scale and pre-arms peer_ramp on the local cluster.
+	 * Read via READ_ONCE on the hot probe path; written via
+	 * WRITE_ONCE from sysfs and from zenith_apply_profile().
+	 */
+	unsigned int		vh_arch_freq_scale_enable;
 };
 
 /*
@@ -4743,6 +4803,24 @@ struct zenith_policy {
 	 * Reset to zero on zenith_start() alongside stats[].
 	 */
 	unsigned long		dec_lat_buckets[4];
+
+	/* Patch B9-1: realised per-cluster freq scale, cached from the
+	 * android_vh_arch_set_freq_scale vendor hook.  Stores the most
+	 * recent SCHED_CAPACITY_SCALE-domain value (0..1024) the
+	 * scheduler observed for this policy after a freq write
+	 * actually took effect.  Updated under no governor lock from
+	 * the hook callback (which can fire in arbitrary scheduler
+	 * context); written via WRITE_ONCE so the eval-path readers
+	 * (which hold update_lock) and the cross-cluster comparator in
+	 * the probe (which does not) both see torn-write-safe values
+	 * on 32-bit.  Read via READ_ONCE.
+	 *
+	 * Cleared (set to 0) at policy init by kzalloc(); never
+	 * decremented other than by the hook overwriting it on the
+	 * next realisation.  When tunables->vh_arch_freq_scale_enable
+	 * is 0 this field never moves off zero.
+	 */
+	unsigned long		vh_arch_freq_scale_last;
 };
 
 struct zenith_cpu {
@@ -11104,6 +11182,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int psi_mem_cap_pct;
 		unsigned int psi_mem_cap_window_ms;
 		unsigned int audio_hyst_ms;
+		unsigned int vh_arch_freq_scale_enable;
 	};
 	static const struct zenith_profile_defaults profiles[] = {
 		{
@@ -11314,6 +11393,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_pct = 90,
 			.psi_mem_cap_window_ms = 1000,
 			.audio_hyst_ms = 250,
+			.vh_arch_freq_scale_enable = 1,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -11525,6 +11605,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_window_ms =
 				ZENITH_DEFAULT_PSI_MEM_CAP_WINDOW_MS,
 			.audio_hyst_ms = ZENITH_DEFAULT_AUDIO_HYST_MS,
+			.vh_arch_freq_scale_enable =
+				ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -11719,6 +11801,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_pct = 70,
 			.psi_mem_cap_window_ms = 1500,
 			.audio_hyst_ms = 100,
+			.vh_arch_freq_scale_enable = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -11888,6 +11971,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_pct = 80,
 			.psi_mem_cap_window_ms = 1000,
 			.audio_hyst_ms = 0,
+			.vh_arch_freq_scale_enable = 0,
 		},
 		{
 			/* Patch 4.1: GAMING profile.
@@ -12024,6 +12108,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_pct = 90,
 			.psi_mem_cap_window_ms = 1000,
 			.audio_hyst_ms = 250,
+			.vh_arch_freq_scale_enable = 1,
 		},
 		{
 			/* Patch 4.2: AUDIO profile.
@@ -12206,6 +12291,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.psi_mem_cap_pct = 80,
 			.psi_mem_cap_window_ms = 1000,
 			.audio_hyst_ms = 750,
+			.vh_arch_freq_scale_enable = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -12309,6 +12395,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(t->psi_mem_cap_window_ms,
 		   p->psi_mem_cap_window_ms);
 	WRITE_ONCE(t->audio_hyst_ms, p->audio_hyst_ms);
+	WRITE_ONCE(t->vh_arch_freq_scale_enable,
+		   p->vh_arch_freq_scale_enable);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
@@ -17231,6 +17319,35 @@ static ssize_t audio_hyst_ms_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr audio_hyst_ms = __ATTR_RW(audio_hyst_ms);
 
+/* Patch B9-1: vh_arch_freq_scale_enable sysfs knob.  Strict 0/1
+ * boolean; gates the android_vh_arch_set_freq_scale vendor-hook
+ * observer (see ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE for the
+ * full semantics and profile bakes).  Stored via plain assignment;
+ * the probe reads it with READ_ONCE so a torn write would only
+ * delay the gate flip by one realisation event.
+ */
+static ssize_t
+vh_arch_freq_scale_enable_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->vh_arch_freq_scale_enable);
+}
+
+static ssize_t
+vh_arch_freq_scale_enable_store(struct gov_attr_set *attr_set,
+				const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->vh_arch_freq_scale_enable, val);
+	return count;
+}
+static struct governor_attr vh_arch_freq_scale_enable =
+	__ATTR_RW(vh_arch_freq_scale_enable);
+
 /* camera_aware sysfs knob.  Strict 0/1 boolean; non-zero values
  * normalised to 1 on store.
  */
@@ -18115,6 +18232,7 @@ static struct attribute *zenith_attrs[] = {
 	&audio_floor_pct.attr,
 	&audio_cap_pct.attr,
 	&audio_hyst_ms.attr,
+	&vh_arch_freq_scale_enable.attr,
 	&camera_aware.attr,
 	&camera_comms.attr,
 	&camera_active.attr,
@@ -18294,6 +18412,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->dl_task_floor_pct	= ZENITH_DEFAULT_DL_TASK_FLOOR_PCT;
 	tunables->io_floor_hyst_ms	= ZENITH_DEFAULT_IO_FLOOR_HYST_MS;
 	tunables->io_floor_hyst_pct	= ZENITH_DEFAULT_IO_FLOOR_HYST_PCT;
+	tunables->vh_arch_freq_scale_enable =
+		ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE;
 	tunables->peak_hysteresis_streak =
 		ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK;
 	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
@@ -19053,11 +19173,102 @@ static void zenith_probe_wakeup_new(void *data, struct task_struct *p)
 		   (u64)pulse_ms * NSEC_PER_MSEC);
 }
 
+/* Patch B9-1: android_vh_arch_set_freq_scale observer.
+ *
+ * The hook fires from arch_set_freq_scale() in drivers/base/
+ * arch_topology.c whenever the scheduler caches a new per-cluster
+ * frequency-scale value (used downstream for capacity_orig_of() /
+ * cpu_util_*() accounting).  The signal is unique compared to the
+ * tracepoints zenith already consumes in two ways:
+ *
+ *   1. It fires after the freq write has *taken effect*, not after
+ *      zenith decided to write it.  On platforms that route the
+ *      actual freq change through firmware / SCMI / a separate fast
+ *      switch, drift between decision and realisation is real.
+ *   2. It also fires for clusters zenith does *not* drive (e.g. on
+ *      a hetero SoC where the BIG cluster is on schedutil and the
+ *      LITTLE on zenith).  This gives zenith cross-cluster
+ *      activity awareness without coupling to either governor's
+ *      internal state.
+ *
+ * Use is opt-in via tunables->vh_arch_freq_scale_enable (default
+ * 0).  When the gate is off the probe is a single READ_ONCE plus a
+ * branch -- the cost on hot platforms (where this fires per
+ * fast-switch) is dominated by the policy lookup.  When on:
+ *
+ *   - cache the realised scale in z_policy->vh_arch_freq_scale_-
+ *     last (WRITE_ONCE; readers see torn-write-safe values)
+ *   - if the scale jumped by >= ZENITH_VH_ARCH_FREQ_SCALE_STEP
+ *     compared to the prior cached value (~5%% of SCHED_CAPACITY_-
+ *     SCALE; filters governor-noise re-evaluations of the same
+ *     OPP), arm the peer cluster's peer_ramp window so a peer
+ *     governor's lift pre-warms us before the next eval window.
+ *
+ * Concurrency:
+ *   - The probe runs in arbitrary scheduler context.  No sleeping
+ *     primitives.  cpufreq_cpu_get_raw() is per_cpu pointer load
+ *     plus a cpumask_test_cpu() check; no locks, no RCU writes.
+ *   - z_policy->governor_data is the same READ_ONCE pattern the
+ *     existing zenith_probe_wakeup_new() uses (see comment block
+ *     above that function for the unregister-vs-free ordering
+ *     argument; identical reasoning applies here because we
+ *     register / unregister via the same trace-point lifecycle in
+ *     zenith_gov_init()).
+ *   - zenith_peer_ramp_arm() takes no locks; it reads the
+ *     tunables window via READ_ONCE and writes a static atomic64
+ *     via atomic64_set.  Safe to call from this context.
+ */
+static void
+zenith_probe_arch_set_freq_scale(void *data, const struct cpumask *cpus,
+				 unsigned long freq, unsigned long max,
+				 unsigned long *scale)
+{
+	struct cpufreq_policy *policy;
+	struct zenith_policy *z_policy;
+	struct zenith_tunables *t;
+	unsigned long new_scale;
+	unsigned long prev_scale;
+	unsigned int cpu;
+
+	if (!cpus || !max)
+		return;
+	cpu = cpumask_first(cpus);
+	if (cpu >= nr_cpu_ids)
+		return;
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy || policy->governor != &zenith_gov)
+		return;
+	z_policy = READ_ONCE(policy->governor_data);
+	if (!z_policy)
+		return;
+	t = z_policy->tunables;
+	if (!t || !READ_ONCE(t->vh_arch_freq_scale_enable))
+		return;
+
+	/* Prefer the scheduler's own normalised value when available;
+	 * fall back to (freq / max) * SCHED_CAPACITY_SCALE if the
+	 * caller didn't supply a destination pointer (defensive --
+	 * the in-tree caller always passes one).
+	 */
+	if (scale)
+		new_scale = *scale;
+	else
+		new_scale = (freq * SCHED_CAPACITY_SCALE) / max;
+
+	prev_scale = READ_ONCE(z_policy->vh_arch_freq_scale_last);
+	WRITE_ONCE(z_policy->vh_arch_freq_scale_last, new_scale);
+
+	if (new_scale > prev_scale &&
+	    new_scale - prev_scale >= ZENITH_VH_ARCH_FREQ_SCALE_STEP)
+		zenith_peer_ramp_arm(z_policy, ktime_get_ns());
+}
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
 	bool input_registered = false;
 	bool fg_pulse_registered = false;
+	bool vh_arch_freq_scale_registered = false;
 #ifdef CONFIG_FB_NOTIFY
 	bool fb_registered = false;
 #endif
@@ -19189,6 +19400,22 @@ static int __init zenith_gov_init(void)
 	else
 		fg_pulse_registered = true;
 
+	/* Patch B9-1: register the android_vh_arch_set_freq_scale
+	 * vendor-hook probe.  Failure is non-fatal; the freq-scale
+	 * realisation observer simply remains silent and zenith falls
+	 * back to its decision-time peer_ramp arming alone.  The
+	 * tunables->vh_arch_freq_scale_enable gate is the runtime
+	 * switch; this register call only makes the probe *available*
+	 * for the gate to flip on.
+	 */
+	ret = register_trace_android_vh_arch_set_freq_scale(
+		zenith_probe_arch_set_freq_scale, NULL);
+	if (ret)
+		pr_warn("Zenith: vh_arch_set_freq_scale probe register failed (%d), vh_arch_freq_scale_enable will be a no-op\n",
+			ret);
+	else
+		vh_arch_freq_scale_registered = true;
+
 	/* Panel-state delivery: register the drm_panel_notifier path first
 	 * (preferred when available because the fb notifier chain is
 	 * deprecated upstream and absent on most modern vendor builds), and
@@ -19257,6 +19484,9 @@ static int __init zenith_gov_init(void)
 		if (fg_pulse_registered)
 			unregister_trace_sched_wakeup_new(
 				zenith_probe_wakeup_new, NULL);
+		if (vh_arch_freq_scale_registered)
+			unregister_trace_android_vh_arch_set_freq_scale(
+				zenith_probe_arch_set_freq_scale, NULL);
 		pr_err("Zenith: cpufreq_register_governor failed (%d)\n", ret);
 		return ret;
 	}
