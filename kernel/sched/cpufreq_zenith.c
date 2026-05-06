@@ -62,6 +62,7 @@
 #include <linux/math64.h>
 #include <linux/notifier.h>
 #include <linux/power_supply.h>
+#include <linux/time.h>
 #include <linux/kernel_stat.h>
 
 /* linux/fb.h transitively pulls linux/acpi.h, which redefines the
@@ -270,6 +271,38 @@
 #define ZENITH_DEFAULT_BATT_HOLD_SCALE_PCT		100
 #define ZENITH_BATT_HOLD_SCALE_PCT_MIN			50
 #define ZENITH_BATT_HOLD_SCALE_PCT_MAX			300
+
+/* Patch 1.10 quiet-hours cap.  Two start / end knobs (in minutes
+ * since 00:00 UTC, range 0..1439) define a daily window; while
+ * inside that window, freq is capped at quiet_hours_cap_pct of
+ * policy->max.  When start == end, the window is zero-length and
+ * the tier is disabled (the default).  When start > end the
+ * window wraps midnight (e.g. 22:00 .. 06:00).
+ *
+ * UTC is the reference because the kernel only knows wall time;
+ * userspace converts the user's local sleep window to UTC and
+ * writes the two knobs at boot.  This avoids dragging timezone
+ * state into the governor.
+ *
+ * quiet_hours_screen_off_only (default 1) gates the cap on
+ * tunables->screen_state == 0, so an unintended throttle never
+ * lands while the user is actively interacting -- the use case
+ * is "slow the CPU while the phone is sleeping next to the bed",
+ * not "throttle the device mid-call".  Setting it to 0 enables
+ * the cap regardless of screen state.
+ *
+ * Profile-baked: PERFORMANCE / LEGACY keep cap_pct = 100 (no cap),
+ * BALANCED holds at 70 %% (mild residency push if a window is
+ * configured), BATTERY at 55 %% (aggressive).  The window itself
+ * is *not* profile-baked because the user's quiet hours are
+ * personal -- profiles only own the cap depth.
+ */
+#define ZENITH_DEFAULT_QUIET_HOURS_START_MIN		0
+#define ZENITH_DEFAULT_QUIET_HOURS_END_MIN		0
+#define ZENITH_DEFAULT_QUIET_HOURS_CAP_PCT		100
+#define ZENITH_DEFAULT_QUIET_HOURS_SCREEN_OFF_ONLY	1
+#define ZENITH_QUIET_HOURS_MINUTE_MAX			1439
+#define ZENITH_QUIET_HOURS_CAP_PCT_MIN			50
 
 /* Predictive up-shift via util-trend ring (tier 2a').
  *
@@ -2638,6 +2671,17 @@ struct zenith_tunables {
 	unsigned int		cluster_wake_pulse_ms;
 	unsigned int		cluster_wake_pulse_idle_ms;
 	unsigned int		cluster_wake_pulse_floor_pct;
+
+	/* Patch 1.10 quiet-hours cap.  See the comment block above
+	 * ZENITH_DEFAULT_QUIET_HOURS_START_MIN for the full rationale.
+	 * quiet_hours_start_min == quiet_hours_end_min disables the
+	 * tier (default).  cap_pct is the only profile-baked knob in
+	 * this group; the start / end window is user-personal.
+	 */
+	unsigned int		quiet_hours_start_min;
+	unsigned int		quiet_hours_end_min;
+	unsigned int		quiet_hours_cap_pct;
+	unsigned int		quiet_hours_screen_off_only;
 
 	/* Pre-arm tier for the peak-headroom rescue.  When 1 (the
 	 * default), an early softer intervention fires while the
@@ -6468,6 +6512,36 @@ static inline void zenith_at_v_reset_window(struct zenith_policy *z_policy)
 	z_policy->at_pending_windows = 0;
 }
 
+/* Patch 1.10: return true when the wall clock is currently inside
+ * the quiet-hours window described by [start_min, end_min) on a
+ * 0..1439 minute-of-day grid (UTC).  Returns false when the
+ * window is zero-length (start == end), which is the configured-
+ * disabled state.  When start > end the window wraps midnight,
+ * matching how a user would expect to write "22:00 to 06:00".
+ *
+ * Uses ktime_get_real_seconds() + time64_to_tm() to derive the
+ * minute-of-day; both are read-only with no allocation, so the
+ * helper is safe to call from the hot eval path.
+ */
+static inline bool zenith_in_quiet_hours(const struct zenith_tunables *t)
+{
+	unsigned int start = t->quiet_hours_start_min;
+	unsigned int end = t->quiet_hours_end_min;
+	struct tm tm;
+	unsigned int now_min;
+
+	if (start == end ||
+	    start > ZENITH_QUIET_HOURS_MINUTE_MAX ||
+	    end > ZENITH_QUIET_HOURS_MINUTE_MAX)
+		return false;
+	time64_to_tm(ktime_get_real_seconds(), 0, &tm);
+	now_min = (unsigned int)tm.tm_hour * 60U +
+		  (unsigned int)tm.tm_min;
+	if (start < end)
+		return now_min >= start && now_min < end;
+	return now_min >= start || now_min < end;
+}
+
 /* Scale a hold-down millisecond budget by batt_hold_scale_pct when
  * the system is running on battery (Patch 1.2).  Returns @ms
  * unchanged when on AC, when scale_pct is 100, or when scale_pct
@@ -8393,6 +8467,41 @@ apply_uclamp_max_cap:
 				freq = psi_cap;
 				tp_path = psi_tag;
 			}
+		}
+	}
+
+	/* 3f. Quiet-hours cap (Patch 1.10).
+	 *
+	 * Hard freq cap inside the user-configured nightly window.
+	 * pin_to_target tiers (input_boost / brutality) bypass the
+	 * cap so a user explicitly poking the device mid-window still
+	 * gets full responsiveness; passive evaluation is what gets
+	 * throttled.  The screen_off_only gate is the second guard:
+	 * with the default of 1, the cap only fires while
+	 * tunables->screen_state == 0, so a quiet-hours window that
+	 * accidentally overlaps an active call or alarm doesn't drag
+	 * the cluster down.
+	 *
+	 * cap_pct is bounded floor 50 % (sysfs); cap_pct == 100 makes
+	 * the tier a no-op and is the default, so without an explicit
+	 * profile / sysfs override the tier is invisible.
+	 */
+	if (!pin_to_target && policy->max &&
+	    z_policy->tunables->quiet_hours_cap_pct &&
+	    z_policy->tunables->quiet_hours_cap_pct < 100 &&
+	    (!z_policy->tunables->quiet_hours_screen_off_only ||
+	     !READ_ONCE(z_policy->tunables->screen_state)) &&
+	    zenith_in_quiet_hours(z_policy->tunables)) {
+		unsigned int qh_cap = (policy->max / 100) *
+			z_policy->tunables->quiet_hours_cap_pct;
+
+		if (qh_cap < policy->min)
+			qh_cap = policy->min;
+		if (qh_cap > policy->max)
+			qh_cap = policy->max;
+		if (freq > qh_cap) {
+			freq = qh_cap;
+			tp_path = "quiet_hours_cap";
 		}
 	}
 
@@ -10463,6 +10572,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int cluster_wake_pulse_ms;
 		unsigned int cluster_wake_pulse_idle_ms;
 		unsigned int cluster_wake_pulse_floor_pct;
+		unsigned int quiet_hours_cap_pct;
+		unsigned int quiet_hours_screen_off_only;
 		unsigned int screen_on_bias_pct;
 		unsigned int input_boost_down_rate_mult_pct;
 		unsigned int predict_up_thresh;
@@ -10534,6 +10645,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.cluster_wake_pulse_ms = 80,
 			.cluster_wake_pulse_idle_ms = 60,
 			.cluster_wake_pulse_floor_pct = 70,
+			.quiet_hours_cap_pct = 100,
+			.quiet_hours_screen_off_only = 1,
 			.screen_on_bias_pct = 0,
 			.input_boost_down_rate_mult_pct = 300,
 			/* Stage 4 / Patch A: PERFORMANCE wants eager
@@ -10720,6 +10833,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_IDLE_MS,
 			.cluster_wake_pulse_floor_pct =
 				ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_FLOOR_PCT,
+			.quiet_hours_cap_pct = 70,
+			.quiet_hours_screen_off_only = 1,
 			.screen_on_bias_pct =
 				ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT,
 			.input_boost_down_rate_mult_pct =
@@ -10898,6 +11013,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.cluster_wake_pulse_ms = 0,
 			.cluster_wake_pulse_idle_ms = 0,
 			.cluster_wake_pulse_floor_pct = 0,
+			.quiet_hours_cap_pct = 55,
+			.quiet_hours_screen_off_only = 1,
 			.screen_on_bias_pct = 80,
 			.input_boost_down_rate_mult_pct = 150,
 			/* Stage 4 / Patch A: BATTERY disables prediction.
@@ -11072,6 +11189,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.cluster_wake_pulse_ms = 0,
 			.cluster_wake_pulse_idle_ms = 0,
 			.cluster_wake_pulse_floor_pct = 0,
+			.quiet_hours_cap_pct = 100,
+			.quiet_hours_screen_off_only = 1,
 			.screen_on_bias_pct = 100,
 			.input_boost_down_rate_mult_pct = 100,
 			/* Stage 4 / Patch A: LEGACY disables prediction
@@ -11222,6 +11341,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	t->cluster_wake_pulse_ms = p->cluster_wake_pulse_ms;
 	t->cluster_wake_pulse_idle_ms = p->cluster_wake_pulse_idle_ms;
 	t->cluster_wake_pulse_floor_pct = p->cluster_wake_pulse_floor_pct;
+	t->quiet_hours_cap_pct	= p->quiet_hours_cap_pct;
+	t->quiet_hours_screen_off_only = p->quiet_hours_screen_off_only;
 	t->screen_on_bias_pct	= p->screen_on_bias_pct;
 	t->input_boost_down_rate_mult_pct =
 		p->input_boost_down_rate_mult_pct;
@@ -14383,6 +14504,112 @@ static ssize_t cluster_wake_pulse_floor_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr cluster_wake_pulse_floor_pct =
 	__ATTR_RW(cluster_wake_pulse_floor_pct);
 
+/* quiet_hours_start_min / quiet_hours_end_min sysfs knobs (Patch
+ * 1.10).  Both accept 0..1439 (minutes since 00:00 UTC).  When
+ * start == end, the tier is disabled.  When start > end, the
+ * window wraps midnight.  See zenith_in_quiet_hours().
+ */
+static ssize_t quiet_hours_start_min_show(struct gov_attr_set *attr_set,
+					  char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->quiet_hours_start_min);
+}
+
+static ssize_t quiet_hours_start_min_store(struct gov_attr_set *attr_set,
+					   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_QUIET_HOURS_MINUTE_MAX)
+		return -EINVAL;
+	t->quiet_hours_start_min = val;
+	return count;
+}
+
+static struct governor_attr quiet_hours_start_min =
+	__ATTR_RW(quiet_hours_start_min);
+
+static ssize_t quiet_hours_end_min_show(struct gov_attr_set *attr_set,
+					char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->quiet_hours_end_min);
+}
+
+static ssize_t quiet_hours_end_min_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val > ZENITH_QUIET_HOURS_MINUTE_MAX)
+		return -EINVAL;
+	t->quiet_hours_end_min = val;
+	return count;
+}
+
+static struct governor_attr quiet_hours_end_min =
+	__ATTR_RW(quiet_hours_end_min);
+
+/* quiet_hours_cap_pct: 50..100, profile-baked.  100 disables the
+ * cap (no-op, default).  Smaller values cap freq harder during
+ * the window.  Floor of 50 mirrors batt_hold_scale_pct's lower
+ * bound and avoids surprising users with a near-min cap.
+ */
+static ssize_t quiet_hours_cap_pct_show(struct gov_attr_set *attr_set,
+					char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->quiet_hours_cap_pct);
+}
+
+static ssize_t quiet_hours_cap_pct_store(struct gov_attr_set *attr_set,
+					 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) ||
+	    val < ZENITH_QUIET_HOURS_CAP_PCT_MIN || val > 100)
+		return -EINVAL;
+	t->quiet_hours_cap_pct = val;
+	return count;
+}
+
+static struct governor_attr quiet_hours_cap_pct =
+	__ATTR_RW(quiet_hours_cap_pct);
+
+/* quiet_hours_screen_off_only: 0 / 1.  Default 1 -- the cap only
+ * fires while the screen is off, so a window that overlaps an
+ * active call / alarm doesn't drag the cluster down.
+ */
+static ssize_t quiet_hours_screen_off_only_show(struct gov_attr_set *attr_set,
+						char *buf)
+{
+	return sprintf(buf, "%u\n",
+		to_zenith_tunables(attr_set)->quiet_hours_screen_off_only);
+}
+
+static ssize_t quiet_hours_screen_off_only_store(struct gov_attr_set *attr_set,
+						 const char *buf,
+						 size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->quiet_hours_screen_off_only = val;
+	return count;
+}
+
+static struct governor_attr quiet_hours_screen_off_only =
+	__ATTR_RW(quiet_hours_screen_off_only);
+
 /* peak_headroom_prearm sysfs knob.  Boolean gate for the soft early
  * intervention tier (2b') that lifts the cluster to eff_hispeed_freq
  * while the starvation streak is accumulating but has not yet
@@ -16367,6 +16594,10 @@ static struct attribute *zenith_attrs[] = {
 	&cluster_wake_pulse_ms.attr,
 	&cluster_wake_pulse_idle_ms.attr,
 	&cluster_wake_pulse_floor_pct.attr,
+	&quiet_hours_start_min.attr,
+	&quiet_hours_end_min.attr,
+	&quiet_hours_cap_pct.attr,
+	&quiet_hours_screen_off_only.attr,
 	&peak_headroom_prearm.attr,
 	&predict_up_thresh.attr,
 	&predict_up_window.attr,
@@ -16647,6 +16878,14 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_IDLE_MS;
 	tunables->cluster_wake_pulse_floor_pct =
 		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_FLOOR_PCT;
+	tunables->quiet_hours_start_min =
+		ZENITH_DEFAULT_QUIET_HOURS_START_MIN;
+	tunables->quiet_hours_end_min =
+		ZENITH_DEFAULT_QUIET_HOURS_END_MIN;
+	tunables->quiet_hours_cap_pct =
+		ZENITH_DEFAULT_QUIET_HOURS_CAP_PCT;
+	tunables->quiet_hours_screen_off_only =
+		ZENITH_DEFAULT_QUIET_HOURS_SCREEN_OFF_ONLY;
 	tunables->predict_up_thresh	= ZENITH_DEFAULT_PREDICT_UP_THRESH;
 	tunables->predict_up_window	= ZENITH_DEFAULT_PREDICT_UP_WINDOW;
 	tunables->peak_hysteresis_streak =
