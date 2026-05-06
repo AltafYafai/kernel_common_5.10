@@ -569,6 +569,42 @@
  */
 #define ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE	0
 
+/* Patch B-AUTO-3: auto-selector engine cadence and hysteresis.
+ *
+ * auto_eval_ms (default 500): the deferrable workqueue runs the
+ * classifier once every auto_eval_ms milliseconds when
+ * active_profile == ZENITH_PROFILE_AUTO.  500 ms is the minimum
+ * cadence that reliably catches the audio / camera open events
+ * without polling so often that we waste wakeups.
+ *
+ * auto_hysteresis_ms (default 2000): the classifier's chosen
+ * target must hold for at least auto_hysteresis_ms before zenith
+ * commits the profile switch.  This debounces transient bursts
+ * (e.g. a 1 s notification ping that briefly trips the audio
+ * detector) so the device does not flap profiles every few
+ * hundred ms.
+ *
+ * Both fields accept 0 -- 0 disables the engine wholesale (the
+ * worker re-arms but exits the classifier early).  B-AUTO-5
+ * promotes auto_eval_ms / auto_hysteresis_ms to profile-baked
+ * defaults; until then they live as the universal defaults
+ * defined here.
+ *
+ * Bounds:
+ *   auto_eval_ms        100 .. 60000
+ *   auto_hysteresis_ms  0   .. 60000
+ *
+ * The lower bound on auto_eval_ms keeps the worker out of the
+ * 1-cpu-pinned-to-pollworker territory; the upper bound on either
+ * cap keeps integration testing tractable.
+ */
+#define ZENITH_DEFAULT_AUTO_EVAL_MS		500
+#define ZENITH_DEFAULT_AUTO_HYSTERESIS_MS	2000
+#define ZENITH_AUTO_EVAL_MS_MIN			100
+#define ZENITH_AUTO_EVAL_MS_MAX			60000
+#define ZENITH_AUTO_HYSTERESIS_MS_MIN		0
+#define ZENITH_AUTO_HYSTERESIS_MS_MAX		60000
+
 /* peak_hysteresis_streak / peak_step_down_pct
  * (defaults 3 / 95, [Stage 4 / Patch E]):
  *
@@ -3212,6 +3248,56 @@ struct zenith_tunables {
 	 * profile_store on AUTO entry.
 	 */
 	unsigned int		auto_target;
+
+	/* Patch B-AUTO-3: deferrable workqueue + hysteresis tracking
+	 * for the auto-selector engine.
+	 *
+	 * eval_work runs on the system unbound deferrable workqueue at
+	 * a (default 500 ms, profile-baked) cadence whenever
+	 * active_profile == ZENITH_PROFILE_AUTO.  It reads device-wide
+	 * signals (B-AUTO-4 adds the classifier; B-AUTO-3 stubs it to
+	 * return BALANCED) and, after auto_pending_target has held
+	 * steady for >= auto_hysteresis_ms, applies the new profile
+	 * via zenith_apply_profile() and stamps auto_target.
+	 *
+	 * eval_work is initialised in the tunables alloc path and
+	 * cancelled in the tunables free path.  It re-arms itself at
+	 * the end of every run (modulo active_profile == AUTO, which
+	 * is the engine's only off-switch).  It is *not* scheduled
+	 * automatically at alloc time -- profile_store on AUTO entry
+	 * is the only producer of an initial schedule, and B-AUTO-5
+	 * adds a cold-boot AUTO flip that triggers that path.
+	 *
+	 * Concurrency: the worker takes attr_set->update_lock around
+	 * any mutation of profile-bake fields (zenith_apply_profile,
+	 * zenith_refresh_rate_delays, zenith_invalidate_cache) so the
+	 * existing sysfs profile_store path stays race-free.  The
+	 * worker reads READ_ONCE(active_profile) outside the lock as
+	 * an early-out so the cancel-in-progress path doesn't deadlock
+	 * on update_lock with profile_store waiting for
+	 * cancel_delayed_work_sync.
+	 *
+	 * auto_pending_target / auto_pending_first_seen_ns implement
+	 * the hysteresis: when the classifier returns a different
+	 * target than auto_target the new value lands in
+	 * auto_pending_target with a fresh first_seen timestamp; if
+	 * the same value re-appears in subsequent windows and
+	 * (now - first_seen) >= auto_hysteresis_ms we commit.  When
+	 * the classifier flaps back to auto_target the pending state
+	 * resets.
+	 */
+	struct delayed_work	eval_work;
+	unsigned int		auto_pending_target;
+	u64			auto_pending_first_seen_ns;
+
+	/* Patch B-AUTO-3: cadence + hysteresis tunables for the
+	 * auto-selector engine.  See ZENITH_DEFAULT_AUTO_EVAL_MS and
+	 * ZENITH_DEFAULT_AUTO_HYSTERESIS_MS for default rationale.
+	 * Bounded by ZENITH_AUTO_EVAL_MS_{MIN,MAX} and
+	 * ZENITH_AUTO_HYSTERESIS_MS_{MIN,MAX} on sysfs writes.
+	 */
+	unsigned int		auto_eval_ms;
+	unsigned int		auto_hysteresis_ms;
 
 	/* Permille (0..1000) of SCHED_CAPACITY_SCALE at which
 	 * zenith_iowait_boost() arms and below which a doubling
@@ -12599,6 +12685,180 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   t->input_boost_touchdown_extra_ms);
 }
 
+/* Patch B-AUTO-3: auto-selector classifier stub.
+ *
+ * Returns the concrete profile zenith should run while
+ * active_profile == ZENITH_PROFILE_AUTO.  This patch ships a
+ * BALANCED-only stub so the eval-work skeleton can be exercised
+ * end-to-end (workqueue cadence, lock acquisition, hysteresis
+ * window, profile commit path) without yet introducing the
+ * priority-cascade logic.  B-AUTO-4 replaces the body with the
+ * real audio / game / performance / battery / balanced cascade
+ * fed by the existing comm-table detectors plus a battery
+ * reader.
+ *
+ * Always-BALANCED is the safe choice for the skeleton patch: the
+ * tunables already cold-boot to BALANCED bake values, so the
+ * worker repeatedly classifies BALANCED, hysteresis is satisfied
+ * trivially, and zenith_apply_profile(BALANCED) on top of the
+ * already-BALANCED bake is idempotent.  The hysteresis machinery
+ * is still exercised because the very first eval transitions
+ * auto_pending_target from 0 (the cold-boot zero of an
+ * uninitialised field) to BALANCED, and the commit path runs.
+ */
+static unsigned int zenith_auto_classify(struct zenith_tunables *t)
+{
+	return ZENITH_PROFILE_BALANCED;
+}
+
+/* Patch B-AUTO-3: auto-selector worker.
+ *
+ * Runs on the system unbound deferrable workqueue at
+ * t->auto_eval_ms cadence whenever active_profile ==
+ * ZENITH_PROFILE_AUTO.  See the eval_work comment in struct
+ * zenith_tunables for the design notes; this is the worker body
+ * itself.
+ *
+ * Off-switch path:
+ *   - active_profile != AUTO  -> return without rearming.  This
+ *     is the path that fires when the user writes "balanced" /
+ *     "performance" / etc to the profile sysfs node.
+ *     profile_store will subsequently cancel_delayed_work_sync
+ *     to drain any in-flight invocation.
+ *
+ * On-path:
+ *   - target = zenith_auto_classify(t)  (B-AUTO-3 stub: BALANCED;
+ *                                        B-AUTO-4: cascade)
+ *   - hysteresis: if target == auto_target the engine is already
+ *     converged; clear pending state and rearm.  Otherwise the
+ *     pending target's first_seen timestamp gates the commit
+ *     until auto_hysteresis_ms has elapsed.  When the timer
+ *     fires we commit -- zenith_apply_profile under
+ *     attr_set->update_lock plus zenith_refresh_rate_delays /
+ *     zenith_invalidate_cache so cached per-policy state for the
+ *     old profile does not leak forward.
+ *   - active_profile *stays* at AUTO across commits; only
+ *     auto_target reflects the engine's current pick.
+ *
+ * Cadence-zero path:
+ *   - if auto_eval_ms == 0 the engine is paused.  The worker
+ *     still rearms (default cadence 500 ms) so a userspace write
+ *     to a non-zero auto_eval_ms re-enters the active path
+ *     promptly, but the classifier is skipped and no profile
+ *     mutation runs.  This makes auto_eval_ms = 0 a runtime
+ *     enable/disable toggle without changing the work struct
+ *     lifecycle.
+ *
+ * Concurrency:
+ *   - active_profile is read once outside the lock as an early-
+ *     out so the cancel-in-progress path (profile_store on AUTO
+ *     exit) does not deadlock on update_lock waiting for
+ *     cancel_delayed_work_sync to drain.
+ *   - all profile-bake mutation paths take attr_set->update_lock
+ *     (mutex, sleepable) just like profile_store does, so the
+ *     two writers serialise cleanly.
+ */
+static void zenith_auto_eval_work_fn(struct work_struct *w)
+{
+	struct zenith_tunables *t = container_of(to_delayed_work(w),
+						 struct zenith_tunables,
+						 eval_work);
+	unsigned int eval_ms;
+	unsigned int hyst_ms;
+	unsigned int target;
+	unsigned int current_target;
+	unsigned int user_eval_ms;
+
+	/* Off-switch: read active_profile lock-free; if userspace has
+	 * already pivoted to a manual profile we exit immediately
+	 * without rearming so cancel_delayed_work_sync converges.
+	 */
+	if (READ_ONCE(t->active_profile) != ZENITH_PROFILE_AUTO)
+		return;
+
+	user_eval_ms = READ_ONCE(t->auto_eval_ms);
+	hyst_ms = READ_ONCE(t->auto_hysteresis_ms);
+	eval_ms = user_eval_ms ? user_eval_ms : ZENITH_DEFAULT_AUTO_EVAL_MS;
+
+	/* Cadence-zero gate: auto_eval_ms == 0 is the runtime pause
+	 * switch.  We still rearm at the default cadence so a future
+	 * userspace write to a non-zero auto_eval_ms re-enters the
+	 * active path promptly, but we skip the classifier and the
+	 * profile commit so no tunable mutation happens while paused.
+	 */
+	if (user_eval_ms == 0)
+		goto rearm;
+
+	target = zenith_auto_classify(t);
+
+	mutex_lock(&t->attr_set.update_lock);
+
+	/* Re-check active_profile under the lock to close the race
+	 * between the lock-free early-out above and a concurrent
+	 * profile_store that took the lock first to switch us to a
+	 * manual profile.  When the race fires we drop the lock and
+	 * exit without rearming -- profile_store's
+	 * cancel_delayed_work_sync follow-up will then converge.
+	 */
+	if (t->active_profile != ZENITH_PROFILE_AUTO) {
+		mutex_unlock(&t->attr_set.update_lock);
+		return;
+	}
+
+	current_target = READ_ONCE(t->auto_target);
+
+	if (target == current_target) {
+		/* Already converged on this target; clear any pending
+		 * hysteresis tracking so a fresh divergence starts
+		 * with a clean first_seen timestamp.
+		 */
+		t->auto_pending_target = current_target;
+		t->auto_pending_first_seen_ns = 0;
+		goto unlock;
+	}
+
+	if (t->auto_pending_target != target) {
+		t->auto_pending_target = target;
+		t->auto_pending_first_seen_ns = ktime_get_ns();
+		goto unlock;
+	}
+
+	/* Pending target unchanged across this window; check whether
+	 * the hysteresis timer has elapsed.
+	 */
+	if (hyst_ms) {
+		u64 now = ktime_get_ns();
+		u64 first_seen = t->auto_pending_first_seen_ns;
+		u64 hyst_ns = (u64)hyst_ms * NSEC_PER_MSEC;
+
+		if (!first_seen || now - first_seen < hyst_ns)
+			goto unlock;
+	}
+
+	/* Hysteresis satisfied -- commit the new profile bake.
+	 * active_profile stays at AUTO so the engine keeps running.
+	 */
+	zenith_apply_profile(t, target);
+	WRITE_ONCE(t->auto_target, target);
+	t->auto_pending_target = target;
+	t->auto_pending_first_seen_ns = 0;
+
+	zenith_refresh_rate_delays(&t->attr_set);
+	zenith_invalidate_cache(&t->attr_set);
+
+unlock:
+	mutex_unlock(&t->attr_set.update_lock);
+
+rearm:
+	/* Final guard against the cancel_delayed_work_sync race --
+	 * if active_profile was flipped out of AUTO while we held
+	 * the lock above, do not rearm.
+	 */
+	if (READ_ONCE(t->active_profile) == ZENITH_PROFILE_AUTO)
+		schedule_delayed_work(&t->eval_work,
+				      msecs_to_jiffies(eval_ms));
+}
+
 /* early_param("zenith.profile", ...) — accepts one of the canonical
  * preset names (performance / balanced / battery / legacy / custom).
  * Anything else is ignored and leaves zenith_cmdline_profile at CUSTOM.
@@ -13911,11 +14171,37 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 	if (prof == ZENITH_PROFILE_AUTO) {
 		zenith_apply_profile(t, ZENITH_PROFILE_BALANCED);
 		WRITE_ONCE(t->auto_target, ZENITH_PROFILE_BALANCED);
+		t->auto_pending_target = ZENITH_PROFILE_BALANCED;
+		t->auto_pending_first_seen_ns = 0;
 	} else {
 		zenith_apply_profile(t, prof);
 	}
 	t->active_profile = prof;
 	t->auto_tune_override_mask = 0;
+	/* Patch B-AUTO-3: AUTO entry scheduling.  On entry we kick
+	 * the eval worker so the first classifier run lands after
+	 * one auto_eval_ms window rather than waiting for some
+	 * external tick.  schedule_delayed_work is idempotent if the
+	 * worker was already pending.
+	 *
+	 * On AUTO exit we *do not* call cancel_delayed_work_sync from
+	 * here -- governor_store holds attr_set->update_lock across
+	 * this entire path, the worker also acquires that lock to
+	 * apply profile mutations, and a sync cancel while the worker
+	 * is waiting on the same lock would deadlock.  Instead we
+	 * rely on the worker's own lock-free
+	 * READ_ONCE(active_profile) early-out: at most one stale
+	 * worker invocation runs after the profile flip, observes
+	 * active_profile != AUTO, and self-cancels (no rearm).  The
+	 * synchronous drain happens later in zenith_tunables_free,
+	 * which runs from the kobject release path with no lock
+	 * held.
+	 */
+	if (prof == ZENITH_PROFILE_AUTO)
+		schedule_delayed_work(&t->eval_work,
+				      msecs_to_jiffies(t->auto_eval_ms ?
+						       t->auto_eval_ms :
+						       ZENITH_DEFAULT_AUTO_EVAL_MS));
 	list_for_each_entry(z_policy, &attr_set->policy_list, tunables_hook) {
 		zenith_reset_local_actions(z_policy);
 		z_policy->at_last_state = ZENITH_AT_STATE_BALANCED;
@@ -17616,6 +17902,65 @@ vh_uclamp_observer_enable_store(struct gov_attr_set *attr_set,
 static struct governor_attr vh_uclamp_observer_enable =
 	__ATTR_RW(vh_uclamp_observer_enable);
 
+/* Patch B-AUTO-3: auto_eval_ms RW sysfs.  Cadence at which the
+ * auto-selector engine runs its classifier when active_profile ==
+ * ZENITH_PROFILE_AUTO.  Bounded by ZENITH_AUTO_EVAL_MS_{MIN,MAX}.
+ * 0 is the runtime pause (worker still rearms but does not
+ * classify or commit).  Reads / writes are READ_ONCE / WRITE_ONCE
+ * because the worker reads this lock-free.
+ */
+static ssize_t auto_eval_ms_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       READ_ONCE(to_zenith_tunables(attr_set)->auto_eval_ms));
+}
+
+static ssize_t auto_eval_ms_store(struct gov_attr_set *attr_set,
+				  const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val && val < ZENITH_AUTO_EVAL_MS_MIN)
+		return -EINVAL;
+	if (val > ZENITH_AUTO_EVAL_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->auto_eval_ms, val);
+	return count;
+}
+static struct governor_attr auto_eval_ms = __ATTR_RW(auto_eval_ms);
+
+/* Patch B-AUTO-3: auto_hysteresis_ms RW sysfs.  How long the
+ * auto-selector classifier's chosen target must hold before
+ * zenith commits the profile switch.  Bounded by
+ * ZENITH_AUTO_HYSTERESIS_MS_{MIN,MAX}; 0 disables hysteresis (the
+ * classifier's pick lands on the very next eval window).
+ */
+static ssize_t auto_hysteresis_ms_show(struct gov_attr_set *attr_set,
+				       char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       READ_ONCE(to_zenith_tunables(attr_set)->auto_hysteresis_ms));
+}
+
+static ssize_t auto_hysteresis_ms_store(struct gov_attr_set *attr_set,
+					const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > ZENITH_AUTO_HYSTERESIS_MS_MAX)
+		return -EINVAL;
+	WRITE_ONCE(t->auto_hysteresis_ms, val);
+	return count;
+}
+static struct governor_attr auto_hysteresis_ms =
+	__ATTR_RW(auto_hysteresis_ms);
+
 /* camera_aware sysfs knob.  Strict 0/1 boolean; non-zero values
  * normalised to 1 on store.
  */
@@ -18406,6 +18751,8 @@ static struct attribute *zenith_attrs[] = {
 	&freq_step_adaptive.attr,
 	&profile.attr,
 	&auto_target.attr,
+	&auto_eval_ms.attr,
+	&auto_hysteresis_ms.attr,
 	&profile_values.attr,
 	&zenith_stats.attr,
 	&zenith_stats_reset.attr,
@@ -18530,7 +18877,22 @@ ATTRIBUTE_GROUPS(zenith);
 
 static void zenith_tunables_free(struct kobject *kobj)
 {
-	kfree(to_zenith_tunables(container_of(kobj, struct gov_attr_set, kobj)));
+	struct zenith_tunables *t =
+		to_zenith_tunables(container_of(kobj, struct gov_attr_set,
+						kobj));
+
+	/* Patch B-AUTO-3: drain the auto-selector worker before
+	 * freeing the tunables container.  The worker re-arms itself
+	 * unconditionally while active_profile == AUTO so we must
+	 * flip active_profile to a non-AUTO value first (the kobject
+	 * is going away, so any value will do); cancel_delayed_work_-
+	 * sync then returns once the in-flight invocation has
+	 * observed the new value via the rearm-side READ_ONCE guard.
+	 */
+	WRITE_ONCE(t->active_profile, ZENITH_PROFILE_CUSTOM);
+	cancel_delayed_work_sync(&t->eval_work);
+
+	kfree(t);
 }
 
 static struct kobj_type zenith_tunables_ktype = {
@@ -18695,6 +19057,19 @@ static int zenith_init(struct cpufreq_policy *policy)
 	 * landed.
 	 */
 	tunables->auto_target		= ZENITH_PROFILE_BALANCED;
+	/* Patch B-AUTO-3: cadence + hysteresis defaults for the auto
+	 * selector engine.  The eval_work itself is initialised below
+	 * after the sysfs attr_set publication, but we need the
+	 * tunables to carry sane values from this point so a
+	 * subsequent profile_store("auto") schedules at the intended
+	 * cadence rather than at jiffies-now (msecs_to_jiffies(0) is
+	 * 0 jiffies, i.e. "run immediately on the next tick").
+	 */
+	tunables->auto_eval_ms		= ZENITH_DEFAULT_AUTO_EVAL_MS;
+	tunables->auto_hysteresis_ms	= ZENITH_DEFAULT_AUTO_HYSTERESIS_MS;
+	tunables->auto_pending_target	= ZENITH_PROFILE_BALANCED;
+	tunables->auto_pending_first_seen_ns = 0;
+	INIT_DEFERRABLE_WORK(&tunables->eval_work, zenith_auto_eval_work_fn);
 	tunables->peak_hysteresis_streak =
 		ZENITH_DEFAULT_PEAK_HYSTERESIS_STREAK;
 	tunables->peak_step_down_pct	= ZENITH_DEFAULT_PEAK_STEP_DOWN_PCT;
