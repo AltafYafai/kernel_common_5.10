@@ -2862,7 +2862,7 @@ struct zenith_tunables {
 	 * of ondemand's ignore_nice_load for a PELT-based governor.
 	 */
 	unsigned int		ignore_nice_load;
-	
+
 	/* Zenith Environment API */
 	unsigned int		screen_state;   /* 1 = ON, 0 = OFF */
 
@@ -5062,8 +5062,9 @@ static unsigned int zenith_em_cap_freq(struct zenith_policy *z_policy, unsigned 
 	for (i = 0; i < pd->nr_perf_states; i++) {
 		ps = &pd->table[i];
 		if (ps->frequency >= target_freq) {
-			/* * If this state consumes disproportionately high power (heuristic: 
-			 * if it's the absolute highest state and we are throttling), cap it 
+			/*
+			 * If this state consumes disproportionately high power (heuristic:
+			 * if it's the absolute highest state and we are throttling), cap it
 			 * to the previous state to save mW.
 			 */
 			if (i == pd->nr_perf_states - 1 && i > 0) {
@@ -7084,7 +7085,7 @@ brutal_entry_deferred:
 	if (arch_scale_freq_invariant())
 		freq = policy->cpuinfo.max_freq;
 	else
-		freq = policy->cur + (policy->cur >> 2); 
+		freq = policy->cur + (policy->cur >> 2);
 
 	freq = map_util_freq(util, freq, max_cap);
 
@@ -8545,7 +8546,7 @@ static void zenith_update_single(struct update_util_data *hook, u64 time, unsign
 
 	util = zenith_get_util(z_cpu);
 	max_cap = z_cpu->max_capacity;
-	
+
 	util = zenith_iowait_apply(z_cpu, time, util, max_cap);
 	zenith_migration_arrival_check(z_cpu, util, max_cap, z_policy);
 	if (READ_ONCE(tunables->wakeup_boost) && max_cap) {
@@ -8610,7 +8611,7 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 	zenith_ignore_dl_rate_limit(z_cpu, z_policy);
 
 	if (zenith_should_update_freq(z_policy, time)) {
-		
+
 		unsigned int nice_pct_max = 0;
 
 		for_each_cpu(j, z_policy->policy->cpus) {
@@ -9938,7 +9939,9 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 { \
 	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
 	unsigned int val; \
-	if (kstrtouint(buf, 10, &val)) return -EINVAL; \
+\
+	if (kstrtouint(buf, 10, &val)) \
+		return -EINVAL; \
 	t->_name = val; \
 	return count; \
 } \
@@ -9982,7 +9985,9 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 { \
 	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
 	unsigned int val; \
-	if (kstrtouint(buf, 10, &val)) return -EINVAL; \
+\
+	if (kstrtouint(buf, 10, &val)) \
+		return -EINVAL; \
 	t->_name = val; \
 	zenith_invalidate_cache(attr_set); \
 	return count; \
@@ -14797,7 +14802,8 @@ static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set, const char 
 	struct zenith_policy *z_pol;
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val)) return -EINVAL;
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
 	t->up_rate_limit_us = val;
 	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_UP_RATE);
 
@@ -14818,7 +14824,8 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set, const cha
 	struct zenith_policy *z_pol;
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val)) return -EINVAL;
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
 	t->down_rate_limit_us = val;
 	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_DOWN_RATE);
 
@@ -16065,7 +16072,8 @@ static int zenith_kthread_create(struct zenith_policy *z_policy)
 	kthread_init_work(&z_policy->work, zenith_work);
 	kthread_init_worker(&z_policy->worker);
 	thread = kthread_create(kthread_worker_fn, &z_policy->worker, "zenith:%d", cpumask_first(z_policy->policy->related_cpus));
-	if (IS_ERR(thread)) return PTR_ERR(thread);
+	if (IS_ERR(thread))
+		return PTR_ERR(thread);
 
 	ret = sched_setattr_nocheck(thread, &attr);
 	if (ret) {
@@ -16486,8 +16494,8 @@ static int zenith_start(struct cpufreq_policy *policy)
 		memset(z_cpu, 0, sizeof(*z_cpu));
 		z_cpu->cpu = cpu;
 		z_cpu->z_policy = z_policy;
-		
-		cpufreq_add_update_util_hook(cpu, &z_cpu->update_util, 
+
+		cpufreq_add_update_util_hook(cpu, &z_cpu->update_util,
 			policy_is_shared(policy) ? zenith_update_shared : zenith_update_single);
 	}
 
