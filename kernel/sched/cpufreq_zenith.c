@@ -130,7 +130,8 @@
  * compiled out, the trace_android_vh_* / register_trace_android_vh_*
  * macros collapse to empty / -ENODEV, and the per-tunable enable gates
  * (vh_arch_freq_scale_enable, vh_uclamp_observer_enable,
- * vh_cpu_idle_enable, vh_freq_qos_enable) become runtime no-ops.
+ * vh_cpu_idle_enable, vh_freq_qos_enable, vh_sched_move_task_enable)
+ * become runtime no-ops.
  *
  * Mirror of the pattern used by kernel/sched/core.c, which also defines
  * its own trace events via CREATE_TRACE_POINTS for <trace/events/sched.h>
@@ -678,6 +679,63 @@
 #define ZENITH_DEFAULT_VH_FREQ_QOS_ENABLE		0
 #define ZENITH_VH_FREQ_QOS_MIN_PCT			75
 #define ZENITH_VH_FREQ_QOS_WINDOW_MS			2000
+
+/* vh_sched_move_task_enable (default 0, [Patch B9-5]):
+ *
+ * Master 0/1 gate for the android_vh_sched_move_task vendor-hook
+ * observer.  When 1, every cgroup move that lands a task whose
+ * task_cpu() belongs to a zenith-driven cpufreq policy stamps a
+ * jiffies timestamp on z_policy->vh_sched_move_task_last_jiffies.
+ * Cgroup churn on Android (Activity#onResume / shell cpuset
+ * reassignment / top-app promotion) clusters tightly around the
+ * "user just brought an app forward" instant; observing this churn
+ * synchronously, instead of waiting for the auto-selector worker
+ * to next tick, gives AUTO mode a low-latency foreground-transition
+ * signal that does not require polling.
+ *
+ * Read-only observer: the probe never mutates the task; it only
+ * stamps the timestamp on a hit.  When 0 the probe is still
+ * installed (one branch on `enable`) but performs no work and the
+ * timestamp never moves off zero.
+ *
+ * Hook flavor: this is android_vh_sched_move_task (a regular
+ * DECLARE_HOOK, multiple registrants permitted).  The audit-list
+ * adjacent candidates -- android_rvh_after_enqueue_task,
+ * android_rvh_after_dequeue_task, android_rvh_wake_up_new_task --
+ * are deliberately not wired here: they are DECLARE_RESTRICTED_HOOKs
+ * (single registrant only, never unregisterable), so a kernel-image
+ * registration would permanently monopolise them and block every
+ * vendor SoC kernel module that wants to register the same hook for
+ * production scheduling decisions.
+ *
+ * Profile bakes (auto-tune):
+ *   PERFORMANCE:  0   (no AUTO mode active under explicit
+ *                      PERFORMANCE; the probe is observability-only,
+ *                      cold-boot opt-in only)
+ *   BALANCED:     0   (default profile; AUTO is the consumer of
+ *                      this signal but the gate stays opt-in until
+ *                      shipping data confirms the timestamp is
+ *                      consumed without false positives)
+ *   BATTERY:      0   (energy-sensitive profile; observability-only
+ *                      probes default off)
+ *   LEGACY:       0   (historical-compat profile keeps the new
+ *                      gate off; runtime opt-in via sysfs is
+ *                      always available)
+ *   GAMING:       0   (game cgroup placement is upstream of the
+ *                      profile pivot, not downstream; this signal
+ *                      does not change a GAMING decision)
+ *   AUDIO:        0   (audio path doesn't pivot on cgroup churn)
+ *   CUSTOM:       0   (cold-boot inherits the default constant)
+ *
+ * Hot-path note: android_vh_sched_move_task fires once per
+ * cgroup-move (sched_move_task() in core.c), which on Android is
+ * sub-Hz in steady state and bursts to a few tens of events per
+ * second during app launches / activity transitions.  The probe is
+ * lock-free (cpufreq_cpu_get_raw + READ_ONCE on governor_data, then
+ * a single WRITE_ONCE to a per-policy field), so even worst-case
+ * burst rate is irrelevant to scheduler-tick budget.
+ */
+#define ZENITH_DEFAULT_VH_SCHED_MOVE_TASK_ENABLE	0
 
 /* Patch B-AUTO-3: auto-selector engine cadence and hysteresis.
  *
@@ -4021,6 +4079,17 @@ struct zenith_tunables {
 	 * stamps a value > 0.
 	 */
 	atomic64_t		vh_freq_qos_pressure_until_ns;
+
+	/* See ZENITH_DEFAULT_VH_SCHED_MOVE_TASK_ENABLE (Patch B9-5).
+	 * Master 0/1 gate for the android_vh_sched_move_task vendor-
+	 * hook observer.  When 0 the registered probe is a single-
+	 * branch no-op; when 1 every cgroup move that lands a task on
+	 * a CPU belonging to a zenith-driven policy stamps jiffies on
+	 * z_policy->vh_sched_move_task_last_jiffies.  Read via
+	 * READ_ONCE on the probe path; written via WRITE_ONCE from
+	 * sysfs and from zenith_apply_profile().
+	 */
+	unsigned int		vh_sched_move_task_enable;
 };
 
 /*
@@ -5208,6 +5277,20 @@ struct zenith_policy {
 	 * moves off zero.
 	 */
 	u64			vh_cpu_idle_last_residency_ns;
+
+	/* Patch B9-5: per-policy jiffies stamp updated by
+	 * zenith_probe_sched_move_task() on every cgroup move that
+	 * lands a task on a CPU belonging to this policy.  Cleared (set
+	 * to 0) at policy init by kzalloc(); only written by the probe
+	 * (under READ_ONCE / WRITE_ONCE, no governor lock taken).  A
+	 * 0 value means "no cgroup move observed since boot or while
+	 * this policy was zenith-driven".  Read with READ_ONCE from
+	 * any consumer (the auto-selector worker is the intended
+	 * future consumer; B9-5 only stamps -- no consumer is wired
+	 * in this patch, by design).  When tunables->vh_sched_move_-
+	 * task_enable is 0 this field never moves off zero.
+	 */
+	unsigned long		vh_sched_move_task_last_jiffies;
 };
 
 struct zenith_cpu {
@@ -11827,6 +11910,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int vh_uclamp_observer_enable;
 		unsigned int vh_cpu_idle_enable;
 		unsigned int vh_freq_qos_enable;
+		unsigned int vh_sched_move_task_enable;
 		/* Patch B10-3: per-profile cgroup-v2 path the
 		 * zenith_psi_*_some_pct() helpers should read from.
 		 * NULL or "" means "use system-wide PSI" (the safe
@@ -12051,6 +12135,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_uclamp_observer_enable = 1,
 			.vh_cpu_idle_enable = 1,
 			.vh_freq_qos_enable = 1,
+			.vh_sched_move_task_enable = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -12277,6 +12362,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * makes this observer useful in the first place.
 			 */
 			.vh_freq_qos_enable = 1,
+			.vh_sched_move_task_enable = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -12475,6 +12561,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_uclamp_observer_enable = 0,
 			.vh_cpu_idle_enable = 1,
 			.vh_freq_qos_enable = 0,
+			.vh_sched_move_task_enable = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -12648,6 +12735,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_uclamp_observer_enable = 0,
 			.vh_cpu_idle_enable = 1,
 			.vh_freq_qos_enable = 0,
+			.vh_sched_move_task_enable = 0,
 		},
 		{
 			/* Patch 4.1: GAMING profile.
@@ -12792,6 +12880,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * redundant.  Bake off.
 			 */
 			.vh_freq_qos_enable = 0,
+			.vh_sched_move_task_enable = 0,
 		},
 		{
 			/* Patch 4.2: AUDIO profile.
@@ -12978,6 +13067,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_uclamp_observer_enable = 0,
 			.vh_cpu_idle_enable = 1,
 			.vh_freq_qos_enable = 0,
+			.vh_sched_move_task_enable = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -13089,6 +13179,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   p->vh_cpu_idle_enable);
 	WRITE_ONCE(t->vh_freq_qos_enable,
 		   p->vh_freq_qos_enable);
+	WRITE_ONCE(t->vh_sched_move_task_enable,
+		   p->vh_sched_move_task_enable);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
@@ -18491,6 +18583,36 @@ vh_freq_qos_enable_store(struct gov_attr_set *attr_set,
 static struct governor_attr vh_freq_qos_enable =
 	__ATTR_RW(vh_freq_qos_enable);
 
+/* Patch B9-5: vh_sched_move_task_enable sysfs knob.  Strict 0/1
+ * boolean; gates the android_vh_sched_move_task vendor-hook observer
+ * (see ZENITH_DEFAULT_VH_SCHED_MOVE_TASK_ENABLE for full semantics
+ * and profile bakes).  Stored via WRITE_ONCE; the probe reads with
+ * READ_ONCE so a torn write would at worst delay the gate flip by
+ * one cgroup move.
+ */
+static ssize_t
+vh_sched_move_task_enable_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->vh_sched_move_task_enable);
+}
+
+static ssize_t
+vh_sched_move_task_enable_store(struct gov_attr_set *attr_set,
+				const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->vh_sched_move_task_enable, val);
+	return count;
+}
+
+static struct governor_attr vh_sched_move_task_enable =
+	__ATTR_RW(vh_sched_move_task_enable);
+
 /* Patch B-AUTO-3: auto_eval_ms RW sysfs.  Cadence at which the
  * auto-selector engine runs its classifier when active_profile ==
  * ZENITH_PROFILE_AUTO.  Bounded by ZENITH_AUTO_EVAL_MS_{MIN,MAX}.
@@ -19503,6 +19625,7 @@ static struct attribute *zenith_attrs[] = {
 	&vh_uclamp_observer_enable.attr,
 	&vh_cpu_idle_enable.attr,
 	&vh_freq_qos_enable.attr,
+	&vh_sched_move_task_enable.attr,
 	&camera_aware.attr,
 	&camera_comms.attr,
 	&camera_active.attr,
@@ -19706,6 +19829,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_VH_CPU_IDLE_ENABLE;
 	tunables->vh_freq_qos_enable =
 		ZENITH_DEFAULT_VH_FREQ_QOS_ENABLE;
+	tunables->vh_sched_move_task_enable =
+		ZENITH_DEFAULT_VH_SCHED_MOVE_TASK_ENABLE;
 	/* vh_freq_qos_pressure_until_ns is already 0 from kzalloc;
 	 * 0 < any future ktime_get_ns() so the auto-classify check
 	 * starts disarmed.  No explicit atomic64_set needed.
@@ -20871,6 +20996,58 @@ zenith_probe_freq_qos_update_request(void *data,
 		     (u64)ZENITH_VH_FREQ_QOS_WINDOW_MS * NSEC_PER_MSEC);
 }
 
+/* Patch B9-5: android_vh_sched_move_task probe.  Stamps a per-policy
+ * jiffies timestamp on z_policy->vh_sched_move_task_last_jiffies on
+ * every cgroup move that lands a task on a CPU belonging to a
+ * zenith-driven policy, gated by tunables->vh_sched_move_task_enable.
+ *
+ * Read-only observer: the hook permits inspection but not mutation
+ * of the task; we only stamp the timestamp.  The tracepoint fires
+ * from sched_move_task() in kernel/sched/core.c, called by the
+ * cgroup attach / migration paths -- preemptible kernel context, no
+ * rq lock held at the trace-point.
+ *
+ * Concurrency: same lock-free contract as B9-1 / B9-2 / B9-3 /
+ * B9-3+.  cpufreq_cpu_get_raw + READ_ONCE on governor_data is the
+ * established pattern; the timestamp write is WRITE_ONCE on a
+ * per-policy unsigned long.  Multiple concurrent moves landing on
+ * different CPUs of the same policy are last-writer-wins, which is
+ * acceptable: any consumer only cares about the recency of the
+ * most recent move, and a torn jiffies write would only delay the
+ * stamp by one move.  No governor lock is taken.
+ *
+ * Filtering: a NULL tsk is impossible at the trace site (the kernel
+ * always passes a real task to sched_move_task) but we defensively
+ * check anyway so the probe is robust to future refactors.  Tasks
+ * whose task_cpu() is not in a zenith-driven policy are silently
+ * dropped, mirroring the B9-2 / B9-3+ behaviour.
+ */
+static void
+zenith_probe_sched_move_task(void *data, struct task_struct *tsk)
+{
+	struct cpufreq_policy *policy;
+	struct zenith_policy *z_policy;
+	struct zenith_tunables *t;
+	unsigned int cpu;
+
+	if (!tsk)
+		return;
+	cpu = task_cpu(tsk);
+	if (cpu >= nr_cpu_ids)
+		return;
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy || policy->governor != &zenith_gov)
+		return;
+	z_policy = READ_ONCE(policy->governor_data);
+	if (!z_policy)
+		return;
+	t = z_policy->tunables;
+	if (!t || !READ_ONCE(t->vh_sched_move_task_enable))
+		return;
+
+	WRITE_ONCE(z_policy->vh_sched_move_task_last_jiffies, jiffies);
+}
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
@@ -20881,6 +21058,7 @@ static int __init zenith_gov_init(void)
 	bool vh_cpu_idle_enter_registered = false;
 	bool vh_cpu_idle_exit_registered = false;
 	bool vh_freq_qos_registered = false;
+	bool vh_sched_move_task_registered = false;
 #ifdef CONFIG_FB_NOTIFY
 	bool fb_registered = false;
 #endif
@@ -21086,6 +21264,22 @@ static int __init zenith_gov_init(void)
 	else
 		vh_freq_qos_registered = true;
 
+	/* Patch B9-5: register the android_vh_sched_move_task vendor-
+	 * hook probe.  Failure is non-fatal; the cgroup-move observer
+	 * simply remains silent and z_policy->vh_sched_move_task_-
+	 * last_jiffies stays at 0 across the lifetime of the policy.
+	 * The tunables->vh_sched_move_task_enable gate is the runtime
+	 * switch; this register call only makes the probe *available*
+	 * for the gate to flip on.
+	 */
+	ret = register_trace_android_vh_sched_move_task(
+		zenith_probe_sched_move_task, NULL);
+	if (ret)
+		pr_warn("Zenith: vh_sched_move_task probe register failed (%d), vh_sched_move_task_enable will be a no-op\n",
+			ret);
+	else
+		vh_sched_move_task_registered = true;
+
 	/* Panel-state delivery: register the drm_panel_notifier path first
 	 * (preferred when available because the fb notifier chain is
 	 * deprecated upstream and absent on most modern vendor builds), and
@@ -21169,6 +21363,9 @@ static int __init zenith_gov_init(void)
 		if (vh_freq_qos_registered)
 			unregister_trace_android_vh_freq_qos_update_request(
 				zenith_probe_freq_qos_update_request, NULL);
+		if (vh_sched_move_task_registered)
+			unregister_trace_android_vh_sched_move_task(
+				zenith_probe_sched_move_task, NULL);
 		pr_err("Zenith: cpufreq_register_governor failed (%d)\n", ret);
 		return ret;
 	}
