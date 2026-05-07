@@ -7382,6 +7382,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	 * one subtract + one bucket increment per eval.
 	 */
 	u64 dec_eval_start_ns = ktime_get_ns();
+	unsigned int dynamic_up_thresh, dynamic_bias, input_boost_floor;
+	unsigned long uclamp_min, uclamp_max;
+	bool uclamp_min_meaningful;
 
 	/* Patch 1.3 cluster-wake-pulse arm.  Compute now_ns once at
 	 * the top of the eval and use it both for the gap measurement
@@ -7412,10 +7415,10 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	}
 
 	/* Dynamic Environment Overrides */
-	unsigned int dynamic_up_thresh = zenith_tunable_or_local(z_policy,
+	dynamic_up_thresh = zenith_tunable_or_local(z_policy,
 		z_policy->tunables->up_threshold,
 		z_policy->at_effective_up_threshold);
-	unsigned int dynamic_bias = z_policy->tunables->powersave_bias;
+	dynamic_bias = z_policy->tunables->powersave_bias;
 
 	/* ADPF / uclamp_min floor.  Sampled once here so every decision
 	 * tier below (screen-off override, light-load cap, powersave_bias,
@@ -7423,9 +7426,9 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	 * is off, when no task on the policy has set uclamp_min, or when
 	 * the governor-level tunable disables respect entirely.
 	 */
-	unsigned long uclamp_min = z_policy->tunables->uclamp_min_respect ?
+	uclamp_min = z_policy->tunables->uclamp_min_respect ?
 		zenith_policy_uclamp_min(z_policy) : 0;
-	bool uclamp_min_meaningful = uclamp_min >=
+	uclamp_min_meaningful = uclamp_min >=
 		((SCHED_CAPACITY_SCALE * ZENITH_UCLAMP_MIN_MEANINGFUL_PCT) / 100);
 
 	/* Input-boost decay floor.  Computed in the input-boost block
@@ -7434,7 +7437,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	 * resolve label.  Zero means no floor (full-boost phase, or no
 	 * boost at all).
 	 */
-	unsigned int input_boost_floor = 0;
+	input_boost_floor = 0;
 
 	/* ADPF / uclamp_max cap.  Sampled once so every decision tier
 	 * below sees a consistent view.  SCHED_CAPACITY_SCALE means
@@ -7442,7 +7445,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	 * not in use, when no task has set a UCLAMP_MAX, or when the
 	 * governor-level respect tunable is off.
 	 */
-	unsigned long uclamp_max = z_policy->tunables->uclamp_max_respect ?
+	uclamp_max = z_policy->tunables->uclamp_max_respect ?
 		zenith_policy_uclamp_max(z_policy) : SCHED_CAPACITY_SCALE;
 
 	/* In-kernel game detector tick.  Gated by the static branch
