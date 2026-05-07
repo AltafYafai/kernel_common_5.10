@@ -133,6 +133,15 @@
  */
 #include <trace/hooks/sched.h>
 
+/* Patch B9-3: vendor hooks on cpuidle entry/exit.  Sourced from
+ * cpuidle_enter_state() in drivers/cpuidle/cpuidle.c.  Both probes
+ * run in regular kernel context on the local CPU (the enter probe
+ * fires before rcu_idle_enter(); the exit probe fires after
+ * rcu_idle_exit()).  Same post-CREATE_TRACE_POINTS placement
+ * reasoning as topology.h / sched.h above.
+ */
+#include <trace/hooks/cpuidle.h>
+
 /* Constants & Defaults */
 /* Permille of SCHED_CAPACITY_SCALE at which iowait boost starts.
  * 125 == SCHED_CAPACITY_SCALE / 8, preserving the historical default.
@@ -569,6 +578,53 @@
  *   CUSTOM:       0   (cold-boot opt-in)
  */
 #define ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE	0
+
+/* vh_cpu_idle_enable (default 1, [Patch B9-3]):
+ *
+ * Master 0/1 gate for the android_vh_cpu_idle_enter /
+ * android_vh_cpu_idle_exit vendor-hook observer pair.  When 1, every
+ * cpuidle exit on a CPU belonging to a zenith-driven policy stamps
+ * the residency of that idle period (exit_ns - enter_ns) into
+ * z_policy->vh_cpu_idle_last_residency_ns.  zenith_get_next_freq()
+ * then suppresses cluster_wake_pulse arming when the cluster just
+ * emerged from a deep idle (>= ZENITH_VH_CPU_IDLE_RESIDENCY_LONG_NS).
+ *
+ * Rationale: cluster_wake_pulse exists to compensate for cold-cache
+ * latency after a brief micro-idle.  After a deep idle the workload
+ * waking the cluster is fresh / sparse and the next eval will tell
+ * us the actual demand within one rate window -- forcing a pulse
+ * floor would just waste energy ramping past real demand.  This
+ * argument applies equally to every profile, so the gate is enabled
+ * across the board out of the box; the sysfs knob remains as a
+ * runtime kill-switch in case a regression needs to be triaged
+ * without a rebuild.
+ *
+ * Read-only observer: the enter probe does NOT mutate the cpuidle
+ * state index passed by the hook (the hook permits mutation; we
+ * leave cpuidle's own selection untouched).  When 0 the probe is
+ * still installed (one branch on `enable`) but performs no work.
+ *
+ * Profile bakes (auto-tune):
+ *   PERFORMANCE:  1   (fresh-demand reading after deep idle, no
+ *                      pulse waste)
+ *   BALANCED:     1   (cold-boot default; same energy-saving
+ *                      argument as PERFORMANCE)
+ *   BATTERY:      1   (energy-sensitive profile -- skipping
+ *                      wasteful ramps directly serves the goal)
+ *   LEGACY:       1   (historical-compat profile keeps the new
+ *                      gate on; runtime kill-switch via sysfs is
+ *                      always available)
+ *   GAMING:       1   (frame-pace stability beats cold-cache pulse)
+ *   AUDIO:        1   (audio path also benefits from skipping
+ *                      pulses after long idles between callbacks)
+ *   CUSTOM:       1   (cold-boot inherits the default constant)
+ *
+ * ZENITH_VH_CPU_IDLE_RESIDENCY_LONG_NS gates the suppression: only
+ * an idle period >= 4 ms counts as "deep" enough to gate the
+ * pulse.  Brief idles (<<4 ms) leave cwp arming untouched.
+ */
+#define ZENITH_DEFAULT_VH_CPU_IDLE_ENABLE		1
+#define ZENITH_VH_CPU_IDLE_RESIDENCY_LONG_NS		(4ULL * NSEC_PER_MSEC)
 
 /* Patch B-AUTO-3: auto-selector engine cadence and hysteresis.
  *
@@ -3871,6 +3927,19 @@ struct zenith_tunables {
 	 * WRITE_ONCE from sysfs and from zenith_apply_profile().
 	 */
 	unsigned int		vh_uclamp_observer_enable;
+
+	/* See ZENITH_DEFAULT_VH_CPU_IDLE_ENABLE (Patch B9-3).
+	 * Master 0/1 gate for the android_vh_cpu_idle_enter /
+	 * android_vh_cpu_idle_exit vendor-hook observer pair.  When 0
+	 * both registered probes are single-branch no-ops; when 1 the
+	 * exit probe stamps idle residency into z_policy->vh_cpu_idle_-
+	 * last_residency_ns, and zenith_get_next_freq() suppresses
+	 * cluster_wake_pulse arming when that residency exceeds
+	 * ZENITH_VH_CPU_IDLE_RESIDENCY_LONG_NS.  Read via READ_ONCE on
+	 * both the probe path and the cwp arm site; written via
+	 * WRITE_ONCE from sysfs and from zenith_apply_profile().
+	 */
+	unsigned int		vh_cpu_idle_enable;
 };
 
 /*
@@ -5044,6 +5113,20 @@ struct zenith_policy {
 	 * is 0 this field never moves off zero.
 	 */
 	unsigned long		vh_arch_freq_scale_last;
+
+	/* Patch B9-3: most recent cpuidle residency observed on a CPU
+	 * belonging to this policy, in ns.  Stamped by zenith_probe_-
+	 * cpu_idle_exit() as (now_ns - per_cpu enter_ns).  Read by the
+	 * cluster_wake_pulse arm site in zenith_get_next_freq() with
+	 * READ_ONCE; the cluster_wake_pulse is suppressed when this
+	 * value crosses ZENITH_VH_CPU_IDLE_RESIDENCY_LONG_NS.  Cleared
+	 * (set to 0) at policy init by kzalloc(); only written by the
+	 * exit probe so a last-writer-wins race across CPUs in the
+	 * cluster is acceptable (the next exit on any CPU resets it).
+	 * When tunables->vh_cpu_idle_enable is 0 this field never
+	 * moves off zero.
+	 */
+	u64			vh_cpu_idle_last_residency_ns;
 };
 
 struct zenith_cpu {
@@ -5151,6 +5234,20 @@ struct zenith_cpu {
 	bool			kc_hispeed_active;
 	u64			kc_hispeed_start_ns;
 	unsigned int		kc_idle_windows;
+
+	/* Patch B9-3: ktime_get_ns() timestamp of the most recent
+	 * cpuidle entry observed on this CPU.  Stamped by zenith_-
+	 * probe_cpu_idle_enter() and consumed exactly once by
+	 * zenith_probe_cpu_idle_exit() to compute (exit_ns -
+	 * enter_ns) before stamping the per-policy
+	 * vh_cpu_idle_last_residency_ns aggregate.  Cleared (set to
+	 * 0) at zenith_start() time by the kzalloc-style memset; the
+	 * exit probe treats 0 as "no enter observed" and skips the
+	 * residency stamp.  When tunables->vh_cpu_idle_enable is 0
+	 * this field never moves off zero (the enter probe gates on
+	 * the same READ_ONCE).
+	 */
+	u64			vh_cpu_idle_last_enter_ns;
 };
 
 static DEFINE_PER_CPU(struct zenith_cpu, zenith_cpu);
@@ -7403,8 +7500,28 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 			z_policy->tunables->cluster_wake_pulse_ms;
 		unsigned int idle_ms =
 			z_policy->tunables->cluster_wake_pulse_idle_ms;
+		bool deep_idle_seen = false;
 
-		if (pulse_ms && prev &&
+		/* Patch B9-3: suppress cluster_wake_pulse arm when the
+		 * cluster just emerged from a deep cpuidle residency.
+		 * The cwp tier exists to compensate for cold-cache latency
+		 * after a brief micro-idle; a >= ZENITH_VH_CPU_IDLE_-
+		 * RESIDENCY_LONG_NS idle period means the workload waking
+		 * the cluster is fresh, not a continuation of a hot stream,
+		 * and the next eval window will measure actual demand
+		 * directly.  Forcing a pulse floor here would ramp past
+		 * real demand and waste energy.  Reads are READ_ONCE on
+		 * both gates; the residency aggregate is stamped lock-free
+		 * by the cpu_idle_exit probe.  When vh_cpu_idle_enable is
+		 * 0 the residency field never moves off zero so the gate
+		 * is a compile-time-shaped no-op for that build.
+		 */
+		if (READ_ONCE(z_policy->tunables->vh_cpu_idle_enable) &&
+		    READ_ONCE(z_policy->vh_cpu_idle_last_residency_ns) >=
+			ZENITH_VH_CPU_IDLE_RESIDENCY_LONG_NS)
+			deep_idle_seen = true;
+
+		if (pulse_ms && prev && !deep_idle_seen &&
 		    now_arm_ns - prev >=
 			(u64)idle_ms * NSEC_PER_MSEC) {
 			z_policy->cluster_wake_pulse_until_ns =
@@ -11627,6 +11744,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int audio_hyst_ms;
 		unsigned int vh_arch_freq_scale_enable;
 		unsigned int vh_uclamp_observer_enable;
+		unsigned int vh_cpu_idle_enable;
 		/* Patch B10-3: per-profile cgroup-v2 path the
 		 * zenith_psi_*_some_pct() helpers should read from.
 		 * NULL or "" means "use system-wide PSI" (the safe
@@ -11849,6 +11967,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.audio_hyst_ms = 250,
 			.vh_arch_freq_scale_enable = 1,
 			.vh_uclamp_observer_enable = 1,
+			.vh_cpu_idle_enable = 1,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -12064,6 +12183,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE,
 			.vh_uclamp_observer_enable =
 				ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE,
+			.vh_cpu_idle_enable =
+				ZENITH_DEFAULT_VH_CPU_IDLE_ENABLE,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -12260,6 +12381,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.audio_hyst_ms = 100,
 			.vh_arch_freq_scale_enable = 0,
 			.vh_uclamp_observer_enable = 0,
+			.vh_cpu_idle_enable = 1,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -12431,6 +12553,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.audio_hyst_ms = 0,
 			.vh_arch_freq_scale_enable = 0,
 			.vh_uclamp_observer_enable = 0,
+			.vh_cpu_idle_enable = 1,
 		},
 		{
 			/* Patch 4.1: GAMING profile.
@@ -12569,6 +12692,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.audio_hyst_ms = 250,
 			.vh_arch_freq_scale_enable = 1,
 			.vh_uclamp_observer_enable = 1,
+			.vh_cpu_idle_enable = 1,
 		},
 		{
 			/* Patch 4.2: AUDIO profile.
@@ -12753,6 +12877,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.audio_hyst_ms = 750,
 			.vh_arch_freq_scale_enable = 0,
 			.vh_uclamp_observer_enable = 0,
+			.vh_cpu_idle_enable = 1,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -12860,6 +12985,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   p->vh_arch_freq_scale_enable);
 	WRITE_ONCE(t->vh_uclamp_observer_enable,
 		   p->vh_uclamp_observer_enable);
+	WRITE_ONCE(t->vh_cpu_idle_enable,
+		   p->vh_cpu_idle_enable);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
@@ -18188,6 +18315,37 @@ vh_uclamp_observer_enable_store(struct gov_attr_set *attr_set,
 static struct governor_attr vh_uclamp_observer_enable =
 	__ATTR_RW(vh_uclamp_observer_enable);
 
+/* Patch B9-3: vh_cpu_idle_enable sysfs knob.  Strict 0/1 boolean;
+ * gates the android_vh_cpu_idle_enter / android_vh_cpu_idle_exit
+ * vendor-hook observer pair (see ZENITH_DEFAULT_VH_CPU_IDLE_ENABLE
+ * for full semantics and profile bakes).  Stored via WRITE_ONCE;
+ * both probes and the cwp arm-site reader use READ_ONCE so a torn
+ * write would at worst delay the gate flip by one cpuidle exit /
+ * one eval window.
+ */
+static ssize_t
+vh_cpu_idle_enable_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->vh_cpu_idle_enable);
+}
+
+static ssize_t
+vh_cpu_idle_enable_store(struct gov_attr_set *attr_set,
+			 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->vh_cpu_idle_enable, val);
+	return count;
+}
+
+static struct governor_attr vh_cpu_idle_enable =
+	__ATTR_RW(vh_cpu_idle_enable);
+
 /* Patch B-AUTO-3: auto_eval_ms RW sysfs.  Cadence at which the
  * auto-selector engine runs its classifier when active_profile ==
  * ZENITH_PROFILE_AUTO.  Bounded by ZENITH_AUTO_EVAL_MS_{MIN,MAX}.
@@ -19178,6 +19336,7 @@ static struct attribute *zenith_attrs[] = {
 	&audio_hyst_ms.attr,
 	&vh_arch_freq_scale_enable.attr,
 	&vh_uclamp_observer_enable.attr,
+	&vh_cpu_idle_enable.attr,
 	&camera_aware.attr,
 	&camera_comms.attr,
 	&camera_active.attr,
@@ -19377,6 +19536,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_VH_ARCH_FREQ_SCALE_ENABLE;
 	tunables->vh_uclamp_observer_enable =
 		ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE;
+	tunables->vh_cpu_idle_enable =
+		ZENITH_DEFAULT_VH_CPU_IDLE_ENABLE;
 	/* Patch B-AUTO-2: seed auto_target so the auto_target sysfs
 	 * node never reads 0 / "balanced" by accident on a fresh
 	 * tunables alloc.  The actual cold-boot active_profile flip to
@@ -20364,6 +20525,104 @@ zenith_probe_setscheduler_uclamp(void *data, struct task_struct *tsk,
 	zenith_peer_ramp_arm(z_policy, ktime_get_ns());
 }
 
+/* Patch B9-3: android_vh_cpu_idle_enter probe.  Stamps a per-CPU
+ * ktime_get_ns() timestamp on the zenith_cpu container of the CPU
+ * going idle, gated by the master vh_cpu_idle_enable tunable.  Read-
+ * only observer: the cpuidle hook permits mutating *state but we
+ * leave it untouched -- cpuidle's own state selection is not our
+ * concern here.
+ *
+ * Hook fires in regular kernel context on the local CPU, before
+ * rcu_idle_enter().  cpufreq_cpu_get_raw + READ_ONCE on
+ * governor_data is the established no-lock pattern (same as B9-1
+ * and B9-2 above).  No governor lock is taken; the per-cpu
+ * timestamp is naturally single-writer (only the local CPU enters
+ * idle on itself) so no atomicity constraints beyond WRITE_ONCE.
+ */
+static void
+zenith_probe_cpu_idle_enter(void *data, int *state,
+			    struct cpuidle_device *dev)
+{
+	struct cpufreq_policy *policy;
+	struct zenith_policy *z_policy;
+	struct zenith_tunables *t;
+	struct zenith_cpu *z_cpu;
+	unsigned int cpu;
+
+	if (!dev)
+		return;
+	cpu = (unsigned int)dev->cpu;
+	if (cpu >= nr_cpu_ids)
+		return;
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy || policy->governor != &zenith_gov)
+		return;
+	z_policy = READ_ONCE(policy->governor_data);
+	if (!z_policy)
+		return;
+	t = z_policy->tunables;
+	if (!t || !READ_ONCE(t->vh_cpu_idle_enable))
+		return;
+
+	z_cpu = &per_cpu(zenith_cpu, cpu);
+	WRITE_ONCE(z_cpu->vh_cpu_idle_last_enter_ns, ktime_get_ns());
+}
+
+/* Patch B9-3: android_vh_cpu_idle_exit probe.  Computes residency
+ * (now_ns - per_cpu enter_ns) and stamps the per-policy aggregate
+ * vh_cpu_idle_last_residency_ns, which the cluster_wake_pulse arm
+ * site in zenith_get_next_freq() uses to suppress wasteful pulse
+ * floors after a deep idle.  enter_ns == 0 means "no enter
+ * observed" (e.g. enter probe fired before vh_cpu_idle_enable was
+ * flipped on, or this CPU has not entered cpuidle since boot); the
+ * residency stamp is skipped in that case.  ktime monotonicity
+ * guard (now_ns <= enter_ns) preserves the same skip if the clock
+ * source went backwards across the idle period.
+ *
+ * Last-writer-wins across CPUs in the cluster is acceptable: the
+ * cwp gate cares about whether *some* CPU in the cluster recently
+ * had a deep idle, and the next exit on any CPU resets the field.
+ *
+ * Same lock-free / no-governor-lock contract as the enter probe.
+ */
+static void
+zenith_probe_cpu_idle_exit(void *data, int state,
+			   struct cpuidle_device *dev)
+{
+	struct cpufreq_policy *policy;
+	struct zenith_policy *z_policy;
+	struct zenith_tunables *t;
+	struct zenith_cpu *z_cpu;
+	u64 enter_ns;
+	u64 now_ns;
+	unsigned int cpu;
+
+	if (!dev)
+		return;
+	cpu = (unsigned int)dev->cpu;
+	if (cpu >= nr_cpu_ids)
+		return;
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy || policy->governor != &zenith_gov)
+		return;
+	z_policy = READ_ONCE(policy->governor_data);
+	if (!z_policy)
+		return;
+	t = z_policy->tunables;
+	if (!t || !READ_ONCE(t->vh_cpu_idle_enable))
+		return;
+
+	z_cpu = &per_cpu(zenith_cpu, cpu);
+	enter_ns = READ_ONCE(z_cpu->vh_cpu_idle_last_enter_ns);
+	if (!enter_ns)
+		return;
+	now_ns = ktime_get_ns();
+	if (now_ns <= enter_ns)
+		return;
+	WRITE_ONCE(z_policy->vh_cpu_idle_last_residency_ns,
+		   now_ns - enter_ns);
+}
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
@@ -20371,6 +20630,8 @@ static int __init zenith_gov_init(void)
 	bool fg_pulse_registered = false;
 	bool vh_arch_freq_scale_registered = false;
 	bool vh_uclamp_observer_registered = false;
+	bool vh_cpu_idle_enter_registered = false;
+	bool vh_cpu_idle_exit_registered = false;
 #ifdef CONFIG_FB_NOTIFY
 	bool fb_registered = false;
 #endif
@@ -20533,6 +20794,33 @@ static int __init zenith_gov_init(void)
 	else
 		vh_uclamp_observer_registered = true;
 
+	/* Patch B9-3: register the android_vh_cpu_idle_enter / _exit
+	 * vendor-hook probe pair.  Failure on either is non-fatal and
+	 * independent: if only the enter probe registers, the exit
+	 * probe will treat per-cpu enter_ns == 0 as "no enter
+	 * observed" and skip the residency stamp; if only the exit
+	 * probe registers, no enter_ns is ever stamped so residency
+	 * stays 0 and the cwp gate never fires.  In both partial
+	 * failure cases vh_cpu_idle_enable becomes effectively a
+	 * no-op.  The tunables->vh_cpu_idle_enable gate is the
+	 * runtime switch (default 0).
+	 */
+	ret = register_trace_android_vh_cpu_idle_enter(
+		zenith_probe_cpu_idle_enter, NULL);
+	if (ret)
+		pr_warn("Zenith: vh_cpu_idle_enter probe register failed (%d), vh_cpu_idle_enable will be a no-op\n",
+			ret);
+	else
+		vh_cpu_idle_enter_registered = true;
+
+	ret = register_trace_android_vh_cpu_idle_exit(
+		zenith_probe_cpu_idle_exit, NULL);
+	if (ret)
+		pr_warn("Zenith: vh_cpu_idle_exit probe register failed (%d), vh_cpu_idle_enable will be a no-op\n",
+			ret);
+	else
+		vh_cpu_idle_exit_registered = true;
+
 	/* Panel-state delivery: register the drm_panel_notifier path first
 	 * (preferred when available because the fb notifier chain is
 	 * deprecated upstream and absent on most modern vendor builds), and
@@ -20607,6 +20895,12 @@ static int __init zenith_gov_init(void)
 		if (vh_uclamp_observer_registered)
 			unregister_trace_android_vh_setscheduler_uclamp(
 				zenith_probe_setscheduler_uclamp, NULL);
+		if (vh_cpu_idle_enter_registered)
+			unregister_trace_android_vh_cpu_idle_enter(
+				zenith_probe_cpu_idle_enter, NULL);
+		if (vh_cpu_idle_exit_registered)
+			unregister_trace_android_vh_cpu_idle_exit(
+				zenith_probe_cpu_idle_exit, NULL);
 		pr_err("Zenith: cpufreq_register_governor failed (%d)\n", ret);
 		return ret;
 	}
