@@ -112,24 +112,25 @@
 #include <trace/events/cpufreq_zenith.h>
 #undef CREATE_TRACE_POINTS
 
-/* Vendor-hook headers (B9-1 topology, B9-2 sched, B9-3 cpuidle).  Pulled
- * in *after* CREATE_TRACE_POINTS has been undef'd above, so each header
- * only DECLAREs its android_vh_* / android_rvh_* tracepoints (the
- * #include <trace/define_trace.h> at the bottom of every trace/hooks
- * header is a no-op when CREATE_TRACE_POINTS is not defined).  The
- * canonical owner of every __traceiter_android_* / __tracepoint_android_*
- * symbol referenced below is drivers/android/vendor_hooks.o, which sets
+/* Vendor-hook headers (B9-1 topology, B9-2 sched, B9-3 cpuidle, B9-3+
+ * power).  Pulled in *after* CREATE_TRACE_POINTS has been undef'd
+ * above, so each header only DECLAREs its android_vh_* /
+ * android_rvh_* tracepoints (the #include <trace/define_trace.h> at
+ * the bottom of every trace/hooks header is a no-op when
+ * CREATE_TRACE_POINTS is not defined).  The canonical owner of every
+ * __traceiter_android_* / __tracepoint_android_* symbol referenced
+ * below is drivers/android/vendor_hooks.o, which sets
  * CREATE_TRACE_POINTS itself before pulling these same headers in
  * (drivers/android/vendor_hooks.c).  Defining them here would emit a
  * second copy of those symbols and the link would fail with duplicate
  * definitions in kernel/built-in.a vs drivers/built-in.a.
  *
- * All three headers are always pulled in regardless of
+ * All four headers are always pulled in regardless of
  * CONFIG_ANDROID_VENDOR_HOOKS: when the vendor-hook infrastructure is
  * compiled out, the trace_android_vh_* / register_trace_android_vh_*
  * macros collapse to empty / -ENODEV, and the per-tunable enable gates
  * (vh_arch_freq_scale_enable, vh_uclamp_observer_enable,
- * vh_cpu_idle_enable) become runtime no-ops.
+ * vh_cpu_idle_enable, vh_freq_qos_enable) become runtime no-ops.
  *
  * Mirror of the pattern used by kernel/sched/core.c, which also defines
  * its own trace events via CREATE_TRACE_POINTS for <trace/events/sched.h>
@@ -139,6 +140,7 @@
 #include <trace/hooks/topology.h>
 #include <trace/hooks/sched.h>
 #include <trace/hooks/cpuidle.h>
+#include <trace/hooks/power.h>
 
 /* Constants & Defaults */
 /* Permille of SCHED_CAPACITY_SCALE at which iowait boost starts.
@@ -623,6 +625,59 @@
  */
 #define ZENITH_DEFAULT_VH_CPU_IDLE_ENABLE		1
 #define ZENITH_VH_CPU_IDLE_RESIDENCY_LONG_NS		(4ULL * NSEC_PER_MSEC)
+
+/* vh_freq_qos_enable (default 0, [Patch B9-3+]):
+ *
+ * Master 0/1 gate for the android_vh_freq_qos_update_request vendor-
+ * hook observer.  When 1, every freq-QoS update against a zenith-
+ * driven cpufreq policy that raises FREQ_QOS_MIN to a value at or
+ * above ZENITH_VH_FREQ_QOS_MIN_PCT of cpuinfo.max_freq stamps a
+ * pressure window timestamp on the per-tunables atomic
+ * vh_freq_qos_pressure_until_ns.  zenith_auto_classify() then biases
+ * to PERFORMANCE while the timestamp is still ahead of the current
+ * ktime_get_ns(), so the auto-selector can pivot in response to a
+ * deliberate vendor / thermal / ADPF "I want sustained high freq"
+ * signal rather than waiting for PELT load to climb.
+ *
+ * Read-only observer: the probe never mutates req or value; it only
+ * stamps a timestamp on a hit.  When 0 the probe is still installed
+ * (one branch on `enable`) but performs no work, and the auto-
+ * selector consume side likewise short-circuits.
+ *
+ * Profile bakes (auto-tune):
+ *   PERFORMANCE:  1   (probe runs for telemetry symmetry; auto-
+ *                      classify check is a no-op self-pivot)
+ *   BALANCED:     1   (default profile; this is where the AUTO
+ *                      pivot to PERFORMANCE on QoS pressure
+ *                      actually matters -- the engine sits in
+ *                      BALANCED most of the time)
+ *   BATTERY:      0   (explicit "ignore vendor pressure, save
+ *                      battery"; user-chosen profile must win)
+ *   LEGACY:       0   (historical-compat profile keeps the new
+ *                      gate off; runtime opt-in via sysfs is
+ *                      always available)
+ *   GAMING:       0   (already aggressive headroom; redundant)
+ *   AUDIO:        0   (audio takes precedence in the cascade
+ *                      anyway; the bake is a no-op)
+ *   CUSTOM:       0   (cold-boot inherits the default constant)
+ *
+ * Note: only FREQ_QOS_MIN raises trigger the pressure stamp.
+ * FREQ_QOS_MAX updates (typically thermal / battery caps lowering
+ * the ceiling) are deliberately ignored -- a thermal cap should not
+ * perversely pivot the engine to PERFORMANCE.
+ *
+ * ZENITH_VH_FREQ_QOS_MIN_PCT (default 75) is the threshold relative
+ * to policy->cpuinfo.max_freq; a request below this is not "high"
+ * pressure and is ignored.  ZENITH_VH_FREQ_QOS_WINDOW_MS (default
+ * 2000) is how long a single hit keeps the pressure flag armed; it
+ * matches the default auto_hysteresis_ms so a transient single
+ * request lands in the noise the auto-selector already debounces,
+ * while a sustained sequence of QoS raises (HAL polling at 250 ms
+ * cadence, ADPF push) keeps the flag continuously armed.
+ */
+#define ZENITH_DEFAULT_VH_FREQ_QOS_ENABLE		0
+#define ZENITH_VH_FREQ_QOS_MIN_PCT			75
+#define ZENITH_VH_FREQ_QOS_WINDOW_MS			2000
 
 /* Patch B-AUTO-3: auto-selector engine cadence and hysteresis.
  *
@@ -3938,6 +3993,34 @@ struct zenith_tunables {
 	 * WRITE_ONCE from sysfs and from zenith_apply_profile().
 	 */
 	unsigned int		vh_cpu_idle_enable;
+
+	/* See ZENITH_DEFAULT_VH_FREQ_QOS_ENABLE (Patch B9-3+).
+	 * Master 0/1 gate for the android_vh_freq_qos_update_request
+	 * vendor-hook observer.  When 0 the registered probe is a
+	 * single-branch no-op and the auto-classify consume side
+	 * short-circuits; when 1 a high-min FREQ_QOS update against a
+	 * zenith-driven policy stamps vh_freq_qos_pressure_until_ns and
+	 * zenith_auto_classify() pivots to PERFORMANCE while the
+	 * timestamp is still ahead of ktime_get_ns().  Read via
+	 * READ_ONCE on both the probe path and the auto-classify
+	 * consumer; written via WRITE_ONCE from sysfs and from
+	 * zenith_apply_profile().
+	 */
+	unsigned int		vh_freq_qos_enable;
+
+	/* Per-tunables freq-QoS pressure window (Patch B9-3+).
+	 * Set by zenith_probe_freq_qos_update_request() to
+	 * ktime_get_ns() + ZENITH_VH_FREQ_QOS_WINDOW_MS * NSEC_PER_MSEC
+	 * on each high-min FREQ_QOS hit; read by
+	 * zenith_auto_classify() against ktime_get_ns() to determine
+	 * whether the AUTO selector should bias to PERFORMANCE.
+	 * atomic64_t so the producer (probe in arbitrary scheduler
+	 * context) and consumer (auto-eval worker, sleepable context)
+	 * race-free without a governor lock.  Initialised to 0 by
+	 * kzalloc(); 0 means "no pressure" because every real hit
+	 * stamps a value > 0.
+	 */
+	atomic64_t		vh_freq_qos_pressure_until_ns;
 };
 
 /*
@@ -11743,6 +11826,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int vh_arch_freq_scale_enable;
 		unsigned int vh_uclamp_observer_enable;
 		unsigned int vh_cpu_idle_enable;
+		unsigned int vh_freq_qos_enable;
 		/* Patch B10-3: per-profile cgroup-v2 path the
 		 * zenith_psi_*_some_pct() helpers should read from.
 		 * NULL or "" means "use system-wide PSI" (the safe
@@ -11966,6 +12050,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_arch_freq_scale_enable = 1,
 			.vh_uclamp_observer_enable = 1,
 			.vh_cpu_idle_enable = 1,
+			.vh_freq_qos_enable = 1,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -12183,6 +12268,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE,
 			.vh_cpu_idle_enable =
 				ZENITH_DEFAULT_VH_CPU_IDLE_ENABLE,
+			/* See ZENITH_DEFAULT_VH_FREQ_QOS_ENABLE for the
+			 * BALANCED-vs-cold-boot rationale: the cold-boot
+			 * default is 0 (opt-in), but the BALANCED bake is
+			 * explicitly 1 because BALANCED is the AUTO
+			 * engine's default resting state, and the AUTO
+			 * pivot to PERFORMANCE on QoS pressure is what
+			 * makes this observer useful in the first place.
+			 */
+			.vh_freq_qos_enable = 1,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -12380,6 +12474,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_arch_freq_scale_enable = 0,
 			.vh_uclamp_observer_enable = 0,
 			.vh_cpu_idle_enable = 1,
+			.vh_freq_qos_enable = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -12552,6 +12647,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_arch_freq_scale_enable = 0,
 			.vh_uclamp_observer_enable = 0,
 			.vh_cpu_idle_enable = 1,
+			.vh_freq_qos_enable = 0,
 		},
 		{
 			/* Patch 4.1: GAMING profile.
@@ -12691,6 +12787,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_arch_freq_scale_enable = 1,
 			.vh_uclamp_observer_enable = 1,
 			.vh_cpu_idle_enable = 1,
+			/* Patch B9-3+: GAMING already provides aggressive
+			 * headroom; QoS-pressure pivot to PERFORMANCE is
+			 * redundant.  Bake off.
+			 */
+			.vh_freq_qos_enable = 0,
 		},
 		{
 			/* Patch 4.2: AUDIO profile.
@@ -12876,6 +12977,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_arch_freq_scale_enable = 0,
 			.vh_uclamp_observer_enable = 0,
 			.vh_cpu_idle_enable = 1,
+			.vh_freq_qos_enable = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -12985,6 +13087,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   p->vh_uclamp_observer_enable);
 	WRITE_ONCE(t->vh_cpu_idle_enable,
 		   p->vh_cpu_idle_enable);
+	WRITE_ONCE(t->vh_freq_qos_enable,
+		   p->vh_freq_qos_enable);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
@@ -13111,6 +13215,18 @@ static unsigned int zenith_auto_classify(struct zenith_tunables *t)
 		return ZENITH_PROFILE_GAMING;
 
 	if (camera)
+		return ZENITH_PROFILE_PERFORMANCE;
+
+	/* Patch B9-3+: high-pressure FREQ_QOS_MIN raised by a vendor /
+	 * thermal / ADPF requester within the last
+	 * ZENITH_VH_FREQ_QOS_WINDOW_MS.  Tunable-gated
+	 * (vh_freq_qos_enable) so the consumer side mirrors the
+	 * probe's own write-side gate.  pressure_until_ns is 0 on
+	 * cold boot (kzalloc); the s64 comparison treats 0 < now_ns
+	 * correctly without wrap.
+	 */
+	if (READ_ONCE(t->vh_freq_qos_enable) &&
+	    atomic64_read(&t->vh_freq_qos_pressure_until_ns) > (s64)now_ns)
 		return ZENITH_PROFILE_PERFORMANCE;
 
 	if (input_recent && screen_on)
@@ -18344,6 +18460,37 @@ vh_cpu_idle_enable_store(struct gov_attr_set *attr_set,
 static struct governor_attr vh_cpu_idle_enable =
 	__ATTR_RW(vh_cpu_idle_enable);
 
+/* Patch B9-3+: vh_freq_qos_enable sysfs knob.  Strict 0/1 boolean;
+ * gates the android_vh_freq_qos_update_request vendor-hook observer
+ * (see ZENITH_DEFAULT_VH_FREQ_QOS_ENABLE for full semantics and
+ * profile bakes).  Stored via WRITE_ONCE; the probe and the auto-
+ * classify consumer both read with READ_ONCE so a torn write would
+ * at worst delay the gate flip by one QoS update / one auto-eval
+ * window.
+ */
+static ssize_t
+vh_freq_qos_enable_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->vh_freq_qos_enable);
+}
+
+static ssize_t
+vh_freq_qos_enable_store(struct gov_attr_set *attr_set,
+			 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->vh_freq_qos_enable, val);
+	return count;
+}
+
+static struct governor_attr vh_freq_qos_enable =
+	__ATTR_RW(vh_freq_qos_enable);
+
 /* Patch B-AUTO-3: auto_eval_ms RW sysfs.  Cadence at which the
  * auto-selector engine runs its classifier when active_profile ==
  * ZENITH_PROFILE_AUTO.  Bounded by ZENITH_AUTO_EVAL_MS_{MIN,MAX}.
@@ -19335,6 +19482,7 @@ static struct attribute *zenith_attrs[] = {
 	&vh_arch_freq_scale_enable.attr,
 	&vh_uclamp_observer_enable.attr,
 	&vh_cpu_idle_enable.attr,
+	&vh_freq_qos_enable.attr,
 	&camera_aware.attr,
 	&camera_comms.attr,
 	&camera_active.attr,
@@ -19536,6 +19684,12 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_VH_UCLAMP_OBSERVER_ENABLE;
 	tunables->vh_cpu_idle_enable =
 		ZENITH_DEFAULT_VH_CPU_IDLE_ENABLE;
+	tunables->vh_freq_qos_enable =
+		ZENITH_DEFAULT_VH_FREQ_QOS_ENABLE;
+	/* vh_freq_qos_pressure_until_ns is already 0 from kzalloc;
+	 * 0 < any future ktime_get_ns() so the auto-classify check
+	 * starts disarmed.  No explicit atomic64_set needed.
+	 */
 	/* Patch B-AUTO-2: seed auto_target so the auto_target sysfs
 	 * node never reads 0 / "balanced" by accident on a fresh
 	 * tunables alloc.  The actual cold-boot active_profile flip to
@@ -20621,6 +20775,82 @@ zenith_probe_cpu_idle_exit(void *data, int state,
 		   now_ns - enter_ns);
 }
 
+/* Patch B9-3+: android_vh_freq_qos_update_request observer.
+ *
+ * Fires from kernel/power/qos.c::freq_qos_update_request() before
+ * freq_qos_apply() so the call sees the new requested value but the
+ * aggregated freq_constraints have not yet rolled forward.  Used by
+ * thermal manager / battery saver / ADPF / vendor power HAL to drive
+ * cpufreq min/max constraints; we only consume FREQ_QOS_MIN raises
+ * here -- a vendor module asking for sustained high-min freq is the
+ * deliberate "I want headroom" signal we want the AUTO selector to
+ * pivot on.
+ *
+ * Lookup path: req->qos is a `struct freq_constraints *` which may
+ * be embedded in a cpufreq_policy (the cpufreq freq-QoS path) or in
+ * a per-device dev_pm_qos block.  We walk possible CPUs and match
+ * by &policy->constraints; non-cpufreq freq_qos requests yield no
+ * match and are silently ignored.  Bounded by num_possible_cpus();
+ * fires only on QoS update so cost is fine.
+ *
+ * Pressure stamp: a hit at or above ZENITH_VH_FREQ_QOS_MIN_PCT of
+ * cpuinfo.max_freq sets vh_freq_qos_pressure_until_ns to now +
+ * ZENITH_VH_FREQ_QOS_WINDOW_MS so the AUTO selector's consumer
+ * (zenith_auto_classify) sees the pressure for the next 2 s.
+ *
+ * Concurrency: same lock-free contract as B9-1 / B9-2 / B9-3.  Hook
+ * fires in process / softirq context (preemptible at the qos.c call
+ * site, no rq lock).  cpufreq_cpu_get_raw + READ_ONCE on
+ * governor_data is the established pattern; the timestamp write is
+ * atomic64_set so no governor lock is required against the
+ * auto-eval consumer's atomic64_read.
+ */
+static void
+zenith_probe_freq_qos_update_request(void *data,
+				     struct freq_qos_request *req,
+				     int value)
+{
+	struct cpufreq_policy *policy = NULL;
+	struct zenith_policy *z_policy;
+	struct zenith_tunables *t;
+	unsigned int max_freq;
+	unsigned int thresh;
+	unsigned int cpu;
+
+	if (!req || req->type != FREQ_QOS_MIN || value <= 0)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct cpufreq_policy *p = cpufreq_cpu_get_raw(cpu);
+
+		if (p && &p->constraints == req->qos) {
+			policy = p;
+			break;
+		}
+	}
+	if (!policy || policy->governor != &zenith_gov)
+		return;
+
+	z_policy = READ_ONCE(policy->governor_data);
+	if (!z_policy)
+		return;
+	t = z_policy->tunables;
+	if (!t || !READ_ONCE(t->vh_freq_qos_enable))
+		return;
+
+	max_freq = policy->cpuinfo.max_freq;
+	if (!max_freq)
+		return;
+
+	thresh = (max_freq * ZENITH_VH_FREQ_QOS_MIN_PCT) / 100;
+	if ((unsigned int)value < thresh)
+		return;
+
+	atomic64_set(&t->vh_freq_qos_pressure_until_ns,
+		     ktime_get_ns() +
+		     (u64)ZENITH_VH_FREQ_QOS_WINDOW_MS * NSEC_PER_MSEC);
+}
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
@@ -20630,6 +20860,7 @@ static int __init zenith_gov_init(void)
 	bool vh_uclamp_observer_registered = false;
 	bool vh_cpu_idle_enter_registered = false;
 	bool vh_cpu_idle_exit_registered = false;
+	bool vh_freq_qos_registered = false;
 #ifdef CONFIG_FB_NOTIFY
 	bool fb_registered = false;
 #endif
@@ -20819,6 +21050,22 @@ static int __init zenith_gov_init(void)
 	else
 		vh_cpu_idle_exit_registered = true;
 
+	/* Patch B9-3+: register the android_vh_freq_qos_update_request
+	 * vendor-hook probe.  Failure is non-fatal; the freq-QoS
+	 * pressure observer simply remains silent and the auto-selector
+	 * falls back to its existing camera / input-recent / battery
+	 * cascade alone.  The tunables->vh_freq_qos_enable gate is the
+	 * runtime switch; this register call only makes the probe
+	 * *available* for the gate to flip on.
+	 */
+	ret = register_trace_android_vh_freq_qos_update_request(
+		zenith_probe_freq_qos_update_request, NULL);
+	if (ret)
+		pr_warn("Zenith: vh_freq_qos_update_request probe register failed (%d), vh_freq_qos_enable will be a no-op\n",
+			ret);
+	else
+		vh_freq_qos_registered = true;
+
 	/* Panel-state delivery: register the drm_panel_notifier path first
 	 * (preferred when available because the fb notifier chain is
 	 * deprecated upstream and absent on most modern vendor builds), and
@@ -20899,6 +21146,9 @@ static int __init zenith_gov_init(void)
 		if (vh_cpu_idle_exit_registered)
 			unregister_trace_android_vh_cpu_idle_exit(
 				zenith_probe_cpu_idle_exit, NULL);
+		if (vh_freq_qos_registered)
+			unregister_trace_android_vh_freq_qos_update_request(
+				zenith_probe_freq_qos_update_request, NULL);
 		pr_err("Zenith: cpufreq_register_governor failed (%d)\n", ret);
 		return ret;
 	}
