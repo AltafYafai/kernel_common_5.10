@@ -4578,7 +4578,7 @@ static atomic_t zenith_v4l2_active_fds = ATOMIC_INIT(0);
  * K5 closes both edges to single-tick precision.
  */
 static atomic_t zenith_alsa_active_fds = ATOMIC_INIT(0);
-#define ZENITH_AUTO_TUNE_PERIOD_MS	10000	/* classify every 10s  */
+#define ZENITH_AUTO_TUNE_PERIOD_MS	5000	/* classify every 5s   */
 
 /* Audit fix F1: scenario-active classifier window.
  *
