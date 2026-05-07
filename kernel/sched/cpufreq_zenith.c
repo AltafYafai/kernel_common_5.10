@@ -1702,7 +1702,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * thermal_derate_rate_pct is the only bound that matters for the
  * output.
  */
-#define ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT	0
+#define ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT	25
 
 /* freq_stability_margin_pct (default 3):
  *
