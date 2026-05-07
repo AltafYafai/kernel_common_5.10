@@ -130,7 +130,8 @@
  * compiled out, the trace_android_vh_* / register_trace_android_vh_*
  * macros collapse to empty / -ENODEV, and the per-tunable enable gates
  * (vh_arch_freq_scale_enable, vh_uclamp_observer_enable,
- * vh_cpu_idle_enable, vh_freq_qos_enable, vh_sched_move_task_enable)
+ * vh_cpu_idle_enable, vh_freq_qos_enable, vh_sched_move_task_enable,
+ * vh_scheduler_tick_enable)
  * become runtime no-ops.
  *
  * Mirror of the pattern used by kernel/sched/core.c, which also defines
@@ -736,6 +737,67 @@
  * burst rate is irrelevant to scheduler-tick budget.
  */
 #define ZENITH_DEFAULT_VH_SCHED_MOVE_TASK_ENABLE	0
+
+/* vh_scheduler_tick_enable (default 0, [Patch B9-4]):
+ *
+ * Master 0/1 gate for the android_vh_scheduler_tick vendor-hook
+ * observer.  When 1, every scheduler tick that fires on a CPU
+ * belonging to a zenith-driven cpufreq policy stamps the wall-time
+ * (ktime_get_ns()) of that tick on z_cpu->vh_scheduler_tick_last_ns
+ * and bumps z_cpu->vh_scheduler_tick_count by one.  Per-CPU storage:
+ * the only writer is the local CPU's tick handler, so no atomics
+ * are needed; remote-CPU readers use READ_ONCE.
+ *
+ * Read-only observer: the probe never mutates the rq, the task, or
+ * any scheduler state; it only stamps the timestamp / count pair on
+ * a hit.  When 0 the probe is still installed (one branch on
+ * `enable`) but performs no work and the per-CPU fields stay at
+ * zero.
+ *
+ * Hook flavor: this is android_vh_scheduler_tick (a regular
+ * DECLARE_HOOK, multiple registrants permitted).  The audit-list
+ * adjacent candidates -- android_rvh_after_enqueue_task,
+ * android_rvh_after_dequeue_task, android_rvh_wake_up_new_task --
+ * are deliberately not wired here: they are DECLARE_RESTRICTED_HOOKs
+ * (single registrant only, never unregisterable), so a kernel-image
+ * registration would permanently monopolise them and block every
+ * vendor SoC kernel module that wants to register the same hook for
+ * production scheduling decisions.
+ *
+ * Profile bakes (auto-tune):
+ *   PERFORMANCE:  0   (no AUTO mode active under explicit
+ *                      PERFORMANCE; the probe is observability-only,
+ *                      cold-boot opt-in only)
+ *   BALANCED:     0   (default profile; gate stays opt-in until
+ *                      shipping data confirms the count + timestamp
+ *                      pair is consumed without false positives)
+ *   BATTERY:      0   (energy-sensitive profile; observability-only
+ *                      probes default off -- HZ * num_CPUs hits/s
+ *                      means even a no-op probe path is a permanent
+ *                      branch in the tick fast path)
+ *   LEGACY:       0   (historical-compat profile keeps the new
+ *                      gate off; runtime opt-in via sysfs is
+ *                      always available)
+ *   GAMING:       0   (already heavily-tuned tick treatment elsewhere
+ *                      in the governor; no need to layer another
+ *                      observer on top by default)
+ *   AUDIO:        0   (audio path doesn't pivot on tick recency)
+ *   CUSTOM:       0   (cold-boot inherits the default constant)
+ *
+ * Hot-path note: android_vh_scheduler_tick fires once per scheduler
+ * tick, i.e. HZ * num_present_cpus calls per second (250 * 8 = 2000
+ * /s on a typical Android arm64 board).  This is the strictest hot
+ * path of any zenith vendor-hook observer.  The probe contract is
+ * therefore: cpufreq_cpu_get_raw + READ_ONCE on governor_data and
+ * tunable gate, then a single ktime_get_ns() and two WRITE_ONCEs to
+ * per-CPU fields.  No mutex, no spinlock, no atomic_*.  Tick context
+ * runs preempt-disabled with no rq lock held (the hook fires after
+ * rq_unlock + trigger_load_balance in scheduler_tick()), so the
+ * probe is already in a sleepless / lock-free regime; the only
+ * remaining cost is the function call itself and the branch on the
+ * enable gate.
+ */
+#define ZENITH_DEFAULT_VH_SCHEDULER_TICK_ENABLE		0
 
 /* Patch B-AUTO-3: auto-selector engine cadence and hysteresis.
  *
@@ -4090,6 +4152,18 @@ struct zenith_tunables {
 	 * sysfs and from zenith_apply_profile().
 	 */
 	unsigned int		vh_sched_move_task_enable;
+
+	/* See ZENITH_DEFAULT_VH_SCHEDULER_TICK_ENABLE (Patch B9-4).
+	 * Master 0/1 gate for the android_vh_scheduler_tick vendor-
+	 * hook observer.  When 0 the registered probe is a single-
+	 * branch no-op; when 1 every scheduler tick on a CPU belonging
+	 * to a zenith-driven policy stamps ktime_get_ns() on
+	 * z_cpu->vh_scheduler_tick_last_ns and bumps z_cpu->vh_-
+	 * scheduler_tick_count.  Read via READ_ONCE on the probe
+	 * (HZ * num_CPUs hot path); written via WRITE_ONCE from sysfs
+	 * and from zenith_apply_profile().
+	 */
+	unsigned int		vh_scheduler_tick_enable;
 };
 
 /*
@@ -5412,6 +5486,18 @@ struct zenith_cpu {
 	 * the same READ_ONCE).
 	 */
 	u64			vh_cpu_idle_last_enter_ns;
+
+	/* Patch B9-4: per-CPU last-tick timestamp + tick count.
+	 * Stamped by zenith_probe_scheduler_tick() once per
+	 * android_vh_scheduler_tick fire on the local CPU.  Single
+	 * writer per CPU (the local CPU's tick handler), so no
+	 * atomics needed; remote-CPU readers use READ_ONCE.  Cleared
+	 * (set to 0) at zenith_start() time by the kzalloc-style
+	 * memset.  When tunables->vh_scheduler_tick_enable is 0 these
+	 * fields never move off zero.
+	 */
+	u64			vh_scheduler_tick_last_ns;
+	unsigned long		vh_scheduler_tick_count;
 };
 
 static DEFINE_PER_CPU(struct zenith_cpu, zenith_cpu);
@@ -11911,6 +11997,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		unsigned int vh_cpu_idle_enable;
 		unsigned int vh_freq_qos_enable;
 		unsigned int vh_sched_move_task_enable;
+		unsigned int vh_scheduler_tick_enable;
 		/* Patch B10-3: per-profile cgroup-v2 path the
 		 * zenith_psi_*_some_pct() helpers should read from.
 		 * NULL or "" means "use system-wide PSI" (the safe
@@ -12136,6 +12223,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_cpu_idle_enable = 1,
 			.vh_freq_qos_enable = 1,
 			.vh_sched_move_task_enable = 0,
+			.vh_scheduler_tick_enable = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_BALANCED,
@@ -12363,6 +12451,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.vh_freq_qos_enable = 1,
 			.vh_sched_move_task_enable = 0,
+			.vh_scheduler_tick_enable = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_BATTERY,
@@ -12562,6 +12651,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_cpu_idle_enable = 1,
 			.vh_freq_qos_enable = 0,
 			.vh_sched_move_task_enable = 0,
+			.vh_scheduler_tick_enable = 0,
 		},
 		{
 			.profile = ZENITH_PROFILE_LEGACY,
@@ -12736,6 +12826,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_cpu_idle_enable = 1,
 			.vh_freq_qos_enable = 0,
 			.vh_sched_move_task_enable = 0,
+			.vh_scheduler_tick_enable = 0,
 		},
 		{
 			/* Patch 4.1: GAMING profile.
@@ -12881,6 +12972,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.vh_freq_qos_enable = 0,
 			.vh_sched_move_task_enable = 0,
+			.vh_scheduler_tick_enable = 0,
 		},
 		{
 			/* Patch 4.2: AUDIO profile.
@@ -13068,6 +13160,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.vh_cpu_idle_enable = 1,
 			.vh_freq_qos_enable = 0,
 			.vh_sched_move_task_enable = 0,
+			.vh_scheduler_tick_enable = 0,
 		},
 	};
 	const struct zenith_profile_defaults *p = NULL;
@@ -13181,6 +13274,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 		   p->vh_freq_qos_enable);
 	WRITE_ONCE(t->vh_sched_move_task_enable,
 		   p->vh_sched_move_task_enable);
+	WRITE_ONCE(t->vh_scheduler_tick_enable,
+		   p->vh_scheduler_tick_enable);
 	WRITE_ONCE(zenith_frame_overrun_slack_us_cache,
 		   p->frame_overrun_slack_us);
 	WRITE_ONCE(zenith_frame_overrun_window_ms_cache,
@@ -18613,6 +18708,36 @@ vh_sched_move_task_enable_store(struct gov_attr_set *attr_set,
 static struct governor_attr vh_sched_move_task_enable =
 	__ATTR_RW(vh_sched_move_task_enable);
 
+/* Patch B9-4: vh_scheduler_tick_enable sysfs knob.  Strict 0/1
+ * boolean; gates the android_vh_scheduler_tick vendor-hook observer
+ * (see ZENITH_DEFAULT_VH_SCHEDULER_TICK_ENABLE for full semantics
+ * and profile bakes).  Stored via WRITE_ONCE; the probe reads with
+ * READ_ONCE so a torn write would at worst delay the gate flip by
+ * one tick (4 ms at HZ=250).
+ */
+static ssize_t
+vh_scheduler_tick_enable_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->vh_scheduler_tick_enable);
+}
+
+static ssize_t
+vh_scheduler_tick_enable_store(struct gov_attr_set *attr_set,
+			       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->vh_scheduler_tick_enable, val);
+	return count;
+}
+
+static struct governor_attr vh_scheduler_tick_enable =
+	__ATTR_RW(vh_scheduler_tick_enable);
+
 /* Patch B-AUTO-3: auto_eval_ms RW sysfs.  Cadence at which the
  * auto-selector engine runs its classifier when active_profile ==
  * ZENITH_PROFILE_AUTO.  Bounded by ZENITH_AUTO_EVAL_MS_{MIN,MAX}.
@@ -19626,6 +19751,7 @@ static struct attribute *zenith_attrs[] = {
 	&vh_cpu_idle_enable.attr,
 	&vh_freq_qos_enable.attr,
 	&vh_sched_move_task_enable.attr,
+	&vh_scheduler_tick_enable.attr,
 	&camera_aware.attr,
 	&camera_comms.attr,
 	&camera_active.attr,
@@ -19831,6 +19957,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_VH_FREQ_QOS_ENABLE;
 	tunables->vh_sched_move_task_enable =
 		ZENITH_DEFAULT_VH_SCHED_MOVE_TASK_ENABLE;
+	tunables->vh_scheduler_tick_enable =
+		ZENITH_DEFAULT_VH_SCHEDULER_TICK_ENABLE;
 	/* vh_freq_qos_pressure_until_ns is already 0 from kzalloc;
 	 * 0 < any future ktime_get_ns() so the auto-classify check
 	 * starts disarmed.  No explicit atomic64_set needed.
@@ -21048,6 +21176,66 @@ zenith_probe_sched_move_task(void *data, struct task_struct *tsk)
 	WRITE_ONCE(z_policy->vh_sched_move_task_last_jiffies, jiffies);
 }
 
+/* Patch B9-4: android_vh_scheduler_tick probe.  Stamps a per-CPU
+ * ktime_get_ns() timestamp on z_cpu->vh_scheduler_tick_last_ns and
+ * bumps z_cpu->vh_scheduler_tick_count once on every scheduler-tick
+ * fire on a CPU belonging to a zenith-driven policy, gated by
+ * tunables->vh_scheduler_tick_enable.
+ *
+ * Hot-path contract: this probe runs from the scheduler tick path
+ * (HZ * num_present_cpus calls/s, ~2000/s on a typical Android
+ * arm64 board) -- the strictest hot path of any zenith vendor-hook
+ * observer.  Mandatory contract: cpufreq_cpu_get_raw + READ_ONCE
+ * on governor_data and the tunable gate, single ktime_get_ns(),
+ * two WRITE_ONCEs to per-CPU fields, no mutex, no spinlock, no
+ * atomic_*.
+ *
+ * Storage: per-CPU (struct zenith_cpu) rather than per-policy
+ * because the tick fires on the local CPU and a remote-CPU stamp
+ * would mis-attribute the residency.  Single writer per CPU (the
+ * local CPU's tick handler) so the WRITE_ONCEs do not race; remote
+ * readers use READ_ONCE.
+ *
+ * Filtering: the hook fires under preempt_disable from
+ * scheduler_tick() in kernel/sched/core.c, after rq_unlock and
+ * trigger_load_balance.  rq is guaranteed non-NULL by the trace
+ * point but we defensively check anyway.  cpu_of(rq) is the local
+ * CPU; we range-check vs nr_cpu_ids before indexing the per-CPU
+ * area to be robust against a future cpu_of() that yields a stale
+ * value during cpu hotplug teardown.
+ */
+static void
+zenith_probe_scheduler_tick(void *data, struct rq *rq)
+{
+	struct cpufreq_policy *policy;
+	struct zenith_policy *z_policy;
+	struct zenith_tunables *t;
+	struct zenith_cpu *z_cpu;
+	unsigned int cpu;
+	u64 now;
+
+	if (!rq)
+		return;
+	cpu = cpu_of(rq);
+	if (cpu >= nr_cpu_ids)
+		return;
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy || policy->governor != &zenith_gov)
+		return;
+	z_policy = READ_ONCE(policy->governor_data);
+	if (!z_policy)
+		return;
+	t = z_policy->tunables;
+	if (!t || !READ_ONCE(t->vh_scheduler_tick_enable))
+		return;
+
+	now = ktime_get_ns();
+	z_cpu = &per_cpu(zenith_cpu, cpu);
+	WRITE_ONCE(z_cpu->vh_scheduler_tick_last_ns, now);
+	WRITE_ONCE(z_cpu->vh_scheduler_tick_count,
+		   READ_ONCE(z_cpu->vh_scheduler_tick_count) + 1);
+}
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
@@ -21059,6 +21247,7 @@ static int __init zenith_gov_init(void)
 	bool vh_cpu_idle_exit_registered = false;
 	bool vh_freq_qos_registered = false;
 	bool vh_sched_move_task_registered = false;
+	bool vh_scheduler_tick_registered = false;
 #ifdef CONFIG_FB_NOTIFY
 	bool fb_registered = false;
 #endif
@@ -21280,6 +21469,22 @@ static int __init zenith_gov_init(void)
 	else
 		vh_sched_move_task_registered = true;
 
+	/* Patch B9-4: register the android_vh_scheduler_tick vendor-
+	 * hook probe.  Failure is non-fatal; the per-CPU tick observer
+	 * simply remains silent and z_cpu->vh_scheduler_tick_last_ns /
+	 * _count stay at 0 across the lifetime of the policy.  The
+	 * tunables->vh_scheduler_tick_enable gate is the runtime
+	 * switch; this register call only makes the probe *available*
+	 * for the gate to flip on.
+	 */
+	ret = register_trace_android_vh_scheduler_tick(
+		zenith_probe_scheduler_tick, NULL);
+	if (ret)
+		pr_warn("Zenith: vh_scheduler_tick probe register failed (%d), vh_scheduler_tick_enable will be a no-op\n",
+			ret);
+	else
+		vh_scheduler_tick_registered = true;
+
 	/* Panel-state delivery: register the drm_panel_notifier path first
 	 * (preferred when available because the fb notifier chain is
 	 * deprecated upstream and absent on most modern vendor builds), and
@@ -21366,6 +21571,9 @@ static int __init zenith_gov_init(void)
 		if (vh_sched_move_task_registered)
 			unregister_trace_android_vh_sched_move_task(
 				zenith_probe_sched_move_task, NULL);
+		if (vh_scheduler_tick_registered)
+			unregister_trace_android_vh_scheduler_tick(
+				zenith_probe_scheduler_tick, NULL);
 		pr_err("Zenith: cpufreq_register_governor failed (%d)\n", ret);
 		return ret;
 	}
