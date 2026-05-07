@@ -19102,16 +19102,25 @@ static ssize_t frame_budget_us_per_policy_show(struct gov_attr_set *attr_set,
 	unsigned int cpu;
 	bool first = true;
 
-	for (cpu = 0; cpu < NR_CPUS; cpu++) {
+	/* Iterate only over CPUs that actually exist on this machine.
+	 * Slots in [nr_cpu_ids, NR_CPUS) are kept at zero by the store
+	 * side (input is rejected with -EINVAL above nr_cpu_ids), so
+	 * skipping them here is functionally equivalent and avoids a
+	 * read of zero-initialized storage we know cannot be non-zero.
+	 * sysfs_emit_at is the bounded form of sprintf for sysfs show
+	 * handlers: identical formatted output, but it cannot overrun
+	 * the PAGE_SIZE buffer the sysfs core hands us.
+	 */
+	for_each_possible_cpu(cpu) {
 		unsigned int v = t->frame_budget_us_per_policy[cpu];
 
 		if (!v)
 			continue;
-		len += sprintf(buf + len, "%s%u:%u",
-			       first ? "" : ",", cpu, v);
+		len += sysfs_emit_at(buf, len, "%s%u:%u",
+				     first ? "" : ",", cpu, v);
 		first = false;
 	}
-	len += sprintf(buf + len, "\n");
+	len += sysfs_emit_at(buf, len, "\n");
 	return len;
 }
 
@@ -19162,14 +19171,25 @@ static ssize_t frame_budget_us_per_policy_store(struct gov_attr_set *attr_set,
 			return -EINVAL;
 		if (kstrtouint(colon + 1, 10, &val))
 			return -EINVAL;
-		if (anchor >= NR_CPUS || val > ZENITH_FRAME_BUDGET_US_MAX)
+		/* Reject input that targets a CPU index above the number
+		 * of CPUs that actually exist on this machine.  The array
+		 * is still sized [NR_CPUS], but slots in [nr_cpu_ids,
+		 * NR_CPUS) are dead storage -- accepting them here would
+		 * silently mask a typo / misconfigured boot string.
+		 */
+		if (anchor >= nr_cpu_ids || val > ZENITH_FRAME_BUDGET_US_MAX)
 			return -EINVAL;
 		parsed[anchor] = val;
 		p = comma ? comma + 1 : end;
 	}
 
 commit:
-	for (cpu = 0; cpu < NR_CPUS; cpu++)
+	/* Only write to slots for CPUs that actually exist.  Slots in
+	 * [nr_cpu_ids, NR_CPUS) stay at zero (the kzalloc value) for
+	 * the lifetime of the tunables, because the bounds check above
+	 * never lets the store path write a non-zero value into them.
+	 */
+	for_each_possible_cpu(cpu)
 		WRITE_ONCE(t->frame_budget_us_per_policy[cpu], parsed[cpu]);
 	return count;
 }
