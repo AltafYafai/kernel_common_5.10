@@ -110,36 +110,34 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/cpufreq_zenith.h>
+#undef CREATE_TRACE_POINTS
 
-/* Patch B9-1: vendor hook on cluster freq-scale realisation.  Lets
- * zenith observe the *realised* per-cluster freq scale (set by the
- * scheduler from cpufreq_driver_fast_switch / arch_set_freq_scale)
- * rather than relying on its own decision-time view.  Header is
- * always pulled in -- the consumer is gated at runtime by
- * tunables->vh_arch_freq_scale_enable, and the registration in
- * zenith_gov_init() is a no-op when CONFIG_ANDROID_VENDOR_HOOKS=n
- * because the trace_android_vh_* exports collapse to empty in that
- * configuration.  Pulled in *after* CREATE_TRACE_POINTS so the
- * TRACE_INCLUDE_PATH redefinition done by trace/hooks headers does
- * not leak into trace/events/cpufreq_zenith.h's own define_trace.h
- * re-include.
+/* Vendor-hook headers (B9-1 topology, B9-2 sched, B9-3 cpuidle).  Pulled
+ * in *after* CREATE_TRACE_POINTS has been undef'd above, so each header
+ * only DECLAREs its android_vh_* / android_rvh_* tracepoints (the
+ * #include <trace/define_trace.h> at the bottom of every trace/hooks
+ * header is a no-op when CREATE_TRACE_POINTS is not defined).  The
+ * canonical owner of every __traceiter_android_* / __tracepoint_android_*
+ * symbol referenced below is drivers/android/vendor_hooks.o, which sets
+ * CREATE_TRACE_POINTS itself before pulling these same headers in
+ * (drivers/android/vendor_hooks.c).  Defining them here would emit a
+ * second copy of those symbols and the link would fail with duplicate
+ * definitions in kernel/built-in.a vs drivers/built-in.a.
+ *
+ * All three headers are always pulled in regardless of
+ * CONFIG_ANDROID_VENDOR_HOOKS: when the vendor-hook infrastructure is
+ * compiled out, the trace_android_vh_* / register_trace_android_vh_*
+ * macros collapse to empty / -ENODEV, and the per-tunable enable gates
+ * (vh_arch_freq_scale_enable, vh_uclamp_observer_enable,
+ * vh_cpu_idle_enable) become runtime no-ops.
+ *
+ * Mirror of the pattern used by kernel/sched/core.c, which also defines
+ * its own trace events via CREATE_TRACE_POINTS for <trace/events/sched.h>
+ * and then includes <trace/hooks/sched.h> + <trace/hooks/dtask.h> as
+ * declare-only consumers.
  */
 #include <trace/hooks/topology.h>
-
-/* Patch B9-2: vendor hook on userspace uclamp writes (ADPF path).
- * Sourced from sched_setattr() / sched_setscheduler() when userspace
- * assigns SCHED_FLAG_KEEP_PARAMS | SCHED_FLAG_UTIL_CLAMP.  Same
- * post-CREATE_TRACE_POINTS placement reasoning as topology.h above.
- */
 #include <trace/hooks/sched.h>
-
-/* Patch B9-3: vendor hooks on cpuidle entry/exit.  Sourced from
- * cpuidle_enter_state() in drivers/cpuidle/cpuidle.c.  Both probes
- * run in regular kernel context on the local CPU (the enter probe
- * fires before rcu_idle_enter(); the exit probe fires after
- * rcu_idle_exit()).  Same post-CREATE_TRACE_POINTS placement
- * reasoning as topology.h / sched.h above.
- */
 #include <trace/hooks/cpuidle.h>
 
 /* Constants & Defaults */
