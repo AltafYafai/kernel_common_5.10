@@ -1704,6 +1704,55 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  */
 #define ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT	25
 
+/* auto_thermal_cap (default 0, off):
+ *
+ * Final-stage hard cap on target_freq when the per-policy thermal
+ * pressure (arch_scale_thermal_pressure() expressed as a
+ * percentage of capacity) is sustained at or above
+ * auto_thermal_cap_pressure_pct.  Layered AFTER the level /
+ * derivative util_derate paths and the V2 THERMAL_RECOVERY state
+ * machine, this tier acts as an absolute upper bound on freq.
+ * Workloads that race past those mechanisms (input_boost,
+ * peak_headroom_rescue, frame_overrun, dl_task_floor) cannot pin
+ * policy->max indefinitely once thermal pressure exceeds the
+ * configured threshold while this gate is on.
+ *
+ * Default is OFF (=0) so existing tunings are unchanged on
+ * upgrade.  Operators that observe sustained thermal climbs in
+ * spite of the V2 state machine flip auto_thermal_cap=1 per policy
+ * and tune the threshold / cap pair to taste:
+ *
+ *   echo 1 > /sys/devices/system/cpu/cpufreq/policy0/zenith/\
+ *           auto_thermal_cap
+ *   echo 50 > .../auto_thermal_cap_pressure_pct  (fire at >= 50%%)
+ *   echo 80 > .../auto_thermal_cap_freq_pct      (cap to 80%% of max)
+ *
+ * Pressure threshold is bounded ZENITH_AUTO_THERMAL_CAP_PRESSURE_-
+ * PCT_{MIN,MAX} (1..100); freq cap is bounded ZENITH_AUTO_-
+ * THERMAL_CAP_FREQ_PCT_{MIN,MAX} (50..100) so an accidental
+ * "= 0" cannot zero the cluster.
+ *
+ * The cap is applied AFTER em_cap (Step 6) so the EM ladder still
+ * has a chance to validate the resolved freq against the energy
+ * model; auto_thermal_cap then clamps to the smaller of (em_cap
+ * result, policy->max * auto_thermal_cap_freq_pct / 100).
+ *
+ * tp_path = "auto_thermal_cap" when the cap fires.  Counted in
+ * ZENITH_STAT_AUTO_THERMAL_CAP via zenith_path_to_bucket() and
+ * surfaced as auto_thermal_cap=N in the zenith_stats sysfs node.
+ *
+ * No KMI exposure (governor-private sysfs).  The runtime path is
+ * gated on the boolean tunable; when 0 it short-circuits before
+ * any pressure read, costing a single READ_ONCE per call.
+ */
+#define ZENITH_DEFAULT_AUTO_THERMAL_CAP			0
+#define ZENITH_DEFAULT_AUTO_THERMAL_CAP_PRESSURE_PCT	50
+#define ZENITH_AUTO_THERMAL_CAP_PRESSURE_PCT_MIN	1
+#define ZENITH_AUTO_THERMAL_CAP_PRESSURE_PCT_MAX	100
+#define ZENITH_DEFAULT_AUTO_THERMAL_CAP_FREQ_PCT	80
+#define ZENITH_AUTO_THERMAL_CAP_FREQ_PCT_MIN		50
+#define ZENITH_AUTO_THERMAL_CAP_FREQ_PCT_MAX		100
+
 /* freq_stability_margin_pct (default 3):
  *
  * When the resolved target_freq is within margin percent of policy->max
@@ -3695,6 +3744,30 @@ struct zenith_tunables {
 	 */
 	unsigned int		thermal_derate_rate_pct;
 
+	/* See ZENITH_DEFAULT_AUTO_THERMAL_CAP comment block.  Boolean
+	 * gate; when 1, applies a hard cap on target_freq once the
+	 * per-policy thermal pressure crosses auto_thermal_cap_-
+	 * pressure_pct.  Default 0; flip to 1 via sysfs to opt in.
+	 * Read with READ_ONCE in the eval-path tier so the lockless
+	 * sysfs writer cannot tear the gate value across CPUs.
+	 */
+	unsigned int		auto_thermal_cap;
+
+	/* Threshold in percent of arch_scale_thermal_pressure() at
+	 * which auto_thermal_cap fires.  Bounded
+	 * ZENITH_AUTO_THERMAL_CAP_PRESSURE_PCT_{MIN,MAX} (1..100).
+	 * Read in the eval-path tier with READ_ONCE alongside
+	 * auto_thermal_cap and auto_thermal_cap_freq_pct.
+	 */
+	unsigned int		auto_thermal_cap_pressure_pct;
+
+	/* Cap as a percent of policy->max applied when auto_thermal_-
+	 * cap fires.  Bounded ZENITH_AUTO_THERMAL_CAP_FREQ_PCT_{MIN,
+	 * MAX} (50..100).  The min bound (50) prevents an accidental
+	 * "= 0" from zeroing the cluster.
+	 */
+	unsigned int		auto_thermal_cap_freq_pct;
+
 	/* See ZENITH_DEFAULT_FREQ_STABILITY_MARGIN_PCT.  Percent of
 	 * policy->max below which tiny downward transitions are held at
 	 * the current request.  0 disables; range 0..10.
@@ -4673,6 +4746,7 @@ enum zenith_stat_idx {
 	ZENITH_STAT_MIGRATION_FLOOR,	/* migration_floor (Patch K1) */
 	ZENITH_STAT_PSI_CPU_FLOOR,	/* psi_cpu_floor (Patch K2) */
 	ZENITH_STAT_FRAME_OVERRUN,	/* frame_overrun (Patch K3) */
+	ZENITH_STAT_AUTO_THERMAL_CAP,	/* auto_thermal_cap (Path B) */
 	ZENITH_STAT_NR
 };
 
@@ -7304,6 +7378,8 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
 		return ZENITH_STAT_PSI_CPU_FLOOR;
 	if (!strcmp(path, "frame_overrun"))
 		return ZENITH_STAT_FRAME_OVERRUN;
+	if (!strcmp(path, "auto_thermal_cap"))
+		return ZENITH_STAT_AUTO_THERMAL_CAP;
 	return ZENITH_STAT_OTHER;
 }
 
@@ -10045,6 +10121,36 @@ apply_uclamp_max_cap:
 		target_freq = zenith_em_cap_freq(z_policy, target_freq);
 		if (target_freq != em_in)
 			tp_path = "em_cap";
+	}
+
+	/* 6a. auto_thermal_cap (Path B): final-stage hard cap on
+	 * target_freq when sustained thermal pressure exceeds the
+	 * configured threshold.  Default off (auto_thermal_cap == 0);
+	 * a single READ_ONCE short-circuits the pressure read on the
+	 * fast path.  Applied AFTER em_cap so the energy model has
+	 * already validated the freq; this tier just clamps the upper
+	 * bound to policy->max * auto_thermal_cap_freq_pct / 100 when
+	 * the pressure threshold is met.  See ZENITH_DEFAULT_AUTO_-
+	 * THERMAL_CAP comment block.
+	 */
+	if (READ_ONCE(z_policy->tunables->auto_thermal_cap)) {
+		unsigned int p_pct =
+			zenith_policy_thermal_pressure_pct(z_policy);
+		unsigned int thresh = READ_ONCE(z_policy->tunables->
+					auto_thermal_cap_pressure_pct);
+		unsigned int cap_pct = READ_ONCE(z_policy->tunables->
+					auto_thermal_cap_freq_pct);
+
+		if (p_pct >= thresh && cap_pct < 100) {
+			unsigned long cap_freq =
+				((unsigned long)policy->max * cap_pct) /
+				100UL;
+
+			if (cap_freq && target_freq > cap_freq) {
+				target_freq = cap_freq;
+				tp_path = "auto_thermal_cap";
+			}
+		}
 	}
 
 	/* 7. Sampling-down multiplier: extend the down-rate delay by
@@ -15275,6 +15381,7 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 		[ZENITH_STAT_MIGRATION_FLOOR]	= "migration_floor",
 		[ZENITH_STAT_PSI_CPU_FLOOR]	= "psi_cpu_floor",
 		[ZENITH_STAT_FRAME_OVERRUN]	= "frame_overrun",
+		[ZENITH_STAT_AUTO_THERMAL_CAP]	= "auto_thermal_cap",
 	};
 	unsigned long sum[ZENITH_STAT_NR] = { 0 };
 	struct zenith_policy *z_pol;
@@ -15840,6 +15947,75 @@ static ssize_t thermal_derate_rate_pct_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr thermal_derate_rate_pct =
 	__ATTR_RW(thermal_derate_rate_pct);
+
+static ssize_t auto_thermal_cap_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_thermal_cap);
+}
+
+static ssize_t auto_thermal_cap_store(struct gov_attr_set *attr_set,
+				      const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->auto_thermal_cap = val;
+	return count;
+}
+static struct governor_attr auto_thermal_cap =
+	__ATTR_RW(auto_thermal_cap);
+
+static ssize_t auto_thermal_cap_pressure_pct_show(struct gov_attr_set *attr_set,
+						  char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+			       auto_thermal_cap_pressure_pct);
+}
+
+static ssize_t auto_thermal_cap_pressure_pct_store(struct gov_attr_set *attr_set,
+						   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val < ZENITH_AUTO_THERMAL_CAP_PRESSURE_PCT_MIN ||
+	    val > ZENITH_AUTO_THERMAL_CAP_PRESSURE_PCT_MAX)
+		return -EINVAL;
+	t->auto_thermal_cap_pressure_pct = val;
+	return count;
+}
+static struct governor_attr auto_thermal_cap_pressure_pct =
+	__ATTR_RW(auto_thermal_cap_pressure_pct);
+
+static ssize_t auto_thermal_cap_freq_pct_show(struct gov_attr_set *attr_set,
+					      char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->auto_thermal_cap_freq_pct);
+}
+
+static ssize_t auto_thermal_cap_freq_pct_store(struct gov_attr_set *attr_set,
+					       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val < ZENITH_AUTO_THERMAL_CAP_FREQ_PCT_MIN ||
+	    val > ZENITH_AUTO_THERMAL_CAP_FREQ_PCT_MAX)
+		return -EINVAL;
+	t->auto_thermal_cap_freq_pct = val;
+	return count;
+}
+static struct governor_attr auto_thermal_cap_freq_pct =
+	__ATTR_RW(auto_thermal_cap_freq_pct);
 
 static ssize_t freq_stability_margin_pct_show(struct gov_attr_set *attr_set,
 					      char *buf)
@@ -19706,6 +19882,9 @@ static struct attribute *zenith_attrs[] = {
 	&prefer_silver_hot_bump_pct.attr,
 	&thermal_util_derate.attr,
 	&thermal_derate_rate_pct.attr,
+	&auto_thermal_cap.attr,
+	&auto_thermal_cap_pressure_pct.attr,
+	&auto_thermal_cap_freq_pct.attr,
 	&freq_stability_margin_pct.attr,
 	&down_rate_adaptive.attr,
 	&wakeup_boost.attr,
@@ -20087,6 +20266,11 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->brutal_decay_ms	= ZENITH_DEFAULT_BRUTAL_DECAY_MS;
 	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
 	tunables->thermal_derate_rate_pct = ZENITH_DEFAULT_THERMAL_DERATE_RATE_PCT;
+	tunables->auto_thermal_cap	= ZENITH_DEFAULT_AUTO_THERMAL_CAP;
+	tunables->auto_thermal_cap_pressure_pct =
+		ZENITH_DEFAULT_AUTO_THERMAL_CAP_PRESSURE_PCT;
+	tunables->auto_thermal_cap_freq_pct =
+		ZENITH_DEFAULT_AUTO_THERMAL_CAP_FREQ_PCT;
 	tunables->freq_stability_margin_pct = ZENITH_DEFAULT_FREQ_STABILITY_MARGIN_PCT;
 	tunables->down_rate_adaptive	= ZENITH_DEFAULT_DOWN_RATE_ADAPTIVE;
 	tunables->wakeup_boost		= ZENITH_DEFAULT_WAKEUP_BOOST;
