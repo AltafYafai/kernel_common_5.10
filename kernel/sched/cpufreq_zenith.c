@@ -2320,6 +2320,18 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_V3_OFFSET_MIN			(-1)
 #define ZENITH_AT_V3_OFFSET_MAX			(+4)
 
+/* Per-policy V3 calibration ring depth.  Each slot records one
+ * zenith_at_v3_calibrate() invocation (both OBSERVE and APPLY modes,
+ * so operators can see when V3 was running and how it nudged the
+ * offsets).  Eight entries cover ~8 minutes of history at the
+ * default 60 s interval and ~80 minutes at the 600 s clamp; small
+ * enough to fit the read inside a sysfs PAGE_SIZE comfortably with
+ * the per-policy header line.  Bumping this is cheap (8 bytes per
+ * entry) but anything past PAGE_SIZE bytes will get truncated by
+ * the show handler's bound check.
+ */
+#define ZENITH_AT_V3_CALIB_LOG_NR		8
+
 #define ZENITH_DEFAULT_AT_CLUSTER_AWARE		1
 #define ZENITH_DEFAULT_AT_V2_SIGNALS		1
 #define ZENITH_DEFAULT_AT_THERMAL_SLOPE		1
@@ -4881,6 +4893,26 @@ struct zenith_at_log_entry {
 	u8		_pad[3];
 };
 
+/* Patch J: per-policy V3 calibration ring entry.  One slot per
+ * zenith_at_v3_calibrate() invocation, recording the boottime ns,
+ * the V2 transition count counted from the at_log walk, the V3 mode
+ * the calibration ran under (OBSERVE / APPLY -- mode 0 OFF never
+ * pushes), and the hyst/cool offset before and after any APPLY-mode
+ * nudge.  before == after on OBSERVE-mode entries and on
+ * rail-clamped APPLY entries; the differential lets the reader
+ * trivially see "when did V3 actually move me" without bpftrace.
+ */
+struct zenith_at_v3_calib_log_entry {
+	u64		ts_ns;
+	u32		transitions;
+	u8		mode;			/* ZENITH_AT_V3_MODE_* */
+	s8		hyst_before;
+	s8		hyst_after;
+	s8		cool_before;
+	s8		cool_after;
+	u8		_pad[3];
+};
+
 struct zenith_policy {
 	struct cpufreq_policy	*policy;
 	struct zenith_tunables	*tunables;
@@ -5304,6 +5336,22 @@ struct zenith_policy {
 	unsigned int		at_v3_last_transitions;
 	signed char		at_v3_hyst_offset;
 	signed char		at_v3_cool_offset;
+
+	/* Patch J: V3 calibration audit ring.  Pushed by
+	 * zenith_at_v3_calibrate() at the end of every calibration
+	 * tick (both OBSERVE and APPLY).  Surfaced via the
+	 * auto_tune_v3_calib_log RO sysfs node so the operator can
+	 * see V3's actual drift trajectory without ftrace.
+	 * Single-writer (the v2 worker thread) / multi-reader (sysfs
+	 * *_show under the gov_attr_set rwsem); reset alongside the
+	 * other observability surfaces in
+	 * zenith_policy_observability_reset() and on V3 master
+	 * MODE_OFF transitions in auto_tune_v3_store.
+	 */
+	struct zenith_at_v3_calib_log_entry
+				at_v3_calib_log[ZENITH_AT_V3_CALIB_LOG_NR];
+	unsigned int		at_v3_calib_log_head;
+	unsigned int		at_v3_calib_log_count;
 
 	/* round-U-z10 glide / coordination knobs auto-driven by the V2
 	 * worker via zenith_at_apply_glides() when
@@ -10938,6 +10986,13 @@ static void zenith_at_v3_calibrate(struct zenith_policy *z_policy,
 	unsigned int prev_state;
 	unsigned int idx, count, head;
 	bool has_prev = false;
+	/* Patch J: snapshot of the live offsets before any APPLY-mode
+	 * nudge below; recorded in the calibration ring at the tail of
+	 * this function so userspace can audit V3 drift.
+	 */
+	signed char hyst_before, cool_before;
+	struct zenith_at_v3_calib_log_entry *log_entry;
+	unsigned int log_slot;
 
 	interval_ms = READ_ONCE(t->auto_tune_v3_interval_ms);
 	if (interval_ms < ZENITH_AT_V3_INTERVAL_MIN_MS)
@@ -10979,21 +11034,50 @@ static void zenith_at_v3_calibrate(struct zenith_policy *z_policy,
 	z_policy->at_v3_last_transitions = transitions;
 	z_policy->at_v3_last_calib_ns = now;
 
-	if (mode != ZENITH_AT_V3_MODE_APPLY)
-		return;
+	hyst_before = z_policy->at_v3_hyst_offset;
+	cool_before = z_policy->at_v3_cool_offset;
 
-	/* Apply bounded nudge to offsets. */
-	if (transitions >= ZENITH_AT_V3_THRASH_HI) {
-		if (z_policy->at_v3_hyst_offset < ZENITH_AT_V3_OFFSET_MAX)
-			z_policy->at_v3_hyst_offset++;
-		if (z_policy->at_v3_cool_offset < ZENITH_AT_V3_OFFSET_MAX)
-			z_policy->at_v3_cool_offset++;
-	} else if (transitions <= ZENITH_AT_V3_THRASH_LO) {
-		if (z_policy->at_v3_hyst_offset > ZENITH_AT_V3_OFFSET_MIN)
-			z_policy->at_v3_hyst_offset--;
-		if (z_policy->at_v3_cool_offset > ZENITH_AT_V3_OFFSET_MIN)
-			z_policy->at_v3_cool_offset--;
+	/* Apply bounded nudge to offsets only in APPLY mode.  OBSERVE
+	 * mode still falls through to the calibration-ring push below
+	 * with before == after so userspace can see "V3 ran but did
+	 * not nudge because mode is OBSERVE".
+	 */
+	if (mode == ZENITH_AT_V3_MODE_APPLY) {
+		if (transitions >= ZENITH_AT_V3_THRASH_HI) {
+			if (z_policy->at_v3_hyst_offset < ZENITH_AT_V3_OFFSET_MAX)
+				z_policy->at_v3_hyst_offset++;
+			if (z_policy->at_v3_cool_offset < ZENITH_AT_V3_OFFSET_MAX)
+				z_policy->at_v3_cool_offset++;
+		} else if (transitions <= ZENITH_AT_V3_THRASH_LO) {
+			if (z_policy->at_v3_hyst_offset > ZENITH_AT_V3_OFFSET_MIN)
+				z_policy->at_v3_hyst_offset--;
+			if (z_policy->at_v3_cool_offset > ZENITH_AT_V3_OFFSET_MIN)
+				z_policy->at_v3_cool_offset--;
+		}
 	}
+
+	/* Patch J: push a calibration record on every tick (both
+	 * OBSERVE and APPLY) so userspace can audit V3 drift without
+	 * ftrace.  Single-writer ring -- no locking needed against
+	 * sysfs readers, who walk the ring under the gov_attr_set
+	 * rwsem and accept the same wrap-window tearing the existing
+	 * at_log path tolerates.
+	 */
+	log_slot = z_policy->at_v3_calib_log_head;
+	if (log_slot >= ZENITH_AT_V3_CALIB_LOG_NR)
+		log_slot = 0;
+	log_entry = &z_policy->at_v3_calib_log[log_slot];
+	log_entry->ts_ns	= now;
+	log_entry->transitions	= transitions;
+	log_entry->mode		= (u8)mode;
+	log_entry->hyst_before	= hyst_before;
+	log_entry->hyst_after	= z_policy->at_v3_hyst_offset;
+	log_entry->cool_before	= cool_before;
+	log_entry->cool_after	= z_policy->at_v3_cool_offset;
+	z_policy->at_v3_calib_log_head =
+		(log_slot + 1) % ZENITH_AT_V3_CALIB_LOG_NR;
+	if (z_policy->at_v3_calib_log_count < ZENITH_AT_V3_CALIB_LOG_NR)
+		z_policy->at_v3_calib_log_count++;
 }
 
 /* Effective hysteresis_windows / cooldown_windows after V3 nudge.
@@ -11060,6 +11144,15 @@ static void zenith_policy_observability_reset(struct zenith_policy *z_policy)
 	memset(z_policy->at_log, 0, sizeof(z_policy->at_log));
 	z_policy->at_log_head = 0;
 	z_policy->at_log_count = 0;
+	/* Patch J: clear the V3 calibration audit ring on the same
+	 * sysfs reset path.  Same rationale as the at_log clear above:
+	 * keep all observability surfaces aligned so an operator can
+	 * read a clean baseline from any of them on the next eval tick.
+	 */
+	memset(z_policy->at_v3_calib_log, 0,
+	       sizeof(z_policy->at_v3_calib_log));
+	z_policy->at_v3_calib_log_head = 0;
+	z_policy->at_v3_calib_log_count = 0;
 	/* Patch B7-2: clear the per-policy decision ring on the same
 	 * sysfs reset path that clears stats / dec_lat_buckets.  Keeps
 	 * the three observability surfaces aligned so an operator can
@@ -14918,6 +15011,16 @@ static ssize_t auto_tune_v3_store(struct gov_attr_set *attr_set,
 			z_policy->at_v3_cool_offset = 0;
 			z_policy->at_v3_last_calib_ns = 0;
 			z_policy->at_v3_last_transitions = 0;
+			/* Patch J: clear the calibration audit ring on the
+			 * V3 master-disable transition so a subsequent
+			 * re-enable starts the audit trail from a clean
+			 * baseline, matching the rest of the V3 fields
+			 * cleared here.
+			 */
+			memset(z_policy->at_v3_calib_log, 0,
+			       sizeof(z_policy->at_v3_calib_log));
+			z_policy->at_v3_calib_log_head = 0;
+			z_policy->at_v3_calib_log_count = 0;
 		}
 	}
 	/* V3 mode flips alter the offsets fed into
@@ -14992,6 +15095,66 @@ static ssize_t auto_tune_v3_state_show(struct gov_attr_set *attr_set,
 }
 static struct governor_attr auto_tune_v3_state =
 	__ATTR_RO(auto_tune_v3_state);
+
+/* Patch J: auto_tune_v3_calib_log RO sysfs.  Dumps the per-policy
+ * V3 calibration audit ring -- one line per calibration tick,
+ * oldest first, capped at ZENITH_AT_V3_CALIB_LOG_NR entries.
+ * Format chosen to fit comfortably under PAGE_SIZE for the common
+ * HMP topology (2 policies x 8 entries) while remaining grep
+ * friendly: every key is name=value with no quoted strings or
+ * commas.
+ *
+ * Mode is reported as the integer ZENITH_AT_V3_MODE_* value so a
+ * scraper can index into it directly; hyst/cool deltas are emitted
+ * as (before -> after) pairs so the operator can see at a glance
+ * which entries actually moved the offsets and which were OBSERVE
+ * passes or rail-clamped APPLY passes.
+ */
+static ssize_t auto_tune_v3_calib_log_show(struct gov_attr_set *attr_set,
+					   char *buf)
+{
+	struct zenith_policy *z_pol;
+	ssize_t len = 0;
+
+	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
+		unsigned int count = z_pol->at_v3_calib_log_count;
+		unsigned int head = z_pol->at_v3_calib_log_head;
+		unsigned int start, i;
+
+		if (count > ZENITH_AT_V3_CALIB_LOG_NR)
+			count = ZENITH_AT_V3_CALIB_LOG_NR;
+		start = (count == ZENITH_AT_V3_CALIB_LOG_NR) ? head : 0;
+
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "policy%u: %u entries\n",
+				 z_pol->policy ? z_pol->policy->cpu : 0,
+				 count);
+		if (len >= PAGE_SIZE)
+			break;
+
+		for (i = 0; i < count; i++) {
+			struct zenith_at_v3_calib_log_entry *e =
+				&z_pol->at_v3_calib_log[
+					(start + i) %
+					ZENITH_AT_V3_CALIB_LOG_NR];
+
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+				"  ts_ns=%llu mode=%u trans=%u hyst=%d->%d cool=%d->%d\n",
+				(unsigned long long)e->ts_ns,
+				(unsigned int)e->mode,
+				e->transitions,
+				(int)e->hyst_before, (int)e->hyst_after,
+				(int)e->cool_before, (int)e->cool_after);
+			if (len >= PAGE_SIZE)
+				break;
+		}
+		if (len >= PAGE_SIZE)
+			break;
+	}
+	return len;
+}
+static struct governor_attr auto_tune_v3_calib_log =
+	__ATTR_RO(auto_tune_v3_calib_log);
 
 static ssize_t auto_tune_cluster_aware_show(struct gov_attr_set *attr_set,
 					    char *buf)
@@ -20217,6 +20380,7 @@ static struct attribute *zenith_attrs[] = {
 	&auto_tune_v3.attr,
 	&auto_tune_v3_interval_ms.attr,
 	&auto_tune_v3_state.attr,
+	&auto_tune_v3_calib_log.attr,
 	&auto_tune_cluster_aware.attr,
 	&auto_tune_v2_signals.attr,
 	&auto_tune_thermal_slope.attr,
