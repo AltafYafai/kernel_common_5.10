@@ -12123,6 +12123,138 @@ static struct governor_attr ignore_nice_load = __ATTR_RW(ignore_nice_load);
  * of this function.  Forgetting any of those three steps will leave
  * the field at its module default for that profile, which is
  * almost always wrong.
+ *
+ * Profile-baked vs. global-only tunable split (audited 2026-05-07,
+ * zenith-tunables-audit).  struct zenith_tunables exposes ~180
+ * tunables; this function bakes the subset whose semantics differ
+ * by user-picked profile.  Everything else is "global-only": set
+ * once at zenith_create_tunables_data() time from the
+ * ZENITH_DEFAULT_* constants and only mutated by direct sysfs
+ * writes (no profile path touches them).
+ *
+ * BAKED (81 fields, in the same order as struct
+ * zenith_profile_defaults below).  Adding a field here without
+ * updating all four preset tables triggers the warning above; a
+ * static assert is not feasible because the struct is anonymous
+ * inside this function.
+ *
+ *   V1 base (legacy schedutil-plus tier, 24 fields):
+ *     up_rate_limit_us, down_rate_limit_us, up_threshold,
+ *     down_threshold, hispeed_freq_pct, hispeed_load, climb_mode,
+ *     freq_step_pct, powersave_bias, bias_load_threshold,
+ *     ignore_nice_load, input_boost_ms, input_boost_decay_ms,
+ *     input_boost_cap_pct, light_load_threshold,
+ *     sampling_down_factor, thermal_auto, screen_auto,
+ *     util_math_v2, kcpustat_hispeed_enable, down_rate_adaptive,
+ *     wakeup_boost, down_threshold_adaptive,
+ *     rate_limit_cluster_scale.
+ *
+ *   Stage 1/2 (peak-headroom + scenario shaping, 17 fields):
+ *     peak_headroom_rescue, peak_headroom_prearm,
+ *     peak_headroom_starve_load_pct,
+ *     peak_headroom_freq_floor_pct,
+ *     peak_headroom_starve_streak, peak_headroom_jump_pct,
+ *     peak_headroom_hold_ms, batt_hold_scale_pct,
+ *     cluster_wake_pulse_ms, cluster_wake_pulse_idle_ms,
+ *     cluster_wake_pulse_floor_pct, quiet_hours_cap_pct,
+ *     quiet_hours_screen_off_only, fg_transition_pulse_ms,
+ *     fg_transition_pulse_pct, screen_on_bias_pct,
+ *     input_boost_down_rate_mult_pct.
+ *
+ *   Stage 4 / Stage 5 (predict + rising-edge + DL + IO + render
+ *   + peak-hyst + boost-idle + bg-util + sleeper + peer-ramp +
+ *   migration-floor + PSI-CPU floor + frame-overrun + PSI-mem
+ *   cap, 32 fields):
+ *     predict_up_thresh, predict_up_window, pelt_rising_edge_thresh,
+ *     pelt_rising_edge_min_pct, dl_task_floor_pct,
+ *     io_floor_hyst_ms, io_floor_hyst_pct, render_floor_pct,
+ *     render_floor_min_runtime_ms, input_boost_touchdown_extra_ms,
+ *     peak_hysteresis_streak, peak_step_down_pct,
+ *     boost_idle_thresh, boost_idle_streak, bg_util_scale_pct,
+ *     sleeper_tail_thresh_us, sleeper_tail_pct,
+ *     peer_ramp_window_ms, peer_ramp_floor_pct,
+ *     peer_ramp_window_off_ms, migration_jump_pct,
+ *     migration_floor_window_ms, migration_floor_pct,
+ *     psi_cpu_floor_thresh, frame_overrun_slack_us,
+ *     frame_overrun_window_ms, frame_overrun_floor_pct,
+ *     frame_overrun_deep_streak, frame_overrun_deep_floor_pct,
+ *     psi_mem_cap_thresh, psi_mem_cap_pct, psi_mem_cap_window_ms.
+ *
+ *   Audio + vendor-hooks (7 fields):
+ *     audio_hyst_ms, vh_arch_freq_scale_enable,
+ *     vh_uclamp_observer_enable, vh_cpu_idle_enable,
+ *     vh_freq_qos_enable, vh_sched_move_task_enable,
+ *     vh_scheduler_tick_enable.
+ *
+ *   Patch B10-3 (1 field):
+ *     psi_cgroup_path.
+ *
+ * GLOBAL-ONLY (~100 fields).  Not enumerated individually; the
+ * categories are:
+ *
+ *   - User intent / opt-in flags whose semantics are device-wide
+ *     and not per-profile: audio_aware, render_aware, camera_aware,
+ *     psi_aware, prefer_silver_aware, game_auto, auto_tune_v2,
+ *     auto_tune_v3 (all of the seven static-key-gated aware-flags
+ *     and tier switches plus auto_tune_cluster_aware,
+ *     auto_tune_v2_signals, auto_tune_frame_pacing,
+ *     auto_tune_sustained_gaming).
+ *
+ *   - Mode-style scalars whose semantics are device-wide:
+ *     thermal_state, thermal_active, thermal_aware, screen_state,
+ *     freq_step_adaptive, climb_mode_brutal_*, profile (the
+ *     reported profile node itself), profile_auto.
+ *
+ *   - Hardware-shaped freqs that depend on the SoC's freq table,
+ *     not the user's intent: hispeed_freq, light_load_freq,
+ *     efficient_freq[N], eff_bin_*, up_delay_us.
+ *
+ *   - Auto-tune V2/V3 internals that the auto-tune state machine
+ *     manages directly (auto_tune_eval_ms,
+ *     auto_tune_hysteresis_ms, auto_tune_hysteresis_windows,
+ *     auto_tune_cooldown_windows, auto_tune_v2_var_promote_thresh,
+ *     auto_tune_util_rising_thresh_pct,
+ *     auto_tune_render_rt_floor_pct, auto_tune_v3_interval_ms,
+ *     auto_tune_v3_state, auto_tune_thermal_slope,
+ *     auto_tune_thermal_pressure_pct,
+ *     auto_tune_thermal_slope_pct, auto_tune_sat_load_pct,
+ *     auto_tune_hi_sat_pct, auto_tune_lo_sat_pct,
+ *     auto_tune_hi_events_x2, auto_tune_lo_events_x2,
+ *     auto_tune_scenario, all of the at_log_* sysfs RO mirrors).
+ *
+ *   - PSI thresholds and adaptive-up internals that already key off
+ *     other profile-baked tiers: psi_mem_thresh, psi_cpu_thresh,
+ *     psi_io_thresh, up_threshold_adaptive (the adaptive value, as
+ *     opposed to the on/off knob which is profile-baked).
+ *
+ *   - Boot-time and frame-budget knobs that are global by design:
+ *     boot_boost_ms, boot_boost_decay_ms, boot_complete_auto,
+ *     frame_budget_us, frame_budget_us_auto, frame_pace_floor_pct,
+ *     fg_*_pct ratios that are not in the bake set above.
+ *
+ *   - Boost / wakeup secondary knobs whose primary on/off lives in
+ *     the bake set: input_boost_decay_curve, input_boost_big_only,
+ *     wakeup_boost_ms, brutal_decay_ms, hispeed_*_streak,
+ *     hispeed_hyst_pct, hispeed_entry_streak, freq_stability_-
+ *     margin_pct, sampling_down_factor's helpers (already-baked
+ *     factor itself is the bake-set entry), boost_exit_extend.
+ *
+ *   - Stats / observability: zenith_stats_*, *_active mirrors
+ *     written from the runtime path, prefer_silver_*_pct, and the
+ *     prefer_silver_hot_threshold_pct / prefer_silver_hot_bump_pct
+ *     pair (the on/off prefer_silver_aware lives in the aware-flag
+ *     opt-in group above).
+ *
+ * Rule of thumb for new tunables: if the right value depends on
+ * what the user picked in /sys/.../zenith/profile, add it to the
+ * bake set below.  If the right value depends on the device's
+ * hardware (freq table, cluster topology) or on the user's intent
+ * to enable an opt-in detection path (an aware-flag), keep it
+ * global-only.  Default values for both groups belong in the
+ * ZENITH_DEFAULT_* block at the top of this file; the four preset
+ * tables only need to override values that differ from the
+ * BALANCED row, but the current convention is to fill every cell
+ * for readability.
  */
 static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 {
