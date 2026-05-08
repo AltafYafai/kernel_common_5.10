@@ -14920,6 +14920,15 @@ static ssize_t auto_tune_v3_store(struct gov_attr_set *attr_set,
 			z_policy->at_v3_last_transitions = 0;
 		}
 	}
+	/* V3 mode flips alter the offsets fed into
+	 * zenith_at_eff_hyst_windows() / zenith_at_eff_cool_windows()
+	 * on the freq-decision path.  Drop any cached effective
+	 * windows so the next tick recomputes on the new mode --
+	 * matters most on MODE_APPLY -> MODE_OFF and MODE_DRY ->
+	 * MODE_APPLY transitions where the offset surface changes
+	 * shape under the cache.
+	 */
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr auto_tune_v3 = __ATTR_RW(auto_tune_v3);
@@ -16135,6 +16144,14 @@ static ssize_t thermal_aware_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 	t->thermal_aware = val;
 	zenith_set_static_key(&zenith_thermal_aware_key, val);
+	/* Master-switch flips alter the freq-decision surface fed by
+	 * the thermal cluster (thermal_util_derate, the
+	 * thermal_pressure_continuous up_thresh ramp, auto_thermal_cap,
+	 * V2 THERMAL_RECOVERY).  Drop any cached snapshots so the
+	 * next tick recomputes on the new gate state, matching the
+	 * symmetry of thermal_pressure_continuous_store above.
+	 */
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr thermal_aware = __ATTR_RW(thermal_aware);
@@ -16296,6 +16313,11 @@ static ssize_t auto_thermal_cap_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
 	t->auto_thermal_cap = val;
+	/* Cap master switch governs whether the auto_thermal_cap_*_pct
+	 * pair feeds the freq decision; flip needs a cache drop so the
+	 * next tick recomputes the headroom on the new gate state.
+	 */
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr auto_thermal_cap =
