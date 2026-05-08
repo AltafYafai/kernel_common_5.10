@@ -4855,6 +4855,7 @@ enum zenith_stat_idx {
 	ZENITH_STAT_PSI_CPU_FLOOR,	/* psi_cpu_floor (Patch K2) */
 	ZENITH_STAT_FRAME_OVERRUN,	/* frame_overrun (Patch K3) */
 	ZENITH_STAT_AUTO_THERMAL_CAP,	/* auto_thermal_cap (Path B) */
+	ZENITH_STAT_QUIET_HOURS_CAP,	/* quiet_hours_cap (Patch 1.10) */
 	ZENITH_STAT_NR
 };
 
@@ -7518,6 +7519,8 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
 		return ZENITH_STAT_FRAME_OVERRUN;
 	if (!strcmp(path, "auto_thermal_cap"))
 		return ZENITH_STAT_AUTO_THERMAL_CAP;
+	if (!strcmp(path, "quiet_hours_cap"))
+		return ZENITH_STAT_QUIET_HOURS_CAP;
 	return ZENITH_STAT_OTHER;
 }
 
@@ -15667,6 +15670,7 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 		[ZENITH_STAT_PSI_CPU_FLOOR]	= "psi_cpu_floor",
 		[ZENITH_STAT_FRAME_OVERRUN]	= "frame_overrun",
 		[ZENITH_STAT_AUTO_THERMAL_CAP]	= "auto_thermal_cap",
+		[ZENITH_STAT_QUIET_HOURS_CAP]	= "quiet_hours_cap",
 	};
 	unsigned long sum[ZENITH_STAT_NR] = { 0 };
 	struct zenith_policy *z_pol;
