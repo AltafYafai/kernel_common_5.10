@@ -1507,7 +1507,16 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  *     observe-only mode (scalar = 1) and apply mode (scalar = 2)
  *     both produce key = TRUE.  See ZENITH_DEFAULT_AUTO_TUNE_V3
  *     comment block.
- *   - zenith_set_profile_defaults() never touches any of the six
+ *   - zenith_thermal_aware_key matches thermal_aware, which defaults
+ *     to 1 (the master gate is on out of the box).  Same init-time
+ *     sync rule as audio_aware / render_aware: zenith_init() must
+ *     call zenith_set_static_key() so the key starts TRUE; otherwise
+ *     the gated thermal mechanisms (thermal_util_derate,
+ *     auto_thermal_cap, the V2 THERMAL_RECOVERY transitions, and
+ *     zenith_thermal_active()) would read the scalar as 1 but skip
+ *     the branch via the still-FALSE key, silently disabling thermal
+ *     handling on a default install.
+ *   - zenith_set_profile_defaults() never touches any of the seven
  *     scalars (they are user-managed opt-ins, not preset state), so
  *     no profile-apply path needs to re-sync the keys.
  */
@@ -1517,6 +1526,7 @@ DEFINE_STATIC_KEY_FALSE(zenith_render_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_psi_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_game_auto_key);
 DEFINE_STATIC_KEY_FALSE(zenith_auto_tune_v3_key);
+DEFINE_STATIC_KEY_FALSE(zenith_thermal_aware_key);
 
 /* Transition invariant for the six feature static keys above:
  *
@@ -1598,6 +1608,35 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE	0
 #define ZENITH_DEFAULT_THERMAL_AUTO		1
 #define ZENITH_THERMAL_AUTO_PRESSURE_PCT	10
+/*
+ * thermal_aware: master gate for the cluster of thermal mechanisms
+ * the governor exposes as separate tunables.  When 1 (default), the
+ * gated mechanisms are active subject to their own per-mechanism
+ * tunables; when 0, all of the following short-circuit to no-ops
+ * regardless of their per-mechanism switch:
+ *
+ *   - thermal_util_derate (level term in zenith_get_util())
+ *   - thermal_derate_rate_pct (slope term, lives inside the same
+ *     thermal_util_derate block, so the master gate covers it)
+ *   - the thermal_pressure_continuous up_thresh ramp inside the
+ *     screen-off / zenith_thermal_active() path (gated indirectly
+ *     because zenith_thermal_active() short-circuits to false when
+ *     the master gate is off)
+ *   - auto_thermal_cap (target_freq cap in zenith_get_next_freq())
+ *   - the auto_tune_v2 THERMAL_RECOVERY state transitions
+ *
+ * Default 1 to preserve the current shipping behaviour: every
+ * mechanism whose individual tunable is on stays on without any
+ * userspace flip.  Audited 2026-05-07 (zenith-tunables-audit) as the
+ * single naming/master-gate cleanup that lets userspace turn off all
+ * thermal-driven freq adjustment at once for benchmarking, captures,
+ * or thermal-test rigs without having to know the names of every
+ * thermal sub-tunable.  Strict 0/1 boolean.  Static-key gated for
+ * branchless cost when on; sysfs store calls
+ * zenith_set_static_key() to keep the key state in sync with the
+ * scalar.
+ */
+#define ZENITH_DEFAULT_THERMAL_AWARE		1
 /*
  * thermal_pressure_continuous default flipped from 0 to 1 in the
  * wave-2 auto-defaults round.  The legacy hard-cliff path snapped
@@ -3717,6 +3756,27 @@ struct zenith_tunables {
 	 */
 	unsigned int		thermal_auto;
 
+	/* See ZENITH_DEFAULT_THERMAL_AWARE comment block.  Master gate
+	 * for the cluster of thermal mechanisms (thermal_util_derate,
+	 * the thermal_pressure_continuous up_thresh ramp,
+	 * auto_thermal_cap, the V2 THERMAL_RECOVERY transitions, and
+	 * zenith_thermal_active() itself).  Default 1.  Strict 0/1.
+	 * Static-key gated via zenith_thermal_aware_key.
+	 */
+	unsigned int		thermal_aware;
+
+	/* RO sysfs mirror.  Set on each call to zenith_thermal_active()
+	 * to the function's return value, so userspace can observe
+	 * whether the governor currently believes thermal pressure is
+	 * high enough to justify the cluster of thermal mechanisms.
+	 * Multiple policies may stomp on this from their own update
+	 * paths; that race is benign because the field is observability
+	 * only and not consumed by any decision tier.  Always 0 when
+	 * thermal_aware is 0 (zenith_thermal_active() short-circuits
+	 * before writing).
+	 */
+	unsigned int		thermal_active;
+
 	/* When 1, replace the binary "thermal_active -> dynamic_up_thresh
 	 * = 90" cliff with a linear ramp from up_threshold (cool, 0%
 	 * pressure) to 90 (hot, 100% pressure).  Smooths long-session
@@ -5805,13 +5865,18 @@ static unsigned long zenith_get_util(struct zenith_cpu *z_cpu)
 	 * util_out by (max - pressure) / max so the freq decision
 	 * targets what we can actually deliver instead of pinning to
 	 * the (already throttled) policy->max.  See the
-	 * ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block.
+	 * ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block.  Wrapped
+	 * by the thermal_aware master gate so a userspace flip to 0
+	 * disables both the level term and the slope term inside this
+	 * block at zero hot-path cost when the master gate is on (the
+	 * common case).
 	 *
 	 * Sub-floor pressure is ignored to avoid the multiply cost on
 	 * the noise.  trace_zenith_thermal_derate fires only when the
 	 * derate actually changes util.
 	 */
-	if (READ_ONCE(z_cpu->z_policy->tunables->thermal_util_derate) && max) {
+	if (ZENITH_FEATURE_ENABLED(thermal_aware) &&
+	    READ_ONCE(z_cpu->z_policy->tunables->thermal_util_derate) && max) {
 		unsigned long pressure = arch_scale_thermal_pressure(z_cpu->cpu);
 		unsigned long pressure_pct = (pressure * 100) / max;
 
@@ -6147,23 +6212,48 @@ static bool zenith_thermal_active(struct zenith_policy *z_policy)
 	struct cpufreq_policy *policy = z_policy->policy;
 	struct zenith_tunables *tunables = z_policy->tunables;
 	unsigned long pressure, cap;
+	bool active;
 	int cpu;
 
-	if (tunables->thermal_state)
-		return true;
-	if (!tunables->thermal_auto)
+	/* Master gate.  When thermal_aware == 0 every consumer of this
+	 * helper (the screen-off thermal cliff path, the V2 sustained
+	 * paths that read pressure, anything that calls
+	 * zenith_thermal_active() directly) sees "cool" regardless of
+	 * actual pressure or thermal_state.  Static-key gated for
+	 * branchless cost when on, the common case.  Also clear the
+	 * sysfs mirror so userspace never sees a stale 1 after a
+	 * userspace flip of thermal_aware to 0.
+	 */
+	if (!ZENITH_FEATURE_ENABLED(thermal_aware)) {
+		WRITE_ONCE(tunables->thermal_active, 0);
 		return false;
+	}
+
+	if (tunables->thermal_state) {
+		WRITE_ONCE(tunables->thermal_active, 1);
+		return true;
+	}
+	if (!tunables->thermal_auto) {
+		WRITE_ONCE(tunables->thermal_active, 0);
+		return false;
+	}
 
 	cpu = cpumask_first(policy->cpus);
-	if (cpu >= nr_cpu_ids)
+	if (cpu >= nr_cpu_ids) {
+		WRITE_ONCE(tunables->thermal_active, 0);
 		return false;
+	}
 
 	cap = arch_scale_cpu_capacity(cpu);
-	if (!cap)
+	if (!cap) {
+		WRITE_ONCE(tunables->thermal_active, 0);
 		return false;
+	}
 
 	pressure = arch_scale_thermal_pressure(cpu);
-	return (pressure * 100 / cap) >= ZENITH_THERMAL_AUTO_PRESSURE_PCT;
+	active = (pressure * 100 / cap) >= ZENITH_THERMAL_AUTO_PRESSURE_PCT;
+	WRITE_ONCE(tunables->thermal_active, active ? 1 : 0);
+	return active;
 }
 
 static unsigned int zenith_policy_thermal_pressure_pct(struct zenith_policy *z_policy)
@@ -10149,9 +10239,12 @@ apply_uclamp_max_cap:
 	 * already validated the freq; this tier just clamps the upper
 	 * bound to policy->max * auto_thermal_cap_freq_pct / 100 when
 	 * the pressure threshold is met.  See ZENITH_DEFAULT_AUTO_-
-	 * THERMAL_CAP comment block.
+	 * THERMAL_CAP comment block.  Wrapped by the thermal_aware
+	 * master gate (static-key) so the entire pressure read +
+	 * threshold compare folds away when the master gate is off.
 	 */
-	if (READ_ONCE(z_policy->tunables->auto_thermal_cap)) {
+	if (ZENITH_FEATURE_ENABLED(thermal_aware) &&
+	    READ_ONCE(z_policy->tunables->auto_thermal_cap)) {
 		unsigned int p_pct =
 			zenith_policy_thermal_pressure_pct(z_policy);
 		unsigned int thresh = READ_ONCE(z_policy->tunables->
@@ -14064,17 +14157,29 @@ static void zenith_auto_tune_work(struct work_struct *w)
 				render, memstall, prev, target);
 	}
 
-	thermal = READ_ONCE(t->thermal_state);
-	if (t->auto_tune_v2 && t->auto_tune_thermal_slope) {
-		thermal_pressure = zenith_policy_thermal_pressure_pct(z_policy);
-		if (thermal_pressure > z_policy->at_last_thermal_pressure)
-			thermal_delta = thermal_pressure -
-				z_policy->at_last_thermal_pressure;
-		thermal_slope = thermal_pressure >=
-				t->auto_tune_thermal_pressure_pct ||
-			thermal_delta >= t->auto_tune_thermal_slope_pct;
-		if (thermal_slope)
-			flags |= ZENITH_AT_FLAG_THERMAL_SLOPE;
+	/* Master gate covers both the level signal (thermal_state) and
+	 * the slope signal (auto_tune_thermal_slope) the V2 evaluator
+	 * uses to drive the THERMAL_RECOVERY state.  When thermal_aware
+	 * == 0 we pin both inputs to 0 here so the THERMAL_RECOVERY
+	 * branches below never fire; the screen / PSI / frame /
+	 * variance branches are unaffected because they don't depend
+	 * on either signal.  See ZENITH_DEFAULT_THERMAL_AWARE comment
+	 * block.
+	 */
+	if (ZENITH_FEATURE_ENABLED(thermal_aware)) {
+		thermal = READ_ONCE(t->thermal_state);
+		if (t->auto_tune_v2 && t->auto_tune_thermal_slope) {
+			thermal_pressure =
+				zenith_policy_thermal_pressure_pct(z_policy);
+			if (thermal_pressure > z_policy->at_last_thermal_pressure)
+				thermal_delta = thermal_pressure -
+					z_policy->at_last_thermal_pressure;
+			thermal_slope = thermal_pressure >=
+					t->auto_tune_thermal_pressure_pct ||
+				thermal_delta >= t->auto_tune_thermal_slope_pct;
+			if (thermal_slope)
+				flags |= ZENITH_AT_FLAG_THERMAL_SLOPE;
+		}
 	}
 	if (thermal) {
 		flags |= ZENITH_AT_FLAG_THERMAL;
@@ -15839,6 +15944,50 @@ static ssize_t thermal_pressure_continuous_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr thermal_pressure_continuous =
 	__ATTR_RW(thermal_pressure_continuous);
+
+/* thermal_aware sysfs knob.  Master gate over the cluster of
+ * thermal-driven freq adjustments (thermal_util_derate, the
+ * thermal_pressure_continuous up_thresh ramp, auto_thermal_cap, the
+ * V2 THERMAL_RECOVERY transitions).  Strict 0/1 boolean.  Mirrors
+ * the value into zenith_thermal_aware_key so the gated branches
+ * fold to no-ops in the off case.  See ZENITH_DEFAULT_THERMAL_AWARE
+ * for rationale.
+ */
+static ssize_t thermal_aware_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->thermal_aware);
+}
+
+static ssize_t thermal_aware_store(struct gov_attr_set *attr_set,
+				   const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	t->thermal_aware = val;
+	zenith_set_static_key(&zenith_thermal_aware_key, val);
+	return count;
+}
+static struct governor_attr thermal_aware = __ATTR_RW(thermal_aware);
+
+/* thermal_active sysfs knob.  Read-only mirror of
+ * zenith_thermal_active(): 1 when the governor currently believes
+ * thermal pressure is at or above the threshold, 0 otherwise.
+ * Written by the kernel from zenith_thermal_active() on every call.
+ * Always 0 when thermal_aware is 0.  Read with READ_ONCE because
+ * the writes from per-policy update paths can race with sysfs
+ * reads, and tearing the unsigned int read across CPUs is benign
+ * but observable.
+ */
+static ssize_t thermal_active_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       READ_ONCE(to_zenith_tunables(attr_set)->thermal_active));
+}
+static struct governor_attr thermal_active = __ATTR_RO(thermal_active);
 
 /* prefer_silver_aware: strict 0/1.  See struct zenith_tunables for
  * semantics.  When CONFIG_SCHED_PREFER_SILVER=n the field is still
@@ -19894,6 +20043,8 @@ static struct attribute *zenith_attrs[] = {
 	&screen_auto.attr,
 	&thermal_state.attr,
 	&thermal_auto.attr,
+	&thermal_aware.attr,
+	&thermal_active.attr,
 	&thermal_pressure_continuous.attr,
 	&prefer_silver_aware.attr,
 	&prefer_silver_hot_threshold_pct.attr,
@@ -20274,6 +20425,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->screen_auto		= 1;
 	tunables->thermal_state		= 0;
 	tunables->thermal_auto		= ZENITH_DEFAULT_THERMAL_AUTO;
+	tunables->thermal_aware		= ZENITH_DEFAULT_THERMAL_AWARE;
+	tunables->thermal_active	= 0;
 	tunables->thermal_pressure_continuous =
 		ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS;
 	tunables->prefer_silver_aware	= ZENITH_DEFAULT_PREFER_SILVER_AWARE;
@@ -20351,20 +20504,23 @@ static int zenith_init(struct cpufreq_policy *policy)
 	WRITE_ONCE(zenith_input_boost_touchdown_extra_ms_cache,
 		   ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS);
 
-	/* Sync the audio_aware / render_aware / camera_aware / psi_aware
-	 * / game_auto / auto_tune_v3 static keys against their default
-	 * scalars.  See the comment above DEFINE_STATIC_KEY_FALSE for the
-	 * invariant: scalars whose default is non-zero need an explicit
-	 * init-time key enable.  audio_aware / render_aware were flipped
-	 * to 1 in wave-2; game_auto was flipped to 1 and auto_tune_v3 to
-	 * 2 in wave-7; camera_aware and psi_aware were flipped to 1 in
-	 * the auto-defaults round mirroring audio/render so all six
-	 * detector branches ship live by default.  Idempotent across
-	 * re-attaches: zenith_set_static_key() is a no-op if the key is
-	 * already in the requested state.  zenith_set_static_key()
-	 * coerces non-zero scalars (including the auto_tune_v3 = 2
-	 * APPLY mode) to TRUE, which is the correct branch state for
-	 * any non-OFF mode.
+	/* Sync the audio_aware / render_aware / camera_aware /
+	 * psi_aware / game_auto / auto_tune_v3 / thermal_aware static
+	 * keys against their default scalars.  See the comment above
+	 * DEFINE_STATIC_KEY_FALSE for the invariant: scalars whose
+	 * default is non-zero need an explicit init-time key enable.
+	 * audio_aware / render_aware were flipped to 1 in wave-2;
+	 * game_auto was flipped to 1 and auto_tune_v3 to 2 in wave-7;
+	 * camera_aware and psi_aware were flipped to 1 in the
+	 * auto-defaults round mirroring audio/render so all six
+	 * detector branches ship live by default; thermal_aware
+	 * defaults to 1 as the master gate over the thermal-mechanism
+	 * cluster.  Idempotent across re-attaches:
+	 * zenith_set_static_key() is a no-op if the key is already
+	 * in the requested state.  zenith_set_static_key() coerces
+	 * non-zero scalars (including the auto_tune_v3 = 2 APPLY
+	 * mode) to TRUE, which is the correct branch state for any
+	 * non-OFF mode.
 	 */
 	zenith_set_static_key(&zenith_audio_aware_key,
 			      tunables->audio_aware);
@@ -20378,6 +20534,8 @@ static int zenith_init(struct cpufreq_policy *policy)
 			      tunables->game_auto);
 	zenith_set_static_key(&zenith_auto_tune_v3_key,
 			      tunables->auto_tune_v3);
+	zenith_set_static_key(&zenith_thermal_aware_key,
+			      tunables->thermal_aware);
 
 	/* Apply a cmdline-picked preset before the sysfs attr set is
 	 * published, so userspace sees the cmdline-picked preset as the
