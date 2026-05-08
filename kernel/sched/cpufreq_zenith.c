@@ -1587,7 +1587,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 }
 
 #define ZENITH_FEATURE_ENABLED(name)	\
-	static_branch_unlikely(&zenith_##name##_key)
+	static_branch_likely(&zenith_##name##_key)
 
 #define ZENITH_DEFAULT_CLIMB_MODE		ZENITH_CLIMB_MODE_SNAP
 #define ZENITH_DEFAULT_FREQ_STEP_PCT		5
@@ -4512,7 +4512,7 @@ static bool zenith_game_auto_active(void)
  */
 static inline unsigned int zenith_eff_game_mode(unsigned int base_gm)
 {
-	if (static_branch_unlikely(&zenith_game_auto_key) &&
+	if (static_branch_likely(&zenith_game_auto_key) &&
 	    base_gm < 1 &&
 	    zenith_game_auto_active())
 		return 1;
@@ -8044,7 +8044,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	 * latter is allowed to declare additional locals without
 	 * tripping -Wdeclaration-after-statement.
 	 */
-	if (static_branch_unlikely(&zenith_game_auto_key) &&
+	if (static_branch_likely(&zenith_game_auto_key) &&
 	    READ_ONCE(z_policy->tunables->game_auto))
 		zenith_policy_game_auto_tick(z_policy);
 
@@ -11009,7 +11009,7 @@ zenith_at_eff_hyst_windows(struct zenith_policy *z_policy, unsigned int base)
 {
 	int v;
 
-	if (!static_branch_unlikely(&zenith_auto_tune_v3_key))
+	if (!static_branch_likely(&zenith_auto_tune_v3_key))
 		return base;
 	if (READ_ONCE(z_policy->tunables->auto_tune_v3) !=
 	    ZENITH_AT_V3_MODE_APPLY)
@@ -11028,7 +11028,7 @@ zenith_at_eff_cool_windows(struct zenith_policy *z_policy, unsigned int base)
 {
 	int v;
 
-	if (!static_branch_unlikely(&zenith_auto_tune_v3_key))
+	if (!static_branch_likely(&zenith_auto_tune_v3_key))
 		return base;
 	if (READ_ONCE(z_policy->tunables->auto_tune_v3) !=
 	    ZENITH_AT_V3_MODE_APPLY)
@@ -14609,7 +14609,7 @@ rearm:
 	 * actual work to once per 10..600 s.  See ZENITH_DEFAULT_AUTO_TUNE_V3
 	 * comment block.
 	 */
-	if (static_branch_unlikely(&zenith_auto_tune_v3_key)) {
+	if (static_branch_likely(&zenith_auto_tune_v3_key)) {
 		unsigned int v3_mode = READ_ONCE(t->auto_tune_v3);
 
 		if (v3_mode != ZENITH_AT_V3_MODE_OFF)
