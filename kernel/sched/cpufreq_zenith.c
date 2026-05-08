@@ -14104,7 +14104,7 @@ static void zenith_auto_tune_work(struct work_struct *w)
 	bool frame_active = false;
 	bool screen_off = false;
 	bool thermal_slope = false;
-	bool thermal;
+	bool thermal = false;
 	unsigned int psi_mem_pct = 0;
 	unsigned int psi_cpu_pct = 0;
 	unsigned int psi_io_pct = 0;
