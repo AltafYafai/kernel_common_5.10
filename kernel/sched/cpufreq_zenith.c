@@ -1485,9 +1485,6 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  *
  * Init-time invariant:
  *
- *   - zenith_camera_aware_key and zenith_psi_aware_key match scalars
- *     that still default to 0, so they correctly start FALSE without
- *     any explicit init-time enable.
  *   - zenith_audio_aware_key and zenith_render_aware_key match scalars
  *     that were flipped to default 1 in the wave-2 auto-defaults
  *     round, so the keys must be explicitly enabled in zenith_init()
@@ -1495,6 +1492,11 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  *     would read the scalar as 1 but skip the branch via the still-FALSE
  *     key.  zenith_init() now calls zenith_set_static_key() against
  *     each scalar's value (idempotent across re-attaches).
+ *   - zenith_camera_aware_key and zenith_psi_aware_key match scalars
+ *     that were flipped to default 1 in the auto-defaults round that
+ *     mirrored audio_aware / render_aware, so the same init-time sync
+ *     rule applies: zenith_init() must enable the key against the
+ *     default scalar value.
  *   - zenith_game_auto_key and zenith_auto_tune_v3_key match scalars
  *     that were flipped to non-zero defaults in the wave-7
  *     auto-defaults round (game_auto = 1, auto_tune_v3 = 2), so the
@@ -1544,7 +1546,8 @@ DEFINE_STATIC_KEY_FALSE(zenith_auto_tune_v3_key);
  *     be explicitly enabled at init time (after tunables defaults are
  *     written), otherwise the hot path will read the scalar as 1 but
  *     skip the static-branch body.  zenith_init() syncs the
- *     audio_aware / render_aware keys against their default scalars
+ *     audio_aware / render_aware / camera_aware / psi_aware /
+ *     game_auto / auto_tune_v3 keys against their default scalars
  *     for exactly this reason.
  *   - Profile presets in zenith_apply_profile() must not silently
  *     toggle a feature scalar without also calling
@@ -2856,7 +2859,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT	0
 #define ZENITH_FRAME_PACE_BASE_BUDGET_US	16667
 
-/* psi_aware (default 0, off) + psi_mem_thresh (default 50)
+/* psi_aware (default 1, on) + psi_mem_thresh (default 50)
  * + psi_cpu_thresh (default 0, off) + psi_io_thresh (default 0, off):
  *
  * When psi_aware=1, zenith_get_next_freq() reads the system-wide
@@ -2894,8 +2897,15 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * helpers without changing freq).  psi_cpu_thresh / psi_io_thresh
  * default to 0 so out-of-box behaviour matches pre-N1: only the mem
  * cap fires when psi_aware=1.
+ *
+ * Default flipped from 0 to 1 in the auto-defaults round that
+ * accompanies camera_aware: zenith is intended to be self-tuning, and
+ * leaving the gate off meant the memstall cap shipped dormant.  The
+ * out-of-box impact is a memstall reader gated by psi_mem_thresh = 50
+ * (i.e. only fires under sustained heavy memory pressure); the cpu
+ * and io caps remain off-by-threshold (0).
  */
-#define ZENITH_DEFAULT_PSI_AWARE		0
+#define ZENITH_DEFAULT_PSI_AWARE		1
 #define ZENITH_DEFAULT_PSI_MEM_THRESH		50
 #define ZENITH_DEFAULT_PSI_CPU_THRESH		0
 #define ZENITH_DEFAULT_PSI_IO_THRESH		0
@@ -2982,7 +2992,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEC_RING_NR			32
 #define ZENITH_DEC_RING_MASK			(ZENITH_DEC_RING_NR - 1)
 
-/* camera_aware (default 0, off) + camera_active (default 0, auto)
+/* camera_aware (default 1, on) + camera_active (default 0, auto)
  * + camera_floor_pct (default 0):
  *
  * When camera_aware=1, zenith_get_next_freq() walks the policy's
@@ -3015,8 +3025,16 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  * ZENITH_CAMERA_CACHE_TTL_NS (mirrored from render).  Set
  * camera_aware=0 to fully disable; set camera_floor_pct=0 to leave
  * comm-walk + tracepoint visibility on but apply no floor.
+ *
+ * Default flipped from 0 to 1 in the auto-defaults round that
+ * accompanies psi_aware: zenith is intended to be self-tuning, and
+ * shipping the gate off meant the camera floor never fired without
+ * an explicit sysfs poke.  Out-of-box impact is a comm-walk on the
+ * eval-cadence path (cached for ZENITH_CAMERA_CACHE_TTL_NS); no
+ * frequency clamp is applied unless camera_floor_pct is also set
+ * to a non-zero value (it stays at 0 by default).
  */
-#define ZENITH_DEFAULT_CAMERA_AWARE		0
+#define ZENITH_DEFAULT_CAMERA_AWARE		1
 #define ZENITH_DEFAULT_CAMERA_ACTIVE		0
 #define ZENITH_DEFAULT_CAMERA_FLOOR_PCT		0
 #define ZENITH_CAMERA_CACHE_TTL_NS		(4 * NSEC_PER_MSEC)
@@ -20333,14 +20351,15 @@ static int zenith_init(struct cpufreq_policy *policy)
 	WRITE_ONCE(zenith_input_boost_touchdown_extra_ms_cache,
 		   ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS);
 
-	/* Sync the audio_aware / render_aware / game_auto / auto_tune_v3
-	 * static keys against their default scalars.  See the comment
-	 * above DEFINE_STATIC_KEY_FALSE for the invariant: scalars whose
-	 * default is non-zero need an explicit init-time key enable.
-	 * audio_aware / render_aware were flipped to 1 in wave-2;
-	 * game_auto was flipped to 1 and auto_tune_v3 to 2 in wave-7.
-	 * camera_aware and psi_aware still default to 0 so their keys
-	 * remain FALSE; we do not call them here.  Idempotent across
+	/* Sync the audio_aware / render_aware / camera_aware / psi_aware
+	 * / game_auto / auto_tune_v3 static keys against their default
+	 * scalars.  See the comment above DEFINE_STATIC_KEY_FALSE for the
+	 * invariant: scalars whose default is non-zero need an explicit
+	 * init-time key enable.  audio_aware / render_aware were flipped
+	 * to 1 in wave-2; game_auto was flipped to 1 and auto_tune_v3 to
+	 * 2 in wave-7; camera_aware and psi_aware were flipped to 1 in
+	 * the auto-defaults round mirroring audio/render so all six
+	 * detector branches ship live by default.  Idempotent across
 	 * re-attaches: zenith_set_static_key() is a no-op if the key is
 	 * already in the requested state.  zenith_set_static_key()
 	 * coerces non-zero scalars (including the auto_tune_v3 = 2
@@ -20351,6 +20370,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 			      tunables->audio_aware);
 	zenith_set_static_key(&zenith_render_aware_key,
 			      tunables->render_aware);
+	zenith_set_static_key(&zenith_camera_aware_key,
+			      tunables->camera_aware);
+	zenith_set_static_key(&zenith_psi_aware_key,
+			      tunables->psi_aware);
 	zenith_set_static_key(&zenith_game_auto_key,
 			      tunables->game_auto);
 	zenith_set_static_key(&zenith_auto_tune_v3_key,
