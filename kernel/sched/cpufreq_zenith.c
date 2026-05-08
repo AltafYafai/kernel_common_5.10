@@ -2513,6 +2513,20 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_OVERRIDE_PSI_MEM_CAP_PCT	BIT(18)
 #define ZENITH_AT_OVERRIDE_PSI_MEM_CAP_WINDOW	BIT(19)
 
+/* Floor/cap-knob override fence.  Five sysfs knobs that are read on
+ * the freq-update hot path but are not driven by any V2 / V3 path
+ * today.  The bits sit dormant: a sysfs write to any of the five
+ * knobs ORs in its bit, and any future zenith_at_set_uint() caller
+ * gated on these bits will short-circuit, leaving the user value
+ * alone.  Profile-flip-clears-mask is in zenith_apply_profile()
+ * already (existing code, no edit needed here).
+ */
+#define ZENITH_AT_OVERRIDE_RENDER_FLOOR_PCT	BIT(20)
+#define ZENITH_AT_OVERRIDE_AUDIO_FLOOR_PCT	BIT(21)
+#define ZENITH_AT_OVERRIDE_AUDIO_CAP_PCT	BIT(22)
+#define ZENITH_AT_OVERRIDE_AUDIO_HYST_MS	BIT(23)
+#define ZENITH_AT_OVERRIDE_CAMERA_FLOOR_PCT	BIT(24)
+
 /* Patch L: V2-classifier tier-armed bitmask.
  *
  * Written by zenith_at_apply_tiers() per V2 worker pass; read by
@@ -18909,6 +18923,8 @@ static ssize_t render_floor_pct_store(struct gov_attr_set *attr_set,
 	if (val > 100)
 		return -EINVAL;
 	t->render_floor_pct = val;
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_RENDER_FLOOR_PCT);
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr render_floor_pct = __ATTR_RW(render_floor_pct);
@@ -18993,6 +19009,8 @@ static ssize_t audio_floor_pct_store(struct gov_attr_set *attr_set,
 	if (val > 100)
 		return -EINVAL;
 	t->audio_floor_pct = val;
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_AUDIO_FLOOR_PCT);
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr audio_floor_pct = __ATTR_RW(audio_floor_pct);
@@ -19018,6 +19036,8 @@ static ssize_t audio_cap_pct_store(struct gov_attr_set *attr_set,
 	if (val > 100)
 		return -EINVAL;
 	t->audio_cap_pct = val;
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_AUDIO_CAP_PCT);
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr audio_cap_pct = __ATTR_RW(audio_cap_pct);
@@ -19045,6 +19065,8 @@ static ssize_t audio_hyst_ms_store(struct gov_attr_set *attr_set,
 	if (val > ZENITH_AUDIO_HYST_MS_MAX)
 		return -EINVAL;
 	t->audio_hyst_ms = val;
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_AUDIO_HYST_MS);
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr audio_hyst_ms = __ATTR_RW(audio_hyst_ms);
@@ -19423,6 +19445,8 @@ static ssize_t camera_floor_pct_store(struct gov_attr_set *attr_set,
 	if (val > 100)
 		return -EINVAL;
 	t->camera_floor_pct = val;
+	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_CAMERA_FLOOR_PCT);
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr camera_floor_pct = __ATTR_RW(camera_floor_pct);
@@ -19959,6 +19983,7 @@ static ssize_t frame_pace_floor_pct_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 	WRITE_ONCE(t->frame_pace_floor_pct, val);
 	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_FRAME_PACE);
+	zenith_invalidate_cache(attr_set);
 	return count;
 }
 static struct governor_attr frame_pace_floor_pct =
