@@ -178,6 +178,12 @@
 #define ZENITH_DEFAULT_UP_THRESHOLD_HISPEED	0	/* disabled */
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
 #define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
+/* Defensive sysfs upper bound for hispeed_freq (kHz).  50 GHz is well past
+ * any real CPU; rejects UINT_MAX-style garbage at the sysfs layer.  Values
+ * below this still receive the existing consumer-side comparison against
+ * policy->cur / policy->max.
+ */
+#define ZENITH_HISPEED_FREQ_MAX			50000000U
 #define ZENITH_DEFAULT_HISPEED_FREQ_PCT		55	/* fallback when hispeed_freq=0 */
 #define ZENITH_DEFAULT_HISPEED_LOAD		65
 #define ZENITH_DEFAULT_HISPEED_HYST_PCT		10	/* exit hysteresis margin */
@@ -1874,6 +1880,12 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 
 #define ZENITH_DEFAULT_UP_RATE_LIMIT_US		100
 #define ZENITH_DEFAULT_DOWN_RATE_LIMIT_US	4000
+/* Defensive sysfs upper bound for up_rate_limit_us and down_rate_limit_us
+ * (microseconds).  60 seconds is well past any sane cpufreq sampling
+ * cadence; the goal is to reject UINT_MAX-style garbage at the sysfs
+ * layer rather than to impose a tight policy.
+ */
+#define ZENITH_RATE_LIMIT_US_MAX		60000000U
 
 /* Multiplier for the effective down-rate delay while an input
  * boost is active.  Range 100..1000 (percent).  100 = no extension
@@ -2080,6 +2092,10 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_EFF_BIN_HYST_PCT_MAX		20
 #define ZENITH_DEFAULT_UP_DELAY_US		4000
 #define ZENITH_DEFAULT_LIGHT_LOAD_FREQ		0
+/* Defensive sysfs upper bound for light_load_freq (kHz).  50 GHz is well
+ * past any real CPU; rejects UINT_MAX-style garbage at the sysfs layer.
+ */
+#define ZENITH_LIGHT_LOAD_FREQ_MAX		50000000U
 #define ZENITH_DEFAULT_LIGHT_LOAD_THRESHOLD	20
 #define ZENITH_DEFAULT_SAMPLING_DOWN_FACTOR	2
 #define ZENITH_MAX_SAMPLING_DOWN_FACTOR		10
@@ -16786,7 +16802,7 @@ static ssize_t light_load_freq_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_LIGHT_LOAD_FREQ_MAX)
 		return -EINVAL;
 	t->light_load_freq = val;
 	zenith_invalidate_cache(attr_set);
@@ -16999,7 +17015,7 @@ static ssize_t hispeed_freq_store(struct gov_attr_set *attr_set,
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_HISPEED_FREQ_MAX)
 		return -EINVAL;
 	t->hispeed_freq = val;
 	zenith_invalidate_cache(attr_set);
@@ -18658,7 +18674,7 @@ static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set, const char 
 	struct zenith_policy *z_pol;
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_RATE_LIMIT_US_MAX)
 		return -EINVAL;
 	t->up_rate_limit_us = val;
 	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_UP_RATE);
@@ -18681,7 +18697,7 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set,
 	struct zenith_policy *z_pol;
 	unsigned int val;
 
-	if (kstrtouint(buf, 10, &val))
+	if (kstrtouint(buf, 10, &val) || val > ZENITH_RATE_LIMIT_US_MAX)
 		return -EINVAL;
 	t->down_rate_limit_us = val;
 	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_DOWN_RATE);
