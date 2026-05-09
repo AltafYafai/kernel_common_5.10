@@ -3226,6 +3226,18 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_KCPUSTAT_WINDOW_MAX_US		100000
 #define ZENITH_KCPUSTAT_FILTER_SHIFT_MAX	8
 
+/* Patch L: master switch for human-readable zenith state logging.
+ * When ZENITH_DEFAULT_VERBOSE_LOG is non-zero, profile-change /
+ * profile-bake-summary / 7-master-switch-flip events emit a
+ * pr_info() line tagged "zenith:" to dmesg (forwarded to logcat
+ * under the KERNEL tag on Android).  Default 0 so production
+ * builds do not get spammed; flipping verbose_log=1 at runtime
+ * makes the logging hot.  Plain RW boolean tunable; not profile-
+ * baked since logging policy is operator preference, not workload-
+ * driven.
+ */
+#define ZENITH_DEFAULT_VERBOSE_LOG		0
+
 /*
  * Zenith Tunables & State API
  */
@@ -4357,6 +4369,14 @@ struct zenith_tunables {
 	 * and from zenith_apply_profile().
 	 */
 	unsigned int		vh_scheduler_tick_enable;
+
+	/* Patch L: see ZENITH_DEFAULT_VERBOSE_LOG comment block.
+	 * Operator-controlled gate for the human-readable zenith
+	 * dmesg / logcat trail.  Read via READ_ONCE on the (cold)
+	 * sysfs and profile_store paths; written via WRITE_ONCE
+	 * from the verbose_log_store handler.
+	 */
+	unsigned int		verbose_log;
 };
 
 /*
@@ -11224,6 +11244,64 @@ static const char *zenith_profile_name(unsigned int profile)
 	}
 }
 
+/* Patch L: human-readable zenith logging helpers.  All three are
+ * gated on READ_ONCE(t->verbose_log) so production builds (where
+ * verbose_log defaults to 0) pay only the cost of one load + one
+ * branch on the cold profile_store / master-store paths.  The
+ * pr_info() format strings deliberately match across the three
+ * helpers so a userspace log scraper can grep "zenith: " and parse
+ * a stable structure.
+ *
+ * profile_change: emitted by profile_store on the user-write path
+ *                 *before* the bake runs, so the dmesg trail reads
+ *                 "switching X -> Y" / "applied Y profile: ..." in
+ *                 chronological order.
+ * profile_applied: emitted at the tail of zenith_apply_profile()
+ *                  with a one-line summary of the major bake
+ *                  results.  Fires for AUTO-driven applies too,
+ *                  giving the operator visibility into the auto
+ *                  selector's decisions.
+ * master_flip:    emitted by each of the seven master-switch stores
+ *                 (audio_aware / render_aware / camera_aware /
+ *                 psi_aware / game_auto / auto_tune_v3 /
+ *                 thermal_aware) after a value change is committed,
+ *                 with old / new values both included so the trail
+ *                 is meaningful even under fast successive flips.
+ */
+static inline void zenith_log_profile_change(struct zenith_tunables *t,
+					     unsigned int old_prof,
+					     unsigned int new_prof)
+{
+	if (!READ_ONCE(t->verbose_log))
+		return;
+	pr_info("zenith: switching profile %s -> %s\n",
+		zenith_profile_name(old_prof),
+		zenith_profile_name(new_prof));
+}
+
+static inline void zenith_log_profile_applied(struct zenith_tunables *t,
+					      unsigned int prof)
+{
+	if (!READ_ONCE(t->verbose_log))
+		return;
+	pr_info("zenith: applied %s profile: hispeed_freq_pct=%u up_threshold=%u down_threshold=%u climb_mode=%u freq_step_pct=%u powersave_bias=%u up_rate_limit_us=%u down_rate_limit_us=%u wakeup_boost=%u down_threshold_adaptive=%u\n",
+		zenith_profile_name(prof),
+		t->hispeed_freq_pct, t->up_threshold, t->down_threshold,
+		t->climb_mode, t->freq_step_pct, t->powersave_bias,
+		t->up_rate_limit_us, t->down_rate_limit_us,
+		t->wakeup_boost, t->down_threshold_adaptive);
+}
+
+static inline void zenith_log_master_flip(struct zenith_tunables *t,
+					  const char *name,
+					  unsigned int old_val,
+					  unsigned int new_val)
+{
+	if (!READ_ONCE(t->verbose_log))
+		return;
+	pr_info("zenith: master %s %u -> %u\n", name, old_val, new_val);
+}
+
 static const char *zenith_at_state_name(unsigned int state)
 {
 	switch (state) {
@@ -13778,6 +13856,16 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	WRITE_ONCE(zenith_input_boost_active_ms, t->input_boost_ms);
 	WRITE_ONCE(zenith_input_boost_touchdown_extra_ms_cache,
 		   t->input_boost_touchdown_extra_ms);
+
+	/* Patch L: emit a one-line summary of the bake result so the
+	 * operator can confirm in dmesg / logcat which profile is
+	 * live and what the major tunables were set to.  Fires on
+	 * every apply path -- user-driven profile_store, AUTO-driven
+	 * worker, and the early-balanced-then-AUTO bootstrap inside
+	 * profile_store's AUTO branch.  Gated on verbose_log inside
+	 * the helper.
+	 */
+	zenith_log_profile_applied(t, prof);
 }
 
 /* Patch B-AUTO-4: auto-selector classifier (priority cascade).
@@ -14998,10 +15086,12 @@ static ssize_t auto_tune_v3_store(struct gov_attr_set *attr_set,
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
 	struct zenith_policy *z_policy;
+	unsigned int old;
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val) || val > ZENITH_AT_V3_MODE_MAX)
 		return -EINVAL;
+	old = t->auto_tune_v3;
 	t->auto_tune_v3 = val;
 	zenith_set_static_key(&zenith_auto_tune_v3_key, val);
 	if (val == ZENITH_AT_V3_MODE_OFF) {
@@ -15032,6 +15122,8 @@ static ssize_t auto_tune_v3_store(struct gov_attr_set *attr_set,
 	 * shape under the cache.
 	 */
 	zenith_invalidate_cache(attr_set);
+	if (old != val)
+		zenith_log_master_flip(t, "auto_tune_v3", old, val);
 	return count;
 }
 static struct governor_attr auto_tune_v3 = __ATTR_RW(auto_tune_v3);
@@ -15440,6 +15532,14 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 	if (t->active_profile == prof)
 		return count;
 
+	/* Patch L: log the profile transition before the bake runs so
+	 * the dmesg trail reads chronologically against the
+	 * subsequent "applied" summary line emitted by
+	 * zenith_apply_profile().  Gated on verbose_log inside the
+	 * helper.
+	 */
+	zenith_log_profile_change(t, t->active_profile, prof);
+
 	/* Patch B-AUTO-2: AUTO is a meta-profile, not a tunables bake.
 	 * Apply the BALANCED preset immediately (so the device is on a
 	 * known-safe baseline before the auto-selector engine's first
@@ -15502,6 +15602,32 @@ static ssize_t profile_store(struct gov_attr_set *attr_set,
 	return count;
 }
 static struct governor_attr profile = __ATTR_RW(profile);
+
+/* Patch L: verbose_log RW sysfs.  Plain 0/1 boolean.  When 1, the
+ * three helpers (zenith_log_profile_change, zenith_log_profile_-
+ * applied, zenith_log_master_flip) emit "zenith:" prefixed
+ * pr_info() lines on the user-driven sysfs write paths.  Default 0
+ * so production builds aren't spammed.  Read via READ_ONCE inside
+ * the helpers; written via WRITE_ONCE here.
+ */
+static ssize_t verbose_log_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->verbose_log);
+}
+
+static ssize_t verbose_log_store(struct gov_attr_set *attr_set,
+				 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	WRITE_ONCE(t->verbose_log, val);
+	return count;
+}
+static struct governor_attr verbose_log = __ATTR_RW(verbose_log);
 
 /* Patch B-AUTO-2: auto_target RO sysfs.  When active_profile ==
  * ZENITH_PROFILE_AUTO this prints the concrete profile the auto-
@@ -16301,10 +16427,12 @@ static ssize_t thermal_aware_store(struct gov_attr_set *attr_set,
 				   const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int old;
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
+	old = t->thermal_aware;
 	t->thermal_aware = val;
 	zenith_set_static_key(&zenith_thermal_aware_key, val);
 	/* Master-switch flips alter the freq-decision surface fed by
@@ -16315,6 +16443,8 @@ static ssize_t thermal_aware_store(struct gov_attr_set *attr_set,
 	 * symmetry of thermal_pressure_continuous_store above.
 	 */
 	zenith_invalidate_cache(attr_set);
+	if (old != val)
+		zenith_log_master_flip(t, "thermal_aware", old, val);
 	return count;
 }
 static struct governor_attr thermal_aware = __ATTR_RW(thermal_aware);
@@ -19081,12 +19211,16 @@ static ssize_t render_aware_store(struct gov_attr_set *attr_set,
 				  const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int old;
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
+	old = t->render_aware;
 	t->render_aware = val;
 	zenith_set_static_key(&zenith_render_aware_key, val);
+	if (old != val)
+		zenith_log_master_flip(t, "render_aware", old, val);
 	return count;
 }
 static struct governor_attr render_aware = __ATTR_RW(render_aware);
@@ -19165,12 +19299,16 @@ static ssize_t audio_aware_store(struct gov_attr_set *attr_set,
 				 const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int old;
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
+	old = t->audio_aware;
 	t->audio_aware = val;
 	zenith_set_static_key(&zenith_audio_aware_key, val);
+	if (old != val)
+		zenith_log_master_flip(t, "audio_aware", old, val);
 	return count;
 }
 static struct governor_attr audio_aware = __ATTR_RW(audio_aware);
@@ -19512,12 +19650,16 @@ static ssize_t camera_aware_store(struct gov_attr_set *attr_set,
 				  const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int old;
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
+	old = t->camera_aware;
 	t->camera_aware = val;
 	zenith_set_static_key(&zenith_camera_aware_key, val);
+	if (old != val)
+		zenith_log_master_flip(t, "camera_aware", old, val);
 	return count;
 }
 static struct governor_attr camera_aware = __ATTR_RW(camera_aware);
@@ -19685,14 +19827,18 @@ static ssize_t game_auto_store(struct gov_attr_set *attr_set,
 			       const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int old;
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
+	old = t->game_auto;
 	t->game_auto = val;
 	zenith_set_static_key(&zenith_game_auto_key, val);
 	if (!val)
 		WRITE_ONCE(zenith_game_auto_active_until_ns, 0);
+	if (old != val)
+		zenith_log_master_flip(t, "game_auto", old, val);
 	return count;
 }
 static struct governor_attr game_auto = __ATTR_RW(game_auto);
@@ -19723,12 +19869,16 @@ static ssize_t psi_aware_store(struct gov_attr_set *attr_set,
 			       const char *buf, size_t count)
 {
 	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int old;
 	unsigned int val;
 
 	if (kstrtouint(buf, 10, &val) || val > 1)
 		return -EINVAL;
+	old = t->psi_aware;
 	t->psi_aware = val;
 	zenith_set_static_key(&zenith_psi_aware_key, val);
+	if (old != val)
+		zenith_log_master_flip(t, "psi_aware", old, val);
 	return count;
 }
 static struct governor_attr psi_aware = __ATTR_RW(psi_aware);
@@ -20353,6 +20503,7 @@ static struct attribute *zenith_attrs[] = {
 	&freq_step_pct.attr,
 	&freq_step_adaptive.attr,
 	&profile.attr,
+	&verbose_log.attr,
 	&auto_target.attr,
 	&auto_eval_ms.attr,
 	&auto_hysteresis_ms.attr,
@@ -20863,6 +21014,7 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->frame_budget_us	= ZENITH_DEFAULT_FRAME_BUDGET_US;
 	tunables->frame_budget_us_auto	= ZENITH_DEFAULT_FRAME_BUDGET_US_AUTO;
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
+	tunables->verbose_log		= ZENITH_DEFAULT_VERBOSE_LOG;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 	WRITE_ONCE(zenith_input_boost_touchdown_extra_ms_cache,
 		   ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS);
