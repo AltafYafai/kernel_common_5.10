@@ -3334,6 +3334,21 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_GAME_PERF_BURST_COOLDOWN_MS_MAX		60000
 #define ZENITH_GAME_PERF_BURST_B_THRESHOLD_PCT		70
 #define ZENITH_GAME_PERF_BURST_B_REQUIRED_NS		(2ULL * NSEC_PER_SEC)
+/* Patch M: Schmitt-trigger exit threshold for Signal B.  Once the
+ * sustained-arming counter has stamped, hold it through dips above
+ * this floor so a scene oscillating in the 65..72% band keeps
+ * accumulating sustained time instead of resetting on every dip.
+ * Enter at _B_THRESHOLD_PCT (70), exit at _B_EXIT_THRESHOLD_PCT (60).
+ */
+#define ZENITH_GAME_PERF_BURST_B_EXIT_THRESHOLD_PCT	60
+/* Patch M: lazy retry interval for the per-policy thermal zone cache.
+ * If thermal-core registers after the governor (boot-ordering quirk
+ * on some Tensor builds), zenith_start()'s one-shot resolution leaves
+ * gpb_tzd NULL and the guardrail permanently falls back to
+ * arch_scale_thermal_pressure().  The hot-path helper retries
+ * resolution at most once per this interval until a zone is bound.
+ */
+#define ZENITH_GPB_TZD_RETRY_INTERVAL_NS		(5ULL * NSEC_PER_SEC)
 
 /* FSM states for game_perf_burst.  Read from sysfs as the
  * game_perf_burst_state RO node and from the floor helper to
@@ -3342,6 +3357,16 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_GPB_STATE_IDLE		0
 #define ZENITH_GPB_STATE_ARMED		1
 #define ZENITH_GPB_STATE_COOLDOWN	2
+
+/* Patch M: last-disarm reason tokens for the per-policy stats node.
+ * Recorded by the FSM evaluator at every ARMED -> COOLDOWN edge so
+ * userspace tuning of disarm_grace_ms / cooldown_ms can tell whether
+ * users disarm by Alt+Tab/Home (FAST) or by load actually subsiding
+ * (SUSTAINED).  NONE = no disarm has happened in the current attach.
+ */
+#define ZENITH_GPB_DISARM_NONE		0
+#define ZENITH_GPB_DISARM_FAST		1
+#define ZENITH_GPB_DISARM_SUSTAINED	2
 
 /*
  * Zenith Tunables & State API
@@ -5687,8 +5712,40 @@ struct zenith_policy {
 	 *                            "no per-policy zone resolved", in
 	 *                            which case the helper falls back to
 	 *                            arch_scale_thermal_pressure().
+	 *   gpb_tzd_retry_at_ns      ktime_get_ns() deadline for the next
+	 *                            lazy zone-resolution retry when
+	 *                            gpb_tzd is NULL.  Patch M closes the
+	 *                            boot-ordering hole where thermal-core
+	 *                            registers after the governor: the
+	 *                            hot-path helper will re-attempt
+	 *                            thermal_zone_get_zone_by_name() at
+	 *                            most once per
+	 *                            ZENITH_GPB_TZD_RETRY_INTERVAL_NS
+	 *                            until a zone is bound.
+	 *   gpb_arm_count            number of IDLE -> ARMED *and*
+	 *                            COOLDOWN -> ARMED transitions since
+	 *                            attach.  Bumped from the FSM
+	 *                            evaluator at every rising edge.
+	 *                            Counts re-arms so userspace can see
+	 *                            "user keeps Alt+Tabbing back into
+	 *                            the game" thrash.
+	 *   gpb_disarm_count         number of ARMED -> COOLDOWN
+	 *                            transitions since attach.  Equals
+	 *                            gpb_arm_count when the FSM is
+	 *                            currently IDLE/COOLDOWN, one less
+	 *                            when ARMED.
+	 *   gpb_idle_count           number of COOLDOWN -> IDLE
+	 *                            transitions since attach.  Counts
+	 *                            full glide completions; missing
+	 *                            counts (vs disarm_count) are
+	 *                            re-arms during cooldown.
+	 *   gpb_last_disarm_reason   ZENITH_GPB_DISARM_{NONE,FAST,
+	 *                            SUSTAINED}.  Recorded at every
+	 *                            ARMED -> COOLDOWN edge.
+	 *                            Patch M; surfaced by the
+	 *                            game_perf_burst_stats RO sysfs.
 	 *
-	 * All five fields are only touched from the per-policy hot path
+	 * All ten fields are only touched from the per-policy hot path
 	 * (zenith_get_next_freq() and the FSM evaluator it calls), which
 	 * is serialised by the cpufreq core.  No locking required.  All
 	 * are zero-initialised by zenith_start()'s memset path or
@@ -5699,6 +5756,11 @@ struct zenith_policy {
 	u64			gpb_b_arm_first_seen_ns;
 	u64			gpb_b_disarm_first_seen_ns;
 	struct thermal_zone_device *gpb_tzd;
+	u64			gpb_tzd_retry_at_ns;
+	u32			gpb_arm_count;
+	u32			gpb_disarm_count;
+	u32			gpb_idle_count;
+	u8			gpb_last_disarm_reason;
 
 	/* Last seen zenith_input_boost_until_ns deadline observed inside
 	 * an active boost window for this policy.  Latched in the input
@@ -7593,6 +7655,30 @@ static bool zenith_policy_has_camera(struct zenith_policy *z_policy)
  *   - Job.Worker         Unity Burst job system worker thread
  *                        (DOTS / ECS / parallel-for jobs)
  *   - EnlightenWork      Unity Enlighten realtime-GI worker
+ *
+ * Patch M expansion (post-audit additions; all distinct from existing
+ * Android system thread names so the prefix walk does not collide):
+ *
+ *   - RenderingThread    Unreal Engine alternate render thread name
+ *                        (15 chars, exactly fits TASK_COMM_LEN-1).
+ *                        Distinct from Android HWUI's "RenderThread"
+ *                        (no "ing") -- the prefix walk uses strncmp
+ *                        with strlen(needle) so the system thread
+ *                        does not match this longer prefix.
+ *   - Roblox             Roblox engine prefix.  Roblox spawns
+ *                        threads named "RobloxAppMain", "RobloxRender",
+ *                        "RobloxNetwork", etc., all of which prefix
+ *                        with "Roblox".  One of the most popular
+ *                        mobile titles globally; not covered by any
+ *                        Unity / Unreal / Cocos2d engine matcher.
+ *   - miHoYoSDK          miHoYo / HoYoverse common SDK thread.  Live
+ *                        for Genshin Impact, Honkai: Star Rail,
+ *                        Zenless Zone Zero, and Honkai Impact 3rd.
+ *                        Belt-and-suspenders coverage on top of the
+ *                        UnityMain match -- the SDK thread persists
+ *                        through scenes where UnityMain is briefly
+ *                        scheduled out (login flows, IAP, scene
+ *                        transitions).
  */
 static const char * const zenith_game_auto_comms[] = {
 	"UnityMain",
@@ -7604,6 +7690,9 @@ static const char * const zenith_game_auto_comms[] = {
 	"Cocos2dxRender",
 	"Job.Worker",
 	"EnlightenWork",
+	"RenderingThread",
+	"Roblox",
+	"miHoYoSDK",
 };
 
 /* Hot-path comm walk used by the in-kernel game detector.  TTL'd
@@ -7717,6 +7806,33 @@ static int zenith_gpb_get_temp_dc(struct zenith_policy *z_policy)
 	unsigned int pct;
 	int temp = 0;
 
+	/* Patch M: lazy retry if zenith_start() couldn't bind the
+	 * per-cluster thermal zone (boot ordering: thermal-core may
+	 * register after the governor on some Tensor builds).  Rate
+	 * limited to one re-resolution per
+	 * ZENITH_GPB_TZD_RETRY_INTERVAL_NS so a permanently-foreign SoC
+	 * (no per-cpu thermal zones at all) costs only one
+	 * thermal_zone_get_zone_by_name() per N seconds in the hot path.
+	 */
+	if (!tzd) {
+		u64 now = ktime_get_ns();
+
+		if (now >= z_policy->gpb_tzd_retry_at_ns) {
+			char zone_name[16];
+			unsigned int first_cpu =
+				cpumask_first(z_policy->policy->cpus);
+
+			scnprintf(zone_name, sizeof(zone_name),
+				  "cpu%u-thermal", first_cpu);
+			tzd = thermal_zone_get_zone_by_name(zone_name);
+			if (IS_ERR(tzd))
+				tzd = NULL;
+			z_policy->gpb_tzd = tzd;
+			z_policy->gpb_tzd_retry_at_ns =
+				now + ZENITH_GPB_TZD_RETRY_INTERVAL_NS;
+		}
+	}
+
 	if (tzd && !IS_ERR(tzd) && !thermal_zone_get_temp(tzd, &temp))
 		return temp;
 
@@ -7769,7 +7885,6 @@ static void zenith_gpb_evaluate(struct zenith_policy *z_policy)
 	sig_a = (zenith_eff_game_mode(base_gm) != 0);
 
 	load_pct = READ_ONCE(z_policy->last_load_pct);
-	sig_b = (load_pct >= ZENITH_GAME_PERF_BURST_B_THRESHOLD_PCT);
 
 	/* Signal C suppressor: an active audio sticky window with NO
 	 * game signal arriving first means "the user is watching
@@ -7781,15 +7896,33 @@ static void zenith_gpb_evaluate(struct zenith_policy *z_policy)
 	sig_c_suppress = !sig_a &&
 		(READ_ONCE(z_policy->audio_sticky_until_ns) > now_ns);
 
-	/* Signal-B continuous-on tracking: stamp first-seen on rising
-	 * edge, clear on falling edge.  The 2s requirement is enforced
-	 * below at the IDLE -> ARMED gate.
+	/* Patch M: Schmitt-trigger Signal B.  The non-zero
+	 * gpb_b_arm_first_seen_ns stamp doubles as the latch state.
+	 *
+	 *   off (stamp == 0):  arm only when load >= 70 (enter)
+	 *   on  (stamp != 0):  release only when load < 60 (exit)
+	 *
+	 * This holds sig_b across dips inside the 60..70 hysteresis
+	 * band so a scene oscillating in that range keeps accumulating
+	 * sustained-arming time instead of resetting on every dip.
+	 * The 2s sustained gate enforced at the IDLE -> ARMED edge
+	 * below uses the same first-seen stamp, so once we cross 70
+	 * and stay above 60, the timer keeps ticking.
 	 */
-	if (sig_b) {
-		if (z_policy->gpb_b_arm_first_seen_ns == 0)
-			z_policy->gpb_b_arm_first_seen_ns = now_ns;
+	if (z_policy->gpb_b_arm_first_seen_ns) {
+		if (load_pct < ZENITH_GAME_PERF_BURST_B_EXIT_THRESHOLD_PCT) {
+			z_policy->gpb_b_arm_first_seen_ns = 0;
+			sig_b = false;
+		} else {
+			sig_b = true;
+		}
 	} else {
-		z_policy->gpb_b_arm_first_seen_ns = 0;
+		if (load_pct >= ZENITH_GAME_PERF_BURST_B_THRESHOLD_PCT) {
+			z_policy->gpb_b_arm_first_seen_ns = now_ns;
+			sig_b = true;
+		} else {
+			sig_b = false;
+		}
 	}
 
 	/* Signal-B continuous-off tracking (only meaningful while
@@ -7821,6 +7954,7 @@ static void zenith_gpb_evaluate(struct zenith_policy *z_policy)
 			z_policy->gpb_state = ZENITH_GPB_STATE_ARMED;
 			z_policy->gpb_state_entry_ns = now_ns;
 			z_policy->gpb_b_disarm_first_seen_ns = 0;
+			z_policy->gpb_arm_count++;
 		}
 		break;
 	case ZENITH_GPB_STATE_ARMED:
@@ -7831,6 +7965,9 @@ static void zenith_gpb_evaluate(struct zenith_policy *z_policy)
 		if (!sig_a) {
 			z_policy->gpb_state = ZENITH_GPB_STATE_COOLDOWN;
 			z_policy->gpb_state_entry_ns = now_ns;
+			z_policy->gpb_disarm_count++;
+			z_policy->gpb_last_disarm_reason =
+				ZENITH_GPB_DISARM_FAST;
 			break;
 		}
 		/* Sustained-clear disarm: B has been false continuously
@@ -7842,6 +7979,9 @@ static void zenith_gpb_evaluate(struct zenith_policy *z_policy)
 		    ((u64)disarm_grace_ms * NSEC_PER_MSEC)) {
 			z_policy->gpb_state = ZENITH_GPB_STATE_COOLDOWN;
 			z_policy->gpb_state_entry_ns = now_ns;
+			z_policy->gpb_disarm_count++;
+			z_policy->gpb_last_disarm_reason =
+				ZENITH_GPB_DISARM_SUSTAINED;
 		}
 		break;
 	case ZENITH_GPB_STATE_COOLDOWN:
@@ -7855,6 +7995,7 @@ static void zenith_gpb_evaluate(struct zenith_policy *z_policy)
 			z_policy->gpb_state = ZENITH_GPB_STATE_ARMED;
 			z_policy->gpb_state_entry_ns = now_ns;
 			z_policy->gpb_b_disarm_first_seen_ns = 0;
+			z_policy->gpb_arm_count++;
 			break;
 		}
 		/* COOLDOWN -> IDLE when the glide window expires. */
@@ -7866,6 +8007,7 @@ static void zenith_gpb_evaluate(struct zenith_policy *z_policy)
 			if (elapsed >= ((u64)cooldown_ms * NSEC_PER_MSEC)) {
 				z_policy->gpb_state = ZENITH_GPB_STATE_IDLE;
 				z_policy->gpb_state_entry_ns = now_ns;
+				z_policy->gpb_idle_count++;
 			}
 		}
 		break;
@@ -7955,6 +8097,23 @@ static const char *zenith_gpb_state_name(u8 state)
 		return "ARMED";
 	case ZENITH_GPB_STATE_COOLDOWN:
 		return "COOLDOWN";
+	default:
+		return "?";
+	}
+}
+
+/* Patch M: stringify the last-disarm reason for the stats sysfs.
+ * Stable tokens so userspace tooling can grep / parse the field.
+ */
+static const char *zenith_gpb_disarm_name(u8 reason)
+{
+	switch (reason) {
+	case ZENITH_GPB_DISARM_NONE:
+		return "none";
+	case ZENITH_GPB_DISARM_FAST:
+		return "fast";
+	case ZENITH_GPB_DISARM_SUSTAINED:
+		return "sustained";
 	default:
 		return "?";
 	}
@@ -11740,6 +11899,13 @@ static const char *zenith_profile_name(unsigned int profile)
  * helpers so a userspace log scraper can grep "zenith: " and parse
  * a stable structure.
  *
+ * Patch M: emit via pr_info_ratelimited() so a pathological caller
+ * (auto_tune flapping the profile, or a userspace tool fanning out
+ * master-switch stores) cannot spam dmesg.  Default rate-limit is
+ * 10 messages per 5 seconds (DEFAULT_RATELIMIT_BURST /
+ * DEFAULT_RATELIMIT_INTERVAL); excess events are coalesced with a
+ * "callbacks suppressed" trailer so the trail is still meaningful.
+ *
  * profile_change: emitted by profile_store on the user-write path
  *                 *before* the bake runs, so the dmesg trail reads
  *                 "switching X -> Y" / "applied Y profile: ..." in
@@ -11762,7 +11928,7 @@ static inline void zenith_log_profile_change(struct zenith_tunables *t,
 {
 	if (!READ_ONCE(t->verbose_log))
 		return;
-	pr_info("zenith: switching profile %s -> %s\n",
+	pr_info_ratelimited("zenith: switching profile %s -> %s\n",
 		zenith_profile_name(old_prof),
 		zenith_profile_name(new_prof));
 }
@@ -11772,7 +11938,7 @@ static inline void zenith_log_profile_applied(struct zenith_tunables *t,
 {
 	if (!READ_ONCE(t->verbose_log))
 		return;
-	pr_info("zenith: applied %s profile: hispeed_freq_pct=%u up_threshold=%u down_threshold=%u climb_mode=%u freq_step_pct=%u powersave_bias=%u up_rate_limit_us=%u down_rate_limit_us=%u wakeup_boost=%u down_threshold_adaptive=%u\n",
+	pr_info_ratelimited("zenith: applied %s profile: hispeed_freq_pct=%u up_threshold=%u down_threshold=%u climb_mode=%u freq_step_pct=%u powersave_bias=%u up_rate_limit_us=%u down_rate_limit_us=%u wakeup_boost=%u down_threshold_adaptive=%u\n",
 		zenith_profile_name(prof),
 		t->hispeed_freq_pct, t->up_threshold, t->down_threshold,
 		t->climb_mode, t->freq_step_pct, t->powersave_bias,
@@ -11787,7 +11953,8 @@ static inline void zenith_log_master_flip(struct zenith_tunables *t,
 {
 	if (!READ_ONCE(t->verbose_log))
 		return;
-	pr_info("zenith: master %s %u -> %u\n", name, old_val, new_val);
+	pr_info_ratelimited("zenith: master %s %u -> %u\n",
+		name, old_val, new_val);
 }
 
 static const char *zenith_at_state_name(unsigned int state)
@@ -16304,6 +16471,56 @@ static ssize_t game_perf_burst_state_show(struct gov_attr_set *attr_set,
 }
 static struct governor_attr game_perf_burst_state =
 	__ATTR_RO(game_perf_burst_state);
+
+/* Patch M: game_perf_burst_stats RO sysfs.  Per-policy lifetime
+ * counters and the last ARMED -> COOLDOWN reason, exposed for
+ * empirical tuning of disarm_grace_ms / cooldown_ms.  One line per
+ * attached policy:
+ *
+ *   "<cluster_first_cpu> state=<name> arm=<n> disarm=<n>
+ *    idle=<n> last_disarm=<token>\n"
+ *
+ * Token grammar:
+ *   state         "idle" | "ARMED" | "COOLDOWN"
+ *   last_disarm   "none" | "fast" | "sustained"
+ *
+ * arm:    IDLE -> ARMED + COOLDOWN -> ARMED transitions
+ * disarm: ARMED -> COOLDOWN transitions
+ * idle:   COOLDOWN -> IDLE transitions (full-glide completions;
+ *         arm > idle means we have re-armed during cooldown).
+ *
+ * Zero-initialised per attach (zenith_start) so a governor switch
+ * resets the counters and userspace can compute rates over a known
+ * baseline.  Order-stable per policy attach order.
+ */
+static ssize_t game_perf_burst_stats_show(struct gov_attr_set *attr_set,
+					  char *buf)
+{
+	struct zenith_policy *z_policy;
+	ssize_t off = 0;
+
+	list_for_each_entry(z_policy, &attr_set->policy_list, tunables_hook) {
+		int first_cpu = cpumask_first(z_policy->policy->cpus);
+		const char *state_name =
+			zenith_gpb_state_name(z_policy->gpb_state);
+		const char *disarm_name =
+			zenith_gpb_disarm_name(
+				z_policy->gpb_last_disarm_reason);
+
+		off += scnprintf(buf + off, PAGE_SIZE - off,
+				 "%d state=%s arm=%u disarm=%u idle=%u last_disarm=%s\n",
+				 first_cpu, state_name,
+				 z_policy->gpb_arm_count,
+				 z_policy->gpb_disarm_count,
+				 z_policy->gpb_idle_count,
+				 disarm_name);
+		if (off >= PAGE_SIZE - 64)
+			break;
+	}
+	return off;
+}
+static struct governor_attr game_perf_burst_stats =
+	__ATTR_RO(game_perf_burst_stats);
 
 /* Patch B-AUTO-2: auto_target RO sysfs.  When active_profile ==
  * ZENITH_PROFILE_AUTO this prints the concrete profile the auto-
@@ -21186,6 +21403,7 @@ static struct attribute *zenith_attrs[] = {
 	&game_perf_burst_disarm_grace_ms.attr,
 	&game_perf_burst_cooldown_ms.attr,
 	&game_perf_burst_state.attr,
+	&game_perf_burst_stats.attr,
 	&auto_target.attr,
 	&auto_eval_ms.attr,
 	&auto_hysteresis_ms.attr,
@@ -21979,14 +22197,20 @@ static int zenith_start(struct cpufreq_policy *policy)
 	 * subsystem registers after some cpufreq governors come up
 	 * on certain SoCs) or this is a foreign SoC; the helper
 	 * falls back to arch_scale_thermal_pressure-derived dC so
-	 * the guardrail still works.  We don't retry resolution on
-	 * later ticks -- a single boot-time miss is acceptable; the
-	 * fallback path is correct in steady state.
+	 * the guardrail still works.  Patch M closes the boot-ordering
+	 * gap by retrying resolution lazily from the hot-path helper
+	 * (rate limited via gpb_tzd_retry_at_ns) so a thermal-core
+	 * that registers after this point still binds eventually.
 	 */
 	z_policy->gpb_state = ZENITH_GPB_STATE_IDLE;
 	z_policy->gpb_state_entry_ns = 0;
 	z_policy->gpb_b_arm_first_seen_ns = 0;
 	z_policy->gpb_b_disarm_first_seen_ns = 0;
+	z_policy->gpb_tzd_retry_at_ns = 0;
+	z_policy->gpb_arm_count = 0;
+	z_policy->gpb_disarm_count = 0;
+	z_policy->gpb_idle_count = 0;
+	z_policy->gpb_last_disarm_reason = ZENITH_GPB_DISARM_NONE;
 	{
 		char zone_name[16];
 		struct thermal_zone_device *tzd;
@@ -21998,6 +22222,10 @@ static int zenith_start(struct cpufreq_policy *policy)
 		if (IS_ERR(tzd))
 			tzd = NULL;
 		z_policy->gpb_tzd = tzd;
+		if (!tzd)
+			z_policy->gpb_tzd_retry_at_ns =
+				ktime_get_ns() +
+				ZENITH_GPB_TZD_RETRY_INTERVAL_NS;
 	}
 
 	/* Arm the auto-tune classifier when the tunable is enabled.  The
