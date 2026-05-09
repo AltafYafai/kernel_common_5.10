@@ -4760,6 +4760,19 @@ EXPORT_SYMBOL_GPL(zenith_set_drm_vblank_us);
  */
 struct video_device;
 
+/* Forward declarations of the K4/K5 vendor-hook strong defs below.
+ * The matching __weak prototypes live inline at the call sites
+ * (drivers/media/v4l2-core/v4l2-dev.c and sound/core/pcm_native.c)
+ * so callers stay zero-knowledge of the governor.  Declaring them
+ * here makes the local definitions visible to -Wmissing-prototypes
+ * and sparse, and ensures cpufreq_zenith.c's view of the prototype
+ * is internally consistent.
+ */
+void zenith_v4l2_open_notify(struct video_device *vdev);
+void zenith_v4l2_release_notify(struct video_device *vdev);
+void zenith_alsa_pcm_open_notify(int stream);
+void zenith_alsa_pcm_release_notify(int stream);
+
 /* Tentative declarations of the K4/K5 refcount atomics.  Their
  * defining declarations (with ATOMIC_INIT(0)) live further down the
  * file next to the rest of the auto-tune state; the function bodies
