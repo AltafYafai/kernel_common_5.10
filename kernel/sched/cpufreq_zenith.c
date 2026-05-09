@@ -47,6 +47,7 @@
 #include "sched.h"
 
 #include <linux/cpufreq.h>
+#include <linux/cpufreq_zenith.h>
 #include <linux/sched/cpufreq.h>
 #include <linux/module.h>
 #include <linux/slab.h>
