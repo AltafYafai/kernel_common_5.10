@@ -12885,24 +12885,7 @@ static ssize_t iowait_boost_min_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr iowait_boost_min = __ATTR_RW(iowait_boost_min);
 
-static ssize_t iowait_stack_pct_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->iowait_stack_pct);
-}
-
-static ssize_t iowait_stack_pct_store(struct gov_attr_set *attr_set,
-				      const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->iowait_stack_pct = val;
-	return count;
-}
-static struct governor_attr iowait_stack_pct = __ATTR_RW(iowait_stack_pct);
+ZENITH_TUNABLE_UINT_MAX(iowait_stack_pct, 100);
 
 static ssize_t iowait_backoff_after_ms_show(struct gov_attr_set *attr_set,
 					    char *buf)
@@ -12932,25 +12915,7 @@ static ssize_t iowait_backoff_after_ms_store(struct gov_attr_set *attr_set,
 static struct governor_attr iowait_backoff_after_ms =
 	__ATTR_RW(iowait_backoff_after_ms);
 
-static ssize_t ignore_nice_load_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->ignore_nice_load);
-}
-
-static ssize_t ignore_nice_load_store(struct gov_attr_set *attr_set,
-				      const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->ignore_nice_load = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr ignore_nice_load = __ATTR_RW(ignore_nice_load);
+ZENITH_TUNABLE_UINT_BOOL_INVAL(ignore_nice_load);
 
 /* Apply one of the preset recipes to all tunables in-place. Leaves
  * light_load_freq, hispeed_freq, efficient_freq ladder and other
@@ -15558,24 +15523,7 @@ static ssize_t auto_tune_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr auto_tune = __ATTR_RW(auto_tune);
 
-static ssize_t auto_tune_v2_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->auto_tune_v2);
-}
-
-static ssize_t auto_tune_v2_store(struct gov_attr_set *attr_set,
-				  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->auto_tune_v2 = val;
-	return count;
-}
-static struct governor_attr auto_tune_v2 = __ATTR_RW(auto_tune_v2);
+ZENITH_TUNABLE_UINT_MAX(auto_tune_v2, 1);
 
 /* auto_tune_v2_glides sysfs knob.  Boolean (0/1).  See
  * ZENITH_DEFAULT_AUTO_TUNE_V2_GLIDES.  Master gate for V2-driven
@@ -15584,26 +15532,7 @@ static struct governor_attr auto_tune_v2 = __ATTR_RW(auto_tune_v2);
  * box without forcing operators to write seven separate sysfs
  * entries.  Per-knob user writes still take precedence.
  */
-static ssize_t auto_tune_v2_glides_show(struct gov_attr_set *attr_set,
-					char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->auto_tune_v2_glides);
-}
-
-static ssize_t auto_tune_v2_glides_store(struct gov_attr_set *attr_set,
-					 const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->auto_tune_v2_glides = val;
-	return count;
-}
-static struct governor_attr auto_tune_v2_glides =
-	__ATTR_RW(auto_tune_v2_glides);
+ZENITH_TUNABLE_UINT_MAX(auto_tune_v2_glides, 1);
 
 /* auto_tune_v2_tiers sysfs knob (Patch L).  Boolean (0/1).  See
  * ZENITH_DEFAULT_AUTO_TUNE_V2_TIERS.  Master gate for V2-driven
@@ -15614,27 +15543,7 @@ static struct governor_attr auto_tune_v2_glides =
  * Per-knob user sysfs writes still take precedence either way
  * (via the auto_tune_override_mask path).
  */
-static ssize_t auto_tune_v2_tiers_show(struct gov_attr_set *attr_set,
-				       char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->auto_tune_v2_tiers);
-}
-
-static ssize_t auto_tune_v2_tiers_store(struct gov_attr_set *attr_set,
-					const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->auto_tune_v2_tiers = val;
-	return count;
-}
-
-static struct governor_attr auto_tune_v2_tiers =
-	__ATTR_RW(auto_tune_v2_tiers);
+ZENITH_TUNABLE_UINT_MAX(auto_tune_v2_tiers, 1);
 
 static ssize_t auto_tune_hysteresis_windows_show(struct gov_attr_set *attr_set,
 						 char *buf)
@@ -15974,47 +15883,9 @@ static ssize_t auto_tune_cluster_aware_store(struct gov_attr_set *attr_set,
 static struct governor_attr auto_tune_cluster_aware =
 	__ATTR_RW(auto_tune_cluster_aware);
 
-static ssize_t auto_tune_v2_signals_show(struct gov_attr_set *attr_set,
-					 char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->auto_tune_v2_signals);
-}
+ZENITH_TUNABLE_UINT_MAX(auto_tune_v2_signals, 1);
 
-static ssize_t auto_tune_v2_signals_store(struct gov_attr_set *attr_set,
-					  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->auto_tune_v2_signals = val;
-	return count;
-}
-static struct governor_attr auto_tune_v2_signals =
-	__ATTR_RW(auto_tune_v2_signals);
-
-static ssize_t auto_tune_thermal_slope_show(struct gov_attr_set *attr_set,
-					    char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->auto_tune_thermal_slope);
-}
-
-static ssize_t auto_tune_thermal_slope_store(struct gov_attr_set *attr_set,
-					     const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->auto_tune_thermal_slope = val;
-	return count;
-}
-static struct governor_attr auto_tune_thermal_slope =
-	__ATTR_RW(auto_tune_thermal_slope);
+ZENITH_TUNABLE_UINT_MAX(auto_tune_thermal_slope, 1);
 
 static ssize_t auto_tune_thermal_pressure_pct_show(struct gov_attr_set *attr_set,
 						   char *buf)
@@ -16059,26 +15930,7 @@ static ssize_t auto_tune_thermal_slope_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr auto_tune_thermal_slope_pct =
 	__ATTR_RW(auto_tune_thermal_slope_pct);
 
-static ssize_t auto_tune_frame_pacing_show(struct gov_attr_set *attr_set,
-					   char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->auto_tune_frame_pacing);
-}
-
-static ssize_t auto_tune_frame_pacing_store(struct gov_attr_set *attr_set,
-					    const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->auto_tune_frame_pacing = val;
-	return count;
-}
-static struct governor_attr auto_tune_frame_pacing =
-	__ATTR_RW(auto_tune_frame_pacing);
+ZENITH_TUNABLE_UINT_MAX(auto_tune_frame_pacing, 1);
 
 static ssize_t auto_tune_sustained_gaming_show(struct gov_attr_set *attr_set,
 					       char *buf)
@@ -16147,25 +15999,7 @@ ZENITH_TUNABLE_UINT_MAX(auto_tune_lo_events_x2, 65535);
  * See ZENITH_DEFAULT_AUTO_TUNE_SCENARIO comment block for the
  * detection logic and scenario precedence.
  */
-static ssize_t auto_tune_scenario_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->auto_tune_scenario);
-}
-
-static ssize_t auto_tune_scenario_store(struct gov_attr_set *attr_set,
-					const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->auto_tune_scenario = val;
-	return count;
-}
-static struct governor_attr auto_tune_scenario =
-	__ATTR_RW(auto_tune_scenario);
+ZENITH_TUNABLE_UINT_MAX(auto_tune_scenario, 1);
 
 static ssize_t profile_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -17281,42 +17115,10 @@ static ssize_t screen_off_glide_ms_store(struct gov_attr_set *attr_set,
 static struct governor_attr screen_off_glide_ms =
 	__ATTR_RW(screen_off_glide_ms);
 
-static ssize_t screen_auto_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->screen_auto);
-}
-
-static ssize_t screen_auto_store(struct gov_attr_set *attr_set,
-				 const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->screen_auto = val;
-	return count;
-}
-static struct governor_attr screen_auto = __ATTR_RW(screen_auto);
+ZENITH_TUNABLE_UINT_MAX(screen_auto, 1);
 ZENITH_TUNABLE_UINT_BOOL_INVAL(thermal_state);
 
-static ssize_t thermal_auto_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->thermal_auto);
-}
-
-static ssize_t thermal_auto_store(struct gov_attr_set *attr_set,
-				  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->thermal_auto = val;
-	return count;
-}
-static struct governor_attr thermal_auto = __ATTR_RW(thermal_auto);
+ZENITH_TUNABLE_UINT_MAX(thermal_auto, 1);
 
 /* thermal_pressure_continuous sysfs knob.  Strict 0/1 boolean.  When
  * 1, dynamic_up_thresh ramps linearly from the policy's normal
@@ -17325,27 +17127,7 @@ static struct governor_attr thermal_auto = __ATTR_RW(thermal_auto);
  * zenith_thermal_active() flips true.  See the field comment on
  * struct zenith_tunables for the rationale.
  */
-static ssize_t thermal_pressure_continuous_show(struct gov_attr_set *attr_set,
-						char *buf)
-{
-	return sprintf(buf, "%u\n",
-		to_zenith_tunables(attr_set)->thermal_pressure_continuous);
-}
-
-static ssize_t thermal_pressure_continuous_store(struct gov_attr_set *attr_set,
-						 const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->thermal_pressure_continuous = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr thermal_pressure_continuous =
-	__ATTR_RW(thermal_pressure_continuous);
+ZENITH_TUNABLE_UINT_BOOL_INVAL(thermal_pressure_continuous);
 
 /* thermal_aware sysfs knob.  Master gate over the cluster of
  * thermal-driven freq adjustments (thermal_util_derate, the
@@ -17410,27 +17192,7 @@ static struct governor_attr thermal_active = __ATTR_RO(thermal_active);
  * the run-time bump path is dead because the worker stub never
  * updates ps_hit_rate_pct.
  */
-static ssize_t prefer_silver_aware_show(struct gov_attr_set *attr_set,
-					char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->prefer_silver_aware);
-}
-
-static ssize_t prefer_silver_aware_store(struct gov_attr_set *attr_set,
-					 const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->prefer_silver_aware = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr prefer_silver_aware =
-	__ATTR_RW(prefer_silver_aware);
+ZENITH_TUNABLE_UINT_BOOL_INVAL(prefer_silver_aware);
 
 /* prefer_silver_hot_threshold_pct: 0..100.  When the per-window
  * prefer_silver hit-rate is at or above this percentage,
@@ -17488,46 +17250,9 @@ static struct governor_attr prefer_silver_hot_bump_pct =
 /* thermal_util_derate sysfs knob.  Strict 0/1 boolean.  See the
  * ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block for semantics.
  */
-static ssize_t thermal_util_derate_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->thermal_util_derate);
-}
+ZENITH_TUNABLE_UINT_MAX(thermal_util_derate, 1);
 
-static ssize_t thermal_util_derate_store(struct gov_attr_set *attr_set,
-					 const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->thermal_util_derate = val;
-	return count;
-}
-static struct governor_attr thermal_util_derate =
-	__ATTR_RW(thermal_util_derate);
-
-static ssize_t thermal_derate_rate_pct_show(struct gov_attr_set *attr_set,
-					    char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->thermal_derate_rate_pct);
-}
-
-static ssize_t thermal_derate_rate_pct_store(struct gov_attr_set *attr_set,
-					     const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->thermal_derate_rate_pct = val;
-	return count;
-}
-static struct governor_attr thermal_derate_rate_pct =
-	__ATTR_RW(thermal_derate_rate_pct);
+ZENITH_TUNABLE_UINT_MAX(thermal_derate_rate_pct, 100);
 
 static ssize_t auto_thermal_cap_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -17648,24 +17373,7 @@ static ssize_t down_rate_adaptive_store(struct gov_attr_set *attr_set,
 static struct governor_attr down_rate_adaptive =
 	__ATTR_RW(down_rate_adaptive);
 
-static ssize_t wakeup_boost_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->wakeup_boost);
-}
-
-static ssize_t wakeup_boost_store(struct gov_attr_set *attr_set,
-				  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->wakeup_boost = val;
-	return count;
-}
-static struct governor_attr wakeup_boost = __ATTR_RW(wakeup_boost);
+ZENITH_TUNABLE_UINT_MAX(wakeup_boost, 1);
 
 /* wakeup_boost_ms sysfs knob.  Range 0..ZENITH_WAKEUP_BOOST_MS_MAX.
  * 0 disables the wall-clock bypass and leaves only the legacy
@@ -17673,24 +17381,7 @@ static struct governor_attr wakeup_boost = __ATTR_RW(wakeup_boost);
  * deadline at the detection sites; the up-rate bypass holds until
  * either the tick counter expires or the deadline lapses.
  */
-static ssize_t wakeup_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->wakeup_boost_ms);
-}
-
-static ssize_t wakeup_boost_ms_store(struct gov_attr_set *attr_set,
-				     const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > ZENITH_WAKEUP_BOOST_MS_MAX)
-		return -EINVAL;
-	t->wakeup_boost_ms = val;
-	return count;
-}
-static struct governor_attr wakeup_boost_ms = __ATTR_RW(wakeup_boost_ms);
+ZENITH_TUNABLE_UINT_MAX(wakeup_boost_ms, ZENITH_WAKEUP_BOOST_MS_MAX);
 
 static ssize_t rate_limit_cluster_scale_show(struct gov_attr_set *attr_set,
 					     char *buf)
@@ -17735,26 +17426,7 @@ static ssize_t input_boost_ms_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr input_boost_ms = __ATTR_RW(input_boost_ms);
 
-static ssize_t input_boost_decay_ms_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->input_boost_decay_ms);
-}
-
-static ssize_t input_boost_decay_ms_store(struct gov_attr_set *attr_set,
-					  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1000)
-		return -EINVAL;
-	t->input_boost_decay_ms = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr input_boost_decay_ms =
-	__ATTR_RW(input_boost_decay_ms);
+ZENITH_TUNABLE_UINT_MAX_INVAL(input_boost_decay_ms, 1000);
 
 /* input_boost_touchdown_extra_ms sysfs knob (Patch C).
  *
@@ -17796,46 +17468,9 @@ static struct governor_attr input_boost_touchdown_extra_ms =
 /* input_boost_decay_curve sysfs knob.  0 = linear (legacy),
  * 1 = cubic ease-in.  See ZENITH_DEFAULT_INPUT_BOOST_DECAY_CURVE.
  */
-static ssize_t input_boost_decay_curve_show(struct gov_attr_set *attr_set,
-					    char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->input_boost_decay_curve);
-}
+ZENITH_TUNABLE_UINT_MAX(input_boost_decay_curve, 1);
 
-static ssize_t input_boost_decay_curve_store(struct gov_attr_set *attr_set,
-					     const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->input_boost_decay_curve = val;
-	return count;
-}
-static struct governor_attr input_boost_decay_curve =
-	__ATTR_RW(input_boost_decay_curve);
-
-static ssize_t input_boost_big_only_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->input_boost_big_only);
-}
-
-static ssize_t input_boost_big_only_store(struct gov_attr_set *attr_set,
-					  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->input_boost_big_only = val;
-	return count;
-}
-static struct governor_attr input_boost_big_only =
-	__ATTR_RW(input_boost_big_only);
+ZENITH_TUNABLE_UINT_MAX(input_boost_big_only, 1);
 
 static ssize_t input_boost_cap_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -18061,45 +17696,9 @@ static ssize_t up_delay_us_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr up_delay_us = __ATTR_RW(up_delay_us);
 
-static ssize_t light_load_freq_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->light_load_freq);
-}
+ZENITH_TUNABLE_UINT_MAX_INVAL(light_load_freq, ZENITH_LIGHT_LOAD_FREQ_MAX);
 
-static ssize_t light_load_freq_store(struct gov_attr_set *attr_set,
-				     const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > ZENITH_LIGHT_LOAD_FREQ_MAX)
-		return -EINVAL;
-	t->light_load_freq = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr light_load_freq = __ATTR_RW(light_load_freq);
-
-static ssize_t light_load_threshold_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->light_load_threshold);
-}
-
-static ssize_t light_load_threshold_store(struct gov_attr_set *attr_set,
-					  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->light_load_threshold = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr light_load_threshold = __ATTR_RW(light_load_threshold);
+ZENITH_TUNABLE_UINT_MAX_INVAL(light_load_threshold, 100);
 
 static ssize_t sampling_down_factor_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -18122,44 +17721,9 @@ static ssize_t sampling_down_factor_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr sampling_down_factor = __ATTR_RW(sampling_down_factor);
 
-static ssize_t boost_exit_extend_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->boost_exit_extend);
-}
+ZENITH_TUNABLE_UINT_MAX(boost_exit_extend, 1);
 
-static ssize_t boost_exit_extend_store(struct gov_attr_set *attr_set,
-				       const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->boost_exit_extend = val;
-	return count;
-}
-static struct governor_attr boost_exit_extend = __ATTR_RW(boost_exit_extend);
-
-static ssize_t bias_load_threshold_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->bias_load_threshold);
-}
-
-static ssize_t bias_load_threshold_store(struct gov_attr_set *attr_set,
-					 const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->bias_load_threshold = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr bias_load_threshold = __ATTR_RW(bias_load_threshold);
+ZENITH_TUNABLE_UINT_MAX_INVAL(bias_load_threshold, 100);
 
 static ssize_t up_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -18275,43 +17839,9 @@ static ssize_t down_threshold_adaptive_store(struct gov_attr_set *attr_set,
 static struct governor_attr down_threshold_adaptive =
 	__ATTR_RW(down_threshold_adaptive);
 
-static ssize_t hispeed_freq_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->hispeed_freq);
-}
+ZENITH_TUNABLE_UINT_MAX_INVAL(hispeed_freq, ZENITH_HISPEED_FREQ_MAX);
 
-static ssize_t hispeed_freq_store(struct gov_attr_set *attr_set,
-				  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > ZENITH_HISPEED_FREQ_MAX)
-		return -EINVAL;
-	t->hispeed_freq = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr hispeed_freq = __ATTR_RW(hispeed_freq);
-
-static ssize_t hispeed_freq_pct_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->hispeed_freq_pct);
-}
-
-static ssize_t hispeed_freq_pct_store(struct gov_attr_set *attr_set,
-				      const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->hispeed_freq_pct = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr hispeed_freq_pct = __ATTR_RW(hispeed_freq_pct);
+ZENITH_TUNABLE_UINT_MAX_INVAL(hispeed_freq_pct, 100);
 
 static ssize_t hispeed_load_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -18332,24 +17862,7 @@ static ssize_t hispeed_load_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr hispeed_load = __ATTR_RW(hispeed_load);
 
-static ssize_t hispeed_hyst_pct_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->hispeed_hyst_pct);
-}
-
-static ssize_t hispeed_hyst_pct_store(struct gov_attr_set *attr_set,
-				      const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->hispeed_hyst_pct = val;
-	return count;
-}
-static struct governor_attr hispeed_hyst_pct = __ATTR_RW(hispeed_hyst_pct);
+ZENITH_TUNABLE_UINT_MAX(hispeed_hyst_pct, 100);
 
 /* hispeed_entry_streak sysfs knob.  See ZENITH_DEFAULT_HISPEED_ENTRY_STREAK
  * for semantics.  Capped to ZENITH_HISPEED_ENTRY_STREAK_MAX on store
@@ -18407,27 +17920,7 @@ static struct governor_attr brutal_entry_streak =
  * rationale.  Accepts 0 (disabled) or 1 (enabled, default); any
  * other value is rejected.
  */
-static ssize_t peak_headroom_rescue_show(struct gov_attr_set *attr_set,
-					 char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->peak_headroom_rescue);
-}
-
-static ssize_t peak_headroom_rescue_store(struct gov_attr_set *attr_set,
-					  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->peak_headroom_rescue = val;
-	return count;
-}
-
-static struct governor_attr peak_headroom_rescue =
-	__ATTR_RW(peak_headroom_rescue);
+ZENITH_TUNABLE_UINT_MAX(peak_headroom_rescue, 1);
 
 /* peak_headroom_starve_load_pct sysfs knob.  Minimum cluster
  * load_pct (0..100, util / max_cap * 100) at which a sample counts
@@ -18492,27 +17985,7 @@ static struct governor_attr peak_headroom_freq_floor_pct =
  * a u8 saturating at that value.  0 fires on the very first
  * starving sample.
  */
-static ssize_t peak_headroom_starve_streak_show(struct gov_attr_set *attr_set,
-						char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->peak_headroom_starve_streak);
-}
-
-static ssize_t peak_headroom_starve_streak_store(struct gov_attr_set *attr_set,
-						 const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > ZENITH_PEAK_HEADROOM_STREAK_MAX)
-		return -EINVAL;
-	t->peak_headroom_starve_streak = val;
-	return count;
-}
-
-static struct governor_attr peak_headroom_starve_streak =
-	__ATTR_RW(peak_headroom_starve_streak);
+ZENITH_TUNABLE_UINT_MAX(peak_headroom_starve_streak, ZENITH_PEAK_HEADROOM_STREAK_MAX);
 
 /* peak_headroom_jump_pct sysfs knob.  Target as percentage of
  * policy->max for the rescue freq.  Accepts 1..100; 100 pins to
@@ -18678,28 +18151,7 @@ static struct governor_attr cluster_wake_pulse_idle_ms =
  * 0 stamps the deadline but suppresses the floor application,
  * mirroring the peer_ramp / migration_floor knob shape.
  */
-static ssize_t cluster_wake_pulse_floor_pct_show(struct gov_attr_set *attr_set,
-						 char *buf)
-{
-	return sprintf(buf, "%u\n",
-		to_zenith_tunables(attr_set)->cluster_wake_pulse_floor_pct);
-}
-
-static ssize_t cluster_wake_pulse_floor_pct_store(struct gov_attr_set *attr_set,
-						  const char *buf,
-						  size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->cluster_wake_pulse_floor_pct = val;
-	return count;
-}
-
-static struct governor_attr cluster_wake_pulse_floor_pct =
-	__ATTR_RW(cluster_wake_pulse_floor_pct);
+ZENITH_TUNABLE_UINT_MAX(cluster_wake_pulse_floor_pct, 100);
 
 /* quiet_hours_start_min / quiet_hours_end_min sysfs knobs (Patch
  * 1.10).  Both accept 0..1439 (minutes since 00:00 UTC).  When
@@ -18784,28 +18236,7 @@ static struct governor_attr quiet_hours_cap_pct =
  * fires while the screen is off, so a window that overlaps an
  * active call / alarm doesn't drag the cluster down.
  */
-static ssize_t quiet_hours_screen_off_only_show(struct gov_attr_set *attr_set,
-						char *buf)
-{
-	return sprintf(buf, "%u\n",
-		to_zenith_tunables(attr_set)->quiet_hours_screen_off_only);
-}
-
-static ssize_t quiet_hours_screen_off_only_store(struct gov_attr_set *attr_set,
-						 const char *buf,
-						 size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->quiet_hours_screen_off_only = val;
-	return count;
-}
-
-static struct governor_attr quiet_hours_screen_off_only =
-	__ATTR_RW(quiet_hours_screen_off_only);
+ZENITH_TUNABLE_UINT_MAX(quiet_hours_screen_off_only, 1);
 
 /* Patch 1.4: decision_latency_hist sysfs node.
  *
@@ -18915,27 +18346,7 @@ static struct governor_attr fg_transition_pulse_pct =
  * while the starvation streak is accumulating but has not yet
  * crossed peak_headroom_starve_streak.  Accepts 0 or 1 only.
  */
-static ssize_t peak_headroom_prearm_show(struct gov_attr_set *attr_set,
-					 char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->peak_headroom_prearm);
-}
-
-static ssize_t peak_headroom_prearm_store(struct gov_attr_set *attr_set,
-					  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->peak_headroom_prearm = val;
-	return count;
-}
-
-static struct governor_attr peak_headroom_prearm =
-	__ATTR_RW(peak_headroom_prearm);
+ZENITH_TUNABLE_UINT_MAX(peak_headroom_prearm, 1);
 
 /* predict_up_thresh sysfs knob.  Trend threshold for the
  * predictive up-shift tier (2a') in 256ths of max_cap; see the
@@ -19806,43 +19217,9 @@ static struct governor_attr psi_mem_cap_window_ms =
  * EAS-computed freq across the configured window on every
  * brutal-hold cliff exit.  See struct zenith_tunables for details.
  */
-static ssize_t brutal_decay_ms_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->brutal_decay_ms);
-}
+ZENITH_TUNABLE_UINT_MAX(brutal_decay_ms, ZENITH_BRUTAL_DECAY_MS_MAX);
 
-static ssize_t brutal_decay_ms_store(struct gov_attr_set *attr_set,
-				     const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > ZENITH_BRUTAL_DECAY_MS_MAX)
-		return -EINVAL;
-	t->brutal_decay_ms = val;
-	return count;
-}
-static struct governor_attr brutal_decay_ms = __ATTR_RW(brutal_decay_ms);
-
-static ssize_t climb_mode_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->climb_mode);
-}
-
-static ssize_t climb_mode_store(struct gov_attr_set *attr_set,
-				const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > ZENITH_CLIMB_MODE_STEP)
-		return -EINVAL;
-	t->climb_mode = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr climb_mode = __ATTR_RW(climb_mode);
+ZENITH_TUNABLE_UINT_MAX_INVAL(climb_mode, ZENITH_CLIMB_MODE_STEP);
 
 static ssize_t freq_step_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -19866,45 +19243,9 @@ static struct governor_attr freq_step_pct = __ATTR_RW(freq_step_pct);
 /* freq_step_adaptive sysfs knob.  0/1 only.  See
  * ZENITH_DEFAULT_FREQ_STEP_ADAPTIVE for semantics.
  */
-static ssize_t freq_step_adaptive_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->freq_step_adaptive);
-}
+ZENITH_TUNABLE_UINT_MAX(freq_step_adaptive, 1);
 
-static ssize_t freq_step_adaptive_store(struct gov_attr_set *attr_set,
-					const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->freq_step_adaptive = val;
-	return count;
-}
-static struct governor_attr freq_step_adaptive =
-	__ATTR_RW(freq_step_adaptive);
-
-static ssize_t powersave_bias_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->powersave_bias);
-}
-
-static ssize_t powersave_bias_store(struct gov_attr_set *attr_set,
-				    const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1000)
-		return -EINVAL;
-	t->powersave_bias = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr powersave_bias = __ATTR_RW(powersave_bias);
+ZENITH_TUNABLE_UINT_MAX_INVAL(powersave_bias, 1000);
 
 /* screen_on_bias_pct sysfs knob.  See struct zenith_tunables doc and
  * ZENITH_DEFAULT_SCREEN_ON_BIAS_PCT for full semantics.  Range
@@ -19912,27 +19253,7 @@ static struct governor_attr powersave_bias = __ATTR_RW(powersave_bias);
  * 50 (the default) halves the configured powersave_bias whenever
  * the screen is on; 0 zeroes the bias on screen-on.
  */
-static ssize_t screen_on_bias_pct_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->screen_on_bias_pct);
-}
-
-static ssize_t screen_on_bias_pct_store(struct gov_attr_set *attr_set,
-					const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->screen_on_bias_pct = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-
-static struct governor_attr screen_on_bias_pct =
-	__ATTR_RW(screen_on_bias_pct);
+ZENITH_TUNABLE_UINT_MAX_INVAL(screen_on_bias_pct, 100);
 
 static ssize_t up_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -20034,52 +19355,14 @@ static ssize_t kcpustat_filter_shift_store(struct gov_attr_set *attr_set,
 static struct governor_attr kcpustat_filter_shift =
 	__ATTR_RW(kcpustat_filter_shift);
 
-static ssize_t kcpustat_hispeed_enable_show(struct gov_attr_set *attr_set,
-					    char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->kcpustat_hispeed_enable);
-}
-
-static ssize_t kcpustat_hispeed_enable_store(struct gov_attr_set *attr_set,
-					     const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->kcpustat_hispeed_enable = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr kcpustat_hispeed_enable =
-	__ATTR_RW(kcpustat_hispeed_enable);
+ZENITH_TUNABLE_UINT_BOOL_INVAL(kcpustat_hispeed_enable);
 
 /* Strict-bool tunable selecting v1 (legacy cpu_util_cfs()) vs v2
  * (6.x-style runnable-aware util) input to schedutil_cpu_util in
  * zenith_get_util().  Invalidates the prev_freq cache so toggles
  * take effect on the next tick.
  */
-static ssize_t util_math_v2_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->util_math_v2);
-}
-
-static ssize_t util_math_v2_store(struct gov_attr_set *attr_set,
-				  const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->util_math_v2 = val;
-	zenith_invalidate_cache(attr_set);
-	return count;
-}
-static struct governor_attr util_math_v2 = __ATTR_RW(util_math_v2);
+ZENITH_TUNABLE_UINT_BOOL_INVAL(util_math_v2);
 
 /* predict_util_pct sysfs knob.  See ZENITH_DEFAULT_PREDICT_UTIL_PCT
  * comment block at the top of the file for semantics.  Range
@@ -20113,25 +19396,7 @@ static struct governor_attr predict_util_pct = __ATTR_RW(predict_util_pct);
 /* predict_util_smooth sysfs knob.  0/1 only.  See
  * ZENITH_DEFAULT_PREDICT_UTIL_SMOOTH for semantics.
  */
-static ssize_t predict_util_smooth_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->predict_util_smooth);
-}
-
-static ssize_t predict_util_smooth_store(struct gov_attr_set *attr_set,
-					 const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->predict_util_smooth = val;
-	return count;
-}
-static struct governor_attr predict_util_smooth =
-	__ATTR_RW(predict_util_smooth);
+ZENITH_TUNABLE_UINT_MAX(predict_util_smooth, 1);
 
 /* render_aware sysfs knob.  Strict 0/1 boolean; non-zero values are
  * normalised to 1 on store so userspace can echo any truthy integer.
@@ -21039,26 +20304,7 @@ static struct governor_attr boot_complete = __ATTR_RW(boot_complete);
  * write to boot_complete; the calm streak counter still increments
  * but never raises the latch.
  */
-static ssize_t boot_complete_auto_show(struct gov_attr_set *attr_set,
-				       char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->boot_complete_auto);
-}
-
-static ssize_t boot_complete_auto_store(struct gov_attr_set *attr_set,
-					const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->boot_complete_auto = val;
-	return count;
-}
-static struct governor_attr boot_complete_auto =
-	__ATTR_RW(boot_complete_auto);
+ZENITH_TUNABLE_UINT_MAX(boot_complete_auto, 1);
 
 /* frame_budget_us sysfs knob.  Range 0..ZENITH_FRAME_BUDGET_US_MAX
  * (50 ms).  Userspace writes the current vblank period in
@@ -21272,24 +20518,7 @@ static struct governor_attr frame_pace_floor_pct =
  * 0/1 on store.  No cache invalidation required -- the value is re-read
  * from tunables on every zenith_get_next_freq() call.
  */
-static ssize_t uclamp_min_respect_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->uclamp_min_respect);
-}
-
-static ssize_t uclamp_min_respect_store(struct gov_attr_set *attr_set,
-					const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->uclamp_min_respect = val;
-	return count;
-}
-static struct governor_attr uclamp_min_respect = __ATTR_RW(uclamp_min_respect);
+ZENITH_TUNABLE_UINT_MAX(uclamp_min_respect, 1);
 
 /* peer_ramp_uclamp_min_respect sysfs knob (Patch M2).  Range
  * 0..1.  When set, the peer_ramp floor is computed as
@@ -21356,24 +20585,7 @@ static struct governor_attr migration_floor_uclamp_min_respect =
  * comment block at the top of this file for full semantics.  Normalised to
  * 0/1 on store.
  */
-static ssize_t uclamp_max_respect_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n",
-		       to_zenith_tunables(attr_set)->uclamp_max_respect);
-}
-
-static ssize_t uclamp_max_respect_store(struct gov_attr_set *attr_set,
-					const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 1)
-		return -EINVAL;
-	t->uclamp_max_respect = val;
-	return count;
-}
-static struct governor_attr uclamp_max_respect = __ATTR_RW(uclamp_max_respect);
+ZENITH_TUNABLE_UINT_MAX(uclamp_max_respect, 1);
 
 static struct attribute *zenith_attrs[] = {
 	&up_rate_limit_us.attr,
