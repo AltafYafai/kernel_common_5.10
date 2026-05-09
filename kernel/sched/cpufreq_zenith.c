@@ -315,6 +315,30 @@
 #define ZENITH_BATT_HOLD_SCALE_PCT_MIN			50
 #define ZENITH_BATT_HOLD_SCALE_PCT_MAX			300
 
+/* Wave A charger-aware floor.  Companion to the existing
+ * batt_hold_scale_pct / on_battery infrastructure: when
+ * charger_aware == 1 AND the lazy AC-vs-battery cache reports the
+ * system is on AC (zenith_on_battery == 0), a freq floor of
+ * (policy->max * charger_floor_pct / 100) is applied alongside the
+ * existing audio / render / migration floors.  Both knobs default 0
+ * (off) so a fresh boot is bit-identical to pre-Wave-A behaviour;
+ * users opt in by writing 1 + floor_pct via sysfs.
+ *
+ * Rationale: while the device is plugged in, the energy cost of
+ * holding hispeed approaches zero (the charger is feeding both the
+ * battery and the SoC), so a configurable floor delivers extra
+ * responsiveness with no on-battery cost.  Thermal still wins above
+ * charger_floor_pct because the thermal_state / auto_thermal_cap
+ * chain runs after the floor and can walk it back down if the SoC
+ * overheats.  audio_floor / render_floor / migration_floor all run
+ * before this site, so the charger floor only applies when none of
+ * the situational floors have already raised freq above
+ * charger_floor_pct.
+ */
+#define ZENITH_DEFAULT_CHARGER_AWARE			0
+#define ZENITH_DEFAULT_CHARGER_FLOOR_PCT		0
+#define ZENITH_CHARGER_FLOOR_PCT_MAX			100
+
 /* Patch 1.10 quiet-hours cap.  Two start / end knobs (in minutes
  * since 00:00 UTC, range 0..1439) define a daily window; while
  * inside that window, freq is capped at quiet_hours_cap_pct of
@@ -3492,6 +3516,17 @@ struct zenith_tunables {
 	 * values.  Bounded to ZENITH_BATT_HOLD_SCALE_PCT_{MIN,MAX}.
 	 */
 	unsigned int		batt_hold_scale_pct;
+
+	/* Wave A charger-aware floor.  See the comment block above
+	 * ZENITH_DEFAULT_CHARGER_AWARE for the full rationale.  Both
+	 * default 0 so a fresh boot is bit-identical to pre-Wave-A
+	 * behaviour.  charger_aware == 0 short-circuits the tier;
+	 * charger_floor_pct == 0 leaves the gate live (for tracepoint
+	 * visibility) but applies no floor.  Bounded 0..1 and 0..100
+	 * respectively on store.
+	 */
+	unsigned int		charger_aware;
+	unsigned int		charger_floor_pct;
 
 	/* Patch 1.3 cluster-wake-pulse.  See the comment block above
 	 * ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS for the full rationale.
@@ -10027,6 +10062,33 @@ brutal_entry_deferred:
 		if (has_audio && af && freq < af) {
 			freq = af;
 			tp_path = "audio_floor";
+		}
+	}
+
+	/* Wave A charger-aware floor.  When charger_aware == 1 AND the
+	 * AC-vs-battery cache reports !on_battery, apply a freq floor of
+	 * (policy->max * charger_floor_pct / 100).  The AC-vs-battery
+	 * cache is updated lazily once per ZENITH_AUTO_TUNE_PERIOD by
+	 * zenith_auto_tune_work() via power_supply_is_system_supplied(),
+	 * so the floor follows the cable within roughly one auto_eval_ms
+	 * window of plug / unplug.
+	 *
+	 * Both knobs default 0 so the tier is opt-in; thermal still wins
+	 * downstream because auto_thermal_cap / thermal_state run after
+	 * this site and can walk the floor back down if the SoC heats.
+	 */
+	if (z_policy->tunables->charger_aware &&
+	    z_policy->tunables->charger_floor_pct &&
+	    !atomic_read(&zenith_on_battery)) {
+		unsigned int cf = (policy->max *
+				   z_policy->tunables->charger_floor_pct) /
+				  100;
+
+		if (cf > policy->max)
+			cf = policy->max;
+		if (freq < cf) {
+			freq = cf;
+			tp_path = "charger_floor";
 		}
 	}
 
@@ -18074,6 +18136,15 @@ static ssize_t batt_hold_scale_pct_store(struct gov_attr_set *attr_set,
 static struct governor_attr batt_hold_scale_pct =
 	__ATTR_RW(batt_hold_scale_pct);
 
+/* Wave A charger-aware floor knobs.  charger_aware is a 0/1 gate;
+ * charger_floor_pct is the floor as a percentage of policy->max,
+ * applied when the gate is on AND the AC-vs-battery cache reports
+ * !on_battery.  See the comment block above
+ * ZENITH_DEFAULT_CHARGER_AWARE for the full rationale.
+ */
+ZENITH_TUNABLE_UINT_MAX(charger_aware, 1);
+ZENITH_TUNABLE_UINT_MAX(charger_floor_pct, ZENITH_CHARGER_FLOOR_PCT_MAX);
+
 /* on_battery sysfs read-only diagnostic (Patch 1.2).  Reports the
  * current AC-vs-battery cache state (0 = AC / system-supplied, 1
  * = on battery).  Updated lazily once per ZENITH_AUTO_TUNE_PERIOD
@@ -20608,6 +20679,8 @@ static struct attribute *zenith_attrs[] = {
 	&peak_headroom_hold_ms.attr,
 	&batt_hold_scale_pct.attr,
 	&on_battery.attr,
+	&charger_aware.attr,
+	&charger_floor_pct.attr,
 	&cluster_wake_pulse_ms.attr,
 	&cluster_wake_pulse_idle_ms.attr,
 	&cluster_wake_pulse_floor_pct.attr,
@@ -20939,6 +21012,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PEAK_HEADROOM_PREARM;
 	tunables->batt_hold_scale_pct =
 		ZENITH_DEFAULT_BATT_HOLD_SCALE_PCT;
+	tunables->charger_aware =
+		ZENITH_DEFAULT_CHARGER_AWARE;
+	tunables->charger_floor_pct =
+		ZENITH_DEFAULT_CHARGER_FLOOR_PCT;
 	tunables->cluster_wake_pulse_ms =
 		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS;
 	tunables->cluster_wake_pulse_idle_ms =
