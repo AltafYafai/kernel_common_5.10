@@ -6053,8 +6053,14 @@ static void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time,
 	 * arming sample.  io_floor_hyst_ms == 0 stamps a 0 deadline,
 	 * which the read-side check in zenith_get_next_freq() treats
 	 * as no-floor (legacy behaviour).
+	 *
+	 * z_cpu->z_policy is established non-NULL by both callers
+	 * (zenith_update_single, zenith_update_shared dereference
+	 * z_policy->tunables before calling us); zenith_iowait_floor()
+	 * and zenith_iowait_apply() likewise dereference it
+	 * unconditionally, so we follow the same convention here.
 	 */
-	if (set_iowait_boost && z_cpu->z_policy) {
+	if (set_iowait_boost) {
 		unsigned int hyst_ms =
 			z_cpu->z_policy->tunables->io_floor_hyst_ms;
 
