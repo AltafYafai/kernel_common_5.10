@@ -1527,13 +1527,13 @@ static u8 zenith_cmdline_policy_profile[NR_CPUS] = {
  *     scalars (they are user-managed opt-ins, not preset state), so
  *     no profile-apply path needs to re-sync the keys.
  */
-DEFINE_STATIC_KEY_FALSE(zenith_audio_aware_key);
-DEFINE_STATIC_KEY_FALSE(zenith_camera_aware_key);
-DEFINE_STATIC_KEY_FALSE(zenith_render_aware_key);
-DEFINE_STATIC_KEY_FALSE(zenith_psi_aware_key);
-DEFINE_STATIC_KEY_FALSE(zenith_game_auto_key);
-DEFINE_STATIC_KEY_FALSE(zenith_auto_tune_v3_key);
-DEFINE_STATIC_KEY_FALSE(zenith_thermal_aware_key);
+static DEFINE_STATIC_KEY_FALSE(zenith_audio_aware_key);
+static DEFINE_STATIC_KEY_FALSE(zenith_camera_aware_key);
+static DEFINE_STATIC_KEY_FALSE(zenith_render_aware_key);
+static DEFINE_STATIC_KEY_FALSE(zenith_psi_aware_key);
+static DEFINE_STATIC_KEY_FALSE(zenith_game_auto_key);
+static DEFINE_STATIC_KEY_FALSE(zenith_auto_tune_v3_key);
+static DEFINE_STATIC_KEY_FALSE(zenith_thermal_aware_key);
 /* Patch K: master gate for game_perf_burst.  Defaults TRUE because
  * the matching scalar tunables->game_perf_burst defaults to 1 (the
  * user requested "all automatic"); zenith_init() syncs the key to
@@ -1542,7 +1542,7 @@ DEFINE_STATIC_KEY_FALSE(zenith_thermal_aware_key);
  * on the hot path -- the FSM evaluator and floor application both
  * sit inside ZENITH_FEATURE_ENABLED(game_perf_burst) blocks.
  */
-DEFINE_STATIC_KEY_FALSE(zenith_game_perf_burst_key);
+static DEFINE_STATIC_KEY_FALSE(zenith_game_perf_burst_key);
 
 /* Transition invariant for the six feature static keys above:
  *
