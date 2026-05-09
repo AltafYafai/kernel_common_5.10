@@ -12835,6 +12835,31 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 } \
 static struct governor_attr _name = __ATTR_RW(_name)
 
+/* Combined ZENITH_TUNABLE_UINT_MAX + ZENITH_TUNABLE_UINT_INVAL: clamp
+ * the stored value at _max and invalidate the per-policy freq cache
+ * so the new value takes effect on the next scheduler tick.  Use for
+ * fields that have a non-trivial upper bound *and* feed into the
+ * zenith_get_next_freq() decision (e.g. hispeed_freq, light_load_freq,
+ * climb_mode, powersave_bias).
+ */
+#define ZENITH_TUNABLE_UINT_MAX_INVAL(_name, _max) \
+static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
+{ \
+	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
+	return sprintf(buf, "%u\n", t->_name); \
+} \
+static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
+{ \
+	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
+	unsigned int val; \
+	if (kstrtouint(buf, 10, &val) || val > (_max)) \
+		return -EINVAL; \
+	t->_name = val; \
+	zenith_invalidate_cache(attr_set); \
+	return count; \
+} \
+static struct governor_attr _name = __ATTR_RW(_name)
+
 ZENITH_TUNABLE_UINT_BOOL_INVAL(io_is_busy);
 
 static ssize_t iowait_boost_min_show(struct gov_attr_set *attr_set, char *buf)
