@@ -373,6 +373,39 @@
 #define ZENITH_TOP_APP_CACHE_TTL_NS			(4 * NSEC_PER_MSEC)
 #define ZENITH_TOP_APP_CGROUP_NAME			"top-app"
 
+/* Wave A render-thread util tracker.  More selective sibling of the
+ * existing render_floor: the comm-walk-based render_floor fires
+ * whenever a known render thread is observed on the policy, even
+ * if the thread is sitting idle in its main loop (paused video,
+ * static UI).  This tracker re-uses the same comm walk but adds a
+ * second gate -- the matched task's PELT se.avg.util_avg must be
+ * >= render_thread_util_thresh -- before applying a separate,
+ * higher floor (render_thread_util_floor_pct).
+ *
+ * Threshold is in 1/SCHED_CAPACITY_SCALE units (0..1024) matching
+ * util_avg's scale.  Typical values:
+ *   256  =  25% of a CPU's capacity, low filter -- catches any
+ *           render thread above background idle.
+ *   512  =  50% capacity, medium filter -- catches active
+ *           rendering (60 Hz scroll, video playback).
+ *   768  =  75% capacity, strict filter -- catches heavy GPU
+ *           workloads (gaming, complex animations) only.
+ *
+ * Reuses the cached zenith_policy_has_render() walk; the helper
+ * also stores the matched task's util_avg in
+ * z_policy->render_matched_util_avg, so this tier adds at most a
+ * single load after the cache hit.  All three knobs default 0 so
+ * a fresh boot is bit-identical to pre-Wave-A behaviour and the
+ * tier is opt-in.  Requires render_aware=1 in addition to
+ * render_thread_util_aware=1, because the comm-walk must run for
+ * util_avg to be observed.
+ */
+#define ZENITH_DEFAULT_RENDER_THREAD_UTIL_AWARE		0
+#define ZENITH_DEFAULT_RENDER_THREAD_UTIL_THRESH	0
+#define ZENITH_DEFAULT_RENDER_THREAD_UTIL_FLOOR_PCT	0
+#define ZENITH_RENDER_THREAD_UTIL_THRESH_MAX		1024
+#define ZENITH_RENDER_THREAD_UTIL_FLOOR_PCT_MAX		100
+
 /* Patch 1.10 quiet-hours cap.  Two start / end knobs (in minutes
  * since 00:00 UTC, range 0..1439) define a daily window; while
  * inside that window, freq is capped at quiet_hours_cap_pct of
@@ -3575,6 +3608,18 @@ struct zenith_tunables {
 	unsigned int		top_app_aware;
 	unsigned int		top_app_floor_pct;
 
+	/* Wave A render-thread util tracker.  See the comment block
+	 * above ZENITH_DEFAULT_RENDER_THREAD_UTIL_AWARE for the full
+	 * rationale.  All three default 0 so a fresh boot is bit-
+	 * identical to pre-Wave-A behaviour.  The tier requires
+	 * render_aware=1 to function (the comm-walk must run to
+	 * observe util_avg).  Bounded 0..1, 0..1024, 0..100
+	 * respectively on store.
+	 */
+	unsigned int		render_thread_util_aware;
+	unsigned int		render_thread_util_thresh;
+	unsigned int		render_thread_util_floor_pct;
+
 	/* Patch 1.3 cluster-wake-pulse.  See the comment block above
 	 * ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS for the full rationale.
 	 * cluster_wake_pulse_ms == 0 disables the tier entirely (so
@@ -5743,6 +5788,16 @@ struct zenith_policy {
 	bool			render_active;
 	u64			render_cache_stamp_ns;
 
+	/* Wave A render-thread util tracker.  Stores the
+	 * se.avg.util_avg of the first comm-matched render task
+	 * observed during zenith_policy_has_render()'s walk.  Refreshed
+	 * alongside render_active / render_cache_stamp_ns; valid for
+	 * ZENITH_RENDER_CACHE_TTL_NS.  Zero means "no matched task"
+	 * (or never sampled); non-zero is the matched task's util in
+	 * 1/SCHED_CAPACITY_SCALE units.
+	 */
+	unsigned int		render_matched_util_avg;
+
 	/* Cached per-policy result of the cgroup-aware top-app walk.
 	 * Valid for ZENITH_TOP_APP_CACHE_TTL_NS after
 	 * top_app_cache_stamp_ns.  Refreshed on the next
@@ -7447,6 +7502,7 @@ static bool zenith_policy_has_render(struct zenith_policy *z_policy)
 	struct cpufreq_policy *policy = z_policy->policy;
 	unsigned int cpu;
 	bool match = false;
+	unsigned int matched_util = 0;
 
 	if (z_policy->render_cache_stamp_ns &&
 	    now - z_policy->render_cache_stamp_ns < ZENITH_RENDER_CACHE_TTL_NS)
@@ -7469,6 +7525,16 @@ static bool zenith_policy_has_render(struct zenith_policy *z_policy)
 				if (!strncmp(curr->comm, needle,
 					     strlen(needle))) {
 					match = true;
+					/* Wave A render-thread util
+					 * tracker: capture the matched
+					 * task's PELT util_avg in 1/1024
+					 * units.  Single READ_ONCE() so
+					 * the matched_util field is
+					 * always fresh when render_-
+					 * active is true.
+					 */
+					matched_util = (unsigned int)
+						READ_ONCE(curr->se.avg.util_avg);
 					break;
 				}
 			}
@@ -7479,6 +7545,7 @@ static bool zenith_policy_has_render(struct zenith_policy *z_policy)
 	rcu_read_unlock();
 
 	z_policy->render_active = match;
+	z_policy->render_matched_util_avg = matched_util;
 	z_policy->render_cache_stamp_ns = now;
 	return match;
 }
@@ -10274,6 +10341,40 @@ brutal_entry_deferred:
 		if (has_render && debounce_ok && freq < rf) {
 			freq = rf;
 			tp_path = "render_floor";
+		}
+	}
+
+	/* Wave A render-thread util tracker.  More selective sibling
+	 * of render_floor: applies a separate (typically higher) floor
+	 * only when the matched render thread's PELT util_avg is at or
+	 * above render_thread_util_thresh.  This filters out false
+	 * positives where RenderThread is observed but is sitting idle
+	 * in its main loop (paused video, static UI), where the
+	 * unconditional render_floor over-floors.
+	 *
+	 * Reuses the zenith_policy_has_render() cache; the helper
+	 * stores the matched task's util_avg in
+	 * z_policy->render_matched_util_avg.  All three knobs default
+	 * 0 so the tier is opt-in.  Requires render_aware=1 (otherwise
+	 * the comm-walk does not run and util_avg is not observed).
+	 */
+	if (ZENITH_FEATURE_ENABLED(render_aware) &&
+	    z_policy->tunables->render_thread_util_aware &&
+	    z_policy->tunables->render_thread_util_thresh &&
+	    z_policy->tunables->render_thread_util_floor_pct &&
+	    zenith_policy_has_render(z_policy) &&
+	    z_policy->render_matched_util_avg >=
+	    z_policy->tunables->render_thread_util_thresh) {
+		unsigned int rtuf =
+			(policy->max *
+			 z_policy->tunables->render_thread_util_floor_pct) /
+			100;
+
+		if (rtuf > policy->max)
+			rtuf = policy->max;
+		if (freq < rtuf) {
+			freq = rtuf;
+			tp_path = "render_thread_util_floor";
 		}
 	}
 
@@ -18312,6 +18413,20 @@ ZENITH_TUNABLE_UINT_MAX(charger_floor_pct, ZENITH_CHARGER_FLOOR_PCT_MAX);
 ZENITH_TUNABLE_UINT_MAX(top_app_aware, 1);
 ZENITH_TUNABLE_UINT_MAX(top_app_floor_pct, ZENITH_TOP_APP_FLOOR_PCT_MAX);
 
+/* Wave A render-thread util tracker knobs.  render_thread_util_aware
+ * is a 0/1 gate; render_thread_util_thresh is the util_avg threshold
+ * (1/SCHED_CAPACITY_SCALE units, 0..1024); render_thread_util_floor_pct
+ * is the floor as a percentage of policy->max applied when the gate
+ * is on AND a render thread is observed AND its util_avg >= thresh.
+ * See the comment block above ZENITH_DEFAULT_RENDER_THREAD_UTIL_AWARE
+ * for the full rationale.
+ */
+ZENITH_TUNABLE_UINT_MAX(render_thread_util_aware, 1);
+ZENITH_TUNABLE_UINT_MAX(render_thread_util_thresh,
+			ZENITH_RENDER_THREAD_UTIL_THRESH_MAX);
+ZENITH_TUNABLE_UINT_MAX(render_thread_util_floor_pct,
+			ZENITH_RENDER_THREAD_UTIL_FLOOR_PCT_MAX);
+
 /* on_battery sysfs read-only diagnostic (Patch 1.2).  Reports the
  * current AC-vs-battery cache state (0 = AC / system-supplied, 1
  * = on battery).  Updated lazily once per ZENITH_AUTO_TUNE_PERIOD
@@ -20850,6 +20965,9 @@ static struct attribute *zenith_attrs[] = {
 	&charger_floor_pct.attr,
 	&top_app_aware.attr,
 	&top_app_floor_pct.attr,
+	&render_thread_util_aware.attr,
+	&render_thread_util_thresh.attr,
+	&render_thread_util_floor_pct.attr,
 	&cluster_wake_pulse_ms.attr,
 	&cluster_wake_pulse_idle_ms.attr,
 	&cluster_wake_pulse_floor_pct.attr,
@@ -21189,6 +21307,12 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_TOP_APP_AWARE;
 	tunables->top_app_floor_pct =
 		ZENITH_DEFAULT_TOP_APP_FLOOR_PCT;
+	tunables->render_thread_util_aware =
+		ZENITH_DEFAULT_RENDER_THREAD_UTIL_AWARE;
+	tunables->render_thread_util_thresh =
+		ZENITH_DEFAULT_RENDER_THREAD_UTIL_THRESH;
+	tunables->render_thread_util_floor_pct =
+		ZENITH_DEFAULT_RENDER_THREAD_UTIL_FLOOR_PCT;
 	tunables->cluster_wake_pulse_ms =
 		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS;
 	tunables->cluster_wake_pulse_idle_ms =
