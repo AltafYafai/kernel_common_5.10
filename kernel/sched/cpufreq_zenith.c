@@ -57,6 +57,7 @@
 #include <linux/cgroup.h>
 #include <linux/energy_model.h>
 #include <linux/input.h>
+#include <linux/perf_event.h>
 #include <linux/jump_label.h>
 #include <linux/atomic.h>
 #include <linux/bits.h>
@@ -405,6 +406,37 @@
 #define ZENITH_DEFAULT_RENDER_THREAD_UTIL_FLOOR_PCT	0
 #define ZENITH_RENDER_THREAD_UTIL_THRESH_MAX		1024
 #define ZENITH_RENDER_THREAD_UTIL_FLOOR_PCT_MAX		100
+
+/* Wave B PMU IPC tracker.  Per-CPU hardware perf_event counters
+ * (instructions retired / CPU cycles) sampled once per
+ * zenith_auto_tune_work() pass.  IPC == instructions / cycles is the
+ * canonical efficiency signal: high IPC means the workload is
+ * compute-bound and benefits from extra freq headroom; low IPC means
+ * the workload is memory-bound or stalled and extra freq mostly burns
+ * energy without helping throughput.  This tier raises a freq floor
+ * when measured IPC crosses pmu_ipc_thresh, so user-tunable workloads
+ * that want "freq when it actually pays" can opt in.
+ *
+ * IPC is reported as percent (100 = 1.0 IPC).  Modern Cortex-A series
+ * cores typically run 0.5..2.0 IPC under common Android workloads, so
+ * a default thresh of 100 (1.0 IPC) catches "actually using the CPU"
+ * without firing on memory-bound stalls.  Cap at 1000 (10.0 IPC)
+ * which is well above any real-world value -- the cap exists only to
+ * keep the percent representation in unsigned int range.
+ *
+ * Gated on CONFIG_PERF_EVENTS at build time.  When the kernel is
+ * built without perf_events, all helpers compile to no-ops, the
+ * tunables remain visible but their effect is constant zero, and
+ * the floor never applies.  Per-CPU events are allocated lazily in
+ * zenith_start() and torn down in zenith_stop(); allocation
+ * failures (PMU not exposed by the SoC, perf locked down) are
+ * silently tolerated and the floor never applies on those CPUs.
+ */
+#define ZENITH_DEFAULT_PMU_AWARE			0
+#define ZENITH_DEFAULT_PMU_IPC_THRESH			100
+#define ZENITH_DEFAULT_PMU_IPC_FLOOR_PCT		0
+#define ZENITH_PMU_IPC_THRESH_MAX			1000
+#define ZENITH_PMU_IPC_FLOOR_PCT_MAX			100
 
 /* Patch 1.10 quiet-hours cap.  Two start / end knobs (in minutes
  * since 00:00 UTC, range 0..1439) define a daily window; while
@@ -3620,6 +3652,18 @@ struct zenith_tunables {
 	unsigned int		render_thread_util_thresh;
 	unsigned int		render_thread_util_floor_pct;
 
+	/* Wave B PMU IPC tracker.  See the comment block above
+	 * ZENITH_DEFAULT_PMU_AWARE for the full rationale.  All three
+	 * default 0 (except pmu_ipc_thresh which defaults to 100 /
+	 * 1.0 IPC because a 0 threshold would be meaningless) so a
+	 * fresh boot is bit-identical to pre-Wave-B behaviour and the
+	 * tier is opt-in.  Bounded 0..1, 0..1000, 0..100 respectively
+	 * on store.
+	 */
+	unsigned int		pmu_aware;
+	unsigned int		pmu_ipc_thresh;
+	unsigned int		pmu_ipc_floor_pct;
+
 	/* Patch 1.3 cluster-wake-pulse.  See the comment block above
 	 * ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS for the full rationale.
 	 * cluster_wake_pulse_ms == 0 disables the tier entirely (so
@@ -6153,6 +6197,40 @@ struct zenith_cpu {
 };
 
 static DEFINE_PER_CPU(struct zenith_cpu, zenith_cpu);
+
+/* Wave B PMU IPC tracker per-CPU state.  See the comment block above
+ * ZENITH_DEFAULT_PMU_AWARE for the full rationale.  Allocated by
+ * zenith_pmu_init_cpu() at zenith_start() time; released by
+ * zenith_pmu_exit_cpu() at zenith_stop() time.  Sampled once per
+ * zenith_auto_tune_work() pass; the resulting IPC is cached in
+ * ipc_pct (1.0 IPC == 100) and read by zenith_policy_max_ipc_pct().
+ *
+ * On CONFIG_PERF_EVENTS=n the perf_event pointers are absent and
+ * the helper functions all collapse to no-ops via the #else branch
+ * below.
+ */
+struct zenith_pmu_state {
+#if IS_ENABLED(CONFIG_PERF_EVENTS)
+	struct perf_event	*inst_event;
+	struct perf_event	*cycle_event;
+#endif
+	u64			last_inst;
+	u64			last_cycles;
+	unsigned int		ipc_pct;
+};
+
+static DEFINE_PER_CPU(struct zenith_pmu_state, zenith_pmu);
+
+/* Wave B PMU IPC tracker forward declarations.  The bodies live next
+ * to zenith_init() / zenith_start() because they share their lifecycle;
+ * the call sites in zenith_auto_tune_work() and zenith_get_next_freq()
+ * are upstream of the definitions in source order, so a forward
+ * declaration is required.
+ */
+static int zenith_pmu_init_cpu(unsigned int cpu);
+static void zenith_pmu_exit_cpu(unsigned int cpu);
+static void zenith_pmu_sample_cpu(unsigned int cpu);
+static unsigned int zenith_policy_max_ipc_pct(struct zenith_policy *z_policy);
 
 static unsigned int zenith_tunable_or_local(struct zenith_policy *z_policy,
 					    unsigned int tunable,
@@ -10375,6 +10453,35 @@ brutal_entry_deferred:
 		if (freq < rtuf) {
 			freq = rtuf;
 			tp_path = "render_thread_util_floor";
+		}
+	}
+
+	/* Wave B PMU IPC tracker.  Apply a freq floor when measured
+	 * IPC across the policy's CPUs is at or above pmu_ipc_thresh.
+	 * The IPC cache is refreshed once per auto_tune window
+	 * (zenith_pmu_sample_cpu() is called from zenith_auto_tune_-
+	 * work()), so the floor follows workload-mix changes within
+	 * roughly one auto_eval_ms after a transition.  Both knobs
+	 * default 0 so the tier is opt-in; on CONFIG_PERF_EVENTS=n
+	 * the helper returns a constant zero and the floor never
+	 * applies.  See the comment block above ZENITH_DEFAULT_PMU_-
+	 * AWARE for the full rationale.
+	 */
+	if (z_policy->tunables->pmu_aware &&
+	    z_policy->tunables->pmu_ipc_thresh &&
+	    z_policy->tunables->pmu_ipc_floor_pct &&
+	    zenith_policy_max_ipc_pct(z_policy) >=
+	    z_policy->tunables->pmu_ipc_thresh) {
+		unsigned int pf =
+			(policy->max *
+			 z_policy->tunables->pmu_ipc_floor_pct) /
+			100;
+
+		if (pf > policy->max)
+			pf = policy->max;
+		if (freq < pf) {
+			freq = pf;
+			tp_path = "pmu_ipc_floor";
 		}
 	}
 
@@ -15300,6 +15407,25 @@ static void zenith_auto_tune_work(struct work_struct *w)
 			atomic_set(&zenith_on_battery, psy ? 0 : 1);
 	}
 
+	/* Wave B PMU IPC tracker.  Sample per-CPU instructions /
+	 * cycles perf_events once per auto_tune window.  Cheap
+	 * (perf_event_read_value() walks one IPI per CPU; total cost
+	 * for a 4-CPU policy is roughly 4 IPIs per ZENITH_AUTO_TUNE_-
+	 * PERIOD_MS, 10 s by default).  Updates the per-CPU ipc_pct
+	 * cache that zenith_get_next_freq()'s pmu_ipc_floor block
+	 * reads via zenith_policy_max_ipc_pct().  When pmu_aware is 0
+	 * the sampling still runs but the result is unused (always
+	 * cheap to compute, and keeps the cache fresh in case the
+	 * tunable is flipped on at runtime).  Compiles out on
+	 * CONFIG_PERF_EVENTS=n via the #else branch in the helper.
+	 */
+	{
+		unsigned int cpu;
+
+		for_each_cpu(cpu, z_policy->policy->cpus)
+			zenith_pmu_sample_cpu(cpu);
+	}
+
 	total = (unsigned int)atomic_xchg(&z_policy->at_samples_total, 0);
 	saturated = (unsigned int)atomic_xchg(&z_policy->at_samples_saturated, 0);
 
@@ -18427,6 +18553,17 @@ ZENITH_TUNABLE_UINT_MAX(render_thread_util_thresh,
 ZENITH_TUNABLE_UINT_MAX(render_thread_util_floor_pct,
 			ZENITH_RENDER_THREAD_UTIL_FLOOR_PCT_MAX);
 
+/* Wave B PMU IPC tracker knobs.  pmu_aware is a 0/1 gate; pmu_ipc_-
+ * thresh is the IPC threshold in percent (100 = 1.0 IPC, default
+ * 100, max 1000); pmu_ipc_floor_pct is the floor as a percentage of
+ * policy->max applied when the gate is on AND the policy's max
+ * sampled IPC across CPUs is >= thresh.  See the comment block above
+ * ZENITH_DEFAULT_PMU_AWARE for the full rationale.
+ */
+ZENITH_TUNABLE_UINT_MAX(pmu_aware, 1);
+ZENITH_TUNABLE_UINT_MAX(pmu_ipc_thresh, ZENITH_PMU_IPC_THRESH_MAX);
+ZENITH_TUNABLE_UINT_MAX(pmu_ipc_floor_pct, ZENITH_PMU_IPC_FLOOR_PCT_MAX);
+
 /* on_battery sysfs read-only diagnostic (Patch 1.2).  Reports the
  * current AC-vs-battery cache state (0 = AC / system-supplied, 1
  * = on battery).  Updated lazily once per ZENITH_AUTO_TUNE_PERIOD
@@ -20968,6 +21105,9 @@ static struct attribute *zenith_attrs[] = {
 	&render_thread_util_aware.attr,
 	&render_thread_util_thresh.attr,
 	&render_thread_util_floor_pct.attr,
+	&pmu_aware.attr,
+	&pmu_ipc_thresh.attr,
+	&pmu_ipc_floor_pct.attr,
 	&cluster_wake_pulse_ms.attr,
 	&cluster_wake_pulse_idle_ms.attr,
 	&cluster_wake_pulse_floor_pct.attr,
@@ -21227,6 +21367,147 @@ static int zenith_kthread_create(struct zenith_policy *z_policy)
 	return 0;
 }
 
+/* Wave B PMU IPC tracker.  Allocate the per-CPU instructions and
+ * cycles perf_events on this CPU.  Idempotent: if the events are
+ * already allocated (re-attach on the same CPU after a governor
+ * cycle), return success without re-allocating.  Allocation failures
+ * (PMU not exposed by the SoC, perf locked down, OOM) leave the
+ * pointers NULL; subsequent zenith_pmu_sample_cpu() calls return
+ * early and the floor never applies on this CPU.  See the comment
+ * block above ZENITH_DEFAULT_PMU_AWARE for the full rationale.
+ */
+#if IS_ENABLED(CONFIG_PERF_EVENTS)
+static int zenith_pmu_init_cpu(unsigned int cpu)
+{
+	struct zenith_pmu_state *st = per_cpu_ptr(&zenith_pmu, cpu);
+	struct perf_event_attr inst_attr = {
+		.type		= PERF_TYPE_HARDWARE,
+		.config		= PERF_COUNT_HW_INSTRUCTIONS,
+		.size		= sizeof(inst_attr),
+		.pinned		= 1,
+		.disabled	= 0,
+		.exclude_idle	= 1,
+	};
+	struct perf_event_attr cycle_attr = inst_attr;
+
+	cycle_attr.config = PERF_COUNT_HW_CPU_CYCLES;
+
+	if (st->inst_event && st->cycle_event)
+		return 0;
+
+	if (!st->inst_event) {
+		struct perf_event *e =
+			perf_event_create_kernel_counter(&inst_attr, cpu,
+							 NULL, NULL, NULL);
+
+		if (IS_ERR(e)) {
+			st->inst_event = NULL;
+			return PTR_ERR(e);
+		}
+		st->inst_event = e;
+	}
+	if (!st->cycle_event) {
+		struct perf_event *e =
+			perf_event_create_kernel_counter(&cycle_attr, cpu,
+							 NULL, NULL, NULL);
+
+		if (IS_ERR(e)) {
+			perf_event_release_kernel(st->inst_event);
+			st->inst_event = NULL;
+			st->cycle_event = NULL;
+			return PTR_ERR(e);
+		}
+		st->cycle_event = e;
+	}
+	st->last_inst = 0;
+	st->last_cycles = 0;
+	st->ipc_pct = 0;
+	return 0;
+}
+
+static void zenith_pmu_exit_cpu(unsigned int cpu)
+{
+	struct zenith_pmu_state *st = per_cpu_ptr(&zenith_pmu, cpu);
+
+	if (st->inst_event) {
+		perf_event_release_kernel(st->inst_event);
+		st->inst_event = NULL;
+	}
+	if (st->cycle_event) {
+		perf_event_release_kernel(st->cycle_event);
+		st->cycle_event = NULL;
+	}
+	st->last_inst = 0;
+	st->last_cycles = 0;
+	st->ipc_pct = 0;
+}
+
+/* Sample the per-CPU instructions and cycles counters and compute
+ * IPC as a percentage.  Called from zenith_auto_tune_work() (process
+ * context); perf_event_read_value() uses smp_call_function_single()
+ * internally to read the counter on the target CPU, so this is safe
+ * to call on any CPU regardless of which CPU owns the event.  Stores
+ * the latest IPC in st->ipc_pct via WRITE_ONCE() so the lock-free
+ * reader in zenith_policy_max_ipc_pct() sees a coherent value.
+ */
+static void zenith_pmu_sample_cpu(unsigned int cpu)
+{
+	struct zenith_pmu_state *st = per_cpu_ptr(&zenith_pmu, cpu);
+	u64 enabled, running, inst, cycles, di, dc;
+
+	if (!st->inst_event || !st->cycle_event)
+		return;
+
+	inst   = perf_event_read_value(st->inst_event,  &enabled, &running);
+	cycles = perf_event_read_value(st->cycle_event, &enabled, &running);
+
+	di = inst   - st->last_inst;
+	dc = cycles - st->last_cycles;
+	st->last_inst   = inst;
+	st->last_cycles = cycles;
+
+	if (dc) {
+		u64 r = div64_u64(di * 100, dc);
+
+		if (r > ZENITH_PMU_IPC_THRESH_MAX)
+			r = ZENITH_PMU_IPC_THRESH_MAX;
+		WRITE_ONCE(st->ipc_pct, (unsigned int)r);
+	}
+}
+
+static unsigned int zenith_policy_max_ipc_pct(struct zenith_policy *z_policy)
+{
+	struct cpufreq_policy *policy = z_policy->policy;
+	unsigned int cpu;
+	unsigned int max_ipc = 0;
+
+	for_each_cpu(cpu, policy->cpus) {
+		struct zenith_pmu_state *st = per_cpu_ptr(&zenith_pmu, cpu);
+		unsigned int ipc = READ_ONCE(st->ipc_pct);
+
+		if (ipc > max_ipc)
+			max_ipc = ipc;
+	}
+	return max_ipc;
+}
+#else
+static inline int zenith_pmu_init_cpu(unsigned int cpu)
+{
+	return 0;
+}
+static inline void zenith_pmu_exit_cpu(unsigned int cpu)
+{
+}
+static inline void zenith_pmu_sample_cpu(unsigned int cpu)
+{
+}
+static inline unsigned int
+zenith_policy_max_ipc_pct(struct zenith_policy *z_policy)
+{
+	return 0;
+}
+#endif
+
 static int zenith_init(struct cpufreq_policy *policy)
 {
 	struct zenith_policy *z_policy;
@@ -21313,6 +21594,12 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_RENDER_THREAD_UTIL_THRESH;
 	tunables->render_thread_util_floor_pct =
 		ZENITH_DEFAULT_RENDER_THREAD_UTIL_FLOOR_PCT;
+	tunables->pmu_aware =
+		ZENITH_DEFAULT_PMU_AWARE;
+	tunables->pmu_ipc_thresh =
+		ZENITH_DEFAULT_PMU_IPC_THRESH;
+	tunables->pmu_ipc_floor_pct =
+		ZENITH_DEFAULT_PMU_IPC_FLOOR_PCT;
 	tunables->cluster_wake_pulse_ms =
 		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS;
 	tunables->cluster_wake_pulse_idle_ms =
@@ -21810,6 +22097,14 @@ static int zenith_start(struct cpufreq_policy *policy)
 
 		cpufreq_add_update_util_hook(cpu, &z_cpu->update_util,
 			policy_is_shared(policy) ? zenith_update_shared : zenith_update_single);
+
+		/* Wave B PMU IPC tracker.  Allocate per-CPU
+		 * instructions / cycles perf_events.  Idempotent and
+		 * failure-tolerant: errors leave the per-CPU pointers
+		 * NULL and the floor never applies on this CPU.  See
+		 * the comment block above ZENITH_DEFAULT_PMU_AWARE.
+		 */
+		(void)zenith_pmu_init_cpu(cpu);
 	}
 
 	/* Patch K: reset the game_perf_burst FSM and resolve the
@@ -21882,8 +22177,16 @@ static void zenith_stop(struct cpufreq_policy *policy)
 	struct zenith_policy *z_policy = policy->governor_data;
 	unsigned int cpu;
 
-	for_each_cpu(cpu, policy->cpus)
+	for_each_cpu(cpu, policy->cpus) {
 		cpufreq_remove_update_util_hook(cpu);
+		/* Wave B PMU IPC tracker.  Release per-CPU perf_events
+		 * before the per-CPU update hook is fully removed so
+		 * any in-flight sample_cpu() (which uses
+		 * smp_call_function_single() under the hood) completes
+		 * against valid pointers.
+		 */
+		zenith_pmu_exit_cpu(cpu);
+	}
 	synchronize_rcu();
 
 	if (!policy->fast_switch_enabled) {
