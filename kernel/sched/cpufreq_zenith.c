@@ -339,6 +339,40 @@
 #define ZENITH_DEFAULT_CHARGER_FLOOR_PCT		0
 #define ZENITH_CHARGER_FLOOR_PCT_MAX			100
 
+/* Wave A cgroup-aware top-app floor.  Replaces the fragile comm-walk
+ * heuristic for foreground detection (game_auto / render_aware /
+ * audio_aware all match by thread name) with a rock-solid cgroup
+ * read.  Android's ActivityManager assigns every UI-visible app's
+ * threads to the cpuset cgroup directory "top-app"; system /
+ * background threads land in "foreground", "background", or
+ * "system-background".  Reading current->cgroups->subsys
+ * [cpuset_cgrp_id]->cgroup->kn->name == "top-app" answers "is the
+ * user looking at this task right now" without depending on which
+ * APK happened to be installed or how its threads are named.
+ *
+ * When top_app_aware == 1 AND any CPU in the policy is currently
+ * running a task in the top-app cpuset cgroup, apply a freq floor
+ * of (policy->max * top_app_floor_pct / 100) alongside the existing
+ * audio / render / camera / charger floors.  Cached for
+ * ZENITH_TOP_APP_CACHE_TTL_NS to keep the hot path cheap (one
+ * task_css() + strcmp() per cached interval, not per tick).
+ *
+ * Both knobs default 0 so the tier is opt-in and a fresh boot is
+ * bit-identical to pre-Wave-A behaviour.  Requires CONFIG_CPUSETS=y
+ * in the kernel (mandatory on Android GKI; on CONFIG_CPUSETS=n the
+ * helper always returns false and the floor never applies).
+ *
+ * The cgroup name is fixed at "top-app" because every Android
+ * release since Lollipop has used that exact directory name; if
+ * a vendor renames it, set top_app_aware=0 and use the comm-walk
+ * floors instead.
+ */
+#define ZENITH_DEFAULT_TOP_APP_AWARE			0
+#define ZENITH_DEFAULT_TOP_APP_FLOOR_PCT		0
+#define ZENITH_TOP_APP_FLOOR_PCT_MAX			100
+#define ZENITH_TOP_APP_CACHE_TTL_NS			(4 * NSEC_PER_MSEC)
+#define ZENITH_TOP_APP_CGROUP_NAME			"top-app"
+
 /* Patch 1.10 quiet-hours cap.  Two start / end knobs (in minutes
  * since 00:00 UTC, range 0..1439) define a daily window; while
  * inside that window, freq is capped at quiet_hours_cap_pct of
@@ -3528,6 +3562,19 @@ struct zenith_tunables {
 	unsigned int		charger_aware;
 	unsigned int		charger_floor_pct;
 
+	/* Wave A cgroup-aware top-app floor.  See the comment block
+	 * above ZENITH_DEFAULT_TOP_APP_AWARE for the full rationale.
+	 * Both default 0 so a fresh boot is bit-identical to pre-Wave-A
+	 * behaviour.  top_app_aware == 0 short-circuits the tier;
+	 * top_app_floor_pct == 0 leaves the gate live (for tracepoint
+	 * visibility) but applies no floor.  Bounded 0..1 and 0..100
+	 * respectively on store.  Requires CONFIG_CPUSETS=y; on
+	 * CONFIG_CPUSETS=n the helper always returns false and the
+	 * gate is effectively a no-op.
+	 */
+	unsigned int		top_app_aware;
+	unsigned int		top_app_floor_pct;
+
 	/* Patch 1.3 cluster-wake-pulse.  See the comment block above
 	 * ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS for the full rationale.
 	 * cluster_wake_pulse_ms == 0 disables the tier entirely (so
@@ -5696,6 +5743,15 @@ struct zenith_policy {
 	bool			render_active;
 	u64			render_cache_stamp_ns;
 
+	/* Cached per-policy result of the cgroup-aware top-app walk.
+	 * Valid for ZENITH_TOP_APP_CACHE_TTL_NS after
+	 * top_app_cache_stamp_ns.  Refreshed on the next
+	 * zenith_get_next_freq() call past the TTL.  Zero stamp means
+	 * "never sampled".
+	 */
+	bool			top_app_active;
+	u64			top_app_cache_stamp_ns;
+
 	/* Cached per-policy result of the audio-aware comm walk.  Same
 	 * shape as the render cache above; TTL is
 	 * ZENITH_AUDIO_CACHE_TTL_NS.  Zero stamp means "never sampled".
@@ -7424,6 +7480,78 @@ static bool zenith_policy_has_render(struct zenith_policy *z_policy)
 
 	z_policy->render_active = match;
 	z_policy->render_cache_stamp_ns = now;
+	return match;
+}
+
+/* Wave A cgroup-aware top-app helper.  Reads the cpuset cgroup the
+ * task currently belongs to and checks whether the leaf directory
+ * name is "top-app".  Caller must NOT hold rcu_read_lock; this
+ * helper takes it internally (RCU is recursive, so calling from a
+ * context that already holds the lock is also fine).
+ *
+ * Gated on CONFIG_CPUSETS because cpuset_cgrp_id is only defined
+ * when the cpuset subsystem is built; on !CONFIG_CPUSETS the
+ * helper compiles to a constant false and the floor never
+ * applies.
+ */
+#if IS_ENABLED(CONFIG_CPUSETS)
+static bool zenith_task_in_top_app(struct task_struct *t)
+{
+	struct cgroup_subsys_state *css;
+	bool match = false;
+
+	rcu_read_lock();
+	css = task_css(t, cpuset_cgrp_id);
+	if (css && css->cgroup && css->cgroup->kn) {
+		const char *name = css->cgroup->kn->name;
+
+		if (name && !strcmp(name, ZENITH_TOP_APP_CGROUP_NAME))
+			match = true;
+	}
+	rcu_read_unlock();
+	return match;
+}
+#else
+static inline bool zenith_task_in_top_app(struct task_struct *t)
+{
+	return false;
+}
+#endif
+
+/* Walk the policy's online cpumask and check each cpu_curr's cpuset
+ * cgroup membership.  Returns true on the first match against the
+ * "top-app" cgroup.  Result is cached for ZENITH_TOP_APP_CACHE_TTL_NS
+ * (4 ms) so a hot path (e.g. a 60 / 90 / 120 Hz scroll) only does
+ * the cgroup walk a few times per second per policy.  Caller is
+ * expected to gate the call on tunables->top_app_aware != 0; this
+ * helper does not re-check that.
+ */
+static bool zenith_policy_has_top_app(struct zenith_policy *z_policy)
+{
+	u64 now = ktime_get_ns();
+	struct cpufreq_policy *policy = z_policy->policy;
+	unsigned int cpu;
+	bool match = false;
+
+	if (z_policy->top_app_cache_stamp_ns &&
+	    now - z_policy->top_app_cache_stamp_ns < ZENITH_TOP_APP_CACHE_TTL_NS)
+		return z_policy->top_app_active;
+
+	rcu_read_lock();
+	for_each_cpu(cpu, policy->cpus) {
+		struct task_struct *curr = rcu_dereference(cpu_curr(cpu));
+
+		if (!curr)
+			continue;
+		if (zenith_task_in_top_app(curr)) {
+			match = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	z_policy->top_app_active = match;
+	z_policy->top_app_cache_stamp_ns = now;
 	return match;
 }
 
@@ -10224,6 +10352,35 @@ brutal_entry_deferred:
 		if (active && cf && freq < cf) {
 			freq = cf;
 			tp_path = "camera_floor";
+		}
+	}
+
+	/* Wave A cgroup-aware top-app floor.  When top_app_aware == 1
+	 * AND any CPU in the policy is currently running a task in the
+	 * cpuset cgroup named "top-app", apply a freq floor of
+	 * (policy->max * top_app_floor_pct / 100).  Cached for
+	 * ZENITH_TOP_APP_CACHE_TTL_NS via
+	 * zenith_policy_has_top_app() to keep the hot path cheap.
+	 *
+	 * Comm-walk floors (audio / render / camera / charger) all run
+	 * before this site, so top_app_floor only fires when none of
+	 * the more specific signals already lifted freq above
+	 * top_app_floor_pct.  Both knobs default 0 so the tier is
+	 * opt-in.  Requires CONFIG_CPUSETS=y; on CONFIG_CPUSETS=n the
+	 * helper short-circuits to false and the floor never applies.
+	 */
+	if (z_policy->tunables->top_app_aware &&
+	    z_policy->tunables->top_app_floor_pct &&
+	    zenith_policy_has_top_app(z_policy)) {
+		unsigned int taf = (policy->max *
+				    z_policy->tunables->top_app_floor_pct) /
+				   100;
+
+		if (taf > policy->max)
+			taf = policy->max;
+		if (freq < taf) {
+			freq = taf;
+			tp_path = "top_app_floor";
 		}
 	}
 
@@ -18145,6 +18302,16 @@ static struct governor_attr batt_hold_scale_pct =
 ZENITH_TUNABLE_UINT_MAX(charger_aware, 1);
 ZENITH_TUNABLE_UINT_MAX(charger_floor_pct, ZENITH_CHARGER_FLOOR_PCT_MAX);
 
+/* Wave A cgroup-aware top-app floor knobs.  top_app_aware is a 0/1
+ * gate; top_app_floor_pct is the floor as a percentage of
+ * policy->max, applied when the gate is on AND any CPU in the
+ * policy is currently running a task in the cpuset cgroup named
+ * "top-app".  See the comment block above
+ * ZENITH_DEFAULT_TOP_APP_AWARE for the full rationale.
+ */
+ZENITH_TUNABLE_UINT_MAX(top_app_aware, 1);
+ZENITH_TUNABLE_UINT_MAX(top_app_floor_pct, ZENITH_TOP_APP_FLOOR_PCT_MAX);
+
 /* on_battery sysfs read-only diagnostic (Patch 1.2).  Reports the
  * current AC-vs-battery cache state (0 = AC / system-supplied, 1
  * = on battery).  Updated lazily once per ZENITH_AUTO_TUNE_PERIOD
@@ -20681,6 +20848,8 @@ static struct attribute *zenith_attrs[] = {
 	&on_battery.attr,
 	&charger_aware.attr,
 	&charger_floor_pct.attr,
+	&top_app_aware.attr,
+	&top_app_floor_pct.attr,
 	&cluster_wake_pulse_ms.attr,
 	&cluster_wake_pulse_idle_ms.attr,
 	&cluster_wake_pulse_floor_pct.attr,
@@ -21016,6 +21185,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_CHARGER_AWARE;
 	tunables->charger_floor_pct =
 		ZENITH_DEFAULT_CHARGER_FLOOR_PCT;
+	tunables->top_app_aware =
+		ZENITH_DEFAULT_TOP_APP_AWARE;
+	tunables->top_app_floor_pct =
+		ZENITH_DEFAULT_TOP_APP_FLOOR_PCT;
 	tunables->cluster_wake_pulse_ms =
 		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS;
 	tunables->cluster_wake_pulse_idle_ms =
