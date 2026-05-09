@@ -7347,7 +7347,7 @@ static bool zenith_policy_has_render(struct zenith_policy *z_policy)
 			rcu_dereference(zenith_render_table);
 
 		for_each_cpu(cpu, policy->cpus) {
-			struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+			struct task_struct *curr = rcu_dereference(cpu_curr(cpu));
 			unsigned int i;
 
 			if (!curr || !t)
@@ -7481,7 +7481,7 @@ static bool zenith_policy_has_audio(struct zenith_policy *z_policy)
 			rcu_dereference(zenith_audio_table);
 
 		for_each_cpu(cpu, policy->cpus) {
-			struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+			struct task_struct *curr = rcu_dereference(cpu_curr(cpu));
 			unsigned int i;
 
 			if (!curr || !t)
@@ -7592,7 +7592,7 @@ static bool zenith_policy_has_camera(struct zenith_policy *z_policy)
 
 	rcu_read_lock();
 	for_each_cpu(cpu, policy->cpus) {
-		struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+		struct task_struct *curr = rcu_dereference(cpu_curr(cpu));
 		int i;
 
 		if (!curr)
@@ -7722,7 +7722,7 @@ static bool zenith_policy_has_game_auto(struct zenith_policy *z_policy)
 			rcu_dereference(zenith_game_auto_table);
 
 		for_each_cpu(cpu, policy->cpus) {
-			struct task_struct *curr = READ_ONCE(cpu_curr(cpu));
+			struct task_struct *curr = rcu_dereference(cpu_curr(cpu));
 			unsigned int i;
 
 			if (!curr || !t)
