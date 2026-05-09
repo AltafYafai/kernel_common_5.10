@@ -438,6 +438,38 @@
 #define ZENITH_PMU_IPC_THRESH_MAX			1000
 #define ZENITH_PMU_IPC_FLOOR_PCT_MAX			100
 
+/* Wave B EAS / Energy Model integration.  Reads the per-policy
+ * struct em_perf_domain (registered by the cpufreq driver via
+ * em_dev_register_perf_domain()) to locate the energy-knee OPP --
+ * the performance state with the lowest 'cost' field, where cost ==
+ * power * max_freq / freq is pre-computed by EM at registration
+ * time.  Below the knee, voltage scaling makes the OPP
+ * inefficient in joules-per-instruction; above the knee, voltage
+ * scales linearly with freq while capacity scales sub-linearly,
+ * so cost rises again.  The knee is therefore the most
+ * energy-efficient sustained operating point.
+ *
+ * em_floor_pct applies a freq floor at (em_knee_freq *
+ * em_floor_pct / 100) so the policy never undershoots the
+ * energy-knee for a sustained workload.  Capped at 200% to allow
+ * the user to express "a bit above the knee for safety margin".
+ *
+ * Both knobs default 0 so the tier is opt-in and a fresh boot is
+ * bit-identical to pre-Wave-B behaviour.  Gated on
+ * CONFIG_ENERGY_MODEL at build time; on CONFIG_ENERGY_MODEL=n the
+ * helper returns a constant zero (em_cpu_get() returns NULL
+ * unconditionally) and the floor never applies.
+ *
+ * Caches the knee freq per-policy at zenith_start() to avoid the
+ * em->table walk on every cpufreq tick.  When the cpufreq driver
+ * registers an EM after zenith_start() has run (rare; most boards
+ * register the EM early during cpufreq driver probe), the cache
+ * is refreshed lazily on the first floor application.
+ */
+#define ZENITH_DEFAULT_EM_AWARE				0
+#define ZENITH_DEFAULT_EM_FLOOR_PCT			0
+#define ZENITH_EM_FLOOR_PCT_MAX				200
+
 /* Patch 1.10 quiet-hours cap.  Two start / end knobs (in minutes
  * since 00:00 UTC, range 0..1439) define a daily window; while
  * inside that window, freq is capped at quiet_hours_cap_pct of
@@ -3664,6 +3696,15 @@ struct zenith_tunables {
 	unsigned int		pmu_ipc_thresh;
 	unsigned int		pmu_ipc_floor_pct;
 
+	/* Wave B EAS / Energy Model integration.  See the comment
+	 * block above ZENITH_DEFAULT_EM_AWARE for the full rationale.
+	 * Both default 0 so a fresh boot is bit-identical to pre-
+	 * Wave-B behaviour.  Bounded 0..1 and 0..200 respectively on
+	 * store.
+	 */
+	unsigned int		em_aware;
+	unsigned int		em_floor_pct;
+
 	/* Patch 1.3 cluster-wake-pulse.  See the comment block above
 	 * ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS for the full rationale.
 	 * cluster_wake_pulse_ms == 0 disables the tier entirely (so
@@ -5851,6 +5892,15 @@ struct zenith_policy {
 	bool			top_app_active;
 	u64			top_app_cache_stamp_ns;
 
+	/* Wave B EAS energy-knee freq cache.  Populated at
+	 * zenith_start() time from em_cpu_get(); refreshed lazily on
+	 * the first em_floor application if the EM was not yet
+	 * registered when zenith_start() ran.  Zero means "no EM"
+	 * (or never sampled); non-zero is the energy-knee freq in
+	 * KHz.
+	 */
+	unsigned int		em_knee_freq;
+
 	/* Cached per-policy result of the audio-aware comm walk.  Same
 	 * shape as the render cache above; TTL is
 	 * ZENITH_AUDIO_CACHE_TTL_NS.  Zero stamp means "never sampled".
@@ -6231,6 +6281,16 @@ static int zenith_pmu_init_cpu(unsigned int cpu);
 static void zenith_pmu_exit_cpu(unsigned int cpu);
 static void zenith_pmu_sample_cpu(unsigned int cpu);
 static unsigned int zenith_policy_max_ipc_pct(struct zenith_policy *z_policy);
+
+/* Wave B EAS / Energy Model integration.  Resolve the energy-knee
+ * frequency of the policy's perf_domain (the OPP with the lowest
+ * em->table[].cost field).  Cached in z_policy->em_knee_freq so the
+ * em->table walk runs at most once per zenith_start() pass.  Returns
+ * 0 if no EM is registered for the policy or if all costs are zero
+ * (badly-formed EM).  See the comment block above
+ * ZENITH_DEFAULT_EM_AWARE for the full rationale.
+ */
+static unsigned int zenith_em_knee_freq(struct zenith_policy *z_policy);
 
 static unsigned int zenith_tunable_or_local(struct zenith_policy *z_policy,
 					    unsigned int tunable,
@@ -10482,6 +10542,36 @@ brutal_entry_deferred:
 		if (freq < pf) {
 			freq = pf;
 			tp_path = "pmu_ipc_floor";
+		}
+	}
+
+	/* Wave B EAS energy-knee floor.  When em_aware is on AND the
+	 * cpufreq driver has registered an Energy Model for this
+	 * policy AND em_floor_pct is non-zero, raise the freq floor to
+	 * (em_knee_freq * em_floor_pct / 100).  The energy-knee is
+	 * the OPP that minimises joules per instruction for sustained
+	 * load -- below the knee, voltage scaling stops paying off
+	 * and the policy wastes time without saving much energy.
+	 * Floor still subject to the policy->max clamp downstream.
+	 * See the comment block above ZENITH_DEFAULT_EM_AWARE for
+	 * the full rationale.
+	 */
+	if (z_policy->tunables->em_aware &&
+	    z_policy->tunables->em_floor_pct) {
+		unsigned int knee = zenith_em_knee_freq(z_policy);
+
+		if (knee) {
+			unsigned int ef =
+				(knee *
+				 z_policy->tunables->em_floor_pct) /
+				100;
+
+			if (ef > policy->max)
+				ef = policy->max;
+			if (freq < ef) {
+				freq = ef;
+				tp_path = "em_floor";
+			}
 		}
 	}
 
@@ -18564,6 +18654,15 @@ ZENITH_TUNABLE_UINT_MAX(pmu_aware, 1);
 ZENITH_TUNABLE_UINT_MAX(pmu_ipc_thresh, ZENITH_PMU_IPC_THRESH_MAX);
 ZENITH_TUNABLE_UINT_MAX(pmu_ipc_floor_pct, ZENITH_PMU_IPC_FLOOR_PCT_MAX);
 
+/* Wave B EAS energy-knee floor knobs.  em_aware is a 0/1 gate;
+ * em_floor_pct is the floor as a percentage of the policy's energy-
+ * knee freq, capped at 200% to allow the user to express "a bit
+ * above the knee for safety margin".  See the comment block above
+ * ZENITH_DEFAULT_EM_AWARE for the full rationale.
+ */
+ZENITH_TUNABLE_UINT_MAX(em_aware, 1);
+ZENITH_TUNABLE_UINT_MAX(em_floor_pct, ZENITH_EM_FLOOR_PCT_MAX);
+
 /* on_battery sysfs read-only diagnostic (Patch 1.2).  Reports the
  * current AC-vs-battery cache state (0 = AC / system-supplied, 1
  * = on battery).  Updated lazily once per ZENITH_AUTO_TUNE_PERIOD
@@ -21108,6 +21207,8 @@ static struct attribute *zenith_attrs[] = {
 	&pmu_aware.attr,
 	&pmu_ipc_thresh.attr,
 	&pmu_ipc_floor_pct.attr,
+	&em_aware.attr,
+	&em_floor_pct.attr,
 	&cluster_wake_pulse_ms.attr,
 	&cluster_wake_pulse_idle_ms.attr,
 	&cluster_wake_pulse_floor_pct.attr,
@@ -21508,6 +21609,49 @@ zenith_policy_max_ipc_pct(struct zenith_policy *z_policy)
 }
 #endif
 
+/* Wave B EAS / Energy Model integration.  See the comment block
+ * above ZENITH_DEFAULT_EM_AWARE for the full rationale.  On
+ * CONFIG_ENERGY_MODEL=n, em_cpu_get() returns NULL unconditionally
+ * (header-defined) and this function returns 0; the caller treats
+ * 0 as "no EM" and the em_floor never applies.  No #if guard is
+ * required at this site because the header itself stubs the API.
+ */
+static unsigned int zenith_em_knee_freq(struct zenith_policy *z_policy)
+{
+	struct em_perf_domain *em;
+	unsigned int cpu = cpumask_first(z_policy->policy->cpus);
+	unsigned long best_cost = ULONG_MAX;
+	unsigned int knee_freq = 0;
+	int i;
+
+	if (z_policy->em_knee_freq)
+		return z_policy->em_knee_freq;
+
+	em = em_cpu_get(cpu);
+	if (!em || em->nr_perf_states <= 0 || !em->table)
+		return 0;
+
+	for (i = 0; i < em->nr_perf_states; i++) {
+		unsigned long c = em->table[i].cost;
+
+		if (c && c < best_cost) {
+			best_cost = c;
+			knee_freq = (unsigned int)em->table[i].frequency;
+		}
+	}
+
+	/* Bad EM (all costs zero, or single-OPP table): fall back to
+	 * the lowest registered freq, which is at least a meaningful
+	 * lower bound for the knee.  Caller still scales by
+	 * em_floor_pct so a 0% effective floor is fine.
+	 */
+	if (!knee_freq)
+		knee_freq = (unsigned int)em->table[0].frequency;
+
+	z_policy->em_knee_freq = knee_freq;
+	return knee_freq;
+}
+
 static int zenith_init(struct cpufreq_policy *policy)
 {
 	struct zenith_policy *z_policy;
@@ -21600,6 +21744,10 @@ static int zenith_init(struct cpufreq_policy *policy)
 		ZENITH_DEFAULT_PMU_IPC_THRESH;
 	tunables->pmu_ipc_floor_pct =
 		ZENITH_DEFAULT_PMU_IPC_FLOOR_PCT;
+	tunables->em_aware =
+		ZENITH_DEFAULT_EM_AWARE;
+	tunables->em_floor_pct =
+		ZENITH_DEFAULT_EM_FLOOR_PCT;
 	tunables->cluster_wake_pulse_ms =
 		ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS;
 	tunables->cluster_wake_pulse_idle_ms =
