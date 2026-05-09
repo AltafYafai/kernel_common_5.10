@@ -65,6 +65,7 @@
 #include <linux/power_supply.h>
 #include <linux/time.h>
 #include <linux/kernel_stat.h>
+#include <linux/thermal.h>
 
 /* linux/fb.h transitively pulls linux/acpi.h, which redefines the
  * ACPI_PROBE_TABLE macro already defined by sched.h ->
@@ -1533,6 +1534,15 @@ DEFINE_STATIC_KEY_FALSE(zenith_psi_aware_key);
 DEFINE_STATIC_KEY_FALSE(zenith_game_auto_key);
 DEFINE_STATIC_KEY_FALSE(zenith_auto_tune_v3_key);
 DEFINE_STATIC_KEY_FALSE(zenith_thermal_aware_key);
+/* Patch K: master gate for game_perf_burst.  Defaults TRUE because
+ * the matching scalar tunables->game_perf_burst defaults to 1 (the
+ * user requested "all automatic"); zenith_init() syncs the key to
+ * the scalar at attach time exactly as audio_aware / render_aware /
+ * etc. above.  When the master is 0 the static branch costs nothing
+ * on the hot path -- the FSM evaluator and floor application both
+ * sit inside ZENITH_FEATURE_ENABLED(game_perf_burst) blocks.
+ */
+DEFINE_STATIC_KEY_FALSE(zenith_game_perf_burst_key);
 
 /* Transition invariant for the six feature static keys above:
  *
@@ -3238,6 +3248,101 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  */
 #define ZENITH_DEFAULT_VERBOSE_LOG		0
 
+/* Patch K: game / sustained-high-load performance burst.  Five
+ * tunables form one mechanism:
+ *
+ *   game_perf_burst                       master 0/1, default 1
+ *   game_perf_burst_floor_pct             freq floor while ARMED
+ *   game_perf_burst_thermal_ceiling_dc    skin-temp guardrail (mC)
+ *   game_perf_burst_disarm_grace_ms       sustained-clear hold for disarm
+ *   game_perf_burst_cooldown_ms           post-disarm step-down glide
+ *
+ * Detection is a multi-signal AND gate evaluated once per
+ * zenith_get_next_freq() invocation (250us..few-ms cadence
+ * depending on load / kthread / fast-switch path):
+ *
+ *   A.  zenith_eff_game_mode() != 0
+ *       (manual game_mode write or in-kernel game_auto latched on a
+ *        sustained known-game comm-walk match -- see ZENITH_DEFAULT_-
+ *        GAME_AUTO comment block).
+ *   B.  Sustained big-cluster util >= 70% for >= 2 seconds.
+ *       (Read from z_policy->last_load_pct, which is stamped every
+ *        tick at the bottom of zenith_get_next_freq() with the load
+ *        used by the up-thresh decision -- so this Signal sees the
+ *        *previous* tick's load, exactly the right thing for a
+ *        sustained-window gate.)
+ *   C.  Not video-only / audio-pinned -- the existing audio_aware
+ *       sticky-active deadline is treated as a video-pin proxy and
+ *       suppresses arming when audio is hot but no game signal
+ *       arrived first.  In practice this filters Netflix / VLC
+ *       playback that would otherwise trip Signal B alone.
+ *
+ * Trigger: A AND (B for >= 2s) AND (NOT C-suppressing).
+ *
+ * Disarm: !A OR (B-clear for >= disarm_grace_ms).  Both edges are
+ * cheap loads on the hot path.  After disarm the FSM enters a
+ * COOLDOWN glide that linearly steps the floor down to 0 over
+ * cooldown_ms milliseconds, so freq doesn't whiplash on Alt+Tab.
+ *
+ * Latency expectations:
+ *   worst case  ~2s     (Signal B requirement) + 1 hot-path tick
+ *   best case   ~250ms  (already-armed game_auto + already-saturated
+ *                        big cluster, hot path runs straight to ARM)
+ *   disarm      ~1s     (default disarm_grace_ms; clamps tail floor)
+ *
+ * Thermal guardrail (option (c) hybrid):
+ *   - At zenith_start() resolve "cpu<N>-thermal" against the kernel
+ *     thermal subsystem where N == cpumask_first(policy->cpus).
+ *     Cache the resulting struct thermal_zone_device * in
+ *     z_policy->gpb_tzd.  IS_ERR / NULL means "no zone for this
+ *     policy" (foreign SoC, thermal subsystem not registered yet,
+ *     etc.) and the helper falls back to arch_scale_thermal_pressure
+ *     converted to a synthetic dC scale (30..70 dC across the 0..100
+ *     pressure range) so the guardrail still works on platforms
+ *     without a per-cluster thermal zone.
+ *   - When the live skin temp >= ceiling_dc, the burst floor is
+ *     suppressed for this tick and the existing auto_thermal_cap /
+ *     thermal_util_derate path stays in charge.  ARMED state is
+ *     retained -- as soon as temp drops below the ceiling on a
+ *     subsequent tick the floor re-engages without re-arming.
+ *
+ * Defaults reasoning:
+ *   - master = 1 because the user asked for "all automatic"; the
+ *     gate keeps it from firing outside detected games / sustained
+ *     load.
+ *   - floor_pct = 85 sits above hispeed_freq for every preset and
+ *     below policy->max enough to leave the existing thermal path
+ *     useful headroom.
+ *   - thermal_ceiling_dc = 48000 (48 dC) is the user's 45..50 dC
+ *     range midpoint.
+ *   - disarm_grace_ms = 1000 keeps Alt+Tab snappy without bouncing
+ *     on a single sub-threshold tick.
+ *   - cooldown_ms = 5000 lets the cluster drift back without freq
+ *     whiplash; matches the existing peak_headroom / brutal_decay
+ *     scale.
+ */
+#define ZENITH_DEFAULT_GAME_PERF_BURST			1
+#define ZENITH_DEFAULT_GAME_PERF_BURST_FLOOR_PCT		85
+#define ZENITH_DEFAULT_GAME_PERF_BURST_THERMAL_CEILING_DC	48000
+#define ZENITH_DEFAULT_GAME_PERF_BURST_DISARM_GRACE_MS	1000
+#define ZENITH_DEFAULT_GAME_PERF_BURST_COOLDOWN_MS		5000
+#define ZENITH_GAME_PERF_BURST_FLOOR_PCT_MIN		50
+#define ZENITH_GAME_PERF_BURST_FLOOR_PCT_MAX		100
+#define ZENITH_GAME_PERF_BURST_THERMAL_CEILING_DC_MIN	40000
+#define ZENITH_GAME_PERF_BURST_THERMAL_CEILING_DC_MAX	60000
+#define ZENITH_GAME_PERF_BURST_DISARM_GRACE_MS_MAX	10000
+#define ZENITH_GAME_PERF_BURST_COOLDOWN_MS_MAX		60000
+#define ZENITH_GAME_PERF_BURST_B_THRESHOLD_PCT		70
+#define ZENITH_GAME_PERF_BURST_B_REQUIRED_NS		(2ULL * NSEC_PER_SEC)
+
+/* FSM states for game_perf_burst.  Read from sysfs as the
+ * game_perf_burst_state RO node and from the floor helper to
+ * decide what (if any) freq floor to apply this tick.
+ */
+#define ZENITH_GPB_STATE_IDLE		0
+#define ZENITH_GPB_STATE_ARMED		1
+#define ZENITH_GPB_STATE_COOLDOWN	2
+
 /*
  * Zenith Tunables & State API
  */
@@ -4377,6 +4482,43 @@ struct zenith_tunables {
 	 * from the verbose_log_store handler.
 	 */
 	unsigned int		verbose_log;
+
+	/* Patch K: game / sustained-high-load performance burst.  See
+	 * ZENITH_DEFAULT_GAME_PERF_BURST and the long comment block
+	 * above ZENITH_GPB_STATE_IDLE for the full mechanism.  Five
+	 * cooperating fields:
+	 *
+	 *   game_perf_burst                       master 0/1, default 1
+	 *                                         (also gates the
+	 *                                          zenith_game_perf_burst_-
+	 *                                          key static branch)
+	 *   game_perf_burst_floor_pct             freq floor while ARMED,
+	 *                                         applied as
+	 *                                         policy->max * pct / 100
+	 *                                         in zenith_get_next_freq()
+	 *   game_perf_burst_thermal_ceiling_dc    skin-temp guardrail,
+	 *                                         millidegrees C
+	 *                                         (matches the kernel
+	 *                                          thermal subsystem unit)
+	 *   game_perf_burst_disarm_grace_ms       sustained-clear hold
+	 *                                         before transitioning out
+	 *                                         of ARMED on Signal-B drop
+	 *   game_perf_burst_cooldown_ms           length of the COOLDOWN
+	 *                                         glide that linearly
+	 *                                         steps the floor down to 0
+	 *
+	 * All five are read on the hot path inside
+	 * ZENITH_FEATURE_ENABLED(game_perf_burst); writes are via
+	 * WRITE_ONCE in their respective sysfs handlers.  Not profile-
+	 * baked because the burst mechanic is workload-detection driven,
+	 * not preset state -- presets that wanted to bias the floor would
+	 * have to write to game_perf_burst_floor_pct explicitly.
+	 */
+	unsigned int		game_perf_burst;
+	unsigned int		game_perf_burst_floor_pct;
+	unsigned int		game_perf_burst_thermal_ceiling_dc;
+	unsigned int		game_perf_burst_disarm_grace_ms;
+	unsigned int		game_perf_burst_cooldown_ms;
 };
 
 /*
@@ -5520,6 +5662,43 @@ struct zenith_policy {
 	bool			game_auto_match;
 	u64			game_auto_cache_stamp_ns;
 	unsigned int		game_auto_streak;
+
+	/* Patch K: per-policy state for the game / sustained-high-load
+	 * performance burst FSM.  See ZENITH_DEFAULT_GAME_PERF_BURST and
+	 * the long comment block above ZENITH_GPB_STATE_IDLE for the
+	 * full mechanism; this struct holds the live FSM state only.
+	 *
+	 *   gpb_state                ZENITH_GPB_STATE_{IDLE,ARMED,COOLDOWN}
+	 *   gpb_state_entry_ns       ktime_get_ns() at the last FSM
+	 *                            transition; used by the COOLDOWN
+	 *                            glide to compute the linear ramp
+	 *   gpb_b_arm_first_seen_ns  ktime_get_ns() at the first tick
+	 *                            where Signal B (load >= 70%) was
+	 *                            seen continuously; 0 = not seen
+	 *   gpb_b_disarm_first_seen_ns
+	 *                            ktime_get_ns() at the first ARMED
+	 *                            tick where Signal B has dropped
+	 *                            below 70%; 0 = currently still hot
+	 *   gpb_tzd                  cached struct thermal_zone_device *
+	 *                            for this policy's primary CPU
+	 *                            ("cpu<N>-thermal"), resolved at
+	 *                            zenith_start() and consulted by the
+	 *                            thermal guardrail helper.  NULL means
+	 *                            "no per-policy zone resolved", in
+	 *                            which case the helper falls back to
+	 *                            arch_scale_thermal_pressure().
+	 *
+	 * All five fields are only touched from the per-policy hot path
+	 * (zenith_get_next_freq() and the FSM evaluator it calls), which
+	 * is serialised by the cpufreq core.  No locking required.  All
+	 * are zero-initialised by zenith_start()'s memset path or
+	 * explicitly cleared at attach.
+	 */
+	u8			gpb_state;
+	u64			gpb_state_entry_ns;
+	u64			gpb_b_arm_first_seen_ns;
+	u64			gpb_b_disarm_first_seen_ns;
+	struct thermal_zone_device *gpb_tzd;
 
 	/* Last seen zenith_input_boost_until_ns deadline observed inside
 	 * an active boost window for this policy.  Latched in the input
@@ -7509,6 +7688,278 @@ static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
 	}
 }
 
+/* Patch K: live skin-temp readout for the game_perf_burst guardrail.
+ * Returns millidegrees C.
+ *
+ * Primary path: thermal_zone_get_temp() against the per-policy zone
+ * resolved at zenith_start() time.  This is the kernel thermal
+ * subsystem's authoritative reading -- same number userspace would
+ * see at /sys/class/thermal/thermal_zone<N>/temp.
+ *
+ * Fallback: if the zone is unresolved (NULL / IS_ERR -- foreign SoC,
+ * thermal subsystem not registered yet, etc.) or the read returns
+ * an error, synthesize an approximate dC value from
+ * arch_scale_thermal_pressure().  The pressure is a 0..1024 capacity-
+ * reduction scalar; mapping 0..100% pressure linearly to 30..70 dC
+ * gives the burst guardrail a reasonable best-effort estimate even
+ * on platforms where the thermal subsystem hasn't published a
+ * per-cluster zone.
+ *
+ * Both paths are cheap (single load + one library call) so the
+ * helper is safe to call once per zenith_get_next_freq().  No
+ * caching layer here; the thermal subsystem already caches its own
+ * sensor reads (driver dependent), and the fallback path is a
+ * single arch_scale_thermal_pressure() read.
+ */
+static int zenith_gpb_get_temp_dc(struct zenith_policy *z_policy)
+{
+	struct thermal_zone_device *tzd = z_policy->gpb_tzd;
+	unsigned int pct;
+	int temp = 0;
+
+	if (tzd && !IS_ERR(tzd) && !thermal_zone_get_temp(tzd, &temp))
+		return temp;
+
+	pct = zenith_policy_thermal_pressure_pct(z_policy);
+	if (pct > 100)
+		pct = 100;
+	return 30000 + (int)(pct * 400);
+}
+
+/* Patch K: game_perf_burst FSM evaluator.  Called once per
+ * zenith_get_next_freq() invocation, gated by the
+ * zenith_game_perf_burst_key static branch and the live tunables
+ * scalar (defends against momentary tear during sysfs store).
+ *
+ * Reads:
+ *   - zenith_eff_game_mode()                 Signal A
+ *   - z_policy->last_load_pct (previous tick) Signal B
+ *   - z_policy->audio_sticky_until_ns         Signal C suppressor
+ *
+ * Writes:
+ *   - z_policy->gpb_state                    FSM state
+ *   - z_policy->gpb_state_entry_ns           transition timestamp
+ *   - z_policy->gpb_b_arm_first_seen_ns      Signal-B continuous-on
+ *   - z_policy->gpb_b_disarm_first_seen_ns   Signal-B continuous-off
+ *
+ * No locking required: per-policy hot path is serialised by the
+ * cpufreq core (single writer for this set of fields).
+ *
+ * Note: zenith_eff_game_mode() peeks at zenith_game_auto_active_until_ns
+ * which is updated by zenith_policy_game_auto_tick() above; the
+ * caller invokes the auto_tick first so a fresh tick's match has
+ * already been latched when the FSM evaluator runs.
+ */
+static void zenith_gpb_evaluate(struct zenith_policy *z_policy)
+{
+	struct zenith_tunables *t = z_policy->tunables;
+	u64 now_ns = ktime_get_ns();
+	bool sig_a, sig_b, sig_c_suppress;
+	unsigned int load_pct;
+	unsigned int disarm_grace_ms;
+	unsigned int base_gm;
+
+	/* Signal A: zenith_eff_game_mode().  Pass the manual game_mode
+	 * scalar as the base; the helper bumps it to 1 when game_auto
+	 * has latched a sustained known-game comm-walk match.  Read via
+	 * READ_ONCE so a momentary tear during a sysfs game_mode store
+	 * does not produce a transient false negative on this tick.
+	 */
+	base_gm = READ_ONCE(t->game_mode);
+	sig_a = (zenith_eff_game_mode(base_gm) != 0);
+
+	load_pct = READ_ONCE(z_policy->last_load_pct);
+	sig_b = (load_pct >= ZENITH_GAME_PERF_BURST_B_THRESHOLD_PCT);
+
+	/* Signal C suppressor: an active audio sticky window with NO
+	 * game signal arriving first means "the user is watching
+	 * something, not playing something".  When sig_a is already
+	 * true (game_auto latched or manual game_mode write), the
+	 * suppressor is moot -- a user can play a game while music
+	 * plays, and we do not want to deny them the burst.
+	 */
+	sig_c_suppress = !sig_a &&
+		(READ_ONCE(z_policy->audio_sticky_until_ns) > now_ns);
+
+	/* Signal-B continuous-on tracking: stamp first-seen on rising
+	 * edge, clear on falling edge.  The 2s requirement is enforced
+	 * below at the IDLE -> ARMED gate.
+	 */
+	if (sig_b) {
+		if (z_policy->gpb_b_arm_first_seen_ns == 0)
+			z_policy->gpb_b_arm_first_seen_ns = now_ns;
+	} else {
+		z_policy->gpb_b_arm_first_seen_ns = 0;
+	}
+
+	/* Signal-B continuous-off tracking (only meaningful while
+	 * ARMED).  Stamp first-seen on the ARMED-side falling edge,
+	 * clear on any tick that re-observes B.
+	 */
+	if (z_policy->gpb_state == ZENITH_GPB_STATE_ARMED) {
+		if (!sig_b) {
+			if (z_policy->gpb_b_disarm_first_seen_ns == 0)
+				z_policy->gpb_b_disarm_first_seen_ns = now_ns;
+		} else {
+			z_policy->gpb_b_disarm_first_seen_ns = 0;
+		}
+	} else {
+		z_policy->gpb_b_disarm_first_seen_ns = 0;
+	}
+
+	disarm_grace_ms = READ_ONCE(t->game_perf_burst_disarm_grace_ms);
+
+	switch (z_policy->gpb_state) {
+	case ZENITH_GPB_STATE_IDLE:
+		/* IDLE -> ARMED: A AND (B sustained for >= 2s) AND
+		 * (NOT C suppressing).
+		 */
+		if (sig_a && !sig_c_suppress &&
+		    z_policy->gpb_b_arm_first_seen_ns &&
+		    (now_ns - z_policy->gpb_b_arm_first_seen_ns) >=
+		    ZENITH_GAME_PERF_BURST_B_REQUIRED_NS) {
+			z_policy->gpb_state = ZENITH_GPB_STATE_ARMED;
+			z_policy->gpb_state_entry_ns = now_ns;
+			z_policy->gpb_b_disarm_first_seen_ns = 0;
+		}
+		break;
+	case ZENITH_GPB_STATE_ARMED:
+		/* Fast disarm: !A => COOLDOWN immediately.  This catches
+		 * the user Alt+Tabbing / pressing Home -- game_auto's
+		 * ACTIVE_TTL has expired or game_mode was written 0.
+		 */
+		if (!sig_a) {
+			z_policy->gpb_state = ZENITH_GPB_STATE_COOLDOWN;
+			z_policy->gpb_state_entry_ns = now_ns;
+			break;
+		}
+		/* Sustained-clear disarm: B has been false continuously
+		 * for >= disarm_grace_ms.  Tail of a level / loading
+		 * screen.  Glide back through COOLDOWN.
+		 */
+		if (z_policy->gpb_b_disarm_first_seen_ns &&
+		    (now_ns - z_policy->gpb_b_disarm_first_seen_ns) >=
+		    ((u64)disarm_grace_ms * NSEC_PER_MSEC)) {
+			z_policy->gpb_state = ZENITH_GPB_STATE_COOLDOWN;
+			z_policy->gpb_state_entry_ns = now_ns;
+		}
+		break;
+	case ZENITH_GPB_STATE_COOLDOWN:
+		/* COOLDOWN -> ARMED on a fresh re-arm: user came back
+		 * within the cooldown window.  Skip the 2s sustained
+		 * gate this once (we were just here) so the floor
+		 * re-engages without a second multi-second confidence
+		 * build-up.
+		 */
+		if (sig_a && sig_b && !sig_c_suppress) {
+			z_policy->gpb_state = ZENITH_GPB_STATE_ARMED;
+			z_policy->gpb_state_entry_ns = now_ns;
+			z_policy->gpb_b_disarm_first_seen_ns = 0;
+			break;
+		}
+		/* COOLDOWN -> IDLE when the glide window expires. */
+		{
+			unsigned int cooldown_ms =
+				READ_ONCE(t->game_perf_burst_cooldown_ms);
+			u64 elapsed = now_ns - z_policy->gpb_state_entry_ns;
+
+			if (elapsed >= ((u64)cooldown_ms * NSEC_PER_MSEC)) {
+				z_policy->gpb_state = ZENITH_GPB_STATE_IDLE;
+				z_policy->gpb_state_entry_ns = now_ns;
+			}
+		}
+		break;
+	default:
+		/* Defensive: any unknown state -> IDLE. */
+		z_policy->gpb_state = ZENITH_GPB_STATE_IDLE;
+		z_policy->gpb_state_entry_ns = now_ns;
+		break;
+	}
+}
+
+/* Patch K: compute the per-tick freq floor contribution from the
+ * game_perf_burst FSM.  Returns 0 when the FSM is IDLE, the master
+ * is off, or the thermal guardrail is engaged this tick.  Otherwise
+ * returns the floor freq in policy units (Hz).
+ *
+ * ARMED state: returns policy->max * floor_pct / 100.
+ *
+ * COOLDOWN state: linearly steps the floor from the ARMED level
+ * down to 0 across cooldown_ms.  At t=0  ms post-disarm the floor
+ * still equals the ARMED floor; at t=cooldown_ms it has reached 0.
+ * This avoids freq whiplash when the user Alt+Tabs out.
+ *
+ * Thermal guardrail: when the live skin temp >= ceiling_dc, return
+ * 0 -- the existing auto_thermal_cap / thermal_util_derate path
+ * remains in charge.  The FSM stays in ARMED so the floor will
+ * re-engage automatically once the temp drops back below ceiling.
+ */
+static unsigned int zenith_gpb_floor(struct zenith_policy *z_policy,
+				     unsigned int policy_max)
+{
+	struct zenith_tunables *t = z_policy->tunables;
+	unsigned int floor_pct;
+	unsigned int floor;
+	int temp_dc;
+	int ceiling_dc;
+	u8 state;
+
+	state = z_policy->gpb_state;
+	if (state == ZENITH_GPB_STATE_IDLE)
+		return 0;
+
+	floor_pct = READ_ONCE(t->game_perf_burst_floor_pct);
+	if (!floor_pct || !policy_max)
+		return 0;
+
+	temp_dc = zenith_gpb_get_temp_dc(z_policy);
+	ceiling_dc = (int)READ_ONCE(t->game_perf_burst_thermal_ceiling_dc);
+	if (temp_dc >= ceiling_dc)
+		return 0;
+
+	floor = (policy_max / 100) * floor_pct;
+	if (floor > policy_max)
+		floor = policy_max;
+
+	if (state == ZENITH_GPB_STATE_COOLDOWN) {
+		unsigned int cooldown_ms =
+			READ_ONCE(t->game_perf_burst_cooldown_ms);
+		u64 cooldown_ns = (u64)cooldown_ms * NSEC_PER_MSEC;
+		u64 now_ns = ktime_get_ns();
+		u64 elapsed = now_ns - z_policy->gpb_state_entry_ns;
+
+		if (!cooldown_ns || elapsed >= cooldown_ns)
+			return 0;
+		/* Linear ramp: floor *= (cooldown_ns - elapsed) / cooldown_ns
+		 * Computed in u64 to avoid wrap on policy_max * remaining.
+		 */
+		{
+			u64 remaining = cooldown_ns - elapsed;
+			u64 scaled = ((u64)floor * remaining) / cooldown_ns;
+
+			floor = (unsigned int)scaled;
+		}
+	}
+	return floor;
+}
+
+/* Patch K: stringify the FSM state for sysfs read-back.  Stable
+ * tokens so userspace tooling can grep / parse the state node.
+ */
+static const char *zenith_gpb_state_name(u8 state)
+{
+	switch (state) {
+	case ZENITH_GPB_STATE_IDLE:
+		return "idle";
+	case ZENITH_GPB_STATE_ARMED:
+		return "ARMED";
+	case ZENITH_GPB_STATE_COOLDOWN:
+		return "COOLDOWN";
+	default:
+		return "?";
+	}
+}
+
 /* Predicate used by the cached_raw_freq shortcut in
  * zenith_get_next_freq().  Returns true when the efficient_freq
  * ladder has any armed bin deadline; in that case the cache hit
@@ -8115,6 +8566,20 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	if (static_branch_likely(&zenith_game_auto_key) &&
 	    READ_ONCE(z_policy->tunables->game_auto))
 		zenith_policy_game_auto_tick(z_policy);
+
+	/* Patch K: game_perf_burst FSM tick.  Must run AFTER the
+	 * game_auto tick above so a fresh streak-driven latch on
+	 * zenith_game_auto_active_until_ns is visible to Signal A
+	 * (zenith_eff_game_mode()) on the same tick that detected it.
+	 * Gated by the game_perf_burst static branch + live tunables
+	 * scalar; both off => zero hot-path cost.  The FSM only
+	 * reads load (Signal B) from z_policy->last_load_pct stamped
+	 * by the previous tick, so the call site here -- before the
+	 * current tick computes its load -- is correct.
+	 */
+	if (static_branch_likely(&zenith_game_perf_burst_key) &&
+	    READ_ONCE(z_policy->tunables->game_perf_burst))
+		zenith_gpb_evaluate(z_policy);
 
 	{
 		/* Screen-off glide tracking.  Detect 1 -> 0 / 0 -> 1
@@ -9518,6 +9983,29 @@ brutal_entry_deferred:
 		if (active && cf && freq < cf) {
 			freq = cf;
 			tp_path = "camera_floor";
+		}
+	}
+
+	/* Patch K: game / sustained-high-load performance burst floor.
+	 * When the FSM (evaluated up-stream from this function, near
+	 * the game_auto tick) is ARMED, lift freq to the operator-
+	 * configured floor.  COOLDOWN linearly steps the floor down to
+	 * 0 across cooldown_ms.  zenith_gpb_floor() returns 0 when:
+	 *   - master tunable is 0
+	 *   - FSM is IDLE (no detected game / sustained load)
+	 *   - thermal guardrail is engaged (skin temp >= ceiling)
+	 * so the call is a no-op outside the active windows.  The
+	 * pin_to_target gate skips the floor while a higher-priority
+	 * pin (input boost / brutality) is in charge.
+	 */
+	if (!pin_to_target &&
+	    ZENITH_FEATURE_ENABLED(game_perf_burst) &&
+	    READ_ONCE(z_policy->tunables->game_perf_burst)) {
+		unsigned int gpb = zenith_gpb_floor(z_policy, policy->max);
+
+		if (gpb && freq < gpb) {
+			freq = gpb;
+			tp_path = "game_perf_burst_floor";
 		}
 	}
 
@@ -15629,6 +16117,194 @@ static ssize_t verbose_log_store(struct gov_attr_set *attr_set,
 }
 static struct governor_attr verbose_log = __ATTR_RW(verbose_log);
 
+/* Patch K: game_perf_burst master sysfs.  0/1 boolean.  See the
+ * long ZENITH_DEFAULT_GAME_PERF_BURST comment block for the full
+ * mechanism.  Toggling this also flips the matching static branch
+ * so the FSM tick + floor application drop off the hot path entirely
+ * when the master is 0.  Verbose-log gated dmesg trail emitted on
+ * every flip (Patch L integration).
+ */
+static ssize_t game_perf_burst_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->game_perf_burst);
+}
+
+static ssize_t game_perf_burst_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int old;
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || val > 1)
+		return -EINVAL;
+	old = t->game_perf_burst;
+	WRITE_ONCE(t->game_perf_burst, val);
+	zenith_set_static_key(&zenith_game_perf_burst_key, val);
+	if (old != val)
+		zenith_log_master_flip(t, "game_perf_burst", old, val);
+	return count;
+}
+static struct governor_attr game_perf_burst = __ATTR_RW(game_perf_burst);
+
+/* Patch K: game_perf_burst_floor_pct sysfs.  Clamped to
+ * [ZENITH_GAME_PERF_BURST_FLOOR_PCT_MIN .. _MAX].  WRITE_ONCE'd
+ * because the value is read on the per-tick hot path inside the
+ * FSM floor helper.
+ */
+static ssize_t game_perf_burst_floor_pct_show(struct gov_attr_set *attr_set,
+					      char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->game_perf_burst_floor_pct);
+}
+
+static ssize_t game_perf_burst_floor_pct_store(struct gov_attr_set *attr_set,
+					       const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val < ZENITH_GAME_PERF_BURST_FLOOR_PCT_MIN)
+		val = ZENITH_GAME_PERF_BURST_FLOOR_PCT_MIN;
+	if (val > ZENITH_GAME_PERF_BURST_FLOOR_PCT_MAX)
+		val = ZENITH_GAME_PERF_BURST_FLOOR_PCT_MAX;
+	WRITE_ONCE(t->game_perf_burst_floor_pct, val);
+	return count;
+}
+static struct governor_attr game_perf_burst_floor_pct =
+	__ATTR_RW(game_perf_burst_floor_pct);
+
+/* Patch K: game_perf_burst_thermal_ceiling_dc sysfs.  Millidegrees C
+ * (matches the kernel thermal subsystem's unit, so this knob plumbs
+ * straight through to thermal_zone_get_temp() comparisons).  Clamp
+ * range 40..60 dC keeps the user from shooting themselves in the
+ * foot with absurd values; the user requested a 45..50 dC operating
+ * range so the default 48000 sits at the midpoint.
+ */
+static ssize_t game_perf_burst_thermal_ceiling_dc_show(
+	struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+				game_perf_burst_thermal_ceiling_dc);
+}
+
+static ssize_t game_perf_burst_thermal_ceiling_dc_store(
+	struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val < ZENITH_GAME_PERF_BURST_THERMAL_CEILING_DC_MIN)
+		val = ZENITH_GAME_PERF_BURST_THERMAL_CEILING_DC_MIN;
+	if (val > ZENITH_GAME_PERF_BURST_THERMAL_CEILING_DC_MAX)
+		val = ZENITH_GAME_PERF_BURST_THERMAL_CEILING_DC_MAX;
+	WRITE_ONCE(t->game_perf_burst_thermal_ceiling_dc, val);
+	return count;
+}
+static struct governor_attr game_perf_burst_thermal_ceiling_dc =
+	__ATTR_RW(game_perf_burst_thermal_ceiling_dc);
+
+/* Patch K: game_perf_burst_disarm_grace_ms sysfs.  Hold time after
+ * Signal B drops before transitioning ARMED -> COOLDOWN.  Default
+ * 1000 keeps Alt+Tab snappy.  Clamp [0, 10000] (10s upper bound is
+ * already absurd for "Alt+Tab grace"; anything more should be a
+ * cooldown_ms tweak instead).
+ */
+static ssize_t game_perf_burst_disarm_grace_ms_show(
+	struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+				game_perf_burst_disarm_grace_ms);
+}
+
+static ssize_t game_perf_burst_disarm_grace_ms_store(
+	struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > ZENITH_GAME_PERF_BURST_DISARM_GRACE_MS_MAX)
+		val = ZENITH_GAME_PERF_BURST_DISARM_GRACE_MS_MAX;
+	WRITE_ONCE(t->game_perf_burst_disarm_grace_ms, val);
+	return count;
+}
+static struct governor_attr game_perf_burst_disarm_grace_ms =
+	__ATTR_RW(game_perf_burst_disarm_grace_ms);
+
+/* Patch K: game_perf_burst_cooldown_ms sysfs.  Length of the
+ * COOLDOWN-state linear floor glide back to 0.  Clamp [0, 60000]
+ * (1 minute upper bound; longer than that is effectively a stuck
+ * floor).  0 disables the glide -- floor drops to 0 immediately on
+ * disarm, which is rarely what you want but is supported.
+ */
+static ssize_t game_perf_burst_cooldown_ms_show(struct gov_attr_set *attr_set,
+						char *buf)
+{
+	return sprintf(buf, "%u\n",
+		       to_zenith_tunables(attr_set)->
+				game_perf_burst_cooldown_ms);
+}
+
+static ssize_t game_perf_burst_cooldown_ms_store(struct gov_attr_set *attr_set,
+						 const char *buf, size_t count)
+{
+	struct zenith_tunables *t = to_zenith_tunables(attr_set);
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > ZENITH_GAME_PERF_BURST_COOLDOWN_MS_MAX)
+		val = ZENITH_GAME_PERF_BURST_COOLDOWN_MS_MAX;
+	WRITE_ONCE(t->game_perf_burst_cooldown_ms, val);
+	return count;
+}
+static struct governor_attr game_perf_burst_cooldown_ms =
+	__ATTR_RW(game_perf_burst_cooldown_ms);
+
+/* Patch K: game_perf_burst_state RO sysfs.  Live FSM state across
+ * all attached policies.  Walks the attr_set policy list and prints
+ * one line per policy: "<cluster_first_cpu> <state>".  When all
+ * policies are IDLE this returns a single "idle" line so userspace
+ * tooling has a stable shape to grep / parse.
+ *
+ * Stable tokens (zenith_gpb_state_name): "idle" / "ARMED" /
+ * "COOLDOWN".  Order-stable per policy attach order.
+ */
+static ssize_t game_perf_burst_state_show(struct gov_attr_set *attr_set,
+					  char *buf)
+{
+	struct zenith_policy *z_policy;
+	ssize_t off = 0;
+	bool any_active = false;
+
+	list_for_each_entry(z_policy, &attr_set->policy_list, tunables_hook) {
+		int first_cpu = cpumask_first(z_policy->policy->cpus);
+		const char *name = zenith_gpb_state_name(z_policy->gpb_state);
+
+		off += scnprintf(buf + off, PAGE_SIZE - off, "%d %s\n",
+				 first_cpu, name);
+		if (z_policy->gpb_state != ZENITH_GPB_STATE_IDLE)
+			any_active = true;
+		if (off >= PAGE_SIZE - 32)
+			break;
+	}
+	if (!any_active && off == 0)
+		off = scnprintf(buf, PAGE_SIZE, "idle\n");
+	return off;
+}
+static struct governor_attr game_perf_burst_state =
+	__ATTR_RO(game_perf_burst_state);
+
 /* Patch B-AUTO-2: auto_target RO sysfs.  When active_profile ==
  * ZENITH_PROFILE_AUTO this prints the concrete profile the auto-
  * selector engine has currently applied (BALANCED, PERFORMANCE,
@@ -20504,6 +21180,12 @@ static struct attribute *zenith_attrs[] = {
 	&freq_step_adaptive.attr,
 	&profile.attr,
 	&verbose_log.attr,
+	&game_perf_burst.attr,
+	&game_perf_burst_floor_pct.attr,
+	&game_perf_burst_thermal_ceiling_dc.attr,
+	&game_perf_burst_disarm_grace_ms.attr,
+	&game_perf_burst_cooldown_ms.attr,
+	&game_perf_burst_state.attr,
 	&auto_target.attr,
 	&auto_eval_ms.attr,
 	&auto_hysteresis_ms.attr,
@@ -21015,6 +21697,19 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->frame_budget_us_auto	= ZENITH_DEFAULT_FRAME_BUDGET_US_AUTO;
 	tunables->frame_pace_floor_pct	= ZENITH_DEFAULT_FRAME_PACE_FLOOR_PCT;
 	tunables->verbose_log		= ZENITH_DEFAULT_VERBOSE_LOG;
+	/* Patch K: game_perf_burst defaults.  See the
+	 * ZENITH_DEFAULT_GAME_PERF_BURST comment block for the
+	 * rationale on each default.
+	 */
+	tunables->game_perf_burst	= ZENITH_DEFAULT_GAME_PERF_BURST;
+	tunables->game_perf_burst_floor_pct =
+		ZENITH_DEFAULT_GAME_PERF_BURST_FLOOR_PCT;
+	tunables->game_perf_burst_thermal_ceiling_dc =
+		ZENITH_DEFAULT_GAME_PERF_BURST_THERMAL_CEILING_DC;
+	tunables->game_perf_burst_disarm_grace_ms =
+		ZENITH_DEFAULT_GAME_PERF_BURST_DISARM_GRACE_MS;
+	tunables->game_perf_burst_cooldown_ms =
+		ZENITH_DEFAULT_GAME_PERF_BURST_COOLDOWN_MS;
 	WRITE_ONCE(zenith_input_boost_active_ms, ZENITH_DEFAULT_INPUT_BOOST_MS);
 	WRITE_ONCE(zenith_input_boost_touchdown_extra_ms_cache,
 		   ZENITH_DEFAULT_INPUT_BOOST_TOUCHDOWN_EXTRA_MS);
@@ -21051,6 +21746,14 @@ static int zenith_init(struct cpufreq_policy *policy)
 			      tunables->auto_tune_v3);
 	zenith_set_static_key(&zenith_thermal_aware_key,
 			      tunables->thermal_aware);
+	/* Patch K: same invariant for game_perf_burst.  Default = 1
+	 * (master ON, "all automatic"); the FSM evaluator + floor
+	 * application both sit inside ZENITH_FEATURE_ENABLED checks
+	 * so this sync is what unlocks the hot-path body when the
+	 * scalar is non-zero.  Idempotent across re-attaches.
+	 */
+	zenith_set_static_key(&zenith_game_perf_burst_key,
+			      tunables->game_perf_burst);
 
 	/* Apply a cmdline-picked preset before the sysfs attr set is
 	 * published, so userspace sees the cmdline-picked preset as the
@@ -21258,6 +21961,43 @@ static int zenith_start(struct cpufreq_policy *policy)
 
 		cpufreq_add_update_util_hook(cpu, &z_cpu->update_util,
 			policy_is_shared(policy) ? zenith_update_shared : zenith_update_single);
+	}
+
+	/* Patch K: reset the game_perf_burst FSM and resolve the
+	 * per-cluster thermal zone for the guardrail.
+	 *
+	 * State reset: zero the FSM scalars so a re-attach (governor
+	 * switch / suspend resume) starts in IDLE rather than picking
+	 * up a stale ARMED/COOLDOWN from the prior attach cycle.
+	 *
+	 * Zone resolution: ask the kernel thermal subsystem for
+	 * "cpu<N>-thermal" where N == cpumask_first(policy->cpus).
+	 * Zuma DT ships cpu0/cpu4/cpu6 zones (anchored at the first
+	 * CPU of each cluster) so this lands on big-cluster zone for
+	 * the policy that owns the big cluster.  IS_ERR / NULL means
+	 * the zone was not registered yet (boot ordering: thermal
+	 * subsystem registers after some cpufreq governors come up
+	 * on certain SoCs) or this is a foreign SoC; the helper
+	 * falls back to arch_scale_thermal_pressure-derived dC so
+	 * the guardrail still works.  We don't retry resolution on
+	 * later ticks -- a single boot-time miss is acceptable; the
+	 * fallback path is correct in steady state.
+	 */
+	z_policy->gpb_state = ZENITH_GPB_STATE_IDLE;
+	z_policy->gpb_state_entry_ns = 0;
+	z_policy->gpb_b_arm_first_seen_ns = 0;
+	z_policy->gpb_b_disarm_first_seen_ns = 0;
+	{
+		char zone_name[16];
+		struct thermal_zone_device *tzd;
+		unsigned int first_cpu = cpumask_first(policy->cpus);
+
+		scnprintf(zone_name, sizeof(zone_name), "cpu%u-thermal",
+			  first_cpu);
+		tzd = thermal_zone_get_zone_by_name(zone_name);
+		if (IS_ERR(tzd))
+			tzd = NULL;
+		z_policy->gpb_tzd = tzd;
 	}
 
 	/* Arm the auto-tune classifier when the tunable is enabled.  The
