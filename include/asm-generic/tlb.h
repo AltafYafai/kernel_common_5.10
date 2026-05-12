@@ -46,8 +46,7 @@
  *
  * The mmu_gather API consists of:
  *
- *  - tlb_gather_mmu() / tlb_gather_mmu_vma() / tlb_finish_mmu(); start and
- *    finish a mmu_gather
+ *  - tlb_gather_mmu() / tlb_finish_mmu(); start and finish a mmu_gather
  *
  *    Finish in particular will issue a (final) TLB invalidate and free
  *    all (remaining) queued pages.
@@ -292,20 +291,6 @@ struct mmu_gather {
 	unsigned int		vma_exec : 1;
 	unsigned int		vma_huge : 1;
 
-	/*
-	 * Did we unshare (unmap) any shared page tables? For now only
-	 * used for hugetlb PMD table sharing.
-	 */
-	unsigned int		unshared_tables : 1;
-
-	/*
-	 * Did we unshare any page tables such that they are now exclusive
-	 * and could get reused+modified by the new owner? When setting this
-	 * flag, "unshared_tables" will be set as well. For now only used
-	 * for hugetlb PMD table sharing.
-	 */
-	unsigned int		fully_unshared_tables : 1;
-
 	unsigned int		batch_count;
 
 #ifndef CONFIG_MMU_GATHER_NO_GATHER
@@ -342,7 +327,6 @@ static inline void __tlb_reset_range(struct mmu_gather *tlb)
 	tlb->cleared_pmds = 0;
 	tlb->cleared_puds = 0;
 	tlb->cleared_p4ds = 0;
-	tlb->unshared_tables = 0;
 	/*
 	 * Do not reset mmu_gather::vma_* fields here, we do not
 	 * call into tlb_start_vma() again to set them if there is an
@@ -438,7 +422,7 @@ static inline void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
 	 * these bits.
 	 */
 	if (!(tlb->freed_tables || tlb->cleared_ptes || tlb->cleared_pmds ||
-	      tlb->cleared_puds || tlb->cleared_p4ds || tlb->unshared_tables))
+	      tlb->cleared_puds || tlb->cleared_p4ds))
 		return;
 
 	tlb_flush(tlb);
