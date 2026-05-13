@@ -1542,18 +1542,95 @@ static int __init hikari_init(void)
 		static_key_enabled(&hikari_active_key.key) ? "on" : "off");
 
 	/*
-	 * Hikari boot signature.  The full ridge narrative lives in the
-	 * Zenith governor's banner (kernel/sched/cpufreq_zenith.c,
-	 * `Zenith :` prefix).  This small block adds a `Hikari :`-prefixed
-	 * stamp so dmesg | grep -E 'Hikari :' still finds the subsystem
-	 * even if the Zenith banner scrolled past or the ring buffer
-	 * wrapped.  Six lines, byte-stable, all under one pr_fmt prefix.
+	 * Hikari boot banner.  Full mythic + mechanism narrative
+	 * emitted once at init.  Single 'Hikari : ' prefix on every
+	 * line so the whole banner is grep-stable; ASCII relationship
+	 * diagrams show how this subsystem composes with the others.
 	 */
-	pr_info("Hikari : 光\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari : when the world stirs, the ridge wakes first.\n");
+	pr_info("Hikari : the first photon over the spine of the mountain is the wake-up call.\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :     __  ___ __              _\n");
+	pr_info("Hikari :    / / / (_) /______ ______(_)\n");
+	pr_info("Hikari :   / /_/ / / //_/ __ `/ ___/ /\n");
+	pr_info("Hikari :  / __  / / ,< / /_/ / /  / /\n");
+	pr_info("Hikari : /_/ /_/_/_/|_|\\__,_/_/  /_/\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :                        光\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :          ----  what Hikari is  ----\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari : a scheduler-side waker.  it measures, per task, the time between\n");
+	pr_info("Hikari : 'this task became runnable' and 'this task actually started running'.\n");
+	pr_info("Hikari : when that wait grows, Hikari publishes a temporary frequency floor\n");
+	pr_info("Hikari : hint to the Zenith governor so the next wake won't see the same wait.\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :          ----  how the breath works  ----\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :            +------------------+\n");
+	pr_info("Hikari :            |  task enqueue    |\n");
+	pr_info("Hikari :            |  hikari_on_enqueue\n");
+	pr_info("Hikari :            +--------+---------+\n");
+	pr_info("Hikari :                     |\n");
+	pr_info("Hikari :               stamp wake_ns\n");
+	pr_info("Hikari :                     |\n");
+	pr_info("Hikari :            +--------v---------+\n");
+	pr_info("Hikari :            |  task dequeue    |\n");
+	pr_info("Hikari :            |  hikari_on_dequeue\n");
+	pr_info("Hikari :            +--------+---------+\n");
+	pr_info("Hikari :                     |\n");
+	pr_info("Hikari :              delta = now - wake_ns\n");
+	pr_info("Hikari :                     |\n");
+	pr_info("Hikari :                   EWMA\n");
+	pr_info("Hikari :               (shift = 3)\n");
+	pr_info("Hikari :                     |\n");
+	pr_info("Hikari :             delta > threshold ?\n");
+	pr_info("Hikari :                     |\n");
+	pr_info("Hikari :                  yes -> publish floor hint\n");
+	pr_info("Hikari :                                  |\n");
+	pr_info("Hikari :                                  v\n");
+	pr_info("Hikari :                        +------------------+\n");
+	pr_info("Hikari :                        |  Zenith governor |\n");
+	pr_info("Hikari :                        |  honors floor    |\n");
+	pr_info("Hikari :                        +--------+---------+\n");
+	pr_info("Hikari :                                 |\n");
+	pr_info("Hikari :                           set min freq\n");
+	pr_info("Hikari :                               for TTL\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :          ----  the gates  ----\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari : every entry into a Hikari hot path is gated by a static_key:\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :     if (!static_key_false(&hikari_active_key)) goto out;\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari : flipped off when /sys/kernel/hikari/enable is 0.  the cost of \"off\"\n");
+	pr_info("Hikari : is a single not-taken branch.  no atomic reads on the cold case.\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari : a kill flag layered on top:  any code path can call\n");
+	pr_info("Hikari : hikari_self_disable(REASON) and from that moment the static key is\n");
+	pr_info("Hikari : flipped off and stays off until userspace clears the flag.\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :          ----  why opt-in  ----\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari : backgrounds outnumber foregrounds by 200x.  if Hikari fired for\n");
+	pr_info("Hikari : every task in the system the wakelist would thrash.  HIKARI_FLAG_OPT_IN\n");
+	pr_info("Hikari : is set automatically when a task enters top-app via the cgroup\n");
+	pr_info("Hikari : hook, and cleared when it leaves.  audio and pipewire threads can\n");
+	pr_info("Hikari : opt-in explicitly via the /proc/<pid>/hikari_audio tag.\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :          ----  what Hikari does not do  ----\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari : Hikari never changes which CPU a task runs on except through the\n");
+	pr_info("Hikari : existing big-cluster placement hint -- which is just a hint, the\n");
+	pr_info("Hikari : core scheduler still decides.  Hikari never changes uclamp values\n");
+	pr_info("Hikari : except via the documented boost/ceiling tunables.  Hikari never\n");
+	pr_info("Hikari : delays a wake -- it can only ask cpufreq to be ready *next* time.\n");
+	pr_info("Hikari : \n");
+	pr_info("Hikari :          ----  one breath, one wake  ----\n");
+	pr_info("Hikari : \n");
 	pr_info("Hikari : light over the ridge.\n");
-	pr_info("Hikari : the breath that wakes scheduling on demand.\n");
-	pr_info("Hikari : opt-in, lazy, gated by a static key.\n");
-	pr_info("Hikari : kill switch always honored.\n");
+	pr_info("Hikari : \n");
 	pr_info("Hikari : built by XTENSEI.\n");
 
 	return 0;
