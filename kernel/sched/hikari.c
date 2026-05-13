@@ -261,8 +261,13 @@ static inline void hikari_lazy_topapp_update(struct task_struct *p)
 	if (in_topapp && !(flags & HIKARI_FLAG_FOREGROUND))
 		hikari_set_flag(p, HIKARI_FLAG_FOREGROUND | HIKARI_FLAG_OPT_IN,
 				true);
-	else if (!in_topapp && (flags & HIKARI_FLAG_FOREGROUND))
-		hikari_set_flag(p, HIKARI_FLAG_FOREGROUND, false);
+	else if (!in_topapp && (flags & HIKARI_FLAG_FOREGROUND)) {
+		u32 clear = HIKARI_FLAG_FOREGROUND;
+
+		if (READ_ONCE(hikari_topapp_auto_optout))
+			clear |= HIKARI_FLAG_OPT_IN;
+		hikari_set_flag(p, clear, false);
+	}
 #endif
 }
 
@@ -718,6 +723,15 @@ static struct ctl_table hikari_sysctl_table[] = {
 	{
 		.procname	= "hikari_audio_intensify",
 		.data		= &hikari_audio_intensify,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= (void *)&hikari_uint_zero,
+		.extra2		= (void *)&hikari_uint_one,
+	},
+	{
+		.procname	= "hikari_topapp_auto_optout",
+		.data		= &hikari_topapp_auto_optout,
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
 		.proc_handler	= proc_douintvec_minmax,
