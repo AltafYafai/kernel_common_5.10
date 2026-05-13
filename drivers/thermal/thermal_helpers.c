@@ -18,6 +18,7 @@
 #include <linux/init.h>
 #include <linux/kobject.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
 
@@ -50,6 +51,59 @@ static unsigned int kasumi_ceiling_mc __read_mostly = 95000;  /* 95 C  */
 static int kasumi_last_real_mc        __read_mostly;
 static int kasumi_last_reported_mc    __read_mostly;
 static int kasumi_applied_offset_mc   __read_mostly;
+
+/*
+ * Zone-type filter.  Comma-separated list of thermal_zone types.
+ *   ""                       (default)  apply to all zones
+ *   "mtktscpu,mtktspmic"     whitelist  apply only to listed zones
+ *   "-battery,mtktsbattery"  blacklist  apply to all EXCEPT listed zones
+ *
+ * Protected by kasumi_filter_lock.  The hot path takes a stack-local
+ * snapshot under the lock and parses without it.
+ */
+#define KASUMI_FILTER_LEN 256
+static char kasumi_zone_filter_buf[KASUMI_FILTER_LEN];
+static DEFINE_SPINLOCK(kasumi_filter_lock);
+
+static bool kasumi_zone_allowed(const char *zone_type)
+{
+	char snapshot[KASUMI_FILTER_LEN];
+	char *p, *tok;
+	bool blacklist;
+	unsigned long flags;
+
+	if (!zone_type)
+		return true;
+
+	spin_lock_irqsave(&kasumi_filter_lock, flags);
+	strscpy(snapshot, kasumi_zone_filter_buf, sizeof(snapshot));
+	spin_unlock_irqrestore(&kasumi_filter_lock, flags);
+
+	if (snapshot[0] == '\0')
+		return true;
+
+	blacklist = (snapshot[0] == '-');
+	p = snapshot + (blacklist ? 1 : 0);
+
+	while ((tok = strsep(&p, ",")) != NULL) {
+		size_t len = strlen(tok);
+
+		while (len > 0 &&
+		       (tok[len - 1] == ' ' ||
+			tok[len - 1] == '\t' ||
+			tok[len - 1] == '\n' ||
+			tok[len - 1] == '\r'))
+			tok[--len] = '\0';
+		while (*tok == ' ' || *tok == '\t')
+			tok++;
+		if (*tok == '\0')
+			continue;
+		if (!strcmp(tok, zone_type))
+			return !blacklist;
+	}
+
+	return blacklist;
+}
 
 static int kasumi_dampen(int real)
 {
@@ -187,8 +241,8 @@ int thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp)
 			*temp = tz->emul_temperature;
 	}
 
-	/* Kasumi thermal dampening */
-	if (!ret)
+	/* Kasumi thermal dampening (skip zones excluded by zone_filter) */
+	if (!ret && kasumi_zone_allowed(tz->type))
 		*temp = kasumi_dampen(*temp);
 
 	mutex_unlock(&tz->lock);
@@ -368,6 +422,41 @@ KASUMI_ATTR_RO(last_real_mc,       kasumi_last_real_mc);
 KASUMI_ATTR_RO(last_reported_mc,   kasumi_last_reported_mc);
 KASUMI_ATTR_RO(applied_offset_mc,  kasumi_applied_offset_mc);
 
+static ssize_t zone_filter_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	unsigned long flags;
+	ssize_t ret;
+
+	spin_lock_irqsave(&kasumi_filter_lock, flags);
+	ret = sysfs_emit(buf, "%s\n", kasumi_zone_filter_buf);
+	spin_unlock_irqrestore(&kasumi_filter_lock, flags);
+	return ret;
+}
+
+static ssize_t zone_filter_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	unsigned long flags;
+	size_t len = count;
+
+	if (len >= KASUMI_FILTER_LEN)
+		return -E2BIG;
+
+	spin_lock_irqsave(&kasumi_filter_lock, flags);
+	memcpy(kasumi_zone_filter_buf, buf, len);
+	kasumi_zone_filter_buf[len] = '\0';
+	/* strip a single trailing newline so 'echo "..." > zone_filter' DTRT */
+	if (len > 0 && kasumi_zone_filter_buf[len - 1] == '\n')
+		kasumi_zone_filter_buf[len - 1] = '\0';
+	spin_unlock_irqrestore(&kasumi_filter_lock, flags);
+	return count;
+}
+
+static struct kobj_attribute kasumi_zone_filter_attr =
+	__ATTR(zone_filter, 0644, zone_filter_show, zone_filter_store);
+
 static struct attribute *kasumi_attrs[] = {
 	&kasumi_enabled_attr.attr,
 	&kasumi_offset_mc_attr.attr,
@@ -376,6 +465,7 @@ static struct attribute *kasumi_attrs[] = {
 	&kasumi_last_real_mc_attr.attr,
 	&kasumi_last_reported_mc_attr.attr,
 	&kasumi_applied_offset_mc_attr.attr,
+	&kasumi_zone_filter_attr.attr,
 	NULL,
 };
 
