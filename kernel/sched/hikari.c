@@ -108,6 +108,8 @@ static unsigned int hikari_floor_ttl_ms = 50;
 static unsigned int hikari_placement_enable;
 static unsigned int hikari_audio_intensify = 1;
 static unsigned int hikari_topapp_auto_optin = 1;
+static unsigned int hikari_topapp_auto_optout;
+static unsigned int hikari_ewma_shift = 3;
 
 static const unsigned int hikari_uint_zero = 0;
 static const unsigned int hikari_uint_one  = 1;
@@ -120,6 +122,8 @@ static const unsigned int hikari_floor_khz_max_c0 = 2000000;
 static const unsigned int hikari_floor_khz_max_c1 = 3000000;
 static const unsigned int hikari_floor_ttl_min = 1;
 static const unsigned int hikari_floor_ttl_max = 500;
+static const unsigned int hikari_ewma_shift_min = 1;
+static const unsigned int hikari_ewma_shift_max = 7;
 
 /*
  * Master state.
@@ -446,14 +450,27 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 	delta = now32 - last;
 
 	/*
-	 * EWMA with alpha = 1/8.  new = (7*old + delta) / 8.
+	 * EWMA with tunable alpha = 1/(1<<shift).  Default shift=3
+	 * gives alpha=1/8: new = (7*old + delta) / 8.  Lower shift
+	 * = more reactive, higher = lazier smoothing.
 	 * Saturates at U32_MAX naturally because all values are u32.
 	 */
-	ewma = READ_ONCE(p->hikari_wait_ewma_ns);
-	if (ewma > U32_MAX - delta) {
-		ewma = U32_MAX;
-	} else {
-		ewma = ((ewma * 7) + delta) / 8;
+	{
+		unsigned int shift = READ_ONCE(hikari_ewma_shift);
+		u32 weight;
+
+		if (shift < hikari_ewma_shift_min)
+			shift = hikari_ewma_shift_min;
+		if (shift > hikari_ewma_shift_max)
+			shift = hikari_ewma_shift_max;
+		weight = (1u << shift) - 1;
+
+		ewma = READ_ONCE(p->hikari_wait_ewma_ns);
+		if (ewma > U32_MAX - delta) {
+			ewma = U32_MAX;
+		} else {
+			ewma = ((ewma * weight) + delta) >> shift;
+		}
 	}
 	WRITE_ONCE(p->hikari_wait_ewma_ns, ewma);
 	WRITE_ONCE(p->hikari_last_enqueue_ns, 0);
@@ -706,6 +723,15 @@ static struct ctl_table hikari_sysctl_table[] = {
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1		= (void *)&hikari_uint_zero,
 		.extra2		= (void *)&hikari_uint_one,
+	},
+	{
+		.procname	= "hikari_ewma_shift",
+		.data		= &hikari_ewma_shift,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= (void *)&hikari_ewma_shift_min,
+		.extra2		= (void *)&hikari_ewma_shift_max,
 	},
 	{
 		.procname	= "hikari_topapp_auto_optin",
