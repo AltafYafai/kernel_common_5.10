@@ -140,6 +140,19 @@ static unsigned int hikari_enable_value = 1;
 static unsigned int hikari_wake_threshold_us = 1000;
 static unsigned int hikari_uclamp_boost_pct = 30;
 static unsigned int hikari_uclamp_ttl_ms = 16;
+/*
+ * uclamp_max ceiling for HIKARI_FLAG_BACKGROUND tasks.  Expressed as
+ * a percentage of SCHED_CAPACITY_SCALE (1024 on arm64); 0 means "no
+ * ceiling, apply the platform uclamp_max as usual".  Sticky -- there
+ * is no TTL because background-ness is a state, not an event.  A
+ * task only sees this ceiling when its HIKARI_FLAG_BACKGROUND bit is
+ * set; clearing the bit removes the ceiling on the next uclamp_eff
+ * read.
+ *
+ * Bounded 0..100; the apply path clamps to SCHED_CAPACITY_SCALE
+ * anyway for paranoia.
+ */
+static unsigned int hikari_uclamp_max_pct;
 static unsigned int hikari_floor_khz_cluster0 = 800000;
 static unsigned int hikari_floor_khz_cluster1 = 1200000;
 static unsigned int hikari_floor_ttl_ms = 50;
@@ -167,6 +180,7 @@ static const unsigned int hikari_threshold_max = 100000;
 static const unsigned int hikari_boost_pct_max = 50;
 static const unsigned int hikari_uclamp_ttl_min = 1;
 static const unsigned int hikari_uclamp_ttl_max = 200;
+static const unsigned int hikari_uclamp_max_pct_max = 100;
 static const unsigned int hikari_floor_khz_max_c0 = 2000000;
 static const unsigned int hikari_floor_khz_max_c1 = 3000000;
 static const unsigned int hikari_floor_ttl_min = 1;
@@ -386,6 +400,44 @@ static inline unsigned int hikari_uclamp_boost_value(void)
  * boosting on this task, or 0 if no boost is active.  Safe to call
  * from the uclamp_eff_get() hot path.
  */
+/*
+ * Per-task uclamp_max ceiling for HIKARI_FLAG_BACKGROUND tasks.
+ * Returns the SCHED_CAPACITY-scaled clamp value, or 0 when no
+ * ceiling should be applied.  Cheap on the hot path -- two reads
+ * and a flag check; SCHED_CAPACITY_SCALE is the divisor so this
+ * compiles to a simple shift+mul on most archs.
+ *
+ * The order of checks here matters: the percentage tunable is the
+ * gate, so a 0 there short-circuits before we even read the
+ * per-task flags.  Lets the master switch ('off') cost a single
+ * READ_ONCE plus a branch.
+ */
+unsigned int hikari_uclamp_max_ceiling(struct task_struct *p)
+{
+	unsigned int pct;
+	unsigned int ceiling;
+
+	if (!hikari_enabled())
+		return 0;
+	if (!p)
+		return 0;
+
+	pct = READ_ONCE(hikari_uclamp_max_pct);
+	if (!pct)
+		return 0;
+	if (pct > 100)
+		pct = 100;
+
+	if (!(READ_ONCE(p->hikari_flags) & HIKARI_FLAG_BACKGROUND))
+		return 0;
+
+	ceiling = (SCHED_CAPACITY_SCALE * pct) / 100U;
+	if (ceiling > SCHED_CAPACITY_SCALE)
+		ceiling = SCHED_CAPACITY_SCALE;
+	return ceiling;
+}
+EXPORT_SYMBOL_GPL(hikari_uclamp_max_ceiling);
+
 unsigned int hikari_uclamp_boost_amount(struct task_struct *p)
 {
 	u32 until;
@@ -798,8 +850,32 @@ void hikari_mark_foreground(struct task_struct *p, bool tagged)
 	 */
 	if (tagged && READ_ONCE(hikari_topapp_auto_optin))
 		hikari_set_flag(p, HIKARI_FLAG_OPT_IN, true);
+
+	/*
+	 * Foreground and background are mutually exclusive states.
+	 * Tagging foreground clears any existing background tag so a
+	 * task that flips between the two cgroups never carries the
+	 * stale ceiling.  Untagging foreground does NOT auto-set
+	 * background -- userspace (or a vendor hook) is responsible
+	 * for the explicit background tag.
+	 */
+	if (tagged)
+		hikari_set_flag(p, HIKARI_FLAG_BACKGROUND, false);
 }
 EXPORT_SYMBOL_GPL(hikari_mark_foreground);
+
+void hikari_mark_background(struct task_struct *p, bool tagged)
+{
+	hikari_set_flag(p, HIKARI_FLAG_BACKGROUND, tagged);
+
+	/*
+	 * Symmetric mutual-exclusion with hikari_mark_foreground:
+	 * tagging background clears any foreground tag.
+	 */
+	if (tagged)
+		hikari_set_flag(p, HIKARI_FLAG_FOREGROUND, false);
+}
+EXPORT_SYMBOL_GPL(hikari_mark_background);
 
 /* ------------------------------------------------------------ */
 /* Notifier registration.                                       */
@@ -888,6 +964,15 @@ static struct ctl_table hikari_sysctl_table[] = {
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1		= (void *)&hikari_uclamp_ttl_min,
 		.extra2		= (void *)&hikari_uclamp_ttl_max,
+	},
+	{
+		.procname	= "hikari_uclamp_max_pct",
+		.data		= &hikari_uclamp_max_pct,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= (void *)&hikari_uint_zero,
+		.extra2		= (void *)&hikari_uclamp_max_pct_max,
 	},
 	{
 		.procname	= "hikari_floor_khz_cluster0",
@@ -1073,6 +1158,10 @@ void hikari_seq_print_stats(struct seq_file *m, struct task_struct *p)
 		   (flags & HIKARI_FLAG_AUDIO_TAGGED) ? 1U : 0U);
 	seq_printf(m, "hikari_foreground: %u\n",
 		   (flags & HIKARI_FLAG_FOREGROUND) ? 1U : 0U);
+	seq_printf(m, "hikari_background: %u\n",
+		   (flags & HIKARI_FLAG_BACKGROUND) ? 1U : 0U);
+	seq_printf(m, "hikari_uclamp_max_ceiling: %u\n",
+		   hikari_uclamp_max_ceiling(p));
 	seq_printf(m, "hikari_wait_ewma_ns: %u\n", ewma);
 	seq_printf(m, "hikari_last_enqueue_ns: %u\n", last_enq);
 	seq_printf(m, "hikari_boost_active: %u\n",
@@ -1318,6 +1407,7 @@ HIKARI_TUNABLE_RW(wake_threshold_us, hikari_wake_threshold_us,
 		  100, 100000);
 HIKARI_TUNABLE_RW(uclamp_boost_pct, hikari_uclamp_boost_pct, 0, 50);
 HIKARI_TUNABLE_RW(uclamp_ttl_ms, hikari_uclamp_ttl_ms, 1, 200);
+HIKARI_TUNABLE_RW(uclamp_max_pct, hikari_uclamp_max_pct, 0, 100);
 HIKARI_TUNABLE_RW(floor_khz_cluster0, hikari_floor_khz_cluster0,
 		  0, 2000000);
 HIKARI_TUNABLE_RW(floor_khz_cluster1, hikari_floor_khz_cluster1,
@@ -1365,6 +1455,7 @@ static struct attribute *hikari_sysfs_attrs[] = {
 	&hikari_attr_wake_threshold_us.attr,
 	&hikari_attr_uclamp_boost_pct.attr,
 	&hikari_attr_uclamp_ttl_ms.attr,
+	&hikari_attr_uclamp_max_pct.attr,
 	&hikari_attr_floor_khz_cluster0.attr,
 	&hikari_attr_floor_khz_cluster1.attr,
 	&hikari_attr_floor_ttl_ms.attr,

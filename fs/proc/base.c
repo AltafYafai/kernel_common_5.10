@@ -1401,6 +1401,27 @@ static const struct file_operations proc_hikari_audio_operations = {
 	.llseek		= default_llseek,
 };
 
+static ssize_t hikari_background_read(struct file *file, char __user *buf,
+				      size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_read(file, buf, count, ppos,
+				     HIKARI_FLAG_BACKGROUND);
+}
+
+static ssize_t hikari_background_write(struct file *file,
+				       const char __user *buf,
+				       size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_write(file, buf, count, ppos,
+				      HIKARI_FLAG_BACKGROUND);
+}
+
+static const struct file_operations proc_hikari_background_operations = {
+	.read		= hikari_background_read,
+	.write		= hikari_background_write,
+	.llseek		= default_llseek,
+};
+
 static int hikari_stats_show(struct seq_file *m, void *v)
 {
 	struct inode *inode = m->private;
@@ -3455,9 +3476,10 @@ static const struct pid_entry tgid_base_stuff[] = {
 	REG("oom_adj",    S_IRUGO|S_IWUSR, proc_oom_adj_operations),
 	REG("oom_score_adj", S_IRUGO|S_IWUSR, proc_oom_score_adj_operations),
 #ifdef CONFIG_HIKARI
-	REG("hikari_enable", S_IRUGO|S_IWUSR, proc_hikari_enable_operations),
-	REG("hikari_audio",  S_IRUGO|S_IWUSR, proc_hikari_audio_operations),
-	REG("hikari_stats",  S_IRUGO,         proc_hikari_stats_operations),
+	REG("hikari_enable",     S_IRUGO|S_IWUSR, proc_hikari_enable_operations),
+	REG("hikari_audio",      S_IRUGO|S_IWUSR, proc_hikari_audio_operations),
+	REG("hikari_background", S_IRUGO|S_IWUSR, proc_hikari_background_operations),
+	REG("hikari_stats",      S_IRUGO,         proc_hikari_stats_operations),
 #endif
 #ifdef CONFIG_AUDIT
 	REG("loginuid",   S_IWUSR|S_IRUGO, proc_loginuid_operations),
@@ -3804,9 +3826,10 @@ static const struct pid_entry tid_base_stuff[] = {
 	REG("oom_adj",   S_IRUGO|S_IWUSR, proc_oom_adj_operations),
 	REG("oom_score_adj", S_IRUGO|S_IWUSR, proc_oom_score_adj_operations),
 #ifdef CONFIG_HIKARI
-	REG("hikari_enable", S_IRUGO|S_IWUSR, proc_hikari_enable_operations),
-	REG("hikari_audio",  S_IRUGO|S_IWUSR, proc_hikari_audio_operations),
-	REG("hikari_stats",  S_IRUGO,         proc_hikari_stats_operations),
+	REG("hikari_enable",     S_IRUGO|S_IWUSR, proc_hikari_enable_operations),
+	REG("hikari_audio",      S_IRUGO|S_IWUSR, proc_hikari_audio_operations),
+	REG("hikari_background", S_IRUGO|S_IWUSR, proc_hikari_background_operations),
+	REG("hikari_stats",      S_IRUGO,         proc_hikari_stats_operations),
 #endif
 #ifdef CONFIG_AUDIT
 	REG("loginuid",  S_IWUSR|S_IRUGO, proc_loginuid_operations),

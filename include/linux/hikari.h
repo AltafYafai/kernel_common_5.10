@@ -36,7 +36,8 @@ struct rq;
 #define HIKARI_FLAG_OPT_IN		(1u << 0)
 #define HIKARI_FLAG_AUDIO_TAGGED	(1u << 1)
 #define HIKARI_FLAG_FOREGROUND		(1u << 2)
-/* Bits 3..23 reserved for future use; must stay zero in current code. */
+#define HIKARI_FLAG_BACKGROUND		(1u << 3)
+/* Bits 4..23 reserved for future use; must stay zero in current code. */
 
 /*
  * Per-task "why was the last hot-path call a no-op?" tag.
@@ -122,6 +123,22 @@ void hikari_mark_audio(struct task_struct *p, bool tagged);
 /* Kernel-side API for tagging a foreground task. */
 void hikari_mark_foreground(struct task_struct *p, bool tagged);
 
+/*
+ * Kernel-side API for tagging a background task.  Mirrors
+ * hikari_mark_foreground.  Tagged background tasks are subject to
+ * hikari_uclamp_max_pct as a per-task uclamp_max ceiling when the
+ * tunable is non-zero -- this is the inverse of the uclamp_min
+ * boost path which fires on foreground.
+ */
+void hikari_mark_background(struct task_struct *p, bool tagged);
+
+/*
+ * Per-task uclamp_max ceiling helper, called from
+ * uclamp_apply_hikari_boost() in core.c.  Returns the SCHED_CAPACITY
+ * scaled ceiling for this task, or 0 if no ceiling should apply.
+ */
+unsigned int hikari_uclamp_max_ceiling(struct task_struct *p);
+
 /* Kernel-side opt-in/opt-out API. */
 void hikari_set_opt_in(struct task_struct *p, bool opt_in);
 
@@ -167,6 +184,9 @@ static inline int  hikari_select_cpu(struct task_struct *p, int prev_cpu,
 				     int wake_flags) { return -1; }
 static inline void hikari_mark_audio(struct task_struct *p, bool tagged) { }
 static inline void hikari_mark_foreground(struct task_struct *p, bool tagged) { }
+static inline void hikari_mark_background(struct task_struct *p, bool tagged) { }
+static inline unsigned int hikari_uclamp_max_ceiling(struct task_struct *p)
+	{ return 0; }
 static inline void hikari_set_opt_in(struct task_struct *p, bool opt_in) { }
 
 struct notifier_block;

@@ -1160,8 +1160,13 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
  */
 #ifdef CONFIG_HIKARI_UCLAMP
 extern unsigned int hikari_uclamp_boost_amount(struct task_struct *p);
+extern unsigned int hikari_uclamp_max_ceiling(struct task_struct *p);
 #else
 static inline unsigned int hikari_uclamp_boost_amount(struct task_struct *p)
+{
+	return 0;
+}
+static inline unsigned int hikari_uclamp_max_ceiling(struct task_struct *p)
 {
 	return 0;
 }
@@ -1172,16 +1177,33 @@ uclamp_apply_hikari_boost(struct task_struct *p, enum uclamp_id clamp_id,
 			  unsigned long base)
 {
 	unsigned int boost;
+	unsigned int ceiling;
 
-	if (clamp_id != UCLAMP_MIN)
-		return base;
+	if (clamp_id == UCLAMP_MIN) {
+		boost = hikari_uclamp_boost_amount(p);
+		if (!boost)
+			return base;
+		if (boost > SCHED_CAPACITY_SCALE)
+			boost = SCHED_CAPACITY_SCALE;
+		return max(base, (unsigned long)boost);
+	}
 
-	boost = hikari_uclamp_boost_amount(p);
-	if (!boost)
-		return base;
-	if (boost > SCHED_CAPACITY_SCALE)
-		boost = SCHED_CAPACITY_SCALE;
-	return max(base, (unsigned long)boost);
+	/*
+	 * UCLAMP_MAX path: hikari applies a per-task uclamp_max
+	 * ceiling for background-tagged tasks when the global
+	 * hikari_uclamp_max_pct knob is non-zero.  Returns the
+	 * minimum of the platform-effective base and the hikari
+	 * ceiling so a strict downstream limit (e.g. cgroup ceiling)
+	 * is never *raised*.
+	 */
+	if (clamp_id == UCLAMP_MAX) {
+		ceiling = hikari_uclamp_max_ceiling(p);
+		if (!ceiling)
+			return base;
+		return min(base, (unsigned long)ceiling);
+	}
+
+	return base;
 }
 
 unsigned long uclamp_eff_value(struct task_struct *p, enum uclamp_id clamp_id)
