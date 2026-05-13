@@ -81,6 +81,14 @@
  * U32_MAX.  ~4.29s upper bound -- any task waiting longer than
  * that on enqueue almost certainly isn't a task we want to chase.
  */
+/*
+ * Wake-time histogram bucket count.  Eight is enough headroom to
+ * separate (sub-100us, common idle wakes) from (100us..250us, the
+ * 'should boost' band) from (>10ms, contended).  See
+ * hikari_wake_hist_edges_us[] below for the cuts.
+ */
+#define HIKARI_WAKE_HIST_BUCKETS	8
+
 struct hikari_pcpu {
 	u32		wake_demand_ewma_ns;
 	unsigned int	wake_floor_khz;
@@ -88,6 +96,34 @@ struct hikari_pcpu {
 	unsigned long	audio_active_until_jiffies;
 	atomic_t	boost_count;
 	atomic_t	hint_count;
+	/*
+	 * Per-CPU wake-to-run wait-time histogram.  Updated from
+	 * hikari_on_dequeue() with the delta we just measured for
+	 * the task being picked.  atomic_long_t so a read across
+	 * all CPUs sums cleanly without a lock; writes are always
+	 * to the local CPU's slot so there is no cross-CPU
+	 * cache-line bouncing.
+	 */
+	atomic_long_t	wake_hist[HIKARI_WAKE_HIST_BUCKETS];
+};
+
+/*
+ * Open-upper bucket edges in microseconds.  A sample in nanoseconds
+ * is divided by 1000 then placed into the first bucket whose edge
+ * exceeds it; the final bucket (10ms+) catches everything else.
+ *
+ * Edges chosen to cover the bands hikari cares about:
+ *   <100us   -- background idle wakes, nothing to chase
+ *   100..250 -- audio-grade wakes, worth boosting
+ *   250..500 -- foreground touch wakes
+ *   500..1ms -- borderline, mostly contended
+ *   1..2ms   -- around the default wake_threshold_us
+ *   2..5ms   -- noticeable jank
+ *   5..10ms  -- bad
+ *   10ms+    -- catastrophic
+ */
+static const u32 hikari_wake_hist_edges_us[HIKARI_WAKE_HIST_BUCKETS - 1] = {
+	100, 250, 500, 1000, 2000, 5000, 10000,
 };
 
 static DEFINE_PER_CPU(struct hikari_pcpu, hikari_pcpu);
@@ -382,6 +418,30 @@ static inline void hikari_apply_uclamp_boost(struct task_struct *p)
 }
 
 /*
+ * Bucket a wake-to-run delta into the per-CPU wake_hist[] array.
+ * Called from hikari_on_dequeue() *after* the wraparound and zero
+ * checks that already validate the delta -- no further bounds
+ * checks are needed here.  Writes always land on the local CPU,
+ * so atomic_long_inc() does not bounce a cache line; we use the
+ * atomic variant so the cross-CPU read summing in wake_hist_show
+ * is safe without a lock.
+ */
+static inline void hikari_wake_hist_record(u32 delta_ns)
+{
+	struct hikari_pcpu *pc = this_cpu_ptr(&hikari_pcpu);
+	u32 us = delta_ns / 1000U;
+	int i;
+
+	for (i = 0; i < HIKARI_WAKE_HIST_BUCKETS - 1; i++) {
+		if (us < hikari_wake_hist_edges_us[i]) {
+			atomic_long_inc(&pc->wake_hist[i]);
+			return;
+		}
+	}
+	atomic_long_inc(&pc->wake_hist[HIKARI_WAKE_HIST_BUCKETS - 1]);
+}
+
+/*
  * Resolve the floor TTL for a specific CPU: per-cluster override if
  * set, otherwise the shared hikari_floor_ttl_ms.  Mirrors the
  * per-cluster floor_khz lookup directly above so both knobs travel
@@ -576,6 +636,13 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 	}
 	WRITE_ONCE(p->hikari_wait_ewma_ns, ewma);
 	WRITE_ONCE(p->hikari_last_enqueue_ns, 0);
+
+	/*
+	 * Histogram the *current sample* (not the EWMA) so the
+	 * shape of /sys/kernel/hikari/wake_hist reflects raw
+	 * wake-to-run wait distribution and not the smoothing.
+	 */
+	hikari_wake_hist_record(delta);
 
 	threshold_ns = READ_ONCE(hikari_wake_threshold_us);
 	if (threshold_ns > U32_MAX / 1000)
@@ -1116,6 +1183,87 @@ static ssize_t little_cluster_show(struct kobject *kobj,
 }
 
 /*
+ * /sys/kernel/hikari/wake_hist  -- R/O
+ *
+ * Sums the per-CPU wake_hist[] buckets and emits one line per bucket
+ * with the closed-open microsecond range, e.g.
+ *
+ *     0..100us:        12345
+ *     100..250us:       4567
+ *     ...
+ *     10000+us:           42
+ *     total:           17394
+ *
+ * The format is grep-able by humans and parseable by tools that split
+ * on the first non-digit character.  Per-CPU summing tolerates
+ * concurrent writers because each bucket is an atomic_long_t.
+ */
+static ssize_t wake_hist_show(struct kobject *kobj,
+			      struct kobj_attribute *attr, char *buf)
+{
+	unsigned long counts[HIKARI_WAKE_HIST_BUCKETS] = { 0 };
+	unsigned long total = 0;
+	ssize_t off = 0;
+	int cpu, i;
+	u32 lo, hi;
+
+	for_each_possible_cpu(cpu) {
+		struct hikari_pcpu *pc = per_cpu_ptr(&hikari_pcpu, cpu);
+
+		for (i = 0; i < HIKARI_WAKE_HIST_BUCKETS; i++)
+			counts[i] += (unsigned long)atomic_long_read(
+				&pc->wake_hist[i]);
+	}
+
+	for (i = 0; i < HIKARI_WAKE_HIST_BUCKETS; i++) {
+		lo = (i == 0) ? 0 : hikari_wake_hist_edges_us[i - 1];
+		if (i == HIKARI_WAKE_HIST_BUCKETS - 1) {
+			off += sysfs_emit_at(buf, off,
+					     "%u+us: %lu\n",
+					     lo, counts[i]);
+		} else {
+			hi = hikari_wake_hist_edges_us[i];
+			off += sysfs_emit_at(buf, off,
+					     "%u..%uus: %lu\n",
+					     lo, hi, counts[i]);
+		}
+		total += counts[i];
+	}
+	off += sysfs_emit_at(buf, off, "total: %lu\n", total);
+	return off;
+}
+
+/*
+ * /sys/kernel/hikari/wake_hist_reset  -- W/O
+ *
+ * Any non-empty write zeroes every CPU's bucket array.  Useful
+ * before running a benchmark so the captured shape reflects only
+ * the benchmark window.  No-op if buf is empty.
+ */
+static ssize_t wake_hist_reset_store(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	int cpu, i;
+
+	if (!count)
+		return -EINVAL;
+
+	for_each_possible_cpu(cpu) {
+		struct hikari_pcpu *pc = per_cpu_ptr(&hikari_pcpu, cpu);
+
+		for (i = 0; i < HIKARI_WAKE_HIST_BUCKETS; i++)
+			atomic_long_set(&pc->wake_hist[i], 0);
+	}
+	return count;
+}
+
+static struct kobj_attribute hikari_attr_wake_hist =
+	__ATTR(wake_hist, 0444, wake_hist_show, NULL);
+static struct kobj_attribute hikari_attr_wake_hist_reset =
+	__ATTR(wake_hist_reset, 0200, NULL, wake_hist_reset_store);
+
+/*
  * R/W sysfs tunables -- mirrors of the /proc/sys/kernel/hikari_*
  * sysctls, exposed here so apps like Franco Kernel Manager can
  * discover them by scanning /sys/kernel/hikari/.
@@ -1210,6 +1358,8 @@ static struct attribute *hikari_sysfs_attrs[] = {
 	&hikari_attr_opted_in_count.attr,
 	&hikari_attr_big_cluster.attr,
 	&hikari_attr_little_cluster.attr,
+	&hikari_attr_wake_hist.attr,
+	&hikari_attr_wake_hist_reset.attr,
 	/* R/W tunables */
 	&hikari_attr_enable.attr,
 	&hikari_attr_wake_threshold_us.attr,
