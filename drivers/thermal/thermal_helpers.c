@@ -15,6 +15,8 @@
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/export.h>
+#include <linux/init.h>
+#include <linux/kobject.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
@@ -22,6 +24,53 @@
 #include <trace/events/thermal.h>
 
 #include "thermal_core.h"
+
+/*
+ * Kasumi (霞) thermal dampening -- XTENSEI
+ *
+ * Delays thermal throttling by subtracting a configurable offset from
+ * the reported temperature.  A linear ramp between ramp_start and
+ * ceiling smoothly reduces the offset to zero so the real temperature
+ * is reported once the safety ceiling is reached.
+ *
+ *   real < ramp_start : reported = real - offset        (full offset)
+ *   ramp_start <= real < ceiling : offset tapers to 0   (smooth ramp)
+ *   real >= ceiling   : reported = real                 (safety)
+ */
+static unsigned int kasumi_enable     __read_mostly = 1;
+static unsigned int kasumi_offset_mc  __read_mostly = 15000;  /* 15 C  */
+static unsigned int kasumi_ramp_mc    __read_mostly = 85000;  /* 85 C  */
+static unsigned int kasumi_ceiling_mc __read_mostly = 95000;  /* 95 C  */
+
+static int kasumi_dampen(int real)
+{
+	unsigned int offset, ramp, ceiling;
+	int dampened;
+
+	if (!READ_ONCE(kasumi_enable) || real <= 0)
+		return real;
+
+	offset  = READ_ONCE(kasumi_offset_mc);
+	ramp    = READ_ONCE(kasumi_ramp_mc);
+	ceiling = READ_ONCE(kasumi_ceiling_mc);
+
+	if (real >= (int)ceiling)
+		return real;
+
+	if (real < (int)ramp) {
+		dampened = real - (int)offset;
+	} else {
+		int range     = (int)ceiling - (int)ramp;
+		int remaining = (int)ceiling - real;
+
+		if (range > 0)
+			dampened = real - (int)offset * remaining / range;
+		else
+			dampened = real;
+	}
+
+	return dampened > 0 ? dampened : 0;
+}
 
 int get_tz_trend(struct thermal_zone_device *tz, int trip)
 {
@@ -107,6 +156,10 @@ int thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp)
 		if (!ret && *temp < crit_temp)
 			*temp = tz->emul_temperature;
 	}
+
+	/* Kasumi thermal dampening */
+	if (!ret)
+		*temp = kasumi_dampen(*temp);
 
 	mutex_unlock(&tz->lock);
 exit:
@@ -245,3 +298,52 @@ int thermal_zone_get_offset(struct thermal_zone_device *tz)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(thermal_zone_get_offset);
+
+/* ---- Kasumi sysfs interface (/sys/kernel/kasumi/) ---- */
+
+#define KASUMI_ATTR_RW(_name, _var)					\
+static ssize_t _name##_show(struct kobject *kobj,			\
+			    struct kobj_attribute *attr, char *buf)	\
+{									\
+	return sysfs_emit(buf, "%u\n", READ_ONCE(_var));		\
+}									\
+static ssize_t _name##_store(struct kobject *kobj,			\
+			     struct kobj_attribute *attr,		\
+			     const char *buf, size_t count)		\
+{									\
+	unsigned int val;						\
+	if (kstrtouint(buf, 0, &val))					\
+		return -EINVAL;						\
+	WRITE_ONCE(_var, val);						\
+	return count;							\
+}									\
+static struct kobj_attribute kasumi_##_name##_attr =			\
+	__ATTR(_name, 0644, _name##_show, _name##_store)
+
+KASUMI_ATTR_RW(enabled,    kasumi_enable);
+KASUMI_ATTR_RW(offset_mc,  kasumi_offset_mc);
+KASUMI_ATTR_RW(ramp_mc,    kasumi_ramp_mc);
+KASUMI_ATTR_RW(ceiling_mc, kasumi_ceiling_mc);
+
+static struct attribute *kasumi_attrs[] = {
+	&kasumi_enabled_attr.attr,
+	&kasumi_offset_mc_attr.attr,
+	&kasumi_ramp_mc_attr.attr,
+	&kasumi_ceiling_mc_attr.attr,
+	NULL,
+};
+
+static struct attribute_group kasumi_attr_group = {
+	.attrs = kasumi_attrs,
+};
+
+static struct kobject *kasumi_kobj;
+
+static int __init kasumi_sysfs_init(void)
+{
+	kasumi_kobj = kobject_create_and_add("kasumi", kernel_kobj);
+	if (!kasumi_kobj)
+		return -ENOMEM;
+	return sysfs_create_group(kasumi_kobj, &kasumi_attr_group);
+}
+late_initcall(kasumi_sysfs_init);
