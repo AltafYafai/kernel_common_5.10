@@ -11820,6 +11820,23 @@ static void zenith_update_shared(struct update_util_data *hook, u64 time, unsign
 			struct zenith_cpu *j_z_cpu = &per_cpu(zenith_cpu, j);
 			unsigned long j_util, j_max;
 
+			/*
+			 * Skip siblings whose zenith_start() has not yet
+			 * populated j_z_cpu->z_policy.  Without this guard,
+			 * the first update tick that fires on a policy CPU
+			 * before all sibling CPUs in the same policy have
+			 * completed their per-CPU zenith_start() iteration
+			 * dereferences NULL->tunables for the not-yet-
+			 * initialized sibling and faults at
+			 * NULL+offsetof(struct zenith_policy, tunables).
+			 * The race window is closed by the two-loop ordering
+			 * in zenith_start(), but keep the runtime check as
+			 * belt-and-suspenders for any future code path that
+			 * might transiently leave z_policy NULL.
+			 */
+			if (unlikely(!READ_ONCE(j_z_cpu->z_policy)))
+				continue;
+
 			j_util = zenith_get_util(j_z_cpu);
 			j_max = j_z_cpu->max_capacity;
 			j_util = zenith_iowait_apply(j_z_cpu, time, j_util, j_max);
@@ -22236,12 +22253,42 @@ static int zenith_start(struct cpufreq_policy *policy)
 	z_policy->at_cooldown_left = 0;
 	z_policy->at_last_target = z_policy->tunables->active_profile;
 
+	/*
+	 * Two-pass attach to close the per-CPU init race.
+	 *
+	 * Pass 1 zeroes per-CPU state and publishes z_policy for every
+	 * CPU in the policy *before* any update-util hook is registered.
+	 * Pass 2 then registers the hooks.  Once the first hook is live,
+	 * the scheduler is free to fire zenith_update_{single,shared} on
+	 * any policy CPU; with z_policy already published on every
+	 * sibling, the per-CPU iteration in zenith_update_shared cannot
+	 * see a NULL z_policy.
+	 *
+	 * Previously this was a single loop, so the moment
+	 * cpufreq_add_update_util_hook() ran for the first CPU the hook
+	 * could fire on that CPU and iterate over a sibling whose
+	 * z_policy had not yet been assigned -- causing a NULL deref at
+	 * zenith_get_util+0x6c (read at NULL+offsetof(tunables)).  The
+	 * race window was widened by any change that shifted CFS tick
+	 * timing (e.g. removing BORE) and was observed at boot on MT6768
+	 * (8-core, two clusters, shared policy per cluster).
+	 */
 	for_each_cpu(cpu, policy->cpus) {
 		struct zenith_cpu *z_cpu = &per_cpu(zenith_cpu, cpu);
 
 		memset(z_cpu, 0, sizeof(*z_cpu));
 		z_cpu->cpu = cpu;
-		z_cpu->z_policy = z_policy;
+		/*
+		 * Pair with READ_ONCE in zenith_update_shared.  Ensures
+		 * the z_policy assignment is visible before any later
+		 * cpufreq_add_update_util_hook() lets the scheduler
+		 * observe the per-CPU state on another CPU.
+		 */
+		WRITE_ONCE(z_cpu->z_policy, z_policy);
+	}
+
+	for_each_cpu(cpu, policy->cpus) {
+		struct zenith_cpu *z_cpu = &per_cpu(zenith_cpu, cpu);
 
 		cpufreq_add_update_util_hook(cpu, &z_cpu->update_util,
 			policy_is_shared(policy) ? zenith_update_shared : zenith_update_single);
