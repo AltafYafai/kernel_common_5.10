@@ -706,21 +706,76 @@ static ssize_t zone_offsets_show(struct kobject *kobj,
 	return ret;
 }
 
+/*
+ * Validate the zone_offsets string before storing.  Accepts the
+ * empty string (clears all overrides) or one or more comma-separated
+ * "<zone_type>=<offset_mc>" tokens.  Leading/trailing whitespace on
+ * each token is tolerated; a trailing newline is stripped.  Anything
+ * else returns -EINVAL so userspace gets a clear write failure rather
+ * than a silent accept-but-ignore.
+ */
+static int kasumi_zone_offsets_validate(const char *s)
+{
+	char scratch[KASUMI_ZONE_OFFSETS_LEN];
+	char *cur, *tok;
+	unsigned int val;
+
+	if (!s || s[0] == '\0')
+		return 0;
+
+	strscpy(scratch, s, sizeof(scratch));
+	cur = scratch;
+
+	while ((tok = strsep(&cur, ",")) != NULL) {
+		char *eq, *name_end;
+
+		while (*tok == ' ' || *tok == '\t')
+			tok++;
+		if (*tok == '\0')
+			continue;
+
+		eq = strchr(tok, '=');
+		if (!eq || eq == tok)
+			return -EINVAL;
+
+		/* Trim trailing whitespace from the zone-name half. */
+		name_end = eq;
+		while (name_end > tok && (name_end[-1] == ' ' ||
+					  name_end[-1] == '\t'))
+			name_end--;
+		if (name_end == tok)
+			return -EINVAL;
+
+		if (kstrtouint(eq + 1, 0, &val))
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
 static ssize_t zone_offsets_store(struct kobject *kobj,
 				  struct kobj_attribute *attr,
 				  const char *buf, size_t count)
 {
 	unsigned long flags;
+	char tmp[KASUMI_ZONE_OFFSETS_LEN];
 	size_t len = count;
+	int ret;
 
 	if (len >= KASUMI_ZONE_OFFSETS_LEN)
 		return -E2BIG;
 
+	memcpy(tmp, buf, len);
+	tmp[len] = '\0';
+	if (len > 0 && tmp[len - 1] == '\n')
+		tmp[len - 1] = '\0';
+
+	ret = kasumi_zone_offsets_validate(tmp);
+	if (ret)
+		return ret;
+
 	spin_lock_irqsave(&kasumi_filter_lock, flags);
-	memcpy(kasumi_zone_offsets_buf, buf, len);
-	kasumi_zone_offsets_buf[len] = '\0';
-	if (len > 0 && kasumi_zone_offsets_buf[len - 1] == '\n')
-		kasumi_zone_offsets_buf[len - 1] = '\0';
+	memcpy(kasumi_zone_offsets_buf, tmp, sizeof(tmp));
 	spin_unlock_irqrestore(&kasumi_filter_lock, flags);
 	return count;
 }
