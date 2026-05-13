@@ -420,6 +420,21 @@ static int __init iyashi_init(void)
 		READ_ONCE(iyashi_near_limit_offset_c),
 		iyashi_cdev_filter_buf);
 
+	/*
+	 * Iyashi boot signature.  The full ridge narrative lives in the
+	 * Zenith governor's banner (kernel/sched/cpufreq_zenith.c,
+	 * `Zenith :` prefix).  This small block adds an `Iyashi :`-prefixed
+	 * stamp so dmesg | grep -E 'Iyashi :' still finds the subsystem
+	 * even if the Zenith banner scrolled past or the ring buffer
+	 * wrapped.  Six lines, byte-stable, all under one pr_fmt prefix.
+	 */
+	pr_info("Iyashi : 癒し\n");
+	pr_info("Iyashi : healing breath.\n");
+	pr_info("Iyashi : leave room.  always leave room.\n");
+	pr_info("Iyashi : top of the OPP stack stays open until the trip is near.\n");
+	pr_info("Iyashi : passthrough_count climbs when cooldown is imminent.\n");
+	pr_info("Iyashi : built by XTENSEI.\n");
+
 	return 0;
 }
 late_initcall_sync(iyashi_init);
