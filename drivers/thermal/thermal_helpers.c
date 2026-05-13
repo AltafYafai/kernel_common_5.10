@@ -385,8 +385,85 @@ static struct attribute_group kasumi_attr_group = {
 
 static struct kobject *kasumi_kobj;
 
+/*
+ * Safety self-test.  Runs once at init before any sysfs is exposed and
+ * asserts the three contracts kasumi_dampen() makes:
+ *
+ *   1. at-or-above-ceiling input is returned unchanged (no dampening),
+ *   2. below-ramp input gets exactly offset_mc subtracted,
+ *   3. zero / negative input is passed through.
+ *
+ * If any of the three fails we refuse to expose /sys/kernel/kasumi at
+ * all, which makes the failure loud (anyone scripting against the
+ * sysfs files will see ENOENT) and prevents a misconfigured build
+ * from quietly hiding throttling.  The dampening hook itself stays
+ * active either way -- this is purely a paranoia check on the math.
+ */
+static int __init kasumi_safety_self_test(void)
+{
+	unsigned int ceiling = READ_ONCE(kasumi_ceiling_mc);
+	unsigned int offset  = READ_ONCE(kasumi_offset_mc);
+	unsigned int ramp    = READ_ONCE(kasumi_ramp_mc);
+	unsigned int saved_enable;
+	int at_ceiling = (int)ceiling;
+	int above_ceiling = (int)ceiling + 1000;
+	int below_ramp = (int)ramp - 5000;
+	int r1, r2, r3, r4;
+	int ret = 0;
+
+	/*
+	 * Force kasumi_enable=1 for the duration of the test so the
+	 * result is independent of the default we ship.  Restore on exit.
+	 */
+	saved_enable = READ_ONCE(kasumi_enable);
+	WRITE_ONCE(kasumi_enable, 1);
+
+	/* 1. at-or-above-ceiling: must be returned unchanged. */
+	r1 = kasumi_dampen(at_ceiling);
+	r2 = kasumi_dampen(above_ceiling);
+	if (r1 != at_ceiling || r2 != above_ceiling) {
+		pr_err("kasumi: safety self-test FAILED: at_ceiling=%d->%d, above_ceiling=%d->%d (expected unchanged)\n",
+		       at_ceiling, r1, above_ceiling, r2);
+		ret = -EIO;
+		goto out;
+	}
+
+	/* 2. below-ramp: must be exactly real - offset. */
+	if (below_ramp > 0) {
+		r3 = kasumi_dampen(below_ramp);
+		if (r3 != below_ramp - (int)offset) {
+			pr_err("kasumi: safety self-test FAILED: below_ramp=%d->%d (expected %d)\n",
+			       below_ramp, r3, below_ramp - (int)offset);
+			ret = -EIO;
+			goto out;
+		}
+	}
+
+	/* 3. zero / negative: must be passed through. */
+	r4 = kasumi_dampen(0);
+	if (r4 != 0) {
+		pr_err("kasumi: safety self-test FAILED: zero input -> %d (expected 0)\n", r4);
+		ret = -EIO;
+		goto out;
+	}
+
+	pr_info("kasumi: safety self-test passed (ceiling=%u offset=%u ramp=%u)\n",
+		ceiling, offset, ramp);
+out:
+	WRITE_ONCE(kasumi_enable, saved_enable);
+	return ret;
+}
+
 static int __init kasumi_sysfs_init(void)
 {
+	int ret;
+
+	ret = kasumi_safety_self_test();
+	if (ret) {
+		pr_err("kasumi: refusing to register sysfs (self-test failed)\n");
+		return ret;
+	}
+
 	kasumi_kobj = kobject_create_and_add("kasumi", kernel_kobj);
 	if (!kasumi_kobj)
 		return -ENOMEM;
