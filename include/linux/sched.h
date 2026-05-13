@@ -1407,8 +1407,31 @@ struct task_struct {
 	/* PF_IO_WORKER */
 	ANDROID_KABI_USE(1, void *pf_io_worker);
 
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
+	/*
+	 * Hikari wake-time policy engine state.  Packed into KABI
+	 * reserves 2 and 3 via ANDROID_KABI_USE2 so task_struct size
+	 * and alignment are unchanged.  See <linux/hikari.h>.
+	 *
+	 * hikari_wait_ewma_ns   - EWMA of wake-to-run wait time, in
+	 *                         nanoseconds (saturating u32; ~4.29s
+	 *                         max which is far above any sane
+	 *                         wake-wait we'd care about).
+	 * hikari_flags          - HIKARI_FLAG_* bits (opt-in, audio,
+	 *                         foreground).
+	 * hikari_last_enqueue_ns- Truncated rq_clock_task() at the
+	 *                         last wake-side enqueue.  Used to
+	 *                         compute the wait sample on dequeue.
+	 * hikari_boost_until_ns - jiffies-equivalent (truncated
+	 *                         ktime_get_ns()) until which the
+	 *                         current uclamp_min boost is active.
+	 *                         Zero means no boost pending.
+	 *
+	 * All four are touched only from the task's own CPU, with the
+	 * task either current or rq->lock held, so READ_ONCE/WRITE_ONCE
+	 * are sufficient and no atomics are needed.
+	 */
+	ANDROID_KABI_USE2(2, u32 hikari_wait_ewma_ns,    u32 hikari_flags);
+	ANDROID_KABI_USE2(3, u32 hikari_last_enqueue_ns, u32 hikari_boost_until_ns);
 	ANDROID_KABI_RESERVE(4);
 	ANDROID_KABI_RESERVE(5);
 
