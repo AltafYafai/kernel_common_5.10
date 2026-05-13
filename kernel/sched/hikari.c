@@ -61,6 +61,7 @@
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/sched/clock.h>
+#include <linux/sched/signal.h>
 #include <linux/sched/topology.h>
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
@@ -905,6 +906,22 @@ static ssize_t total_hint_count_show(struct kobject *kobj,
 	return sysfs_emit(buf, "%llu\n", sum);
 }
 
+static ssize_t opted_in_count_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	struct task_struct *p;
+	unsigned int count = 0;
+
+	rcu_read_lock();
+	for_each_process(p) {
+		if (READ_ONCE(p->hikari_flags) & HIKARI_FLAG_OPT_IN)
+			count++;
+	}
+	rcu_read_unlock();
+
+	return sysfs_emit(buf, "%u\n", count);
+}
+
 static ssize_t big_cluster_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
 {
@@ -929,6 +946,8 @@ static struct kobj_attribute hikari_attr_total_boost_count =
 	__ATTR(total_boost_count, 0444, total_boost_count_show, NULL);
 static struct kobj_attribute hikari_attr_total_hint_count =
 	__ATTR(total_hint_count, 0444, total_hint_count_show, NULL);
+static struct kobj_attribute hikari_attr_opted_in_count =
+	__ATTR(opted_in_count, 0444, opted_in_count_show, NULL);
 static struct kobj_attribute hikari_attr_big_cluster =
 	__ATTR(big_cluster, 0444, big_cluster_show, NULL);
 static struct kobj_attribute hikari_attr_little_cluster =
@@ -940,6 +959,7 @@ static struct attribute *hikari_sysfs_attrs[] = {
 	&hikari_attr_version.attr,
 	&hikari_attr_total_boost_count.attr,
 	&hikari_attr_total_hint_count.attr,
+	&hikari_attr_opted_in_count.attr,
 	&hikari_attr_big_cluster.attr,
 	&hikari_attr_little_cluster.attr,
 	NULL,
