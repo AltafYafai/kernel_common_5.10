@@ -21,6 +21,7 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/timekeeping.h>
 
 #include <trace/events/thermal.h>
 
@@ -78,6 +79,33 @@ static const char * const kasumi_ramp_shape_names[] = {
 	[KASUMI_RAMP_QUADRATIC] = "quadratic",
 	[KASUMI_RAMP_STEP]      = "step",
 };
+
+/*
+ * Boot-time warmup.  The very first seconds after a cold boot are
+ * thermally noisy -- the framework can see a transient spike from
+ * brief userspace init bursts before the platform has settled into
+ * its idle baseline, then trip a guard temperature and pin a cooling
+ * device.  Kasumi already smooths this with offset_mc, but on devices
+ * with aggressive thermal trips the default 15 C is sometimes not
+ * enough.
+ *
+ *   warmup_secs        -- seconds since boot during which the warmup
+ *                         offset takes precedence over offset_mc.
+ *                         Default 0 disables the feature entirely;
+ *                         the dampening branch is the same as before.
+ *
+ *   warmup_offset_mc   -- the offset used while inside the warmup
+ *                         window.  Substitutes for offset_mc; the
+ *                         existing ramp / ceiling / shape logic
+ *                         applies on top of it unchanged.
+ *
+ * The check uses ktime_get_boottime_seconds() which already accounts
+ * for suspend so a device that boots, suspends for hours, and resumes
+ * still observes "boot+30s" not "wall+hours".  Cheap enough on the
+ * read path -- single per-CPU timer read, no locks.
+ */
+static unsigned int kasumi_warmup_secs       __read_mostly;        /* off */
+static unsigned int kasumi_warmup_offset_mc  __read_mostly = 25000; /* 25 C */
 
 /*
  * Observability latches.  Updated at the end of every kasumi_dampen()
@@ -152,6 +180,24 @@ static int kasumi_dampen(int real)
 	offset  = READ_ONCE(kasumi_offset_mc);
 	ramp    = READ_ONCE(kasumi_ramp_mc);
 	ceiling = READ_ONCE(kasumi_ceiling_mc);
+
+	/*
+	 * Boot warmup window.  Substitute warmup_offset_mc for the
+	 * regular offset only while:
+	 *   - warmup_secs is non-zero (admin opted in)
+	 *   - warmup_offset_mc is non-zero (no point in 'use 0 instead')
+	 *   - we are still within warmup_secs seconds of boot
+	 * Past the window everything reverts to the regular offset_mc
+	 * without any reconfiguration step.
+	 */
+	{
+		unsigned int wsecs = READ_ONCE(kasumi_warmup_secs);
+		unsigned int woff  = READ_ONCE(kasumi_warmup_offset_mc);
+
+		if (wsecs && woff &&
+		    ktime_get_boottime_seconds() < (time64_t)wsecs)
+			offset = woff;
+	}
 
 	if (real >= (int)ceiling) {
 		WRITE_ONCE(kasumi_last_real_mc,      real);
@@ -504,6 +550,8 @@ KASUMI_ATTR_RW(enabled,    kasumi_enable);
 KASUMI_ATTR_RW(offset_mc,  kasumi_offset_mc);
 KASUMI_ATTR_RW(ramp_mc,    kasumi_ramp_mc);
 KASUMI_ATTR_RW(ceiling_mc, kasumi_ceiling_mc);
+KASUMI_ATTR_RW(warmup_secs,      kasumi_warmup_secs);
+KASUMI_ATTR_RW(warmup_offset_mc, kasumi_warmup_offset_mc);
 
 KASUMI_ATTR_RO(last_real_mc,       kasumi_last_real_mc);
 KASUMI_ATTR_RO(last_reported_mc,   kasumi_last_reported_mc);
@@ -604,6 +652,8 @@ static struct attribute *kasumi_attrs[] = {
 	&kasumi_ramp_mc_attr.attr,
 	&kasumi_ceiling_mc_attr.attr,
 	&kasumi_ramp_shape_attr.attr,
+	&kasumi_warmup_secs_attr.attr,
+	&kasumi_warmup_offset_mc_attr.attr,
 	&kasumi_last_real_mc_attr.attr,
 	&kasumi_last_reported_mc_attr.attr,
 	&kasumi_applied_offset_mc_attr.attr,
