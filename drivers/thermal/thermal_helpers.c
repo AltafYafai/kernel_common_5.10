@@ -129,6 +129,76 @@ static int kasumi_applied_offset_mc   __read_mostly;
 static char kasumi_zone_filter_buf[KASUMI_FILTER_LEN];
 static DEFINE_SPINLOCK(kasumi_filter_lock);
 
+/*
+ * Per-zone offset override.  Comma-separated list of "zone_type=mc"
+ * pairs that override kasumi_offset_mc for that specific zone, e.g.
+ *
+ *   "mtktscpu=20000,mtktspmic=10000"
+ *
+ * means dampen mtktscpu by 20 C and mtktspmic by 10 C while every
+ * other zone keeps the global offset_mc.  Empty string (default)
+ * means "no per-zone overrides, use offset_mc everywhere".  A zone
+ * type appearing in this list still has to pass zone_filter; the
+ * filter runs first and shorts the whole dampening path before the
+ * override is even consulted.
+ *
+ * Protected by the same spinlock as zone_filter -- both are
+ * stack-snapshotted on the hot path and parsed without the lock,
+ * so concurrent writes never see a torn buffer.
+ *
+ * Bounded length to keep the stack snapshot in kasumi_dampen()
+ * small.  A 256-byte budget fits ~16 typical zone names at a
+ * generous 16-byte avg + 6-byte offset.
+ */
+#define KASUMI_ZONE_OFFSETS_LEN 256
+static char kasumi_zone_offsets_buf[KASUMI_ZONE_OFFSETS_LEN];
+
+/*
+ * Look up a per-zone offset override for zone_type, in millideg C.
+ * Returns 0 if the zone has no override (caller falls back to the
+ * global offset).  Caller passes a stack-local snapshot of
+ * kasumi_zone_offsets_buf so the parser does not block writers.
+ */
+static unsigned int kasumi_zone_offset_lookup(const char *snapshot,
+					      const char *zone_type)
+{
+	char tok[KASUMI_ZONE_OFFSETS_LEN];
+	char *cur, *sep;
+	unsigned int val;
+	size_t zlen;
+
+	if (!zone_type || !snapshot || snapshot[0] == '\0')
+		return 0;
+
+	zlen = strlen(zone_type);
+
+	/*
+	 * Copy snapshot to a local mutable buffer because strsep
+	 * needs to overwrite separators.  Snapshot itself lives on
+	 * the dampen-path's stack so this is one stack-to-stack
+	 * memcpy with strscpy semantics.
+	 */
+	strscpy(tok, snapshot, sizeof(tok));
+	cur = tok;
+
+	while ((sep = strsep(&cur, ",")) != NULL) {
+		char *eq;
+
+		while (*sep == ' ' || *sep == '\t')
+			sep++;
+		eq = strchr(sep, '=');
+		if (!eq)
+			continue;
+		*eq = '\0';
+		if (strlen(sep) != zlen || strcmp(sep, zone_type) != 0)
+			continue;
+		if (kstrtouint(eq + 1, 0, &val))
+			continue;
+		return val;
+	}
+	return 0;
+}
+
 static bool kasumi_zone_allowed(const char *zone_type)
 {
 	char snapshot[KASUMI_FILTER_LEN];
@@ -169,9 +239,10 @@ static bool kasumi_zone_allowed(const char *zone_type)
 	return blacklist;
 }
 
-static int kasumi_dampen(int real)
+static int kasumi_dampen(int real, const char *zone_type)
 {
 	unsigned int offset, ramp, ceiling;
+	unsigned int per_zone;
 	int dampened;
 
 	if (!READ_ONCE(kasumi_enable) || real <= 0)
@@ -182,13 +253,35 @@ static int kasumi_dampen(int real)
 	ceiling = READ_ONCE(kasumi_ceiling_mc);
 
 	/*
+	 * Per-zone offset override.  Takes precedence over offset_mc
+	 * but is itself overridden by the boot warmup substitute
+	 * below.  Snapshot the global buffer once under the lock and
+	 * parse on the stack so concurrent writes do not have to
+	 * wait on dampen.
+	 */
+	if (zone_type) {
+		char snapshot[KASUMI_ZONE_OFFSETS_LEN];
+		unsigned long flags;
+
+		spin_lock_irqsave(&kasumi_filter_lock, flags);
+		strscpy(snapshot, kasumi_zone_offsets_buf, sizeof(snapshot));
+		spin_unlock_irqrestore(&kasumi_filter_lock, flags);
+
+		per_zone = kasumi_zone_offset_lookup(snapshot, zone_type);
+		if (per_zone)
+			offset = per_zone;
+	}
+
+	/*
 	 * Boot warmup window.  Substitute warmup_offset_mc for the
 	 * regular offset only while:
 	 *   - warmup_secs is non-zero (admin opted in)
 	 *   - warmup_offset_mc is non-zero (no point in 'use 0 instead')
 	 *   - we are still within warmup_secs seconds of boot
 	 * Past the window everything reverts to the regular offset_mc
-	 * without any reconfiguration step.
+	 * without any reconfiguration step.  Warmup wins over the
+	 * per-zone override because the boot-time spike is platform-
+	 * wide and not zone-specific.
 	 */
 	{
 		unsigned int wsecs = READ_ONCE(kasumi_warmup_secs);
@@ -369,7 +462,7 @@ int thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp)
 
 	/* Kasumi thermal dampening (skip zones excluded by zone_filter) */
 	if (!ret && kasumi_zone_allowed(tz->type))
-		*temp = kasumi_dampen(*temp);
+		*temp = kasumi_dampen(*temp, tz->type);
 
 	mutex_unlock(&tz->lock);
 exit:
@@ -593,6 +686,49 @@ static struct kobj_attribute kasumi_zone_filter_attr =
 	__ATTR(zone_filter, 0644, zone_filter_show, zone_filter_store);
 
 /*
+ * zone_offsets -- comma-separated "zone_type=offset_mc" pairs.
+ * Validation on write is intentionally light: we accept any string
+ * shorter than the buffer and let the lookup parser tolerate garbage
+ * entries silently.  This matches zone_filter's "permissive write,
+ * skip what we can't parse on read" contract and means tunables.cfg
+ * lines that include comments after a '#' or trailing whitespace
+ * will still get the intended overrides applied.
+ */
+static ssize_t zone_offsets_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	unsigned long flags;
+	ssize_t ret;
+
+	spin_lock_irqsave(&kasumi_filter_lock, flags);
+	ret = sysfs_emit(buf, "%s\n", kasumi_zone_offsets_buf);
+	spin_unlock_irqrestore(&kasumi_filter_lock, flags);
+	return ret;
+}
+
+static ssize_t zone_offsets_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	unsigned long flags;
+	size_t len = count;
+
+	if (len >= KASUMI_ZONE_OFFSETS_LEN)
+		return -E2BIG;
+
+	spin_lock_irqsave(&kasumi_filter_lock, flags);
+	memcpy(kasumi_zone_offsets_buf, buf, len);
+	kasumi_zone_offsets_buf[len] = '\0';
+	if (len > 0 && kasumi_zone_offsets_buf[len - 1] == '\n')
+		kasumi_zone_offsets_buf[len - 1] = '\0';
+	spin_unlock_irqrestore(&kasumi_filter_lock, flags);
+	return count;
+}
+
+static struct kobj_attribute kasumi_zone_offsets_attr =
+	__ATTR(zone_offsets, 0644, zone_offsets_show, zone_offsets_store);
+
+/*
  * ramp_shape -- string-friendly RW attr.  Accepts on write:
  *   "linear" / "0"        -- KASUMI_RAMP_LINEAR    (default)
  *   "quadratic" / "1"     -- KASUMI_RAMP_QUADRATIC
@@ -658,6 +794,7 @@ static struct attribute *kasumi_attrs[] = {
 	&kasumi_last_reported_mc_attr.attr,
 	&kasumi_applied_offset_mc_attr.attr,
 	&kasumi_zone_filter_attr.attr,
+	&kasumi_zone_offsets_attr.attr,
 	NULL,
 };
 
@@ -701,8 +838,8 @@ static int __init kasumi_safety_self_test(void)
 	WRITE_ONCE(kasumi_enable, 1);
 
 	/* 1. at-or-above-ceiling: must be returned unchanged. */
-	r1 = kasumi_dampen(at_ceiling);
-	r2 = kasumi_dampen(above_ceiling);
+	r1 = kasumi_dampen(at_ceiling, NULL);
+	r2 = kasumi_dampen(above_ceiling, NULL);
 	if (r1 != at_ceiling || r2 != above_ceiling) {
 		pr_err("kasumi: safety self-test FAILED: at_ceiling=%d->%d, above_ceiling=%d->%d (expected unchanged)\n",
 		       at_ceiling, r1, above_ceiling, r2);
@@ -712,7 +849,7 @@ static int __init kasumi_safety_self_test(void)
 
 	/* 2. below-ramp: must be exactly real - offset. */
 	if (below_ramp > 0) {
-		r3 = kasumi_dampen(below_ramp);
+		r3 = kasumi_dampen(below_ramp, NULL);
 		if (r3 != below_ramp - (int)offset) {
 			pr_err("kasumi: safety self-test FAILED: below_ramp=%d->%d (expected %d)\n",
 			       below_ramp, r3, below_ramp - (int)offset);
@@ -722,7 +859,7 @@ static int __init kasumi_safety_self_test(void)
 	}
 
 	/* 3. zero / negative: must be passed through. */
-	r4 = kasumi_dampen(0);
+	r4 = kasumi_dampen(0, NULL);
 	if (r4 != 0) {
 		pr_err("kasumi: safety self-test FAILED: zero input -> %d (expected 0)\n", r4);
 		ret = -EIO;
