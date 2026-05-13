@@ -936,6 +936,72 @@ static ssize_t little_cluster_show(struct kobject *kobj,
 			  cpumask_pr_args(&hikari_little_cluster));
 }
 
+/*
+ * R/W sysfs tunables -- mirrors of the /proc/sys/kernel/hikari_*
+ * sysctls, exposed here so apps like Franco Kernel Manager can
+ * discover them by scanning /sys/kernel/hikari/.
+ */
+#define HIKARI_TUNABLE_RW(_name, _var, _min, _max)			\
+static ssize_t _name##_show(struct kobject *kobj,			\
+			    struct kobj_attribute *attr, char *buf)	\
+{									\
+	return sysfs_emit(buf, "%u\n", READ_ONCE(_var));		\
+}									\
+static ssize_t _name##_store(struct kobject *kobj,			\
+			     struct kobj_attribute *attr,		\
+			     const char *buf, size_t count)		\
+{									\
+	unsigned int val;						\
+	if (kstrtouint(buf, 10, &val))					\
+		return -EINVAL;						\
+	if (val < (_min) || val > (_max))				\
+		return -EINVAL;						\
+	WRITE_ONCE(_var, val);						\
+	return count;							\
+}									\
+static struct kobj_attribute hikari_attr_##_name =			\
+	__ATTR(_name, 0644, _name##_show, _name##_store)
+
+static ssize_t enable_show(struct kobject *kobj,
+			   struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(hikari_enable_value));
+}
+
+static ssize_t enable_store(struct kobject *kobj,
+			    struct kobj_attribute *attr,
+			    const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 1)
+		return -EINVAL;
+	WRITE_ONCE(hikari_enable_value, val);
+	if (val)
+		atomic_set(&hikari_kill_flag, 0);
+	return count;
+}
+
+static struct kobj_attribute hikari_attr_enable =
+	__ATTR(enable, 0644, enable_show, enable_store);
+
+HIKARI_TUNABLE_RW(wake_threshold_us, hikari_wake_threshold_us,
+		  100, 100000);
+HIKARI_TUNABLE_RW(uclamp_boost_pct, hikari_uclamp_boost_pct, 0, 50);
+HIKARI_TUNABLE_RW(uclamp_ttl_ms, hikari_uclamp_ttl_ms, 1, 200);
+HIKARI_TUNABLE_RW(floor_khz_cluster0, hikari_floor_khz_cluster0,
+		  0, 2000000);
+HIKARI_TUNABLE_RW(floor_khz_cluster1, hikari_floor_khz_cluster1,
+		  0, 3000000);
+HIKARI_TUNABLE_RW(floor_ttl_ms, hikari_floor_ttl_ms, 1, 500);
+HIKARI_TUNABLE_RW(placement_enable, hikari_placement_enable, 0, 1);
+HIKARI_TUNABLE_RW(audio_intensify, hikari_audio_intensify, 0, 1);
+HIKARI_TUNABLE_RW(topapp_auto_optin, hikari_topapp_auto_optin, 0, 1);
+HIKARI_TUNABLE_RW(topapp_auto_optout, hikari_topapp_auto_optout, 0, 1);
+HIKARI_TUNABLE_RW(ewma_shift, hikari_ewma_shift, 1, 7);
+
 static struct kobj_attribute hikari_attr_enabled =
 	__ATTR(enabled, 0444, enabled_show, NULL);
 static struct kobj_attribute hikari_attr_disabled_reason =
@@ -954,6 +1020,7 @@ static struct kobj_attribute hikari_attr_little_cluster =
 	__ATTR(little_cluster, 0444, little_cluster_show, NULL);
 
 static struct attribute *hikari_sysfs_attrs[] = {
+	/* R/O status */
 	&hikari_attr_enabled.attr,
 	&hikari_attr_disabled_reason.attr,
 	&hikari_attr_version.attr,
@@ -962,6 +1029,19 @@ static struct attribute *hikari_sysfs_attrs[] = {
 	&hikari_attr_opted_in_count.attr,
 	&hikari_attr_big_cluster.attr,
 	&hikari_attr_little_cluster.attr,
+	/* R/W tunables */
+	&hikari_attr_enable.attr,
+	&hikari_attr_wake_threshold_us.attr,
+	&hikari_attr_uclamp_boost_pct.attr,
+	&hikari_attr_uclamp_ttl_ms.attr,
+	&hikari_attr_floor_khz_cluster0.attr,
+	&hikari_attr_floor_khz_cluster1.attr,
+	&hikari_attr_floor_ttl_ms.attr,
+	&hikari_attr_placement_enable.attr,
+	&hikari_attr_audio_intensify.attr,
+	&hikari_attr_topapp_auto_optin.attr,
+	&hikari_attr_topapp_auto_optout.attr,
+	&hikari_attr_ewma_shift.attr,
 	NULL,
 };
 
