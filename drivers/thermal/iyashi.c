@@ -421,18 +421,101 @@ static int __init iyashi_init(void)
 		iyashi_cdev_filter_buf);
 
 	/*
-	 * Iyashi boot signature.  The full ridge narrative lives in the
-	 * Zenith governor's banner (kernel/sched/cpufreq_zenith.c,
-	 * `Zenith :` prefix).  This small block adds an `Iyashi :`-prefixed
-	 * stamp so dmesg | grep -E 'Iyashi :' still finds the subsystem
-	 * even if the Zenith banner scrolled past or the ring buffer
-	 * wrapped.  Six lines, byte-stable, all under one pr_fmt prefix.
+	 * Iyashi boot banner.  Full mythic + mechanism narrative
+	 * emitted once at init.  Single 'Iyashi : ' prefix on every
+	 * line so the whole banner is grep-stable; ASCII relationship
+	 * diagrams show how this subsystem composes with the others.
 	 */
-	pr_info("Iyashi : 癒し\n");
-	pr_info("Iyashi : healing breath.\n");
-	pr_info("Iyashi : leave room.  always leave room.\n");
-	pr_info("Iyashi : top of the OPP stack stays open until the trip is near.\n");
-	pr_info("Iyashi : passthrough_count climbs when cooldown is imminent.\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : when the cooling step lands, the air should not turn to stone.\n");
+	pr_info("Iyashi : the ridge breathes in, holds, breathes out.  Iyashi makes sure\n");
+	pr_info("Iyashi : the breath out still has somewhere to go.\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :     ____                 __    _\n");
+	pr_info("Iyashi :    /  _/_  ______ ______/ /_  (_)\n");
+	pr_info("Iyashi :    / // / / / __ `/ ___/ __ \\/ /\n");
+	pr_info("Iyashi :  _/ // /_/ / /_/ (__  ) / / / /\n");
+	pr_info("Iyashi : /___/\\__, /\\__,_/____/_/ /_/_/\n");
+	pr_info("Iyashi :     /____/\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :                        癒し\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :          ----  what Iyashi is  ----\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : a thermal-aware performance floor for cpufreq cooling.  when the\n");
+	pr_info("Iyashi : thermal subsystem clamps a cpufreq policy down because of heat,\n");
+	pr_info("Iyashi : Iyashi makes sure the clamp does not pin the cluster at its lowest\n");
+	pr_info("Iyashi : OPP -- the top N OPPs are reserved as 'open road' so that a sudden\n");
+	pr_info("Iyashi : foreground request can still produce work.\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : without Iyashi, a hot device can deliver a button-press into a\n");
+	pr_info("Iyashi : fully clamped cpufreq and produce visible lag for an entire second\n");
+	pr_info("Iyashi : while the thermal load shed.\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :          ----  how the breath returns  ----\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :         cpufreq cooling device  decides 'set max = N'\n");
+	pr_info("Iyashi :                               |\n");
+	pr_info("Iyashi :                               v\n");
+	pr_info("Iyashi :             +----------------------------------+\n");
+	pr_info("Iyashi :             |  Iyashi inspects the policy      |\n");
+	pr_info("Iyashi :             |    - count remaining OPPs from N |\n");
+	pr_info("Iyashi :             |    - if fewer than reserve K,    |\n");
+	pr_info("Iyashi :             |      lift max to K-th OPP        |\n");
+	pr_info("Iyashi :             +----------------------------------+\n");
+	pr_info("Iyashi :                               |\n");
+	pr_info("Iyashi :                               v\n");
+	pr_info("Iyashi :             +----------------------------------+\n");
+	pr_info("Iyashi :             |  Iyashi increments counters:     |\n");
+	pr_info("Iyashi :             |    clamped_count    (passthrough)|\n");
+	pr_info("Iyashi :             |    passthrough_count (overrode)  |\n");
+	pr_info("Iyashi :             +----------------------------------+\n");
+	pr_info("Iyashi :                               |\n");
+	pr_info("Iyashi :                               v\n");
+	pr_info("Iyashi :                 cpufreq sees the (possibly lifted) max\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :          ----  the gating  ----\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : Iyashi only acts when:\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :     enabled == 1\n");
+	pr_info("Iyashi :     and the cooling action would cap below the reserve\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : it never lowers a max that the cooler did not lower.  it never\n");
+	pr_info("Iyashi : overrides a userspace request.  it never bypasses a critical-trip\n");
+	pr_info("Iyashi : shutdown -- the critical path skips cpufreq cooling entirely.\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :          ----  observability  ----\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : /sys/kernel/iyashi/enabled         R/W master switch\n");
+	pr_info("Iyashi : /sys/kernel/iyashi/reserve_opps    R/W how many top OPPs to keep\n");
+	pr_info("Iyashi : /sys/kernel/iyashi/clamped_count   R/O times the cooler clamped\n");
+	pr_info("Iyashi : /sys/kernel/iyashi/passthrough_count R/O times Iyashi lifted that clamp\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : a healthy device shows both counters moving under sustained load --\n");
+	pr_info("Iyashi : the ratio passthrough/clamped tells you how often heat alone would\n");
+	pr_info("Iyashi : have starved the foreground.\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :          ----  bond with Kasumi  ----\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : Kasumi softens *what the framework sees*.  Iyashi softens *what\n");
+	pr_info("Iyashi : cpufreq does*.  same goal, different layer.  with both enabled:\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :   raw temp -> Kasumi -> framework -> cooling decision -> Iyashi -> cpufreq\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : Kasumi delays the cooling decision; Iyashi shapes the decision.\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :          ----  bond with Zenith  ----\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi : Zenith sees the post-Iyashi max as the policy's max.  Zenith's\n");
+	pr_info("Iyashi : floor hint from Hikari is still honored *under* the Iyashi-lifted\n");
+	pr_info("Iyashi : ceiling -- the floor cannot exceed the (lifted or not) max.  the\n");
+	pr_info("Iyashi : hand-off is one number through cpufreq's policy lock.\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :          ----  the breath out has somewhere to go  ----\n");
+	pr_info("Iyashi : \n");
+	pr_info("Iyashi :          leave room.  let the foreground land.\n");
+	pr_info("Iyashi : \n");
 	pr_info("Iyashi : built by XTENSEI.\n");
 
 	return 0;
