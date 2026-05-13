@@ -63,6 +63,7 @@
 #include <linux/bits.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
+#include <linux/sysfs.h>
 #include <linux/hikari.h>
 #include <linux/notifier.h>
 #include <linux/power_supply.h>
@@ -7530,14 +7531,14 @@ static ssize_t zenith_show_comm_table(struct zenith_comm_table __rcu **slot,
 	t = rcu_dereference(*slot);
 	if (t) {
 		for (i = 0; i < t->nr; i++) {
-			len += scnprintf(buf + len, PAGE_SIZE - len - 1,
+			len += sysfs_emit_at(buf, len,
 					 "%s%s", first ? "" : ",",
 					 t->entries[i]);
 			first = false;
 		}
 	}
 	rcu_read_unlock();
-	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	len += sysfs_emit_at(buf, len, "\n");
 	return len;
 }
 
@@ -13319,7 +13320,7 @@ static void zenith_at_apply_tiers(struct zenith_policy *z_policy,
 static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
 	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
-	return sprintf(buf, "%u\n", t->_name); \
+	return sysfs_emit(buf, "%u\n", t->_name); \
 } \
 static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
 { \
@@ -13343,7 +13344,7 @@ static struct governor_attr _name = __ATTR_RW(_name)
 static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
 	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
-	return sprintf(buf, "%u\n", t->_name); \
+	return sysfs_emit(buf, "%u\n", t->_name); \
 } \
 static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
 { \
@@ -13365,7 +13366,7 @@ static struct governor_attr _name = __ATTR_RW(_name)
 static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
 	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
-	return sprintf(buf, "%u\n", t->_name); \
+	return sysfs_emit(buf, "%u\n", t->_name); \
 } \
 static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
 { \
@@ -13391,7 +13392,7 @@ static struct governor_attr _name = __ATTR_RW(_name)
 static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
 	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
-	return sprintf(buf, "%u\n", t->_name); \
+	return sysfs_emit(buf, "%u\n", t->_name); \
 } \
 static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
 { \
@@ -13416,7 +13417,7 @@ static struct governor_attr _name = __ATTR_RW(_name)
 static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
 	struct zenith_tunables *t = to_zenith_tunables(attr_set); \
-	return sprintf(buf, "%u\n", t->_name); \
+	return sysfs_emit(buf, "%u\n", t->_name); \
 } \
 static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
 { \
@@ -13434,7 +13435,7 @@ ZENITH_TUNABLE_UINT_BOOL_INVAL(io_is_busy);
 
 static ssize_t iowait_boost_min_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->iowait_boost_min);
 }
 
@@ -13460,7 +13461,7 @@ ZENITH_TUNABLE_UINT_MAX(iowait_stack_pct, 100);
 static ssize_t iowait_backoff_after_ms_show(struct gov_attr_set *attr_set,
 					    char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->iowait_backoff_after_ms);
 }
 
@@ -16081,7 +16082,7 @@ rearm:
 
 static ssize_t auto_tune_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->auto_tune);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->auto_tune);
 }
 
 static ssize_t auto_tune_store(struct gov_attr_set *attr_set,
@@ -16137,7 +16138,7 @@ ZENITH_TUNABLE_UINT_MAX(auto_tune_v2_tiers, 1);
 static ssize_t auto_tune_hysteresis_windows_show(struct gov_attr_set *attr_set,
 						 char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->auto_tune_hysteresis_windows);
 }
 
@@ -16160,7 +16161,7 @@ static struct governor_attr auto_tune_hysteresis_windows =
 static ssize_t auto_tune_cooldown_windows_show(struct gov_attr_set *attr_set,
 					       char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->auto_tune_cooldown_windows);
 }
 
@@ -16183,7 +16184,7 @@ static struct governor_attr auto_tune_cooldown_windows =
 static ssize_t auto_tune_v2_var_promote_thresh_show(struct gov_attr_set *attr_set,
 						    char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->auto_tune_v2_var_promote_thresh);
 }
 
@@ -16213,7 +16214,7 @@ static struct governor_attr auto_tune_v2_var_promote_thresh =
 static ssize_t auto_tune_util_rising_thresh_pct_show(struct gov_attr_set *attr_set,
 						     char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->auto_tune_util_rising_thresh_pct);
 }
 
@@ -16241,7 +16242,7 @@ static struct governor_attr auto_tune_util_rising_thresh_pct =
 static ssize_t auto_tune_render_rt_floor_pct_show(struct gov_attr_set *attr_set,
 						  char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->auto_tune_render_rt_floor_pct);
 }
 
@@ -16276,7 +16277,7 @@ static struct governor_attr auto_tune_render_rt_floor_pct =
  */
 static ssize_t auto_tune_v3_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->auto_tune_v3);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->auto_tune_v3);
 }
 
 static ssize_t auto_tune_v3_store(struct gov_attr_set *attr_set,
@@ -16334,7 +16335,7 @@ static struct governor_attr auto_tune_v3 = __ATTR_RW(auto_tune_v3);
 static ssize_t auto_tune_v3_interval_ms_show(struct gov_attr_set *attr_set,
 					     char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->auto_tune_v3_interval_ms);
 }
 
@@ -16372,7 +16373,7 @@ static ssize_t auto_tune_v3_state_show(struct gov_attr_set *attr_set,
 	ssize_t pos = 0;
 
 	list_for_each_entry(z_policy, &attr_set->policy_list, tunables_hook) {
-		pos += scnprintf(buf + pos, PAGE_SIZE - pos,
+		pos += sysfs_emit_at(buf, pos,
 			"policy%u: transitions=%u hyst_offset=%d cool_offset=%d\n",
 			z_policy->policy ? z_policy->policy->cpu : 0,
 			z_policy->at_v3_last_transitions,
@@ -16415,7 +16416,7 @@ static ssize_t auto_tune_v3_calib_log_show(struct gov_attr_set *attr_set,
 			count = ZENITH_AT_V3_CALIB_LOG_NR;
 		start = (count == ZENITH_AT_V3_CALIB_LOG_NR) ? head : 0;
 
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "policy%u: %u entries\n",
 				 z_pol->policy ? z_pol->policy->cpu : 0,
 				 count);
@@ -16428,7 +16429,7 @@ static ssize_t auto_tune_v3_calib_log_show(struct gov_attr_set *attr_set,
 					(start + i) %
 					ZENITH_AT_V3_CALIB_LOG_NR];
 
-			len += scnprintf(buf + len, PAGE_SIZE - len,
+			len += sysfs_emit_at(buf, len,
 				"  ts_ns=%llu mode=%u trans=%u hyst=%d->%d cool=%d->%d\n",
 				(unsigned long long)e->ts_ns,
 				(unsigned int)e->mode,
@@ -16449,7 +16450,7 @@ static struct governor_attr auto_tune_v3_calib_log =
 static ssize_t auto_tune_cluster_aware_show(struct gov_attr_set *attr_set,
 					    char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->auto_tune_cluster_aware);
 }
 
@@ -16479,7 +16480,7 @@ ZENITH_TUNABLE_UINT_MAX(auto_tune_thermal_slope, 1);
 static ssize_t auto_tune_thermal_pressure_pct_show(struct gov_attr_set *attr_set,
 						   char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->
 		       auto_tune_thermal_pressure_pct);
 }
 
@@ -16501,7 +16502,7 @@ static struct governor_attr auto_tune_thermal_pressure_pct =
 static ssize_t auto_tune_thermal_slope_pct_show(struct gov_attr_set *attr_set,
 						char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->
 		       auto_tune_thermal_slope_pct);
 }
 
@@ -16524,7 +16525,7 @@ ZENITH_TUNABLE_UINT_MAX(auto_tune_frame_pacing, 1);
 static ssize_t auto_tune_sustained_gaming_show(struct gov_attr_set *attr_set,
 					       char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->
 		       auto_tune_sustained_gaming);
 }
 
@@ -16562,7 +16563,7 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, \
 #define ZENITH_AT_PCT_SHOW(_name) \
 static ssize_t _name##_show(struct gov_attr_set *attr_set, char *buf) \
 { \
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->_name); \
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->_name); \
 }
 
 #define ZENITH_AT_PCT_TUNABLE(_name) \
@@ -16593,20 +16594,20 @@ ZENITH_TUNABLE_UINT_MAX(auto_tune_scenario, 1);
 static ssize_t profile_show(struct gov_attr_set *attr_set, char *buf)
 {
 	switch (to_zenith_tunables(attr_set)->active_profile) {
-	case ZENITH_PROFILE_PERFORMANCE:	return sprintf(buf, "performance\n");
-	case ZENITH_PROFILE_BALANCED:		return sprintf(buf, "balanced\n");
-	case ZENITH_PROFILE_BATTERY:		return sprintf(buf, "battery\n");
-	case ZENITH_PROFILE_LEGACY:		return sprintf(buf, "legacy\n");
-	case ZENITH_PROFILE_GAMING:		return sprintf(buf, "gaming\n");
-	case ZENITH_PROFILE_AUDIO:		return sprintf(buf, "audio\n");
+	case ZENITH_PROFILE_PERFORMANCE:	return sysfs_emit(buf, "performance\n");
+	case ZENITH_PROFILE_BALANCED:		return sysfs_emit(buf, "balanced\n");
+	case ZENITH_PROFILE_BATTERY:		return sysfs_emit(buf, "battery\n");
+	case ZENITH_PROFILE_LEGACY:		return sysfs_emit(buf, "legacy\n");
+	case ZENITH_PROFILE_GAMING:		return sysfs_emit(buf, "gaming\n");
+	case ZENITH_PROFILE_AUDIO:		return sysfs_emit(buf, "audio\n");
 	/* Patch B-AUTO-2: AUTO is the meta-profile that engages the
 	 * auto-selector engine.  Userspace sees "auto"; the concrete
 	 * profile the engine has applied is exposed separately via
 	 * the auto_target RO sysfs node.
 	 */
-	case ZENITH_PROFILE_AUTO:		return sprintf(buf, "auto\n");
+	case ZENITH_PROFILE_AUTO:		return sysfs_emit(buf, "auto\n");
 	case ZENITH_PROFILE_CUSTOM:
-	default:				return sprintf(buf, "custom\n");
+	default:				return sysfs_emit(buf, "custom\n");
 	}
 }
 
@@ -16735,7 +16736,7 @@ static struct governor_attr profile = __ATTR_RW(profile);
  */
 static ssize_t verbose_log_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->verbose_log);
 }
 
@@ -16761,7 +16762,7 @@ static struct governor_attr verbose_log = __ATTR_RW(verbose_log);
  */
 static ssize_t game_perf_burst_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->game_perf_burst);
 }
 
@@ -16791,7 +16792,7 @@ static struct governor_attr game_perf_burst = __ATTR_RW(game_perf_burst);
 static ssize_t game_perf_burst_floor_pct_show(struct gov_attr_set *attr_set,
 					      char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->game_perf_burst_floor_pct);
 }
 
@@ -16823,7 +16824,7 @@ static struct governor_attr game_perf_burst_floor_pct =
 static ssize_t game_perf_burst_thermal_ceiling_dc_show(
 	struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 				game_perf_burst_thermal_ceiling_dc);
 }
@@ -16855,7 +16856,7 @@ static struct governor_attr game_perf_burst_thermal_ceiling_dc =
 static ssize_t game_perf_burst_disarm_grace_ms_show(
 	struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 				game_perf_burst_disarm_grace_ms);
 }
@@ -16885,7 +16886,7 @@ static struct governor_attr game_perf_burst_disarm_grace_ms =
 static ssize_t game_perf_burst_cooldown_ms_show(struct gov_attr_set *attr_set,
 						char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 				game_perf_burst_cooldown_ms);
 }
@@ -16926,7 +16927,7 @@ static ssize_t game_perf_burst_state_show(struct gov_attr_set *attr_set,
 		int first_cpu = cpumask_first(z_policy->policy->cpus);
 		const char *name = zenith_gpb_state_name(z_policy->gpb_state);
 
-		off += scnprintf(buf + off, PAGE_SIZE - off, "%d %s\n",
+		off += sysfs_emit_at(buf, off, "%d %s\n",
 				 first_cpu, name);
 		if (z_policy->gpb_state != ZENITH_GPB_STATE_IDLE)
 			any_active = true;
@@ -16934,7 +16935,7 @@ static ssize_t game_perf_burst_state_show(struct gov_attr_set *attr_set,
 			break;
 	}
 	if (!any_active && off == 0)
-		off = scnprintf(buf, PAGE_SIZE, "idle\n");
+		off = sysfs_emit(buf, "idle\n");
 	return off;
 }
 static struct governor_attr game_perf_burst_state =
@@ -16975,7 +16976,7 @@ static ssize_t game_perf_burst_stats_show(struct gov_attr_set *attr_set,
 			zenith_gpb_disarm_name(
 				z_policy->gpb_last_disarm_reason);
 
-		off += scnprintf(buf + off, PAGE_SIZE - off,
+		off += sysfs_emit_at(buf, off,
 				 "%d state=%s arm=%u disarm=%u idle=%u last_disarm=%s\n",
 				 first_cpu, state_name,
 				 z_policy->gpb_arm_count,
@@ -17003,12 +17004,12 @@ static ssize_t auto_target_show(struct gov_attr_set *attr_set, char *buf)
 	unsigned int target = READ_ONCE(to_zenith_tunables(attr_set)->auto_target);
 
 	switch (target) {
-	case ZENITH_PROFILE_PERFORMANCE:	return sprintf(buf, "performance\n");
-	case ZENITH_PROFILE_BALANCED:		return sprintf(buf, "balanced\n");
-	case ZENITH_PROFILE_BATTERY:		return sprintf(buf, "battery\n");
-	case ZENITH_PROFILE_GAMING:		return sprintf(buf, "gaming\n");
-	case ZENITH_PROFILE_AUDIO:		return sprintf(buf, "audio\n");
-	default:				return sprintf(buf, "balanced\n");
+	case ZENITH_PROFILE_PERFORMANCE:	return sysfs_emit(buf, "performance\n");
+	case ZENITH_PROFILE_BALANCED:		return sysfs_emit(buf, "balanced\n");
+	case ZENITH_PROFILE_BATTERY:		return sysfs_emit(buf, "battery\n");
+	case ZENITH_PROFILE_GAMING:		return sysfs_emit(buf, "gaming\n");
+	case ZENITH_PROFILE_AUDIO:		return sysfs_emit(buf, "audio\n");
+	default:				return sysfs_emit(buf, "balanced\n");
 	}
 }
 static struct governor_attr auto_target = __ATTR_RO(auto_target);
@@ -17027,27 +17028,27 @@ static ssize_t auto_tune_status_show(struct gov_attr_set *attr_set, char *buf)
 	struct zenith_policy *z_pol;
 	ssize_t len = 0;
 
-	len += scnprintf(buf + len, PAGE_SIZE - len,
+	len += sysfs_emit_at(buf, len,
 			 "version=%u\n", ZENITH_AT_STATUS_FORMAT_VERSION);
-	len += scnprintf(buf + len, PAGE_SIZE - len,
+	len += sysfs_emit_at(buf, len,
 			 "auto_tune=%u\n", t->auto_tune);
-	len += scnprintf(buf + len, PAGE_SIZE - len,
+	len += sysfs_emit_at(buf, len,
 			 "auto_tune_v2=%u glides=%u tiers=%u\n",
 			 t->auto_tune_v2, t->auto_tune_v2_glides,
 			 t->auto_tune_v2_tiers);
-	len += scnprintf(buf + len, PAGE_SIZE - len,
+	len += sysfs_emit_at(buf, len,
 			 "v2_knobs=cluster:%u signals:%u thermal_slope:%u frame:%u gaming:%u\n",
 			 t->auto_tune_cluster_aware,
 			 t->auto_tune_v2_signals,
 			 t->auto_tune_thermal_slope,
 			 t->auto_tune_frame_pacing,
 			 t->auto_tune_sustained_gaming);
-	len += scnprintf(buf + len, PAGE_SIZE - len, "profile=%s\n",
+	len += sysfs_emit_at(buf, len, "profile=%s\n",
 			 zenith_profile_name(t->active_profile));
-	len += scnprintf(buf + len, PAGE_SIZE - len,
+	len += sysfs_emit_at(buf, len,
 			 "override_mask=0x%lx\n", t->auto_tune_override_mask);
 	list_for_each_entry(z_pol, &attr_set->policy_list, tunables_hook) {
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "policy%u(%s): state=%s applied_state=%s pending=%s pending_windows=%u cooldown=%u reason=%s target=%s samples=%u saturated=%u sat_pct=%u events_x2=%u flags=0x%x var_x256=%u psi=%u/%u/%u thermal=%u+%u frame_us=%u local=%u eff_rate=%u/%u eff_thresh=%u/%u eff_boost=%u/%u eff_frame=%u eff_game=%u\n",
 				 z_pol->policy->cpu,
 				 zenith_at_cluster_name(z_pol->cluster_class),
@@ -17118,7 +17119,7 @@ static ssize_t auto_tune_state_residency_show(struct gov_attr_set *attr_set,
 
 	list_for_each_entry(z_pol, &t->attr_set.policy_list, tunables_hook) {
 		for (s = 0; s < ARRAY_SIZE(z_pol->at_state_residency_ns); s++) {
-			len += scnprintf(buf + len, PAGE_SIZE - len,
+			len += sysfs_emit_at(buf, len,
 					 "policy%u(%s) state=%s residency_ns=%llu\n",
 					 z_pol->policy->cpu,
 					 zenith_at_cluster_name(
@@ -17165,7 +17166,7 @@ static ssize_t auto_tune_state_history_show(struct gov_attr_set *attr_set,
 			 */
 			slot = (head + ZENITH_AT_HISTORY_NR - 1 - i) %
 			       ZENITH_AT_HISTORY_NR;
-			len += scnprintf(buf + len, PAGE_SIZE - len,
+			len += sysfs_emit_at(buf, len,
 					 "policy%u(%s) ts=%llu from=%s to=%s reason=%s flags=0x%x\n",
 					 z_pol->policy->cpu,
 					 zenith_at_cluster_name(z_pol->cluster_class),
@@ -17238,7 +17239,7 @@ static ssize_t profile_values_show(struct gov_attr_set *attr_set, char *buf)
 	for (i = 0; i < ARRAY_SIZE(profs); i++) {
 		memset(&scratch, 0, sizeof(scratch));
 		zenith_apply_profile(&scratch, profs[i].id);
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 			"%s: up_rate_limit_us=%u down_rate_limit_us=%u "
 			"up_threshold=%u down_threshold=%u "
 			"hispeed_freq_pct=%u hispeed_load=%u "
@@ -17263,17 +17264,17 @@ static ssize_t profile_values_show(struct gov_attr_set *attr_set, char *buf)
 			scratch.thermal_auto, scratch.screen_auto,
 			scratch.util_math_v2,
 			scratch.kcpustat_hispeed_enable);
-		len += scnprintf(buf + len, PAGE_SIZE - len, "%s-extra: ",
+		len += sysfs_emit_at(buf, len, "%s-extra: ",
 				 profs[i].name);
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "down_rate_adaptive=%u ",
 				 scratch.down_rate_adaptive);
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "wakeup_boost=%u ", scratch.wakeup_boost);
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "down_threshold_adaptive=%u ",
 				 scratch.down_threshold_adaptive);
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "rate_limit_cluster_scale=%u\n",
 				 scratch.rate_limit_cluster_scale);
 	}
@@ -17342,7 +17343,7 @@ static ssize_t zenith_stats_show(struct gov_attr_set *attr_set, char *buf)
 	}
 
 	for (i = 0; i < ZENITH_STAT_NR; i++) {
-		len += scnprintf(buf + len, PAGE_SIZE - len, "%s=%lu\n",
+		len += sysfs_emit_at(buf, len, "%s=%lu\n",
 				 zenith_stat_names[i], sum[i]);
 		if (len >= PAGE_SIZE)
 			break;
@@ -17390,7 +17391,7 @@ static struct governor_attr zenith_stats_reset =
 static ssize_t zenith_input_stats_show(struct gov_attr_set *attr_set,
 				       char *buf)
 {
-	return sprintf(buf,
+	return sysfs_emit(buf,
 		"events_total=%llu\n"
 		"boosts_armed=%llu\n"
 		"boosts_quiet_extended=%llu\n"
@@ -17431,7 +17432,7 @@ static ssize_t at_log_show(struct gov_attr_set *attr_set, char *buf)
 			count = ZENITH_AT_LOG_NR;
 		start = (count == ZENITH_AT_LOG_NR) ? head : 0;
 
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "policy%u(%s): %u entries\n",
 				 z_pol->policy->cpu,
 				 zenith_at_cluster_name(z_pol->cluster_class),
@@ -17443,7 +17444,7 @@ static ssize_t at_log_show(struct gov_attr_set *attr_set, char *buf)
 			struct zenith_at_log_entry *e =
 				&z_pol->at_log[(start + i) % ZENITH_AT_LOG_NR];
 
-			len += scnprintf(buf + len, PAGE_SIZE - len,
+			len += sysfs_emit_at(buf, len,
 				"  ts_ns=%llu reason=%s from=%s to=%s target=%s sat=%u evx2=%u thp=%u slope=%u var=%u flags=0x%x emerg=%u\n",
 				(unsigned long long)e->ts_ns,
 				zenith_at_reason_name(e->reason),
@@ -17490,7 +17491,7 @@ static ssize_t last_decision_path_show(struct gov_attr_set *attr_set,
 
 		if (!tag)
 			tag = "init";
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "policy%u(%s): %s\n",
 				 z_pol->policy->cpu,
 				 zenith_at_cluster_name(z_pol->cluster_class),
@@ -17532,7 +17533,7 @@ static ssize_t decision_ring_show(struct gov_attr_set *attr_set, char *buf)
 		unsigned int head = READ_ONCE(z_pol->dec_ring_head);
 		unsigned int i;
 
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "policy%u(%s):\n",
 				 z_pol->policy->cpu,
 				 zenith_at_cluster_name(z_pol->cluster_class));
@@ -17547,7 +17548,7 @@ static ssize_t decision_ring_show(struct gov_attr_set *attr_set, char *buf)
 
 			if (!p)
 				continue;
-			len += scnprintf(buf + len, PAGE_SIZE - len,
+			len += sysfs_emit_at(buf, len,
 					 "  %s %u\n", p, lat_ns / 1000);
 			if (len >= PAGE_SIZE)
 				break;
@@ -17646,7 +17647,7 @@ decision_confidence_show(struct gov_attr_set *attr_set, char *buf)
 			}
 		}
 
-		len += scnprintf(buf + len, PAGE_SIZE - len,
+		len += sysfs_emit_at(buf, len,
 				 "policy%u(%s) total=%u:\n",
 				 z_pol->policy->cpu,
 				 zenith_at_cluster_name(z_pol->cluster_class),
@@ -17658,7 +17659,7 @@ decision_confidence_show(struct gov_attr_set *attr_set, char *buf)
 			unsigned int pct = total ?
 				(tally[i].count * 100) / total : 0;
 
-			len += scnprintf(buf + len, PAGE_SIZE - len,
+			len += sysfs_emit_at(buf, len,
 					 "  %-16s %3u %3u%%\n",
 					 tally[i].path, tally[i].count, pct);
 			if (len >= PAGE_SIZE)
@@ -17685,7 +17686,7 @@ ZENITH_TUNABLE_UINT_BOOL_INVAL(screen_state);
 static ssize_t screen_off_glide_ms_show(struct gov_attr_set *attr_set,
 					char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->screen_off_glide_ms);
 }
 
@@ -17728,7 +17729,7 @@ ZENITH_TUNABLE_UINT_BOOL_INVAL(thermal_pressure_continuous);
  */
 static ssize_t thermal_aware_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->thermal_aware);
 }
 
@@ -17769,7 +17770,7 @@ static struct governor_attr thermal_aware = __ATTR_RW(thermal_aware);
  */
 static ssize_t thermal_active_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       READ_ONCE(to_zenith_tunables(attr_set)->thermal_active));
 }
 static struct governor_attr thermal_active = __ATTR_RO(thermal_active);
@@ -17790,7 +17791,7 @@ ZENITH_TUNABLE_UINT_BOOL_INVAL(prefer_silver_aware);
 static ssize_t prefer_silver_hot_threshold_pct_show(
 		struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->prefer_silver_hot_threshold_pct);
 }
 
@@ -17817,7 +17818,7 @@ static struct governor_attr prefer_silver_hot_threshold_pct =
 static ssize_t prefer_silver_hot_bump_pct_show(
 		struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->prefer_silver_hot_bump_pct);
 }
 
@@ -17845,7 +17846,7 @@ ZENITH_TUNABLE_UINT_MAX(thermal_derate_rate_pct, 100);
 
 static ssize_t auto_thermal_cap_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->auto_thermal_cap);
 }
 
@@ -17871,7 +17872,7 @@ static struct governor_attr auto_thermal_cap =
 static ssize_t auto_thermal_cap_pressure_pct_show(struct gov_attr_set *attr_set,
 						  char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 			       auto_thermal_cap_pressure_pct);
 }
@@ -17896,7 +17897,7 @@ static struct governor_attr auto_thermal_cap_pressure_pct =
 static ssize_t auto_thermal_cap_freq_pct_show(struct gov_attr_set *attr_set,
 					      char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->auto_thermal_cap_freq_pct);
 }
 
@@ -17920,7 +17921,7 @@ static struct governor_attr auto_thermal_cap_freq_pct =
 static ssize_t freq_stability_margin_pct_show(struct gov_attr_set *attr_set,
 					      char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 				freq_stability_margin_pct);
 }
@@ -17943,7 +17944,7 @@ static struct governor_attr freq_stability_margin_pct =
 static ssize_t down_rate_adaptive_show(struct gov_attr_set *attr_set,
 				       char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->down_rate_adaptive);
 }
 
@@ -17975,7 +17976,7 @@ ZENITH_TUNABLE_UINT_MAX(wakeup_boost_ms, ZENITH_WAKEUP_BOOST_MS_MAX);
 static ssize_t rate_limit_cluster_scale_show(struct gov_attr_set *attr_set,
 					     char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->rate_limit_cluster_scale);
 }
 
@@ -17996,7 +17997,7 @@ static struct governor_attr rate_limit_cluster_scale =
 
 static ssize_t input_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->input_boost_ms);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->input_boost_ms);
 }
 
 static ssize_t input_boost_ms_store(struct gov_attr_set *attr_set,
@@ -18032,7 +18033,7 @@ ZENITH_TUNABLE_UINT_MAX_INVAL(input_boost_decay_ms, 1000);
 static ssize_t
 input_boost_touchdown_extra_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->input_boost_touchdown_extra_ms);
 }
 
@@ -18063,7 +18064,7 @@ ZENITH_TUNABLE_UINT_MAX(input_boost_big_only, 1);
 
 static ssize_t input_boost_cap_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->input_boost_cap_pct);
 }
 
@@ -18089,7 +18090,7 @@ static struct governor_attr input_boost_cap_pct =
 static ssize_t input_boost_down_rate_mult_pct_show(struct gov_attr_set *attr_set,
 						   char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->input_boost_down_rate_mult_pct);
 }
 
@@ -18156,10 +18157,10 @@ static ssize_t efficient_freq_show(struct gov_attr_set *attr_set, char *buf)
 	ssize_t len = 0;
 
 	if (!t->eff_nr)
-		return sprintf(buf, "0\n");
+		return sysfs_emit(buf, "0\n");
 
 	for (i = 0; i < t->eff_nr; i++)
-		len += sprintf(buf + len, "%u%c",
+		len += sysfs_emit_at(buf, len, "%u%c",
 			       t->eff_freq[i],
 			       (i + 1 == t->eff_nr) ? '\n' : ' ');
 	return len;
@@ -18213,7 +18214,7 @@ static struct governor_attr efficient_freq = __ATTR_RW(efficient_freq);
 
 static ssize_t eff_bin_hyst_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->eff_bin_hyst_pct);
 }
 
@@ -18238,10 +18239,10 @@ static ssize_t up_delay_us_show(struct gov_attr_set *attr_set, char *buf)
 	ssize_t len = 0;
 
 	if (!t->eff_nr)
-		return sprintf(buf, "%u\n", t->up_delay_us);
+		return sysfs_emit(buf, "%u\n", t->up_delay_us);
 
 	for (i = 0; i < t->eff_nr; i++)
-		len += sprintf(buf + len, "%u%c",
+		len += sysfs_emit_at(buf, len, "%u%c",
 			       t->eff_delay_us[i],
 			       (i + 1 == t->eff_nr) ? '\n' : ' ');
 	return len;
@@ -18291,7 +18292,7 @@ ZENITH_TUNABLE_UINT_MAX_INVAL(light_load_threshold, 100);
 
 static ssize_t sampling_down_factor_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->sampling_down_factor);
 }
 
@@ -18316,7 +18317,7 @@ ZENITH_TUNABLE_UINT_MAX_INVAL(bias_load_threshold, 100);
 
 static ssize_t up_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_threshold);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->up_threshold);
 }
 
 static ssize_t up_threshold_store(struct gov_attr_set *attr_set,
@@ -18337,7 +18338,7 @@ static struct governor_attr up_threshold = __ATTR_RW(up_threshold);
 static ssize_t up_threshold_adaptive_show(struct gov_attr_set *attr_set,
 					  char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->up_threshold_adaptive);
 }
 
@@ -18359,7 +18360,7 @@ static struct governor_attr up_threshold_adaptive =
 static ssize_t up_threshold_hispeed_show(struct gov_attr_set *attr_set,
 					 char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->up_threshold_hispeed);
 }
 
@@ -18386,7 +18387,7 @@ static struct governor_attr up_threshold_hispeed =
 
 static ssize_t down_threshold_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->down_threshold);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->down_threshold);
 }
 
 static ssize_t down_threshold_store(struct gov_attr_set *attr_set,
@@ -18407,7 +18408,7 @@ static struct governor_attr down_threshold = __ATTR_RW(down_threshold);
 static ssize_t down_threshold_adaptive_show(struct gov_attr_set *attr_set,
 					    char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->down_threshold_adaptive);
 }
 
@@ -18434,7 +18435,7 @@ ZENITH_TUNABLE_UINT_MAX_INVAL(hispeed_freq_pct, 100);
 
 static ssize_t hispeed_load_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->hispeed_load);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->hispeed_load);
 }
 
 static ssize_t hispeed_load_store(struct gov_attr_set *attr_set,
@@ -18459,7 +18460,7 @@ ZENITH_TUNABLE_UINT_MAX(hispeed_hyst_pct, 100);
  */
 static ssize_t hispeed_entry_streak_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->hispeed_entry_streak);
 }
 
@@ -18484,7 +18485,7 @@ static struct governor_attr hispeed_entry_streak =
  */
 static ssize_t brutal_entry_streak_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->brutal_entry_streak);
 }
 
@@ -18519,7 +18520,7 @@ ZENITH_TUNABLE_UINT_MAX(peak_headroom_rescue, 1);
 static ssize_t peak_headroom_starve_load_pct_show(struct gov_attr_set *attr_set,
 						  char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->peak_headroom_starve_load_pct);
 }
 
@@ -18549,7 +18550,7 @@ static struct governor_attr peak_headroom_starve_load_pct =
 static ssize_t peak_headroom_freq_floor_pct_show(struct gov_attr_set *attr_set,
 						 char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->peak_headroom_freq_floor_pct);
 }
 
@@ -18585,7 +18586,7 @@ ZENITH_TUNABLE_UINT_MAX(peak_headroom_starve_streak, ZENITH_PEAK_HEADROOM_STREAK
 static ssize_t peak_headroom_jump_pct_show(struct gov_attr_set *attr_set,
 					   char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->peak_headroom_jump_pct);
 }
 
@@ -18613,7 +18614,7 @@ static struct governor_attr peak_headroom_jump_pct =
 static ssize_t peak_headroom_hold_ms_show(struct gov_attr_set *attr_set,
 					  char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->peak_headroom_hold_ms);
 }
 
@@ -18642,7 +18643,7 @@ static struct governor_attr peak_headroom_hold_ms =
 static ssize_t batt_hold_scale_pct_show(struct gov_attr_set *attr_set,
 					char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->batt_hold_scale_pct);
 }
 
@@ -18724,7 +18725,7 @@ ZENITH_TUNABLE_UINT_MAX(em_floor_pct, ZENITH_EM_FLOOR_PCT_MAX);
  */
 static ssize_t on_battery_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       (unsigned int)atomic_read(&zenith_on_battery));
 }
 
@@ -18738,7 +18739,7 @@ static struct governor_attr on_battery = __ATTR_RO(on_battery);
 static ssize_t cluster_wake_pulse_ms_show(struct gov_attr_set *attr_set,
 					  char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->cluster_wake_pulse_ms);
 }
 
@@ -18768,7 +18769,7 @@ static struct governor_attr cluster_wake_pulse_ms =
 static ssize_t cluster_wake_pulse_idle_ms_show(struct gov_attr_set *attr_set,
 					       char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->cluster_wake_pulse_idle_ms);
 }
 
@@ -18803,7 +18804,7 @@ ZENITH_TUNABLE_UINT_MAX(cluster_wake_pulse_floor_pct, 100);
 static ssize_t quiet_hours_start_min_show(struct gov_attr_set *attr_set,
 					  char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->quiet_hours_start_min);
 }
 
@@ -18826,7 +18827,7 @@ static struct governor_attr quiet_hours_start_min =
 static ssize_t quiet_hours_end_min_show(struct gov_attr_set *attr_set,
 					char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->quiet_hours_end_min);
 }
 
@@ -18854,7 +18855,7 @@ static struct governor_attr quiet_hours_end_min =
 static ssize_t quiet_hours_cap_pct_show(struct gov_attr_set *attr_set,
 					char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->quiet_hours_cap_pct);
 }
 
@@ -18917,7 +18918,7 @@ static ssize_t decision_latency_hist_show(struct gov_attr_set *attr_set,
 		b2 += z_policy->dec_lat_buckets[2];
 		b3 += z_policy->dec_lat_buckets[3];
 	}
-	return sprintf(buf, "%lu %lu %lu %lu\n", b0, b1, b2, b3);
+	return sysfs_emit(buf, "%lu %lu %lu %lu\n", b0, b1, b2, b3);
 }
 
 static struct governor_attr decision_latency_hist =
@@ -18940,7 +18941,7 @@ static struct governor_attr decision_latency_hist =
 static ssize_t fg_transition_pulse_ms_show(struct gov_attr_set *attr_set,
 					   char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->fg_transition_pulse_ms);
 }
 
@@ -18963,7 +18964,7 @@ static struct governor_attr fg_transition_pulse_ms =
 static ssize_t fg_transition_pulse_pct_show(struct gov_attr_set *attr_set,
 					    char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		to_zenith_tunables(attr_set)->fg_transition_pulse_pct);
 }
 
@@ -18998,7 +18999,7 @@ ZENITH_TUNABLE_UINT_MAX(peak_headroom_prearm, 1);
  */
 static ssize_t predict_up_thresh_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->predict_up_thresh);
 }
 
@@ -19026,7 +19027,7 @@ static struct governor_attr predict_up_thresh =
  */
 static ssize_t predict_up_window_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->predict_up_window);
 }
 
@@ -19055,7 +19056,7 @@ static struct governor_attr predict_up_window =
 static ssize_t
 pelt_rising_edge_thresh_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->pelt_rising_edge_thresh);
 }
 
@@ -19084,7 +19085,7 @@ static struct governor_attr pelt_rising_edge_thresh =
 static ssize_t
 pelt_rising_edge_min_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->pelt_rising_edge_min_pct);
 }
 
@@ -19113,7 +19114,7 @@ static struct governor_attr pelt_rising_edge_min_pct =
 static ssize_t
 dl_task_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->dl_task_floor_pct);
 }
 
@@ -19143,7 +19144,7 @@ static struct governor_attr dl_task_floor_pct =
 static ssize_t
 io_floor_hyst_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->io_floor_hyst_ms);
 }
 
@@ -19172,7 +19173,7 @@ static struct governor_attr io_floor_hyst_ms =
 static ssize_t
 io_floor_hyst_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->io_floor_hyst_pct);
 }
 
@@ -19201,7 +19202,7 @@ static struct governor_attr io_floor_hyst_pct =
 static ssize_t
 peak_hysteresis_streak_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->peak_hysteresis_streak);
 }
 
@@ -19232,7 +19233,7 @@ static struct governor_attr peak_hysteresis_streak =
 static ssize_t
 peak_step_down_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->peak_step_down_pct);
 }
 
@@ -19260,7 +19261,7 @@ static struct governor_attr peak_step_down_pct =
 static ssize_t
 boost_idle_thresh_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->boost_idle_thresh);
 }
 
@@ -19289,7 +19290,7 @@ static struct governor_attr boost_idle_thresh =
 static ssize_t
 boost_idle_streak_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->boost_idle_streak);
 }
 
@@ -19318,7 +19319,7 @@ static struct governor_attr boost_idle_streak =
 static ssize_t
 bg_util_scale_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->bg_util_scale_pct);
 }
 
@@ -19345,7 +19346,7 @@ static struct governor_attr bg_util_scale_pct =
 static ssize_t
 sleeper_tail_thresh_us_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->sleeper_tail_thresh_us);
 }
 
@@ -19372,7 +19373,7 @@ static struct governor_attr sleeper_tail_thresh_us =
 static ssize_t
 sleeper_tail_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->sleeper_tail_pct);
 }
 
@@ -19404,7 +19405,7 @@ static struct governor_attr sleeper_tail_pct =
 static ssize_t
 peer_ramp_window_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->peer_ramp_window_ms);
 }
 
@@ -19436,7 +19437,7 @@ static struct governor_attr peer_ramp_window_ms =
 static ssize_t
 peer_ramp_window_off_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->peer_ramp_window_off_ms);
 }
 
@@ -19466,7 +19467,7 @@ static struct governor_attr peer_ramp_window_off_ms =
 static ssize_t
 peer_ramp_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->peer_ramp_floor_pct);
 }
 
@@ -19493,7 +19494,7 @@ static struct governor_attr peer_ramp_floor_pct =
 static ssize_t
 migration_jump_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->migration_jump_pct);
 }
 
@@ -19523,7 +19524,7 @@ static struct governor_attr migration_jump_pct =
 static ssize_t
 migration_floor_window_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 		       migration_floor_window_ms);
 }
@@ -19554,7 +19555,7 @@ static struct governor_attr migration_floor_window_ms =
 static ssize_t
 migration_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->migration_floor_pct);
 }
 
@@ -19586,7 +19587,7 @@ static struct governor_attr migration_floor_pct =
 static ssize_t
 psi_cpu_floor_thresh_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->psi_cpu_floor_thresh);
 }
 
@@ -19617,7 +19618,7 @@ static struct governor_attr psi_cpu_floor_thresh =
 static ssize_t
 frame_overrun_slack_us_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->frame_overrun_slack_us);
 }
 
@@ -19648,7 +19649,7 @@ static struct governor_attr frame_overrun_slack_us =
 static ssize_t
 frame_overrun_window_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 		       frame_overrun_window_ms);
 }
@@ -19680,7 +19681,7 @@ static struct governor_attr frame_overrun_window_ms =
 static ssize_t
 frame_overrun_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 		       frame_overrun_floor_pct);
 }
@@ -19714,7 +19715,7 @@ static struct governor_attr frame_overrun_floor_pct =
 static ssize_t
 frame_overrun_deep_streak_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 		       frame_overrun_deep_streak);
 }
@@ -19747,7 +19748,7 @@ static struct governor_attr frame_overrun_deep_streak =
 static ssize_t
 frame_overrun_deep_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 		       frame_overrun_deep_floor_pct);
 }
@@ -19779,7 +19780,7 @@ static struct governor_attr frame_overrun_deep_floor_pct =
 static ssize_t
 psi_mem_cap_thresh_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->psi_mem_cap_thresh);
 }
 
@@ -19804,7 +19805,7 @@ static struct governor_attr psi_mem_cap_thresh =
 static ssize_t
 psi_mem_cap_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->psi_mem_cap_pct);
 }
 
@@ -19830,7 +19831,7 @@ static struct governor_attr psi_mem_cap_pct =
 static ssize_t
 psi_mem_cap_window_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->psi_mem_cap_window_ms);
 }
 
@@ -19865,7 +19866,7 @@ ZENITH_TUNABLE_UINT_MAX_INVAL(climb_mode, ZENITH_CLIMB_MODE_STEP);
 
 static ssize_t freq_step_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->freq_step_pct);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->freq_step_pct);
 }
 
 static ssize_t freq_step_pct_store(struct gov_attr_set *attr_set,
@@ -19899,7 +19900,7 @@ ZENITH_TUNABLE_UINT_MAX_INVAL(screen_on_bias_pct, 100);
 
 static ssize_t up_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->up_rate_limit_us);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->up_rate_limit_us);
 }
 
 static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
@@ -19921,7 +19922,7 @@ static struct governor_attr up_rate_limit_us = __ATTR_RW(up_rate_limit_us);
 
 static ssize_t down_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->down_rate_limit_us);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->down_rate_limit_us);
 }
 
 static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set,
@@ -19951,7 +19952,7 @@ static struct governor_attr down_rate_limit_us = __ATTR_RW(down_rate_limit_us);
 static ssize_t kcpustat_window_us_show(struct gov_attr_set *attr_set,
 				       char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->kcpustat_window_us);
 }
 
@@ -19976,7 +19977,7 @@ static struct governor_attr kcpustat_window_us =
 static ssize_t kcpustat_filter_shift_show(struct gov_attr_set *attr_set,
 					  char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->kcpustat_filter_shift);
 }
 
@@ -20015,7 +20016,7 @@ ZENITH_TUNABLE_UINT_BOOL_INVAL(util_math_v2);
  */
 static ssize_t predict_util_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->predict_util_pct);
 }
 
@@ -20048,7 +20049,7 @@ ZENITH_TUNABLE_UINT_MAX(predict_util_smooth, 1);
  */
 static ssize_t render_aware_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->render_aware);
 }
 
@@ -20076,7 +20077,7 @@ static struct governor_attr render_aware = __ATTR_RW(render_aware);
  */
 static ssize_t render_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->render_floor_pct);
 }
 
@@ -20106,7 +20107,7 @@ static struct governor_attr render_floor_pct = __ATTR_RW(render_floor_pct);
 static ssize_t
 render_floor_min_runtime_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->render_floor_min_runtime_ms);
 }
 
@@ -20136,7 +20137,7 @@ static struct governor_attr render_floor_min_runtime_ms =
  */
 static ssize_t audio_aware_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->audio_aware);
 }
 
@@ -20166,7 +20167,7 @@ static struct governor_attr audio_aware = __ATTR_RW(audio_aware);
  */
 static ssize_t audio_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->audio_floor_pct);
 }
 
@@ -20193,7 +20194,7 @@ static struct governor_attr audio_floor_pct = __ATTR_RW(audio_floor_pct);
  */
 static ssize_t audio_cap_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->audio_cap_pct);
 }
 
@@ -20222,7 +20223,7 @@ static struct governor_attr audio_cap_pct = __ATTR_RW(audio_cap_pct);
  */
 static ssize_t audio_hyst_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->audio_hyst_ms);
 }
 
@@ -20253,7 +20254,7 @@ static struct governor_attr audio_hyst_ms = __ATTR_RW(audio_hyst_ms);
 static ssize_t
 vh_arch_freq_scale_enable_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->vh_arch_freq_scale_enable);
 }
 
@@ -20282,7 +20283,7 @@ static struct governor_attr vh_arch_freq_scale_enable =
 static ssize_t
 vh_uclamp_observer_enable_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->vh_uclamp_observer_enable);
 }
 
@@ -20312,7 +20313,7 @@ static struct governor_attr vh_uclamp_observer_enable =
 static ssize_t
 vh_cpu_idle_enable_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->vh_cpu_idle_enable);
 }
 
@@ -20343,7 +20344,7 @@ static struct governor_attr vh_cpu_idle_enable =
 static ssize_t
 vh_freq_qos_enable_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->vh_freq_qos_enable);
 }
 
@@ -20373,7 +20374,7 @@ static struct governor_attr vh_freq_qos_enable =
 static ssize_t
 vh_sched_move_task_enable_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->vh_sched_move_task_enable);
 }
 
@@ -20403,7 +20404,7 @@ static struct governor_attr vh_sched_move_task_enable =
 static ssize_t
 vh_scheduler_tick_enable_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->vh_scheduler_tick_enable);
 }
 
@@ -20432,7 +20433,7 @@ static struct governor_attr vh_scheduler_tick_enable =
  */
 static ssize_t auto_eval_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       READ_ONCE(to_zenith_tunables(attr_set)->auto_eval_ms));
 }
 
@@ -20462,7 +20463,7 @@ static struct governor_attr auto_eval_ms = __ATTR_RW(auto_eval_ms);
 static ssize_t auto_hysteresis_ms_show(struct gov_attr_set *attr_set,
 				       char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       READ_ONCE(to_zenith_tunables(attr_set)->auto_hysteresis_ms));
 }
 
@@ -20487,7 +20488,7 @@ static struct governor_attr auto_hysteresis_ms =
  */
 static ssize_t camera_aware_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->camera_aware);
 }
 
@@ -20582,7 +20583,7 @@ static struct governor_attr game_auto_comms = __ATTR_RW(game_auto_comms);
  */
 static ssize_t camera_active_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->camera_active);
 }
 
@@ -20606,7 +20607,7 @@ static struct governor_attr camera_active = __ATTR_RW(camera_active);
  */
 static ssize_t camera_floor_pct_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->camera_floor_pct);
 }
 
@@ -20634,7 +20635,7 @@ static struct governor_attr camera_floor_pct = __ATTR_RW(camera_floor_pct);
  */
 static ssize_t game_mode_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->game_mode);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->game_mode);
 }
 
 static ssize_t game_mode_store(struct gov_attr_set *attr_set,
@@ -20665,7 +20666,7 @@ static struct governor_attr game_mode = __ATTR_RW(game_mode);
  */
 static ssize_t game_auto_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->game_auto);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->game_auto);
 }
 
 static ssize_t game_auto_store(struct gov_attr_set *attr_set,
@@ -20697,7 +20698,7 @@ static struct governor_attr game_auto = __ATTR_RW(game_auto);
  */
 static ssize_t game_auto_state_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", zenith_game_auto_active() ? 1 : 0);
+	return sysfs_emit(buf, "%u\n", zenith_game_auto_active() ? 1 : 0);
 }
 static struct governor_attr game_auto_state = __ATTR_RO(game_auto_state);
 
@@ -20707,7 +20708,7 @@ static struct governor_attr game_auto_state = __ATTR_RO(game_auto_state);
  */
 static ssize_t psi_aware_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", to_zenith_tunables(attr_set)->psi_aware);
+	return sysfs_emit(buf, "%u\n", to_zenith_tunables(attr_set)->psi_aware);
 }
 
 static ssize_t psi_aware_store(struct gov_attr_set *attr_set,
@@ -20734,7 +20735,7 @@ static struct governor_attr psi_aware = __ATTR_RW(psi_aware);
  */
 static ssize_t psi_mem_thresh_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->psi_mem_thresh);
 }
 
@@ -20759,7 +20760,7 @@ static struct governor_attr psi_mem_thresh = __ATTR_RW(psi_mem_thresh);
  */
 static ssize_t psi_cpu_thresh_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->psi_cpu_thresh);
 }
 
@@ -20780,7 +20781,7 @@ static struct governor_attr psi_cpu_thresh = __ATTR_RW(psi_cpu_thresh);
 
 static ssize_t psi_io_thresh_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->psi_io_thresh);
 }
 
@@ -20815,7 +20816,7 @@ static struct governor_attr psi_io_thresh = __ATTR_RW(psi_io_thresh);
  */
 static ssize_t psi_cgroup_path_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%s\n",
+	return sysfs_emit(buf, "%s\n",
 		       to_zenith_tunables(attr_set)->psi_cgroup_path);
 }
 
@@ -20849,7 +20850,7 @@ static struct governor_attr psi_cgroup_path = __ATTR_RW(psi_cgroup_path);
  */
 static ssize_t boot_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->boot_boost_ms);
 }
 
@@ -20878,7 +20879,7 @@ static struct governor_attr boot_boost_ms = __ATTR_RW(boot_boost_ms);
 static ssize_t boot_boost_decay_ms_show(struct gov_attr_set *attr_set,
 					char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->boot_boost_decay_ms);
 }
 
@@ -20915,7 +20916,7 @@ static struct governor_attr boot_boost_decay_ms =
  */
 static ssize_t boot_complete_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n", atomic_read(&zenith_boot_complete));
+	return sysfs_emit(buf, "%u\n", atomic_read(&zenith_boot_complete));
 }
 
 static ssize_t boot_complete_store(struct gov_attr_set *attr_set,
@@ -20957,7 +20958,7 @@ ZENITH_TUNABLE_UINT_MAX(boot_complete_auto, 1);
  */
 static ssize_t frame_budget_us_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->frame_budget_us);
 }
 
@@ -20987,7 +20988,7 @@ static struct governor_attr frame_budget_us = __ATTR_RW(frame_budget_us);
 static ssize_t frame_budget_us_auto_show(struct gov_attr_set *attr_set,
 					 char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->frame_budget_us_auto);
 }
 
@@ -21012,7 +21013,7 @@ static struct governor_attr frame_budget_us_auto =
  */
 static ssize_t drm_vblank_us_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       (unsigned int)atomic_read(&zenith_drm_vblank_us));
 }
 static struct governor_attr drm_vblank_us = __ATTR_RO(drm_vblank_us);
@@ -21132,7 +21133,7 @@ static struct governor_attr frame_budget_us_per_policy =
 static ssize_t frame_pace_floor_pct_show(struct gov_attr_set *attr_set,
 					 char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->frame_pace_floor_pct);
 }
 
@@ -21171,7 +21172,7 @@ ZENITH_TUNABLE_UINT_MAX(uclamp_min_respect, 1);
 static ssize_t
 peer_ramp_uclamp_min_respect_show(struct gov_attr_set *attr_set, char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 		       peer_ramp_uclamp_min_respect);
 }
@@ -21201,7 +21202,7 @@ static ssize_t
 migration_floor_uclamp_min_respect_show(struct gov_attr_set *attr_set,
 					char *buf)
 {
-	return sprintf(buf, "%u\n",
+	return sysfs_emit(buf, "%u\n",
 		       to_zenith_tunables(attr_set)->
 		       migration_floor_uclamp_min_respect);
 }
