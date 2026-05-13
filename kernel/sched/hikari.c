@@ -107,6 +107,17 @@ static unsigned int hikari_uclamp_ttl_ms = 16;
 static unsigned int hikari_floor_khz_cluster0 = 800000;
 static unsigned int hikari_floor_khz_cluster1 = 1200000;
 static unsigned int hikari_floor_ttl_ms = 50;
+/*
+ * Per-cluster floor-TTL overrides.  Zero (default) means "fall back to
+ * the shared hikari_floor_ttl_ms above".  Non-zero overrides the global
+ * for that cluster only -- so an admin can hold the silvers' wake-floor
+ * hint longer than the golds' (or vice-versa) without disturbing the
+ * single-value semantics anyone already shipping a tunables.cfg
+ * depends on.  Bounded 0..hikari_floor_ttl_max, validated the same
+ * way the shared value is.
+ */
+static unsigned int hikari_floor_ttl_ms_big;
+static unsigned int hikari_floor_ttl_ms_little;
 static unsigned int hikari_placement_enable;
 static unsigned int hikari_audio_intensify = 1;
 static unsigned int hikari_topapp_auto_optin = 1;
@@ -124,6 +135,12 @@ static const unsigned int hikari_floor_khz_max_c0 = 2000000;
 static const unsigned int hikari_floor_khz_max_c1 = 3000000;
 static const unsigned int hikari_floor_ttl_min = 1;
 static const unsigned int hikari_floor_ttl_max = 500;
+/*
+ * Per-cluster override minimum is 0 (= "use the shared value") rather
+ * than 1 like the shared value's, so an admin can clear the override
+ * without disabling the floor entirely.
+ */
+static const unsigned int hikari_floor_ttl_override_min = 0;
 static const unsigned int hikari_ewma_shift_min = 1;
 static const unsigned int hikari_ewma_shift_max = 7;
 
@@ -356,6 +373,24 @@ static inline void hikari_apply_uclamp_boost(struct task_struct *p)
 	atomic_inc(&this_cpu_ptr(&hikari_pcpu)->boost_count);
 }
 
+/*
+ * Resolve the floor TTL for a specific CPU: per-cluster override if
+ * set, otherwise the shared hikari_floor_ttl_ms.  Mirrors the
+ * per-cluster floor_khz lookup directly above so both knobs travel
+ * together.
+ */
+static inline unsigned int hikari_floor_ttl_ms_for_cpu(unsigned int cpu)
+{
+	unsigned int override;
+
+	override = cpumask_test_cpu(cpu, &hikari_big_cluster)
+		   ? READ_ONCE(hikari_floor_ttl_ms_big)
+		   : READ_ONCE(hikari_floor_ttl_ms_little);
+	if (override)
+		return override;
+	return READ_ONCE(hikari_floor_ttl_ms);
+}
+
 static inline void hikari_publish_freq_hint(unsigned int cpu, u32 demand_ns)
 {
 	struct hikari_freq_hint hint;
@@ -375,7 +410,7 @@ static inline void hikari_publish_freq_hint(unsigned int cpu, u32 demand_ns)
 
 	hint.cpu       = cpu;
 	hint.floor_khz = floor;
-	hint.ttl_ms    = READ_ONCE(hikari_floor_ttl_ms);
+	hint.ttl_ms    = hikari_floor_ttl_ms_for_cpu(cpu);
 	hint.demand_ns = demand_ns;
 
 	atomic_inc(&per_cpu_ptr(&hikari_pcpu, cpu)->hint_count);
@@ -421,7 +456,7 @@ static inline void hikari_pcpu_mark_audio(unsigned int cpu)
 	if (cpu >= nr_cpu_ids)
 		return;
 	WRITE_ONCE(per_cpu_ptr(&hikari_pcpu, cpu)->audio_active_until_jiffies,
-		   jiffies + msecs_to_jiffies(READ_ONCE(hikari_floor_ttl_ms)));
+		   jiffies + msecs_to_jiffies(hikari_floor_ttl_ms_for_cpu(cpu)));
 }
 
 static inline bool hikari_cpu_is_audio_active(unsigned int cpu)
@@ -753,6 +788,24 @@ static struct ctl_table hikari_sysctl_table[] = {
 		.extra2		= (void *)&hikari_floor_ttl_max,
 	},
 	{
+		.procname	= "hikari_floor_ttl_ms_big",
+		.data		= &hikari_floor_ttl_ms_big,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= (void *)&hikari_floor_ttl_override_min,
+		.extra2		= (void *)&hikari_floor_ttl_max,
+	},
+	{
+		.procname	= "hikari_floor_ttl_ms_little",
+		.data		= &hikari_floor_ttl_ms_little,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= (void *)&hikari_floor_ttl_override_min,
+		.extra2		= (void *)&hikari_floor_ttl_max,
+	},
+	{
 		.procname	= "hikari_placement_enable",
 		.data		= &hikari_placement_enable,
 		.maxlen		= sizeof(unsigned int),
@@ -1036,6 +1089,8 @@ HIKARI_TUNABLE_RW(floor_khz_cluster0, hikari_floor_khz_cluster0,
 HIKARI_TUNABLE_RW(floor_khz_cluster1, hikari_floor_khz_cluster1,
 		  0, 3000000);
 HIKARI_TUNABLE_RW(floor_ttl_ms, hikari_floor_ttl_ms, 1, 500);
+HIKARI_TUNABLE_RW(floor_ttl_ms_big, hikari_floor_ttl_ms_big, 0, 500);
+HIKARI_TUNABLE_RW(floor_ttl_ms_little, hikari_floor_ttl_ms_little, 0, 500);
 HIKARI_TUNABLE_RW(placement_enable, hikari_placement_enable, 0, 1);
 HIKARI_TUNABLE_RW(audio_intensify, hikari_audio_intensify, 0, 1);
 HIKARI_TUNABLE_RW(topapp_auto_optin, hikari_topapp_auto_optin, 0, 1);
@@ -1077,6 +1132,8 @@ static struct attribute *hikari_sysfs_attrs[] = {
 	&hikari_attr_floor_khz_cluster0.attr,
 	&hikari_attr_floor_khz_cluster1.attr,
 	&hikari_attr_floor_ttl_ms.attr,
+	&hikari_attr_floor_ttl_ms_big.attr,
+	&hikari_attr_floor_ttl_ms_little.attr,
 	&hikari_attr_placement_enable.attr,
 	&hikari_attr_audio_intensify.attr,
 	&hikari_attr_topapp_auto_optin.attr,
