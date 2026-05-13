@@ -75,6 +75,7 @@
  */
 struct hikari_pcpu {
 	u32		wake_demand_ewma_ns;
+	unsigned int	wake_floor_khz;
 	unsigned long	wake_floor_until_jiffies;
 	unsigned long	audio_active_until_jiffies;
 	atomic_t	boost_count;
@@ -293,12 +294,36 @@ static inline void hikari_publish_freq_hint(unsigned int cpu, u32 demand_ns)
 	hint.demand_ns = demand_ns;
 
 	atomic_inc(&per_cpu_ptr(&hikari_pcpu, cpu)->hint_count);
+	WRITE_ONCE(per_cpu_ptr(&hikari_pcpu, cpu)->wake_floor_khz, floor);
 	WRITE_ONCE(per_cpu_ptr(&hikari_pcpu, cpu)->wake_floor_until_jiffies,
 		   jiffies + msecs_to_jiffies(hint.ttl_ms));
 
 	atomic_notifier_call_chain(&hikari_cpufreq_chain,
 				   HIKARI_NOTIFIER_WAKE_DEMAND, &hint);
 }
+
+unsigned int hikari_get_floor_khz(unsigned int cpu)
+{
+	struct hikari_pcpu *pc;
+	unsigned long until;
+	unsigned int khz;
+
+	if (!IS_ENABLED(CONFIG_HIKARI_ZENITH_HINT))
+		return 0;
+	if (!hikari_enabled())
+		return 0;
+	if (cpu >= nr_cpu_ids)
+		return 0;
+
+	pc = per_cpu_ptr(&hikari_pcpu, cpu);
+	until = READ_ONCE(pc->wake_floor_until_jiffies);
+	if (!until || time_after_eq(jiffies, until))
+		return 0;
+
+	khz = READ_ONCE(pc->wake_floor_khz);
+	return khz;
+}
+EXPORT_SYMBOL_GPL(hikari_get_floor_khz);
 
 /*
  * Mark the CPU `p` is currently running on as audio-active for

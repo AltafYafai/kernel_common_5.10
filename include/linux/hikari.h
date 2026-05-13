@@ -106,6 +106,14 @@ int hikari_unregister_cpufreq_notifier(struct notifier_block *nb);
 /* Master enable check, useful for callers that want to skip work. */
 bool hikari_enabled(void);
 
+/*
+ * Direct query for the current wake-time frequency floor on @cpu.
+ * Returns 0 when there is no active floor (Hikari off, no hint
+ * within the TTL window, or the per-CPU floor was zero).  Safe to
+ * call from any context, including the cpufreq governor hot path.
+ */
+unsigned int hikari_get_floor_khz(unsigned int cpu);
+
 #else /* !CONFIG_HIKARI */
 
 static inline void hikari_on_enqueue(struct task_struct *p, struct rq *rq) { }
@@ -124,6 +132,7 @@ static inline int hikari_unregister_cpufreq_notifier(struct notifier_block *nb)
 	{ return 0; }
 
 static inline bool hikari_enabled(void) { return false; }
+static inline unsigned int hikari_get_floor_khz(unsigned int cpu) { return 0; }
 
 #endif /* CONFIG_HIKARI */
 

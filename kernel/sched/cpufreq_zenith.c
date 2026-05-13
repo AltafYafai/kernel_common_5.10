@@ -63,6 +63,7 @@
 #include <linux/bits.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
+#include <linux/hikari.h>
 #include <linux/notifier.h>
 #include <linux/power_supply.h>
 #include <linux/time.h>
@@ -8985,6 +8986,13 @@ static inline unsigned int zenith_batt_scaled(unsigned int ms,
 	return (unsigned int)(((u64)ms * scale_pct) / 100U);
 }
 
+/*
+ * Forward declaration; defined near the bottom of this file
+ * alongside the Hikari notifier subscription.  Used from
+ * zenith_get_next_freq() below.
+ */
+static unsigned int zenith_hikari_policy_floor(struct cpufreq_policy *policy);
+
 static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 					 unsigned long util, unsigned long max_cap)
 {
@@ -11390,6 +11398,18 @@ apply_uclamp_max_cap:
 					      z_policy->cached_uclamp_max,
 					      true);
 		}
+		/*
+		 * Hikari floor application on the early-return path.
+		 * Raises the cached freq if Hikari has a published
+		 * wake-demand floor that exceeds it.  No-op when no
+		 * floor is published or when Hikari is off.
+		 */
+		{
+			unsigned int hf = zenith_hikari_policy_floor(policy);
+
+			if (hf && hf > z_policy->next_freq)
+				return hf;
+		}
 		return z_policy->next_freq;
 	}
 
@@ -11684,6 +11704,22 @@ apply_uclamp_max_cap:
 		if (z_policy->util_history_count <
 		    ZENITH_PREDICT_UP_WINDOW_MAX)
 			z_policy->util_history_count++;
+	}
+
+	/*
+	 * Hikari floor application on the main return path.  Raises
+	 * target_freq if Hikari has a published wake-demand floor
+	 * that exceeds it.  No-op when no floor is published or when
+	 * Hikari is off.  Applied AFTER all in-governor decision
+	 * tiers so the floor acts as a hard, additive lower bound on
+	 * the wake-time freq -- it can lift Zenith's choice but
+	 * never lower it.
+	 */
+	{
+		unsigned int hf = zenith_hikari_policy_floor(policy);
+
+		if (hf && hf > target_freq)
+			target_freq = hf;
 	}
 
 	return target_freq;
@@ -23213,6 +23249,86 @@ zenith_probe_scheduler_tick(void *data, struct rq *rq)
 		   READ_ONCE(z_cpu->vh_scheduler_tick_count) + 1);
 }
 
+/*
+ * Hikari wake-time hint receiver.  The callback runs in atomic
+ * context (from atomic_notifier_call_chain) and must therefore
+ * not sleep, not block, and must avoid touching state that
+ * requires cpufreq's locks.
+ *
+ * The floor value itself is stored per-CPU on the Hikari side
+ * and read out by zenith_get_next_freq() via
+ * hikari_get_floor_khz().  The receiver here is intentionally
+ * minimal: it validates the hint and ACKs.  The next natural
+ * scheduler tick on the hint's target CPU (sub-millisecond on a
+ * busy CPU, up to one tick on an idle one) will see the floor
+ * via hikari_get_floor_khz() and apply it.
+ *
+ * We deliberately do NOT call cpufreq_update_util() from here.
+ * That would either need the target CPU's rq lock (we may be on
+ * a different CPU) or risk re-entering the governor with
+ * unexpected locking.  The added latency from waiting one tick
+ * is acceptable given the floor TTL is on the order of 50ms.
+ */
+static int zenith_hikari_freq_hint_cb(struct notifier_block *nb,
+				      unsigned long event, void *data)
+{
+	struct hikari_freq_hint *hint = data;
+	struct zenith_cpu *z_cpu;
+	struct zenith_policy *z_policy;
+
+	if (event != HIKARI_NOTIFIER_WAKE_DEMAND)
+		return NOTIFY_DONE;
+	if (!hint)
+		return NOTIFY_DONE;
+	if (hint->cpu >= nr_cpu_ids)
+		return NOTIFY_DONE;
+
+	z_cpu = &per_cpu(zenith_cpu, hint->cpu);
+	z_policy = READ_ONCE(z_cpu->z_policy);
+	if (!z_policy)
+		return NOTIFY_DONE;
+	if (!z_policy->policy)
+		return NOTIFY_DONE;
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block zenith_hikari_nb = {
+	.notifier_call = zenith_hikari_freq_hint_cb,
+};
+
+/*
+ * Walk the policy's CPUs, take the max Hikari floor across them,
+ * and clamp to the policy's [min..max] range.  Returns 0 if no
+ * floor is currently published on any CPU in the policy.  Cheap
+ * when Hikari is off (hikari_get_floor_khz early-returns 0 on a
+ * single READ_ONCE inside hikari_enabled()).
+ */
+static unsigned int zenith_hikari_policy_floor(struct cpufreq_policy *policy)
+{
+	unsigned int floor = 0;
+	unsigned int f;
+	int cpu;
+
+	if (!policy)
+		return 0;
+
+	for_each_cpu(cpu, policy->cpus) {
+		f = hikari_get_floor_khz(cpu);
+		if (f > floor)
+			floor = f;
+	}
+
+	if (!floor)
+		return 0;
+
+	if (floor < policy->min)
+		floor = policy->min;
+	if (floor > policy->max)
+		floor = policy->max;
+	return floor;
+}
+
 static int __init zenith_gov_init(void)
 {
 	int ret;
@@ -23695,6 +23811,24 @@ static int __init zenith_gov_init(void)
 		pr_err("Zenith: cpufreq_register_governor failed (%d)\n", ret);
 		return ret;
 	}
+
+	/*
+	 * Subscribe to Hikari's wake-time hint chain.  Failure here is
+	 * non-fatal: Zenith works fine without Hikari hints, and the
+	 * direct hikari_get_floor_khz() read in zenith_get_next_freq()
+	 * is still functional with or without subscription.  Log the
+	 * outcome for observability.
+	 */
+	{
+		int hret = hikari_register_cpufreq_notifier(&zenith_hikari_nb);
+
+		if (hret)
+			pr_warn("Zenith: hikari notifier register failed (%d), continuing without subscription\n",
+				hret);
+		else
+			pr_info("Zenith: subscribed to hikari wake-demand chain\n");
+	}
+
 	return 0;
 }
 fs_initcall(zenith_gov_init);
