@@ -99,7 +99,7 @@ static DEFINE_PER_CPU(struct hikari_pcpu, hikari_pcpu);
  * pass through proc_douintvec_minmax which is a WRITE_ONCE-like
  * store on the slow path.
  */
-static unsigned int hikari_enable_value;
+static unsigned int hikari_enable_value = 1;
 static unsigned int hikari_wake_threshold_us = 1000;
 static unsigned int hikari_uclamp_boost_pct = 30;
 static unsigned int hikari_uclamp_ttl_ms = 16;
