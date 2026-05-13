@@ -565,6 +565,30 @@ static int __init kasumi_sysfs_init(void)
 	kasumi_kobj = kobject_create_and_add("kasumi", kernel_kobj);
 	if (!kasumi_kobj)
 		return -ENOMEM;
-	return sysfs_create_group(kasumi_kobj, &kasumi_attr_group);
+	ret = sysfs_create_group(kasumi_kobj, &kasumi_attr_group);
+	if (ret) {
+		kobject_put(kasumi_kobj);
+		kasumi_kobj = NULL;
+		return ret;
+	}
+
+	/*
+	 * Kasumi boot signature.  The full ridge narrative lives in the
+	 * Zenith governor's banner (kernel/sched/cpufreq_zenith.c,
+	 * `Zenith :` prefix).  This small block adds a `Kasumi :`-prefixed
+	 * stamp so dmesg | grep -E 'Kasumi :' still finds the subsystem
+	 * even if the Zenith banner scrolled past or the ring buffer
+	 * wrapped.  Only emitted after the safety self-test passed and
+	 * sysfs is up, so its presence in dmesg is itself a contract
+	 * receipt.
+	 */
+	pr_info("Kasumi : 霞\n");
+	pr_info("Kasumi : mist over the ridge.\n");
+	pr_info("Kasumi : we veil the heat that does not deserve panic.\n");
+	pr_info("Kasumi : we keep the truth in last_real_mc.\n");
+	pr_info("Kasumi : above the ceiling the mist parts, raw heat returned byte-for-byte.\n");
+	pr_info("Kasumi : built by XTENSEI.\n");
+
+	return 0;
 }
 late_initcall(kasumi_sysfs_init);
