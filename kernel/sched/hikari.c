@@ -49,19 +49,25 @@
 #include <linux/cgroup.h>
 #include <linux/cpufreq.h>
 #include <linux/cpumask.h>
+#include <linux/fs.h>
 #include <linux/hikari.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/kobject.h>
 #include <linux/notifier.h>
 #include <linux/percpu.h>
+#include <linux/pid.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/sched/clock.h>
 #include <linux/sched/topology.h>
+#include <linux/seq_file.h>
 #include <linux/spinlock.h>
 #include <linux/sysctl.h>
+#include <linux/sysfs.h>
 #include <linux/types.h>
+#include <linux/uaccess.h>
 
 #include "sched.h"
 
@@ -721,6 +727,175 @@ static void __init hikari_discover_clusters(void)
 		cpumask_pr_args(&hikari_little_cluster));
 }
 
+/* ------------------------------------------------------------ */
+/* Per-task /proc helpers (callable from fs/proc/base.c).       */
+/* ------------------------------------------------------------ */
+
+/*
+ * Print a human-readable per-task stats blob to @m.  Output
+ * format is one "key: value" line per attribute; the keys are
+ * stable for parsing.
+ */
+void hikari_seq_print_stats(struct seq_file *m, struct task_struct *p)
+{
+	u32 flags, ewma, last_enq, boost_until;
+
+	if (!p) {
+		seq_puts(m, "hikari: invalid task\n");
+		return;
+	}
+
+	flags       = READ_ONCE(p->hikari_flags);
+	ewma        = READ_ONCE(p->hikari_wait_ewma_ns);
+	last_enq    = READ_ONCE(p->hikari_last_enqueue_ns);
+	boost_until = READ_ONCE(p->hikari_boost_until_ns);
+
+	seq_printf(m, "hikari_enabled_global: %u\n",
+		   hikari_enabled() ? 1U : 0U);
+	seq_printf(m, "hikari_opt_in: %u\n",
+		   (flags & HIKARI_FLAG_OPT_IN) ? 1U : 0U);
+	seq_printf(m, "hikari_audio_tagged: %u\n",
+		   (flags & HIKARI_FLAG_AUDIO_TAGGED) ? 1U : 0U);
+	seq_printf(m, "hikari_foreground: %u\n",
+		   (flags & HIKARI_FLAG_FOREGROUND) ? 1U : 0U);
+	seq_printf(m, "hikari_wait_ewma_ns: %u\n", ewma);
+	seq_printf(m, "hikari_last_enqueue_ns: %u\n", last_enq);
+	seq_printf(m, "hikari_boost_active: %u\n",
+		   hikari_token_active(boost_until) ? 1U : 0U);
+	seq_printf(m, "hikari_boost_until_jiffies: %u\n", boost_until);
+}
+EXPORT_SYMBOL_GPL(hikari_seq_print_stats);
+
+/* Helper for /proc/<pid>/hikari_enable + /proc/<pid>/hikari_audio. */
+u32 hikari_task_get_flag(struct task_struct *p, u32 bit)
+{
+	if (!p)
+		return 0;
+	return (READ_ONCE(p->hikari_flags) & bit) ? 1U : 0U;
+}
+EXPORT_SYMBOL_GPL(hikari_task_get_flag);
+
+void hikari_task_set_flag(struct task_struct *p, u32 bit, bool on)
+{
+	hikari_set_flag(p, bit, on);
+}
+EXPORT_SYMBOL_GPL(hikari_task_set_flag);
+
+/* ------------------------------------------------------------ */
+/* /sys/kernel/hikari/ observability.                           */
+/* ------------------------------------------------------------ */
+
+static struct kobject *hikari_kobj;
+
+static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
+{
+	return sysfs_emit(buf, "%u\n", hikari_enabled() ? 1U : 0U);
+}
+
+static ssize_t disabled_reason_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)READ_ONCE(hikari_disable_reason_global));
+}
+
+static ssize_t version_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
+{
+	return sysfs_emit(buf, "%s\n", "hikari-v2");
+}
+
+static ssize_t total_boost_count_show(struct kobject *kobj,
+				      struct kobj_attribute *attr, char *buf)
+{
+	unsigned long long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += (unsigned long long)
+			atomic_read(&per_cpu_ptr(&hikari_pcpu, cpu)->boost_count);
+	return sysfs_emit(buf, "%llu\n", sum);
+}
+
+static ssize_t total_hint_count_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	unsigned long long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += (unsigned long long)
+			atomic_read(&per_cpu_ptr(&hikari_pcpu, cpu)->hint_count);
+	return sysfs_emit(buf, "%llu\n", sum);
+}
+
+static ssize_t big_cluster_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%*pbl\n",
+			  cpumask_pr_args(&hikari_big_cluster));
+}
+
+static ssize_t little_cluster_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%*pbl\n",
+			  cpumask_pr_args(&hikari_little_cluster));
+}
+
+static struct kobj_attribute hikari_attr_enabled =
+	__ATTR(enabled, 0444, enabled_show, NULL);
+static struct kobj_attribute hikari_attr_disabled_reason =
+	__ATTR(disabled_reason, 0444, disabled_reason_show, NULL);
+static struct kobj_attribute hikari_attr_version =
+	__ATTR(version, 0444, version_show, NULL);
+static struct kobj_attribute hikari_attr_total_boost_count =
+	__ATTR(total_boost_count, 0444, total_boost_count_show, NULL);
+static struct kobj_attribute hikari_attr_total_hint_count =
+	__ATTR(total_hint_count, 0444, total_hint_count_show, NULL);
+static struct kobj_attribute hikari_attr_big_cluster =
+	__ATTR(big_cluster, 0444, big_cluster_show, NULL);
+static struct kobj_attribute hikari_attr_little_cluster =
+	__ATTR(little_cluster, 0444, little_cluster_show, NULL);
+
+static struct attribute *hikari_sysfs_attrs[] = {
+	&hikari_attr_enabled.attr,
+	&hikari_attr_disabled_reason.attr,
+	&hikari_attr_version.attr,
+	&hikari_attr_total_boost_count.attr,
+	&hikari_attr_total_hint_count.attr,
+	&hikari_attr_big_cluster.attr,
+	&hikari_attr_little_cluster.attr,
+	NULL,
+};
+
+static const struct attribute_group hikari_sysfs_group = {
+	.attrs = hikari_sysfs_attrs,
+};
+
+static int __init hikari_sysfs_init(void)
+{
+	int ret;
+
+	hikari_kobj = kobject_create_and_add("hikari", kernel_kobj);
+	if (!hikari_kobj) {
+		pr_warn("failed to create /sys/kernel/hikari\n");
+		return -ENOMEM;
+	}
+
+	ret = sysfs_create_group(hikari_kobj, &hikari_sysfs_group);
+	if (ret) {
+		kobject_put(hikari_kobj);
+		hikari_kobj = NULL;
+		pr_warn("failed to create /sys/kernel/hikari attributes (%d)\n",
+			ret);
+		return ret;
+	}
+
+	return 0;
+}
+
 static int __init hikari_init(void)
 {
 	int cpu;
@@ -739,6 +914,13 @@ static int __init hikari_init(void)
 		pr_err("failed to register sysctl entries\n");
 		return -ENOMEM;
 	}
+
+	/*
+	 * Sysfs init: non-fatal on failure.  /sys/kernel/hikari is
+	 * observability-only; if it fails to create, the rest of
+	 * Hikari is still functional.  The warning is logged.
+	 */
+	(void)hikari_sysfs_init();
 
 	hikari_sanity_check_pcpu();
 	if (hikari_is_killed()) {

@@ -114,6 +114,18 @@ bool hikari_enabled(void);
  */
 unsigned int hikari_get_floor_khz(unsigned int cpu);
 
+/*
+ * Per-task observability helpers, called from fs/proc/base.c to
+ * implement /proc/<pid>/hikari_{enable,audio,stats}.  Kept here
+ * so the only files outside kernel/sched/ that need to know
+ * about Hikari are fs/proc/base.c (call sites) and
+ * include/linux/sched.h (task_struct fields).
+ */
+struct seq_file;
+void hikari_seq_print_stats(struct seq_file *m, struct task_struct *p);
+u32  hikari_task_get_flag(struct task_struct *p, u32 bit);
+void hikari_task_set_flag(struct task_struct *p, u32 bit, bool on);
+
 #else /* !CONFIG_HIKARI */
 
 static inline void hikari_on_enqueue(struct task_struct *p, struct rq *rq) { }
@@ -133,6 +145,14 @@ static inline int hikari_unregister_cpufreq_notifier(struct notifier_block *nb)
 
 static inline bool hikari_enabled(void) { return false; }
 static inline unsigned int hikari_get_floor_khz(unsigned int cpu) { return 0; }
+
+struct seq_file;
+static inline void hikari_seq_print_stats(struct seq_file *m,
+					  struct task_struct *p) { }
+static inline u32 hikari_task_get_flag(struct task_struct *p, u32 bit)
+	{ return 0; }
+static inline void hikari_task_set_flag(struct task_struct *p, u32 bit,
+					bool on) { }
 
 #endif /* CONFIG_HIKARI */
 

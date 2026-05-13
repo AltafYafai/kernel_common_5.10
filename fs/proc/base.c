@@ -84,6 +84,7 @@
 #include <linux/poll.h>
 #include <linux/nsproxy.h>
 #include <linux/oom.h>
+#include <linux/hikari.h>
 #include <linux/elf.h>
 #include <linux/pid_namespace.h>
 #include <linux/user_namespace.h>
@@ -1303,6 +1304,127 @@ static const struct file_operations proc_oom_score_adj_operations = {
 	.write		= oom_score_adj_write,
 	.llseek		= default_llseek,
 };
+
+#ifdef CONFIG_HIKARI
+/*
+ * /proc/<pid>/hikari_enable     R/W  per-task opt-in flag.
+ * /proc/<pid>/hikari_audio      R/W  per-task audio tag.
+ * /proc/<pid>/hikari_stats      R/O  human-readable per-task stats.
+ *
+ * Writes accept any non-zero unsigned int as "on" and 0 as "off".
+ * Reads emit a single ASCII digit "0\n" or "1\n".  All accesses
+ * resolve the task via get_proc_task(); a vanished task returns
+ * -ESRCH.
+ */
+static ssize_t hikari_proc_flag_read(struct file *file, char __user *buf,
+				     size_t count, loff_t *ppos, u32 bit)
+{
+	struct task_struct *task = get_proc_task(file_inode(file));
+	char out[4];
+	int len;
+	u32 val;
+
+	if (!task)
+		return -ESRCH;
+	val = hikari_task_get_flag(task, bit);
+	put_task_struct(task);
+
+	len = scnprintf(out, sizeof(out), "%u\n", val);
+	return simple_read_from_buffer(buf, count, ppos, out, len);
+}
+
+static ssize_t hikari_proc_flag_write(struct file *file, const char __user *buf,
+				      size_t count, loff_t *ppos, u32 bit)
+{
+	struct task_struct *task;
+	char tmp[12];
+	unsigned int v;
+	int err;
+
+	if (count == 0)
+		return 0;
+	if (count >= sizeof(tmp))
+		return -EINVAL;
+	memset(tmp, 0, sizeof(tmp));
+	if (copy_from_user(tmp, buf, count))
+		return -EFAULT;
+
+	err = kstrtouint(strstrip(tmp), 0, &v);
+	if (err)
+		return err;
+
+	task = get_proc_task(file_inode(file));
+	if (!task)
+		return -ESRCH;
+	hikari_task_set_flag(task, bit, v != 0);
+	put_task_struct(task);
+	return count;
+}
+
+static ssize_t hikari_enable_read(struct file *file, char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_read(file, buf, count, ppos,
+				     HIKARI_FLAG_OPT_IN);
+}
+
+static ssize_t hikari_enable_write(struct file *file, const char __user *buf,
+				   size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_write(file, buf, count, ppos,
+				      HIKARI_FLAG_OPT_IN);
+}
+
+static const struct file_operations proc_hikari_enable_operations = {
+	.read		= hikari_enable_read,
+	.write		= hikari_enable_write,
+	.llseek		= default_llseek,
+};
+
+static ssize_t hikari_audio_read(struct file *file, char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_read(file, buf, count, ppos,
+				     HIKARI_FLAG_AUDIO_TAGGED);
+}
+
+static ssize_t hikari_audio_write(struct file *file, const char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_write(file, buf, count, ppos,
+				      HIKARI_FLAG_AUDIO_TAGGED);
+}
+
+static const struct file_operations proc_hikari_audio_operations = {
+	.read		= hikari_audio_read,
+	.write		= hikari_audio_write,
+	.llseek		= default_llseek,
+};
+
+static int hikari_stats_show(struct seq_file *m, void *v)
+{
+	struct inode *inode = m->private;
+	struct task_struct *task = get_proc_task(inode);
+
+	if (!task)
+		return -ESRCH;
+	hikari_seq_print_stats(m, task);
+	put_task_struct(task);
+	return 0;
+}
+
+static int hikari_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hikari_stats_show, inode);
+}
+
+static const struct file_operations proc_hikari_stats_operations = {
+	.open		= hikari_stats_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+#endif /* CONFIG_HIKARI */
 
 #ifdef CONFIG_AUDIT
 #define TMPBUFLEN 11
@@ -3332,6 +3454,11 @@ static const struct pid_entry tgid_base_stuff[] = {
 	ONE("oom_score",  S_IRUGO, proc_oom_score),
 	REG("oom_adj",    S_IRUGO|S_IWUSR, proc_oom_adj_operations),
 	REG("oom_score_adj", S_IRUGO|S_IWUSR, proc_oom_score_adj_operations),
+#ifdef CONFIG_HIKARI
+	REG("hikari_enable", S_IRUGO|S_IWUSR, proc_hikari_enable_operations),
+	REG("hikari_audio",  S_IRUGO|S_IWUSR, proc_hikari_audio_operations),
+	REG("hikari_stats",  S_IRUGO,         proc_hikari_stats_operations),
+#endif
 #ifdef CONFIG_AUDIT
 	REG("loginuid",   S_IWUSR|S_IRUGO, proc_loginuid_operations),
 	REG("sessionid",  S_IRUGO, proc_sessionid_operations),
@@ -3676,6 +3803,11 @@ static const struct pid_entry tid_base_stuff[] = {
 	ONE("oom_score", S_IRUGO, proc_oom_score),
 	REG("oom_adj",   S_IRUGO|S_IWUSR, proc_oom_adj_operations),
 	REG("oom_score_adj", S_IRUGO|S_IWUSR, proc_oom_score_adj_operations),
+#ifdef CONFIG_HIKARI
+	REG("hikari_enable", S_IRUGO|S_IWUSR, proc_hikari_enable_operations),
+	REG("hikari_audio",  S_IRUGO|S_IWUSR, proc_hikari_audio_operations),
+	REG("hikari_stats",  S_IRUGO,         proc_hikari_stats_operations),
+#endif
 #ifdef CONFIG_AUDIT
 	REG("loginuid",  S_IWUSR|S_IRUGO, proc_loginuid_operations),
 	REG("sessionid",  S_IRUGO, proc_sessionid_operations),
