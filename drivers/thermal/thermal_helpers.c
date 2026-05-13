@@ -45,6 +45,41 @@ static unsigned int kasumi_ramp_mc    __read_mostly = 85000;  /* 85 C  */
 static unsigned int kasumi_ceiling_mc __read_mostly = 95000;  /* 95 C  */
 
 /*
+ * Shape of the offset taper inside the [ramp_mc, ceiling_mc) window.
+ *
+ *   KASUMI_RAMP_LINEAR    (0, default)
+ *       Existing behaviour: offset tapers linearly from full at
+ *       ramp_mc to zero at ceiling_mc.
+ *
+ *   KASUMI_RAMP_QUADRATIC (1)
+ *       offset tapers as (remaining/range)^2.  Gentler at the start
+ *       of the ramp (close to ramp_mc), steeper near the ceiling.
+ *       Buys a bit more illusion in the warm-but-not-hot region.
+ *
+ *   KASUMI_RAMP_STEP      (2)
+ *       No taper.  Full offset all the way up to the ceiling, then
+ *       a hard cliff to zero at >= ceiling_mc.  Useful for testing
+ *       and for scenarios where the framework needs the cliff to
+ *       trigger throttling on a single threshold crossing.
+ *
+ * Default 0 preserves the previous shape exactly, so this knob is
+ * back-compatible with every existing tunables.cfg.
+ */
+enum {
+	KASUMI_RAMP_LINEAR    = 0,
+	KASUMI_RAMP_QUADRATIC = 1,
+	KASUMI_RAMP_STEP      = 2,
+	KASUMI_RAMP_MAX       = KASUMI_RAMP_STEP,
+};
+static unsigned int kasumi_ramp_shape __read_mostly = KASUMI_RAMP_LINEAR;
+
+static const char * const kasumi_ramp_shape_names[] = {
+	[KASUMI_RAMP_LINEAR]    = "linear",
+	[KASUMI_RAMP_QUADRATIC] = "quadratic",
+	[KASUMI_RAMP_STEP]      = "step",
+};
+
+/*
  * Observability latches.  Updated at the end of every kasumi_dampen()
  * call; readable through /sys/kernel/kasumi/last_*.  R/O so userspace
  * cannot fabricate state.  WRITE_ONCE / READ_ONCE for tearing safety.
@@ -130,11 +165,55 @@ static int kasumi_dampen(int real)
 	} else {
 		int range     = (int)ceiling - (int)ramp;
 		int remaining = (int)ceiling - real;
+		unsigned int shape = READ_ONCE(kasumi_ramp_shape);
 
-		if (range > 0)
-			dampened = real - (int)offset * remaining / range;
-		else
+		if (range <= 0) {
 			dampened = real;
+		} else {
+			switch (shape) {
+			case KASUMI_RAMP_STEP:
+				/*
+				 * No taper -- full offset all the way up
+				 * to the ceiling, then the existing cliff
+				 * branch above takes over at real >= ceiling.
+				 */
+				dampened = real - (int)offset;
+				break;
+			case KASUMI_RAMP_QUADRATIC: {
+				/*
+				 * dampened = real - offset * (1 - (progress/range)^2)
+				 * where progress = real - ramp.  Equivalent form
+				 * with one division:
+				 *     offset_applied = offset *
+				 *                      (range^2 - progress^2)
+				 *                      / range^2
+				 *
+				 * Result: offset drops gently while real is just
+				 * above ramp_mc (preserves more dampening), then
+				 * accelerates toward zero near the ceiling.  At
+				 * midway through the ramp window the applied
+				 * offset is 0.75 * offset vs linear's 0.5 *
+				 * offset -- gentler at first.
+				 *
+				 * Computed in 64-bit because range can be up
+				 * to ~10000 mC; range^2 = 1e8 fits in u32 but
+				 * the (offset * (range^2 - progress^2)) product
+				 * needs u64 head-room.
+				 */
+				int progress = real - (int)ramp;
+				u64 num = (u64)offset *
+					  ((u64)range * range -
+					   (u64)progress * progress);
+				dampened = real - (int)(num /
+							((u64)range * range));
+				break;
+			}
+			case KASUMI_RAMP_LINEAR:
+			default:
+				dampened = real - (int)offset * remaining / range;
+				break;
+			}
+		}
 	}
 
 	if (dampened < 0)
@@ -465,11 +544,66 @@ static ssize_t zone_filter_store(struct kobject *kobj,
 static struct kobj_attribute kasumi_zone_filter_attr =
 	__ATTR(zone_filter, 0644, zone_filter_show, zone_filter_store);
 
+/*
+ * ramp_shape -- string-friendly RW attr.  Accepts on write:
+ *   "linear" / "0"        -- KASUMI_RAMP_LINEAR    (default)
+ *   "quadratic" / "1"     -- KASUMI_RAMP_QUADRATIC
+ *   "step" / "2"          -- KASUMI_RAMP_STEP
+ * On read, returns the canonical string name plus a parenthesised
+ * numeric value:
+ *   "linear (0)\n" | "quadratic (1)\n" | "step (2)\n"
+ * which keeps both human and scripted readers happy.
+ */
+static ssize_t ramp_shape_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	unsigned int s = READ_ONCE(kasumi_ramp_shape);
+
+	if (s > KASUMI_RAMP_MAX)
+		return sysfs_emit(buf, "unknown (%u)\n", s);
+	return sysfs_emit(buf, "%s (%u)\n", kasumi_ramp_shape_names[s], s);
+}
+
+static ssize_t ramp_shape_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	char tok[16];
+	size_t n;
+	unsigned int val, i;
+
+	/* Strip trailing newline / whitespace into a stack-local token. */
+	n = min_t(size_t, count, sizeof(tok) - 1);
+	memcpy(tok, buf, n);
+	tok[n] = '\0';
+	while (n > 0 && (tok[n - 1] == '\n' || tok[n - 1] == '\r' ||
+			 tok[n - 1] == ' '  || tok[n - 1] == '\t'))
+		tok[--n] = '\0';
+
+	for (i = 0; i <= KASUMI_RAMP_MAX; i++) {
+		if (!strcmp(tok, kasumi_ramp_shape_names[i])) {
+			WRITE_ONCE(kasumi_ramp_shape, i);
+			return count;
+		}
+	}
+
+	if (!kstrtouint(tok, 0, &val) && val <= KASUMI_RAMP_MAX) {
+		WRITE_ONCE(kasumi_ramp_shape, val);
+		return count;
+	}
+
+	return -EINVAL;
+}
+
+static struct kobj_attribute kasumi_ramp_shape_attr =
+	__ATTR(ramp_shape, 0644, ramp_shape_show, ramp_shape_store);
+
 static struct attribute *kasumi_attrs[] = {
 	&kasumi_enabled_attr.attr,
 	&kasumi_offset_mc_attr.attr,
 	&kasumi_ramp_mc_attr.attr,
 	&kasumi_ceiling_mc_attr.attr,
+	&kasumi_ramp_shape_attr.attr,
 	&kasumi_last_real_mc_attr.attr,
 	&kasumi_last_reported_mc_attr.attr,
 	&kasumi_applied_offset_mc_attr.attr,
