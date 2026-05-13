@@ -42,6 +42,15 @@ static unsigned int kasumi_offset_mc  __read_mostly = 15000;  /* 15 C  */
 static unsigned int kasumi_ramp_mc    __read_mostly = 85000;  /* 85 C  */
 static unsigned int kasumi_ceiling_mc __read_mostly = 95000;  /* 95 C  */
 
+/*
+ * Observability latches.  Updated at the end of every kasumi_dampen()
+ * call; readable through /sys/kernel/kasumi/last_*.  R/O so userspace
+ * cannot fabricate state.  WRITE_ONCE / READ_ONCE for tearing safety.
+ */
+static int kasumi_last_real_mc        __read_mostly;
+static int kasumi_last_reported_mc    __read_mostly;
+static int kasumi_applied_offset_mc   __read_mostly;
+
 static int kasumi_dampen(int real)
 {
 	unsigned int offset, ramp, ceiling;
@@ -54,8 +63,12 @@ static int kasumi_dampen(int real)
 	ramp    = READ_ONCE(kasumi_ramp_mc);
 	ceiling = READ_ONCE(kasumi_ceiling_mc);
 
-	if (real >= (int)ceiling)
+	if (real >= (int)ceiling) {
+		WRITE_ONCE(kasumi_last_real_mc,      real);
+		WRITE_ONCE(kasumi_last_reported_mc,  real);
+		WRITE_ONCE(kasumi_applied_offset_mc, 0);
 		return real;
+	}
 
 	if (real < (int)ramp) {
 		dampened = real - (int)offset;
@@ -69,8 +82,25 @@ static int kasumi_dampen(int real)
 			dampened = real;
 	}
 
-	return dampened > 0 ? dampened : 0;
+	if (dampened < 0)
+		dampened = 0;
+
+	WRITE_ONCE(kasumi_last_real_mc,      real);
+	WRITE_ONCE(kasumi_last_reported_mc,  dampened);
+	WRITE_ONCE(kasumi_applied_offset_mc, real - dampened);
+
+	return dampened;
 }
+
+/*
+ * Iyashi consumers read this; do not export to userspace through any
+ * other channel than the /sys/kernel/kasumi/last_real_mc attribute.
+ */
+int kasumi_get_last_real_mc(void)
+{
+	return READ_ONCE(kasumi_last_real_mc);
+}
+EXPORT_SYMBOL_GPL(kasumi_get_last_real_mc);
 
 int get_tz_trend(struct thermal_zone_device *tz, int trip)
 {
@@ -320,16 +350,32 @@ static ssize_t _name##_store(struct kobject *kobj,			\
 static struct kobj_attribute kasumi_##_name##_attr =			\
 	__ATTR(_name, 0644, _name##_show, _name##_store)
 
+#define KASUMI_ATTR_RO(_name, _var)					\
+static ssize_t _name##_show(struct kobject *kobj,			\
+			    struct kobj_attribute *attr, char *buf)	\
+{									\
+	return sysfs_emit(buf, "%d\n", READ_ONCE(_var));		\
+}									\
+static struct kobj_attribute kasumi_##_name##_attr =			\
+	__ATTR(_name, 0444, _name##_show, NULL)
+
 KASUMI_ATTR_RW(enabled,    kasumi_enable);
 KASUMI_ATTR_RW(offset_mc,  kasumi_offset_mc);
 KASUMI_ATTR_RW(ramp_mc,    kasumi_ramp_mc);
 KASUMI_ATTR_RW(ceiling_mc, kasumi_ceiling_mc);
+
+KASUMI_ATTR_RO(last_real_mc,       kasumi_last_real_mc);
+KASUMI_ATTR_RO(last_reported_mc,   kasumi_last_reported_mc);
+KASUMI_ATTR_RO(applied_offset_mc,  kasumi_applied_offset_mc);
 
 static struct attribute *kasumi_attrs[] = {
 	&kasumi_enabled_attr.attr,
 	&kasumi_offset_mc_attr.attr,
 	&kasumi_ramp_mc_attr.attr,
 	&kasumi_ceiling_mc_attr.attr,
+	&kasumi_last_real_mc_attr.attr,
+	&kasumi_last_reported_mc_attr.attr,
+	&kasumi_applied_offset_mc_attr.attr,
 	NULL,
 };
 
