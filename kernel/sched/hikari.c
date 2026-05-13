@@ -213,23 +213,53 @@ static inline bool hikari_task_active(struct task_struct *p)
 	return (flags & HIKARI_FLAG_OPT_IN) != 0;
 }
 
-/*
- * Top-app cgroup auto-opt-in helper.  Cheap by design: we tag the
- * task with HIKARI_FLAG_FOREGROUND on demand (called from the
- * scheduler core when migrating between cgroups isn't worth a hook)
- * and let the OPT_IN check decide what to do.
- *
- * NOTE: this is best-effort.  If the cgroup hierarchy doesn't have
- * a "top-app" identifier on this device, the heuristic falls back
- * to comparing the task's cpu cgroup name to "top-app".  False
- * positives are harmless (extra opt-in) and false negatives just
- * skip the auto-opt-in (the user can still set /proc/<pid>/hikari_enable).
- */
+static void hikari_set_flag(struct task_struct *p, u32 bit, bool on);
+
 static inline bool hikari_in_top_app(struct task_struct *p)
 {
-	u32 flags = READ_ONCE(p->hikari_flags);
+	return (READ_ONCE(p->hikari_flags) & HIKARI_FLAG_FOREGROUND) != 0;
+}
 
-	return (flags & HIKARI_FLAG_FOREGROUND) != 0;
+/*
+ * Lazy top-app cgroup auto-opt-in.  Called from hikari_on_enqueue()
+ * under rq_lock, where p->sched_task_group is stable.
+ *
+ * Walks task_group(p)->css.cgroup->kn->name and compares to
+ * "top-app".  Cost: one pointer chain + 7-byte strcmp, only when
+ * hikari_topapp_auto_optin is set.
+ *
+ * State transitions:
+ *   enter top-app  -> set FOREGROUND + OPT_IN
+ *   leave top-app  -> clear FOREGROUND only (OPT_IN may be
+ *                     user-set via /proc and must survive)
+ */
+static inline void hikari_lazy_topapp_update(struct task_struct *p)
+{
+#ifdef CONFIG_CGROUP_SCHED
+	struct task_group *tg;
+	struct cgroup *cgrp;
+	bool in_topapp;
+	u32 flags;
+
+	if (!READ_ONCE(hikari_topapp_auto_optin))
+		return;
+
+	tg = task_group(p);
+	if (!tg)
+		return;
+	cgrp = tg->css.cgroup;
+	if (!cgrp || !cgrp->kn || !cgrp->kn->name)
+		return;
+
+	in_topapp = (strcmp(cgrp->kn->name, "top-app") == 0);
+	flags = READ_ONCE(p->hikari_flags);
+
+	if (in_topapp && !(flags & HIKARI_FLAG_FOREGROUND))
+		hikari_set_flag(p, HIKARI_FLAG_FOREGROUND | HIKARI_FLAG_OPT_IN,
+				true);
+	else if (!in_topapp && (flags & HIKARI_FLAG_FOREGROUND))
+		hikari_set_flag(p, HIKARI_FLAG_FOREGROUND, false);
+#endif
 }
 
 static inline unsigned int hikari_uclamp_boost_value(void)
@@ -363,9 +393,14 @@ void hikari_on_enqueue(struct task_struct *p, struct rq *rq)
 {
 	u32 now32;
 
-	if (!hikari_task_active(p))
+	if (!hikari_enabled())
 		return;
-	if (!rq)
+	if (!p || !rq)
+		return;
+
+	hikari_lazy_topapp_update(p);
+
+	if (!(READ_ONCE(p->hikari_flags) & HIKARI_FLAG_OPT_IN))
 		return;
 
 	now32 = (u32)rq_clock_task(rq);
