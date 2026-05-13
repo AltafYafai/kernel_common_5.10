@@ -1156,6 +1156,22 @@ static int __init hikari_init(void)
 	pr_info("initialised (master enable=%u, static_key=%s)\n",
 		READ_ONCE(hikari_enable_value),
 		static_key_enabled(&hikari_active_key.key) ? "on" : "off");
+
+	/*
+	 * Hikari boot signature.  The full ridge narrative lives in the
+	 * Zenith governor's banner (kernel/sched/cpufreq_zenith.c,
+	 * `Zenith :` prefix).  This small block adds a `Hikari :`-prefixed
+	 * stamp so dmesg | grep -E 'Hikari :' still finds the subsystem
+	 * even if the Zenith banner scrolled past or the ring buffer
+	 * wrapped.  Six lines, byte-stable, all under one pr_fmt prefix.
+	 */
+	pr_info("Hikari : 光\n");
+	pr_info("Hikari : light over the ridge.\n");
+	pr_info("Hikari : the breath that wakes scheduling on demand.\n");
+	pr_info("Hikari : opt-in, lazy, gated by a static key.\n");
+	pr_info("Hikari : kill switch always honored.\n");
+	pr_info("Hikari : built by XTENSEI.\n");
+
 	return 0;
 }
 late_initcall(hikari_init);
