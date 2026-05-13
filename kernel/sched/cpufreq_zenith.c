@@ -8167,6 +8167,22 @@ static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
 	}
 }
 
+/*
+ * Kasumi (drivers/thermal/thermal_helpers.c) intercepts
+ * thermal_zone_get_temp() and dampens the reported temperature.
+ * For Zenith's game_perf_burst guardrail we want the *real* (un-
+ * dampened) value so the FSM can't be fooled by a configured
+ * Kasumi offset; the dampened value still goes to the framework /
+ * userspace as before.  Forward-declared here (no public header
+ * for Kasumi) -- defined and EXPORT_SYMBOL_GPL'd by Kasumi.
+ *
+ * Returns the last raw value seen by kasumi_dampen(), in millideg C.
+ * Returns 0 if Kasumi has never dampened a reading (e.g. Kasumi
+ * disabled, or no thermal zone the filter accepted has been read
+ * yet) -- caller treats 0 as "fall back to whatever I have".
+ */
+extern int kasumi_get_last_real_mc(void);
+
 /* Patch K: live skin-temp readout for the game_perf_burst guardrail.
  * Returns millidegrees C.
  *
@@ -8174,6 +8190,17 @@ static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
  * resolved at zenith_start() time.  This is the kernel thermal
  * subsystem's authoritative reading -- same number userspace would
  * see at /sys/class/thermal/thermal_zone<N>/temp.
+ *
+ * Patch K v2 (Zenith x Kasumi awareness): after a successful
+ * thermal_zone_get_temp() we ask Kasumi for the last *real* (un-
+ * dampened) reading and prefer it over the framework value.  This
+ * lets Zenith make burst-guardrail decisions on the truth even
+ * when Kasumi is veiling heat from the framework.  Tiny race
+ * window: between our get_temp() returning and our
+ * kasumi_get_last_real_mc() call, another CPU could re-dampen a
+ * different zone and overwrite kasumi_last_real_mc.  The window is
+ * sub-millisecond and the guardrail is approximate (FSM thresholds
+ * are degrees apart), so this is acceptable.
  *
  * Fallback: if the zone is unresolved (NULL / IS_ERR -- foreign SoC,
  * thermal subsystem not registered yet, etc.) or the read returns
@@ -8195,6 +8222,7 @@ static int zenith_gpb_get_temp_dc(struct zenith_policy *z_policy)
 	struct thermal_zone_device *tzd = z_policy->gpb_tzd;
 	unsigned int pct;
 	int temp = 0;
+	int real;
 
 	/* Patch M: lazy retry if zenith_start() couldn't bind the
 	 * per-cluster thermal zone (boot ordering: thermal-core may
@@ -8223,8 +8251,10 @@ static int zenith_gpb_get_temp_dc(struct zenith_policy *z_policy)
 		}
 	}
 
-	if (tzd && !IS_ERR(tzd) && !thermal_zone_get_temp(tzd, &temp))
-		return temp;
+	if (tzd && !IS_ERR(tzd) && !thermal_zone_get_temp(tzd, &temp)) {
+		real = kasumi_get_last_real_mc();
+		return real > 0 ? real : temp;
+	}
 
 	pct = zenith_policy_thermal_pressure_pct(z_policy);
 	if (pct > 100)
