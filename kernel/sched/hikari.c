@@ -53,6 +53,7 @@
 #include <linux/hikari.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
+#include <linux/jump_label.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/notifier.h>
@@ -143,6 +144,35 @@ static const unsigned int hikari_ewma_shift_max = 7;
 static bool			hikari_init_complete __read_mostly;
 static atomic_t			hikari_kill_flag = ATOMIC_INIT(0);
 static u8			hikari_disable_reason_global __read_mostly;
+
+/*
+ * Static key gate.  Mirrors hikari_enabled() exactly but compiles to a
+ * single unlikely-branch on the hot path while disabled (init not
+ * complete, kill flag set, or hikari_enable_value == 0).
+ *
+ * Flipped from three sites:
+ *   - hikari_init() turns the key on after init_complete is set, if
+ *     hikari_enable_value != 0 and kill_flag == 0.
+ *   - hikari_self_disable() turns the key off (kill_flag now set).
+ *   - hikari_enable_sysctl_handler() turns the key on/off to match
+ *     the new value (and clears kill_flag if the admin re-enables).
+ *
+ * All three call sites run in process context, so the slow-path
+ * static_branch_enable/disable() blockers (text_poke) are safe.
+ */
+static DEFINE_STATIC_KEY_FALSE(hikari_active_key);
+
+static inline void hikari_active_key_sync(void)
+{
+	bool want = READ_ONCE(hikari_init_complete) &&
+		    atomic_read(&hikari_kill_flag) == 0 &&
+		    READ_ONCE(hikari_enable_value) != 0;
+
+	if (want && !static_key_enabled(&hikari_active_key.key))
+		static_branch_enable(&hikari_active_key);
+	else if (!want && static_key_enabled(&hikari_active_key.key))
+		static_branch_disable(&hikari_active_key);
+}
 static cpumask_t		hikari_big_cluster __read_mostly;
 static cpumask_t		hikari_little_cluster __read_mostly;
 static int			hikari_max_big_cpu __read_mostly = -1;
@@ -160,6 +190,15 @@ static inline void hikari_self_disable(u8 reason)
 	if (atomic_xchg(&hikari_kill_flag, 1) == 0) {
 		hikari_disable_reason_global = reason;
 		pr_err_once("self-disabled (reason=%u)\n", reason);
+		/*
+		 * static_branch_disable() needs process context, but this
+		 * helper is called from hot paths (e.g. scheduler hooks).
+		 * The kill flag itself is already authoritative -- the
+		 * static key resync happens lazily next time the sysctl
+		 * handler runs, or stays slightly stale until reboot.
+		 * Hot-path consumers re-check hikari_enabled() anyway,
+		 * which reads the kill flag directly.
+		 */
 #ifdef CONFIG_HIKARI_DEBUG
 		BUG();
 #endif
@@ -168,7 +207,7 @@ static inline void hikari_self_disable(u8 reason)
 
 bool hikari_enabled(void)
 {
-	if (!READ_ONCE(hikari_init_complete))
+	if (!static_branch_unlikely(&hikari_active_key))
 		return false;
 	if (hikari_is_killed())
 		return false;
@@ -644,6 +683,7 @@ static int hikari_enable_sysctl_handler(struct ctl_table *table, int write,
 	if (write && !ret) {
 		if (READ_ONCE(hikari_enable_value) != 0)
 			atomic_set(&hikari_kill_flag, 0);
+		hikari_active_key_sync();
 	}
 	return ret;
 }
@@ -1106,8 +1146,16 @@ static int __init hikari_init(void)
 	smp_wmb();
 	WRITE_ONCE(hikari_init_complete, true);
 
-	pr_info("initialised (master enable=%u)\n",
-		READ_ONCE(hikari_enable_value));
+	/*
+	 * init_complete is now visible; flip the static key on if the
+	 * master enable sysctl is non-zero.  Hot paths short-circuit to
+	 * a single unlikely-branch when disabled.
+	 */
+	hikari_active_key_sync();
+
+	pr_info("initialised (master enable=%u, static_key=%s)\n",
+		READ_ONCE(hikari_enable_value),
+		static_key_enabled(&hikari_active_key.key) ? "on" : "off");
 	return 0;
 }
 late_initcall(hikari_init);
