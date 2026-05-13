@@ -262,6 +262,14 @@ static inline u32 hikari_token_add_ms(unsigned int ms)
 	return expiry;
 }
 
+/*
+ * Forward declaration -- the setter API block (further down) defines
+ * the cmpxchg-based update.  Used from the hot-path stamp sites in
+ * hikari_on_dequeue() and hikari_select_cpu() so a /proc reader can
+ * tell why Hikari skipped a specific task on its most recent call.
+ */
+static inline void hikari_set_skip_reason(struct task_struct *p, u32 reason);
+
 static inline bool hikari_task_active(struct task_struct *p)
 {
 	u32 flags;
@@ -509,8 +517,22 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 {
 	u32 last, now32, delta, ewma, threshold_ns;
 
-	if (!hikari_task_active(p))
+	if (!hikari_task_active(p)) {
+		/*
+		 * Stamp why so /proc/<pid>/hikari_status can report it.
+		 * hikari_task_active() returns false for three reasons; pick
+		 * the most specific one we can tell apart cheaply.
+		 */
+		if (p) {
+			if (!hikari_enabled())
+				hikari_set_skip_reason(p,
+					HIKARI_SKIP_GLOBAL_DISABLED);
+			else
+				hikari_set_skip_reason(p,
+					HIKARI_SKIP_NOT_OPTED_IN);
+		}
 		return;
+	}
 	if (!rq)
 		return;
 
@@ -563,6 +585,9 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 	if (ewma > threshold_ns) {
 		hikari_apply_uclamp_boost(p);
 		hikari_publish_freq_hint(task_cpu(p), ewma);
+		hikari_set_skip_reason(p, HIKARI_SKIP_ACTIONED);
+	} else {
+		hikari_set_skip_reason(p, HIKARI_SKIP_EWMA_LOW);
 	}
 }
 EXPORT_SYMBOL_GPL(hikari_on_dequeue);
@@ -605,22 +630,36 @@ int hikari_select_cpu(struct task_struct *p, int prev_cpu, int wake_flags)
 
 	ewma = READ_ONCE(p->hikari_wait_ewma_ns);
 	threshold_ns = READ_ONCE(hikari_wake_threshold_us) * 1000;
-	if (ewma <= threshold_ns)
+	if (ewma <= threshold_ns) {
+		hikari_set_skip_reason(p, HIKARI_SKIP_EWMA_LOW);
 		return -1;
+	}
 
 	if (!hikari_in_top_app(p) &&
 	    !hikari_cpu_is_audio_active(prev_cpu) &&
-	    !(READ_ONCE(p->hikari_flags) & HIKARI_FLAG_AUDIO_TAGGED))
+	    !(READ_ONCE(p->hikari_flags) & HIKARI_FLAG_AUDIO_TAGGED)) {
+		hikari_set_skip_reason(p, HIKARI_SKIP_PLACEMENT_NOT_TOPAPP);
 		return -1;
+	}
 
-	if (cpumask_empty(&hikari_big_cluster))
+	if (cpumask_empty(&hikari_big_cluster)) {
+		hikari_set_skip_reason(p, HIKARI_SKIP_PLACEMENT_NO_BIG);
 		return -1;
+	}
 
 	for_each_cpu_and(cpu, &hikari_big_cluster, p->cpus_ptr) {
 		if (!cpu_online(cpu))
 			continue;
+		hikari_set_skip_reason(p, HIKARI_SKIP_ACTIONED);
 		return cpu;
 	}
+
+	/*
+	 * Big-cluster mask is non-empty but the task's allowed-CPU
+	 * intersection with it is empty (pinned to little cores) or
+	 * every big CPU is offline.  Tag the more informative reason.
+	 */
+	hikari_set_skip_reason(p, HIKARI_SKIP_PLACEMENT_PINNED);
 	return -1;
 }
 EXPORT_SYMBOL_GPL(hikari_select_cpu);
@@ -638,6 +677,29 @@ static void hikari_set_flag(struct task_struct *p, u32 bit, bool on)
 	do {
 		cur = READ_ONCE(p->hikari_flags);
 		new = on ? (cur | bit) : (cur & ~bit);
+		if (new == cur)
+			return;
+	} while (cmpxchg(&p->hikari_flags, cur, new) != cur);
+}
+
+/*
+ * Stamp the per-task "last skip reason" into the upper byte of
+ * hikari_flags.  Returns immediately (no atomic) if the value already
+ * matches -- this is the common case for a steady-state task that
+ * stays in the same opt-in / placement bucket across many enqueues.
+ * Otherwise updates via cmpxchg so it cooperates with hikari_set_flag.
+ */
+static inline void hikari_set_skip_reason(struct task_struct *p, u32 reason)
+{
+	u32 cur, new;
+	u32 want = (reason << HIKARI_SKIP_REASON_SHIFT) &
+		   HIKARI_SKIP_REASON_MASK;
+
+	if (!p)
+		return;
+	do {
+		cur = READ_ONCE(p->hikari_flags);
+		new = (cur & ~HIKARI_SKIP_REASON_MASK) | want;
 		if (new == cur)
 			return;
 	} while (cmpxchg(&p->hikari_flags, cur, new) != cur);
@@ -905,9 +967,21 @@ static void __init hikari_discover_clusters(void)
  * format is one "key: value" line per attribute; the keys are
  * stable for parsing.
  */
+static const char * const hikari_skip_reason_names[] = {
+	[HIKARI_SKIP_NONE]			= "none",
+	[HIKARI_SKIP_GLOBAL_DISABLED]		= "global_disabled",
+	[HIKARI_SKIP_NOT_OPTED_IN]		= "not_opted_in",
+	[HIKARI_SKIP_EWMA_LOW]			= "ewma_below_threshold",
+	[HIKARI_SKIP_PLACEMENT_NOT_TOPAPP]	= "placement_not_topapp_or_audio",
+	[HIKARI_SKIP_PLACEMENT_NO_BIG]		= "placement_no_big_cluster",
+	[HIKARI_SKIP_PLACEMENT_PINNED]		= "placement_pinned_off_big",
+	[HIKARI_SKIP_ACTIONED]			= "actioned",
+};
+
 void hikari_seq_print_stats(struct seq_file *m, struct task_struct *p)
 {
-	u32 flags, ewma, last_enq, boost_until;
+	u32 flags, ewma, last_enq, boost_until, reason;
+	const char *reason_name;
 
 	if (!p) {
 		seq_puts(m, "hikari: invalid task\n");
@@ -918,6 +992,11 @@ void hikari_seq_print_stats(struct seq_file *m, struct task_struct *p)
 	ewma        = READ_ONCE(p->hikari_wait_ewma_ns);
 	last_enq    = READ_ONCE(p->hikari_last_enqueue_ns);
 	boost_until = READ_ONCE(p->hikari_boost_until_ns);
+	reason      = (flags & HIKARI_SKIP_REASON_MASK) >>
+		      HIKARI_SKIP_REASON_SHIFT;
+	reason_name = (reason <= HIKARI_SKIP_REASON_MAX)
+		      ? hikari_skip_reason_names[reason]
+		      : "unknown";
 
 	seq_printf(m, "hikari_enabled_global: %u\n",
 		   hikari_enabled() ? 1U : 0U);
@@ -932,6 +1011,13 @@ void hikari_seq_print_stats(struct seq_file *m, struct task_struct *p)
 	seq_printf(m, "hikari_boost_active: %u\n",
 		   hikari_token_active(boost_until) ? 1U : 0U);
 	seq_printf(m, "hikari_boost_until_jiffies: %u\n", boost_until);
+	/*
+	 * Per-task last-skip reason.  Set by the scheduler hot path on
+	 * every call into hikari_on_dequeue() / hikari_select_cpu() so
+	 * a /proc reader can tell why Hikari is (or isn't) firing for
+	 * this specific PID.  See HIKARI_SKIP_* in <linux/hikari.h>.
+	 */
+	seq_printf(m, "hikari_skip_reason: %u %s\n", reason, reason_name);
 }
 EXPORT_SYMBOL_GPL(hikari_seq_print_stats);
 

@@ -36,7 +36,39 @@ struct rq;
 #define HIKARI_FLAG_OPT_IN		(1u << 0)
 #define HIKARI_FLAG_AUDIO_TAGGED	(1u << 1)
 #define HIKARI_FLAG_FOREGROUND		(1u << 2)
-/* Bits 3..31 reserved for future use; must stay zero in current code. */
+/* Bits 3..23 reserved for future use; must stay zero in current code. */
+
+/*
+ * Per-task "why was the last hot-path call a no-op?" tag.
+ *
+ * Packed into the upper byte of hikari_flags (bits 24..31) so it does
+ * not consume another u32 / ANDROID_KABI slot.  Updated from the
+ * scheduler hot path via cmpxchg only when the value would actually
+ * change (the common "skipped for the same reason as last time" case
+ * costs one READ_ONCE + compare, no atomic).
+ *
+ * Reported through /proc/<pid>/hikari_status as 'hikari_skip_reason: N'
+ * plus a human label.  Lets you tell, for a specific PID, why Hikari
+ * isn't firing for it -- "global disabled" vs "not opted in" vs
+ * "EWMA below wake threshold" vs "placement skipped because not
+ * foreground" vs "actioned" (Hikari did fire on the last call).
+ *
+ * The actuator hot paths (on_dequeue / select_cpu) set this; the
+ * value is an *observability* tag, not authoritative state.  Hikari
+ * decisions still come from the underlying flags / sysctls.
+ */
+#define HIKARI_SKIP_REASON_SHIFT	24
+#define HIKARI_SKIP_REASON_MASK		(0xffu << HIKARI_SKIP_REASON_SHIFT)
+
+#define HIKARI_SKIP_NONE		0
+#define HIKARI_SKIP_GLOBAL_DISABLED	1
+#define HIKARI_SKIP_NOT_OPTED_IN	2
+#define HIKARI_SKIP_EWMA_LOW		3
+#define HIKARI_SKIP_PLACEMENT_NOT_TOPAPP 4
+#define HIKARI_SKIP_PLACEMENT_NO_BIG	5
+#define HIKARI_SKIP_PLACEMENT_PINNED	6
+#define HIKARI_SKIP_ACTIONED		7
+#define HIKARI_SKIP_REASON_MAX		HIKARI_SKIP_ACTIONED
 
 /*
  * Reasons Hikari may self-disable at runtime.  Exposed via
