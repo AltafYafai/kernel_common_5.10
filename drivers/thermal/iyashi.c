@@ -41,6 +41,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/atomic.h>
+#include <linux/cpu_cooling.h>
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/init.h>
@@ -66,6 +67,20 @@ static unsigned int iyashi_floor_pct          __read_mostly = 90;
 static unsigned int iyashi_near_limit_offset_c __read_mostly = 5;
 
 /*
+ * Optional frequency-units floor (only meaningful for cpufreq cooling).
+ * 0 = off; the floor is taken from iyashi_floor_pct in cooling-state
+ * units.  Non-zero = compute the deepest cooling state whose target
+ * frequency is still >= (pct% of policy->cpuinfo.max_freq) and use the
+ * MORE PERMISSIVE of {state-units floor, freq-units floor} -- i.e. the
+ * one that keeps cpufreq running faster.
+ *
+ * Why both?  state-units floor_pct is well-defined for non-cpufreq
+ * cooling devices (GPU, fan, etc.); min_freq_pct is only meaningful
+ * for cpufreq cooling but is the knob users actually think in.
+ */
+static unsigned int iyashi_min_freq_pct       __read_mostly;
+
+/*
  * Static key gating.  Flipped by enabled_store() so the disabled
  * fast path is a single unlikely-branch.
  */
@@ -77,6 +92,7 @@ static DEFINE_STATIC_KEY_FALSE(iyashi_active_key);
 
 static atomic64_t iyashi_clamped_count;
 static atomic64_t iyashi_passthrough_count;
+static atomic64_t iyashi_freq_floor_used_count;
 
 static int iyashi_last_min_headroom_c  __read_mostly;
 static int iyashi_last_trip_temp_mc    __read_mostly;
@@ -221,6 +237,31 @@ unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 	 * units where 0 = no mitigation and max_state = fully cold.
 	 */
 	floor_state = max_state * (100 - floor_pct) / 100;
+
+	/*
+	 * Optional freq-units override: if the user expressed the floor
+	 * as "% of cpuinfo_max_freq", translate it through the cpufreq
+	 * cooling helper and prefer it when it is more permissive (i.e.
+	 * its state index is lower, meaning a higher actual frequency).
+	 * cpufreq_cooling_floor_state_for_pct() returns 0 for non-cpufreq
+	 * cdevs or when the helper cannot decide, which we treat as
+	 * "no override".
+	 */
+	{
+		unsigned int min_freq_pct = READ_ONCE(iyashi_min_freq_pct);
+
+		if (min_freq_pct) {
+			unsigned long freq_floor =
+				cpufreq_cooling_floor_state_for_pct(cdev,
+								    min_freq_pct);
+
+			if (freq_floor && freq_floor < floor_state) {
+				floor_state = freq_floor;
+				atomic64_inc(&iyashi_freq_floor_used_count);
+			}
+		}
+	}
+
 	if (target > floor_state) {
 		atomic64_inc(&iyashi_clamped_count);
 		WRITE_ONCE(iyashi_last_target_out, floor_state);
@@ -292,6 +333,7 @@ static struct kobj_attribute iyashi_enabled_attr =
 
 IYASHI_ATTR_RW(floor_pct,           iyashi_floor_pct,           val >= 50 && val <= 100);
 IYASHI_ATTR_RW(near_limit_offset_c, iyashi_near_limit_offset_c, val >= 1  && val <= 15);
+IYASHI_ATTR_RW(min_freq_pct,        iyashi_min_freq_pct,        val == 0  || (val >= 50 && val <= 100));
 
 #define IYASHI_ATTR_RO_INT(_name, _var)					\
 static ssize_t _name##_show(struct kobject *kobj,			\
@@ -320,13 +362,14 @@ static ssize_t _name##_show(struct kobject *kobj,			\
 static struct kobj_attribute iyashi_##_name##_attr =			\
 	__ATTR(_name, 0444, _name##_show, NULL)
 
-IYASHI_ATTR_RO_INT     (last_min_headroom_c, iyashi_last_min_headroom_c);
-IYASHI_ATTR_RO_INT     (last_trip_temp_mc,   iyashi_last_trip_temp_mc);
-IYASHI_ATTR_RO_INT     (last_zone_temp_mc,   iyashi_last_zone_temp_mc);
-IYASHI_ATTR_RO_ULONG   (last_target_in,      iyashi_last_target_in);
-IYASHI_ATTR_RO_ULONG   (last_target_out,     iyashi_last_target_out);
-IYASHI_ATTR_RO_ATOMIC64(clamped_count,       iyashi_clamped_count);
-IYASHI_ATTR_RO_ATOMIC64(passthrough_count,   iyashi_passthrough_count);
+IYASHI_ATTR_RO_INT     (last_min_headroom_c,    iyashi_last_min_headroom_c);
+IYASHI_ATTR_RO_INT     (last_trip_temp_mc,      iyashi_last_trip_temp_mc);
+IYASHI_ATTR_RO_INT     (last_zone_temp_mc,      iyashi_last_zone_temp_mc);
+IYASHI_ATTR_RO_ULONG   (last_target_in,         iyashi_last_target_in);
+IYASHI_ATTR_RO_ULONG   (last_target_out,        iyashi_last_target_out);
+IYASHI_ATTR_RO_ATOMIC64(clamped_count,          iyashi_clamped_count);
+IYASHI_ATTR_RO_ATOMIC64(passthrough_count,      iyashi_passthrough_count);
+IYASHI_ATTR_RO_ATOMIC64(freq_floor_used_count,  iyashi_freq_floor_used_count);
 
 static ssize_t cdev_filter_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
@@ -375,10 +418,12 @@ static struct attribute *iyashi_attrs[] = {
 	&iyashi_version_attr.attr,
 	&iyashi_enabled_attr.attr,
 	&iyashi_floor_pct_attr.attr,
+	&iyashi_min_freq_pct_attr.attr,
 	&iyashi_near_limit_offset_c_attr.attr,
 	&iyashi_cdev_filter_attr.attr,
 	&iyashi_clamped_count_attr.attr,
 	&iyashi_passthrough_count_attr.attr,
+	&iyashi_freq_floor_used_count_attr.attr,
 	&iyashi_last_min_headroom_c_attr.attr,
 	&iyashi_last_trip_temp_mc_attr.attr,
 	&iyashi_last_zone_temp_mc_attr.attr,
