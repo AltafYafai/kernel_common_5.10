@@ -108,6 +108,28 @@ static unsigned int kasumi_warmup_secs       __read_mostly;        /* off */
 static unsigned int kasumi_warmup_offset_mc  __read_mostly = 25000; /* 25 C */
 
 /*
+ * hot_threshold_mc / hot_extra_offset_mc -- temperature-dependent
+ * dampening boost.  When real >= hot_threshold_mc and we are *not*
+ * already above the cliff (real >= ceiling), add hot_extra_offset_mc
+ * to the effective offset.  The reported temperature seen by the
+ * thermal framework therefore lags the real temperature by an even
+ * larger amount once things are hot, which suppresses cpufreq /
+ * GPU / cooling-device throttling decisions that would otherwise
+ * fire while the device is still well below the ceiling.
+ *
+ * Disabled by default (hot_threshold_mc == 0).  Capped so that even
+ * a misconfigured pair (threshold below ramp, extra > ceiling)
+ * cannot cause underflow or absurd reported values -- the cliff at
+ * ceiling_mc still wins so real overheats still expose real temps.
+ *
+ * Observability: kasumi_hot_active_count increments on every dampen
+ * call that actually applied the extra offset.
+ */
+static unsigned int kasumi_hot_threshold_mc  __read_mostly;        /* off */
+static unsigned int kasumi_hot_extra_offset_mc __read_mostly = 10000; /* 10 C */
+static atomic64_t   kasumi_hot_active_count = ATOMIC64_INIT(0);
+
+/*
  * Observability latches.  Updated at the end of every kasumi_dampen()
  * call; readable through /sys/kernel/kasumi/last_*.  R/O so userspace
  * cannot fabricate state.  WRITE_ONCE / READ_ONCE for tearing safety.
@@ -290,6 +312,27 @@ static int kasumi_dampen(int real, const char *zone_type)
 		if (wsecs && woff &&
 		    ktime_get_boottime_seconds() < (time64_t)wsecs)
 			offset = woff;
+	}
+
+	/*
+	 * Hot-zone extra dampening.  Strictly below the ceiling cliff
+	 * so a real overheat still hits the cliff branch immediately
+	 * below and exposes raw temp to the framework.  Saturating
+	 * add: cap effective offset at half ceiling to avoid wrapping
+	 * a careless misconfiguration into a sub-zero "dampened" temp.
+	 */
+	{
+		unsigned int hot_th    = READ_ONCE(kasumi_hot_threshold_mc);
+		unsigned int hot_extra = READ_ONCE(kasumi_hot_extra_offset_mc);
+
+		if (hot_th && hot_extra &&
+		    real >= (int)hot_th && real < (int)ceiling) {
+			unsigned int cap = ceiling / 2;
+			unsigned int sum = offset + hot_extra;
+
+			offset = (sum > cap) ? cap : sum;
+			atomic64_inc(&kasumi_hot_active_count);
+		}
 	}
 
 	if (real >= (int)ceiling) {
@@ -646,9 +689,22 @@ KASUMI_ATTR_RW(ceiling_mc, kasumi_ceiling_mc);
 KASUMI_ATTR_RW(warmup_secs,      kasumi_warmup_secs);
 KASUMI_ATTR_RW(warmup_offset_mc, kasumi_warmup_offset_mc);
 
+KASUMI_ATTR_RW(hot_threshold_mc,    kasumi_hot_threshold_mc);
+KASUMI_ATTR_RW(hot_extra_offset_mc, kasumi_hot_extra_offset_mc);
+
 KASUMI_ATTR_RO(last_real_mc,       kasumi_last_real_mc);
 KASUMI_ATTR_RO(last_reported_mc,   kasumi_last_reported_mc);
 KASUMI_ATTR_RO(applied_offset_mc,  kasumi_applied_offset_mc);
+
+static ssize_t hot_active_count_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lld\n",
+			  (long long)atomic64_read(&kasumi_hot_active_count));
+}
+
+static struct kobj_attribute kasumi_hot_active_count_attr =
+	__ATTR(hot_active_count, 0444, hot_active_count_show, NULL);
 
 static ssize_t zone_filter_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
@@ -845,6 +901,9 @@ static struct attribute *kasumi_attrs[] = {
 	&kasumi_ramp_shape_attr.attr,
 	&kasumi_warmup_secs_attr.attr,
 	&kasumi_warmup_offset_mc_attr.attr,
+	&kasumi_hot_threshold_mc_attr.attr,
+	&kasumi_hot_extra_offset_mc_attr.attr,
+	&kasumi_hot_active_count_attr.attr,
 	&kasumi_last_real_mc_attr.attr,
 	&kasumi_last_reported_mc_attr.attr,
 	&kasumi_applied_offset_mc_attr.attr,
