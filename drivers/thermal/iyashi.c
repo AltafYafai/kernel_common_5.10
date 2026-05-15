@@ -103,15 +103,25 @@ static unsigned long iyashi_last_target_out  __read_mostly;
 /* --------------------------------------------------------------- *
  * cdev filter -- which cooling devices Iyashi acts on             *
  *                                                                 *
- * Default: "thermal-cpufreq-" (prefix match).  Matches every       *
- * cpufreq_cooling.c-registered cdev (name = thermal-cpufreq-N).    *
+ * Default: "thermal-cpufreq-,thermal-devfreq-,thermal-gpufreq-"    *
+ * (prefix match).  Covers every cpufreq_cooling.c-registered cdev *
+ * (name = thermal-cpufreq-N), every devfreq_cooling.c-registered  *
+ * GPU/DDR cdev (name = thermal-devfreq-N), and any vendor          *
+ * thermal-gpufreq-* cdev some downstream trees ship.               *
+ *                                                                 *
+ * The freq-units floor only applies meaningfully to cpufreq cdevs *
+ * (cpufreq_cooling_floor_state_for_pct returns 0 elsewhere), so   *
+ * widening the filter just lets the state-units floor_pct floor   *
+ * also gate GPU/DDR cooling -- it does not implicitly enable      *
+ * min_freq_pct on those devices.                                  *
  *                                                                 *
  * Override via sysfs.  Comma-separated list of prefixes.  A leading*
  * '-' inverts to blacklist mode.                                  *
  * --------------------------------------------------------------- */
 
 #define IYASHI_FILTER_LEN 256
-#define IYASHI_DEFAULT_FILTER "thermal-cpufreq-"
+#define IYASHI_DEFAULT_FILTER \
+	"thermal-cpufreq-,thermal-devfreq-,thermal-gpufreq-"
 
 static char iyashi_cdev_filter_buf[IYASHI_FILTER_LEN] = IYASHI_DEFAULT_FILTER;
 static DEFINE_SPINLOCK(iyashi_filter_lock);
