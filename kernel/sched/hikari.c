@@ -167,6 +167,23 @@ static unsigned int hikari_floor_ttl_ms = 50;
  */
 static unsigned int hikari_floor_ttl_ms_big;
 static unsigned int hikari_floor_ttl_ms_little;
+/*
+ * Always-on per-cluster floor expressed as a percentage of the
+ * cluster's cpuinfo_max_freq.  Distinct from hikari_floor_khz_cluster*
+ * (which is a flat kHz used only during a wake-floor TTL window): a
+ * non-zero value here means "never let the published floor for this
+ * cluster drop below pct% of cpuinfo_max_freq, regardless of whether
+ * there was a recent wake event".  Zero (default) preserves the
+ * pre-existing wake-only behaviour byte-for-byte.
+ *
+ * The percentage is converted to kHz lazily into the matching
+ * hikari_force_floor_khz_* cache below, so the hot path
+ * (hikari_get_floor_khz) does only an unsigned compare.
+ */
+static unsigned int hikari_force_floor_pct_big;
+static unsigned int hikari_force_floor_pct_little;
+static unsigned int hikari_force_floor_khz_big __read_mostly;
+static unsigned int hikari_force_floor_khz_little __read_mostly;
 static unsigned int hikari_placement_enable;
 static unsigned int hikari_audio_intensify = 1;
 static unsigned int hikari_topapp_auto_optin = 1;
@@ -542,11 +559,60 @@ static inline void hikari_publish_freq_hint(unsigned int cpu, u32 demand_ns)
 				   HIKARI_NOTIFIER_WAKE_DEMAND, &hint);
 }
 
+/*
+ * Resolve cpuinfo_max_freq for the named cluster by peeking at any
+ * online CPU in it.  Returns 0 if cpufreq is not ready yet or the
+ * cluster is empty.  Takes (and releases) a cpufreq policy ref, so
+ * cheap-but-not-free -- only called from the writer path below.
+ */
+static unsigned int hikari_cluster_max_khz(const struct cpumask *cluster)
+{
+	struct cpufreq_policy *policy;
+	unsigned int cpu, max_khz = 0;
+
+	for_each_cpu(cpu, cluster) {
+		if (!cpu_online(cpu))
+			continue;
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+		max_khz = policy->cpuinfo.max_freq;
+		cpufreq_cpu_put(policy);
+		if (max_khz)
+			break;
+	}
+	return max_khz;
+}
+
+/*
+ * Recompute hikari_force_floor_khz_{big,little} from the corresponding
+ * _pct knobs and the cluster's current cpuinfo_max_freq.  Called from
+ * the sysfs/sysctl store handlers when the pct changes, and once from
+ * a deferred work item at first opt-in to handle the cpufreq-not-ready
+ * boot race.  Cheap and idempotent.
+ */
+static void hikari_recompute_force_floors(void)
+{
+	unsigned int big_max, little_max, big_pct, little_pct;
+
+	big_max    = hikari_cluster_max_khz(&hikari_big_cluster);
+	little_max = hikari_cluster_max_khz(&hikari_little_cluster);
+	big_pct    = READ_ONCE(hikari_force_floor_pct_big);
+	little_pct = READ_ONCE(hikari_force_floor_pct_little);
+
+	WRITE_ONCE(hikari_force_floor_khz_big,
+		   big_max ? (unsigned int)((u64)big_max * big_pct / 100U) : 0);
+	WRITE_ONCE(hikari_force_floor_khz_little,
+		   little_max ? (unsigned int)((u64)little_max * little_pct / 100U) : 0);
+}
+
 unsigned int hikari_get_floor_khz(unsigned int cpu)
 {
 	struct hikari_pcpu *pc;
 	unsigned long until;
-	unsigned int khz;
+	unsigned int khz = 0;
+	unsigned int force_khz;
+	bool big;
 
 	if (!IS_ENABLED(CONFIG_HIKARI_ZENITH_HINT))
 		return 0;
@@ -557,10 +623,21 @@ unsigned int hikari_get_floor_khz(unsigned int cpu)
 
 	pc = per_cpu_ptr(&hikari_pcpu, cpu);
 	until = READ_ONCE(pc->wake_floor_until_jiffies);
-	if (!until || time_after_eq(jiffies, until))
-		return 0;
+	if (until && !time_after_eq(jiffies, until))
+		khz = READ_ONCE(pc->wake_floor_khz);
 
-	khz = READ_ONCE(pc->wake_floor_khz);
+	/*
+	 * Always-on force-floor: independent of the wake-floor TTL.
+	 * The cached kHz value is recomputed lazily by the writer path
+	 * (hikari_recompute_force_floors), so the hot path is one
+	 * compare + one max.
+	 */
+	big = cpumask_test_cpu(cpu, &hikari_big_cluster);
+	force_khz = big ? READ_ONCE(hikari_force_floor_khz_big)
+			: READ_ONCE(hikari_force_floor_khz_little);
+	if (force_khz > khz)
+		khz = force_khz;
+
 	return khz;
 }
 EXPORT_SYMBOL_GPL(hikari_get_floor_khz);
@@ -1415,6 +1492,90 @@ HIKARI_TUNABLE_RW(floor_khz_cluster1, hikari_floor_khz_cluster1,
 HIKARI_TUNABLE_RW(floor_ttl_ms, hikari_floor_ttl_ms, 1, 500);
 HIKARI_TUNABLE_RW(floor_ttl_ms_big, hikari_floor_ttl_ms_big, 0, 500);
 HIKARI_TUNABLE_RW(floor_ttl_ms_little, hikari_floor_ttl_ms_little, 0, 500);
+
+/*
+ * force_floor_pct_{big,little}: pct of cluster cpuinfo_max_freq that
+ * the published Zenith floor is held at, regardless of any recent
+ * wake event.  Custom store handlers (rather than HIKARI_TUNABLE_RW)
+ * because the kHz cache must be recomputed after every change.
+ */
+static ssize_t force_floor_pct_big_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(hikari_force_floor_pct_big));
+}
+
+static ssize_t force_floor_pct_big_store(struct kobject *kobj,
+					 struct kobj_attribute *attr,
+					 const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	WRITE_ONCE(hikari_force_floor_pct_big, val);
+	hikari_recompute_force_floors();
+	return count;
+}
+
+static struct kobj_attribute hikari_attr_force_floor_pct_big =
+	__ATTR(force_floor_pct_big, 0644,
+	       force_floor_pct_big_show, force_floor_pct_big_store);
+
+static ssize_t force_floor_pct_little_show(struct kobject *kobj,
+					   struct kobj_attribute *attr,
+					   char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  READ_ONCE(hikari_force_floor_pct_little));
+}
+
+static ssize_t force_floor_pct_little_store(struct kobject *kobj,
+					    struct kobj_attribute *attr,
+					    const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 100)
+		return -EINVAL;
+	WRITE_ONCE(hikari_force_floor_pct_little, val);
+	hikari_recompute_force_floors();
+	return count;
+}
+
+static struct kobj_attribute hikari_attr_force_floor_pct_little =
+	__ATTR(force_floor_pct_little, 0644,
+	       force_floor_pct_little_show, force_floor_pct_little_store);
+
+/*
+ * Read-only mirror of the cached kHz values so userspace can verify
+ * the cpuinfo_max_freq lookup landed (useful after boot or hotplug).
+ */
+static ssize_t force_floor_khz_big_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(hikari_force_floor_khz_big));
+}
+
+static struct kobj_attribute hikari_attr_force_floor_khz_big =
+	__ATTR(force_floor_khz_big, 0444, force_floor_khz_big_show, NULL);
+
+static ssize_t force_floor_khz_little_show(struct kobject *kobj,
+					   struct kobj_attribute *attr,
+					   char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  READ_ONCE(hikari_force_floor_khz_little));
+}
+
+static struct kobj_attribute hikari_attr_force_floor_khz_little =
+	__ATTR(force_floor_khz_little, 0444,
+	       force_floor_khz_little_show, NULL);
+
 HIKARI_TUNABLE_RW(placement_enable, hikari_placement_enable, 0, 1);
 HIKARI_TUNABLE_RW(audio_intensify, hikari_audio_intensify, 0, 1);
 HIKARI_TUNABLE_RW(topapp_auto_optin, hikari_topapp_auto_optin, 0, 1);
@@ -1461,6 +1622,10 @@ static struct attribute *hikari_sysfs_attrs[] = {
 	&hikari_attr_floor_ttl_ms.attr,
 	&hikari_attr_floor_ttl_ms_big.attr,
 	&hikari_attr_floor_ttl_ms_little.attr,
+	&hikari_attr_force_floor_pct_big.attr,
+	&hikari_attr_force_floor_pct_little.attr,
+	&hikari_attr_force_floor_khz_big.attr,
+	&hikari_attr_force_floor_khz_little.attr,
 	&hikari_attr_placement_enable.attr,
 	&hikari_attr_audio_intensify.attr,
 	&hikari_attr_topapp_auto_optin.attr,
