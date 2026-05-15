@@ -42,12 +42,16 @@
 
 #include <linux/atomic.h>
 #include <linux/cpu_cooling.h>
+#include <linux/cpufreq.h>
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/init.h>
 #include <linux/jump_label.h>
 #include <linux/kobject.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/notifier.h>
+#include <linux/pm_qos.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -285,6 +289,189 @@ unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 EXPORT_SYMBOL_GPL(iyashi_clamp_target);
 
 /* --------------------------------------------------------------- *
+ * Per-cpufreq-policy freq_qos MIN enforcement (enforce_min)        *
+ *                                                                 *
+ * The clamp_target path above keeps cpufreq cooling devices from  *
+ * pulling cpufreq below the floor.  But "consistent performance"  *
+ * also wants cpufreq to stay high when there is no thermal cap   *
+ * at all (e.g. light wake-bursts).  Iyashi can opt-in to register *
+ * a FREQ_QOS_MIN request per policy so the scheduler is told the  *
+ * floor through cpufreq's official channel.                       *
+ *                                                                 *
+ * Lifecycle:                                                       *
+ *   - enforce_min flips 0->1: walk online cpus, attach qos per pol*
+ *   - enforce_min flips 1->0: walk list, detach + free each entry *
+ *   - min_freq_pct changes while enforce_min=1: update every req  *
+ *   - CPUFREQ_CREATE_POLICY: attach if enforce_min=1              *
+ *   - CPUFREQ_REMOVE_POLICY: detach matching entry if present     *
+ *                                                                 *
+ * Concurrency: iyashi_qos_lock (mutex) guards iyashi_qos_list and *
+ * the enforce_min state transitions.  The freq_qos API takes its  *
+ * own internal locks; iyashi_qos_lock is the order on top.        *
+ * --------------------------------------------------------------- */
+
+static unsigned int iyashi_enforce_min        __read_mostly;
+
+struct iyashi_qos_entry {
+	struct cpufreq_policy	*policy;
+	struct freq_qos_request	 req;
+	struct list_head	 node;
+};
+
+static LIST_HEAD(iyashi_qos_list);
+static DEFINE_MUTEX(iyashi_qos_lock);
+
+static unsigned int iyashi_compute_min_freq(struct cpufreq_policy *policy,
+					    unsigned int pct)
+{
+	u64 v;
+
+	if (!policy || !policy->cpuinfo.max_freq)
+		return 0;
+	if (pct == 0 || pct > 100)
+		return 0;
+
+	v = (u64)policy->cpuinfo.max_freq * pct;
+	do_div(v, 100);
+	if (v > policy->cpuinfo.max_freq)
+		v = policy->cpuinfo.max_freq;
+	return (unsigned int)v;
+}
+
+/* iyashi_qos_lock must be held. */
+static struct iyashi_qos_entry *
+iyashi_qos_find_entry(struct cpufreq_policy *policy)
+{
+	struct iyashi_qos_entry *e;
+
+	list_for_each_entry(e, &iyashi_qos_list, node) {
+		if (e->policy == policy)
+			return e;
+	}
+	return NULL;
+}
+
+/* iyashi_qos_lock must be held.  Adds an entry if one is not present. */
+static int iyashi_qos_attach_locked(struct cpufreq_policy *policy)
+{
+	struct iyashi_qos_entry *entry;
+	unsigned int freq;
+	int ret;
+
+	if (iyashi_qos_find_entry(policy))
+		return 0;
+
+	freq = iyashi_compute_min_freq(policy,
+				       READ_ONCE(iyashi_min_freq_pct));
+	if (!freq)
+		return 0;	/* min_freq_pct == 0 -> nothing to enforce */
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	entry->policy = policy;
+	ret = freq_qos_add_request(&policy->constraints, &entry->req,
+				   FREQ_QOS_MIN, freq);
+	if (ret < 0) {
+		kfree(entry);
+		return ret;
+	}
+
+	list_add(&entry->node, &iyashi_qos_list);
+	return 0;
+}
+
+/* iyashi_qos_lock must be held. */
+static void iyashi_qos_detach_entry_locked(struct iyashi_qos_entry *entry)
+{
+	list_del(&entry->node);
+	freq_qos_remove_request(&entry->req);
+	kfree(entry);
+}
+
+/* Attach a request to every online cpu's policy.  enforce_min=1 path. */
+static void iyashi_qos_attach_all(void)
+{
+	struct cpufreq_policy *policy;
+	int cpu;
+
+	mutex_lock(&iyashi_qos_lock);
+	for_each_online_cpu(cpu) {
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+		/* Only attach once per policy (multiple cpus per policy). */
+		if (!iyashi_qos_find_entry(policy))
+			(void)iyashi_qos_attach_locked(policy);
+		cpufreq_cpu_put(policy);
+	}
+	mutex_unlock(&iyashi_qos_lock);
+}
+
+/* Detach every request.  enforce_min=0 path. */
+static void iyashi_qos_detach_all(void)
+{
+	struct iyashi_qos_entry *e, *tmp;
+
+	mutex_lock(&iyashi_qos_lock);
+	list_for_each_entry_safe(e, tmp, &iyashi_qos_list, node)
+		iyashi_qos_detach_entry_locked(e);
+	mutex_unlock(&iyashi_qos_lock);
+}
+
+/* Update every active request after min_freq_pct changes. */
+static void iyashi_qos_update_all(void)
+{
+	struct iyashi_qos_entry *e;
+	unsigned int freq;
+	unsigned int pct = READ_ONCE(iyashi_min_freq_pct);
+
+	mutex_lock(&iyashi_qos_lock);
+	list_for_each_entry(e, &iyashi_qos_list, node) {
+		freq = iyashi_compute_min_freq(e->policy, pct);
+		if (!freq)
+			freq = FREQ_QOS_MIN_DEFAULT_VALUE;
+		(void)freq_qos_update_request(&e->req, (s32)freq);
+	}
+	mutex_unlock(&iyashi_qos_lock);
+}
+
+static int iyashi_cpufreq_policy_notify(struct notifier_block *nb,
+					unsigned long event, void *data)
+{
+	struct cpufreq_policy *policy = data;
+
+	if (!READ_ONCE(iyashi_enforce_min))
+		return NOTIFY_OK;
+
+	switch (event) {
+	case CPUFREQ_CREATE_POLICY:
+		mutex_lock(&iyashi_qos_lock);
+		(void)iyashi_qos_attach_locked(policy);
+		mutex_unlock(&iyashi_qos_lock);
+		break;
+	case CPUFREQ_REMOVE_POLICY:
+		mutex_lock(&iyashi_qos_lock);
+		{
+			struct iyashi_qos_entry *e =
+				iyashi_qos_find_entry(policy);
+			if (e)
+				iyashi_qos_detach_entry_locked(e);
+		}
+		mutex_unlock(&iyashi_qos_lock);
+		break;
+	default:
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block iyashi_cpufreq_policy_nb = {
+	.notifier_call = iyashi_cpufreq_policy_notify,
+};
+
+/* --------------------------------------------------------------- *
  * sysfs                                                           *
  * --------------------------------------------------------------- */
 
@@ -343,7 +530,67 @@ static struct kobj_attribute iyashi_enabled_attr =
 
 IYASHI_ATTR_RW(floor_pct,           iyashi_floor_pct,           val >= 50 && val <= 100);
 IYASHI_ATTR_RW(near_limit_offset_c, iyashi_near_limit_offset_c, val >= 1  && val <= 15);
-IYASHI_ATTR_RW(min_freq_pct,        iyashi_min_freq_pct,        val == 0  || (val >= 50 && val <= 100));
+
+static ssize_t min_freq_pct_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(iyashi_min_freq_pct));
+}
+
+static ssize_t min_freq_pct_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+	if (!(val == 0 || (val >= 50 && val <= 100)))
+		return -ERANGE;
+
+	WRITE_ONCE(iyashi_min_freq_pct, val);
+
+	/* Re-apply on every attached policy if enforce_min is active. */
+	if (READ_ONCE(iyashi_enforce_min))
+		iyashi_qos_update_all();
+
+	return count;
+}
+
+static struct kobj_attribute iyashi_min_freq_pct_attr =
+	__ATTR(min_freq_pct, 0644, min_freq_pct_show, min_freq_pct_store);
+
+static ssize_t enforce_min_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(iyashi_enforce_min));
+}
+
+static ssize_t enforce_min_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+	if (val > 1)
+		return -ERANGE;
+
+	if (val == READ_ONCE(iyashi_enforce_min))
+		return count;
+
+	WRITE_ONCE(iyashi_enforce_min, val);
+	if (val)
+		iyashi_qos_attach_all();
+	else
+		iyashi_qos_detach_all();
+
+	return count;
+}
+
+static struct kobj_attribute iyashi_enforce_min_attr =
+	__ATTR(enforce_min, 0644, enforce_min_show, enforce_min_store);
 
 #define IYASHI_ATTR_RO_INT(_name, _var)					\
 static ssize_t _name##_show(struct kobject *kobj,			\
@@ -429,6 +676,7 @@ static struct attribute *iyashi_attrs[] = {
 	&iyashi_enabled_attr.attr,
 	&iyashi_floor_pct_attr.attr,
 	&iyashi_min_freq_pct_attr.attr,
+	&iyashi_enforce_min_attr.attr,
 	&iyashi_near_limit_offset_c_attr.attr,
 	&iyashi_cdev_filter_attr.attr,
 	&iyashi_clamped_count_attr.attr,
@@ -469,6 +717,18 @@ static int __init iyashi_init(void)
 
 	if (READ_ONCE(iyashi_enabled))
 		static_branch_enable(&iyashi_active_key);
+
+	/*
+	 * Register a cpufreq policy notifier so the enforce_min path can
+	 * attach/detach a FREQ_QOS_MIN request when policies come and go
+	 * (CPU hot-plug etc.).  The notifier itself early-outs when
+	 * enforce_min == 0, so it is cheap even with the feature disabled.
+	 */
+	ret = cpufreq_register_notifier(&iyashi_cpufreq_policy_nb,
+					CPUFREQ_POLICY_NOTIFIER);
+	if (ret)
+		pr_warn("Iyashi: cpufreq_register_notifier failed: %d (enforce_min will not survive hotplug)\n",
+			ret);
 
 	pr_info("Iyashi (癒し) performance floor active: floor=%u%% near_limit=%uC filter='%s'\n",
 		READ_ONCE(iyashi_floor_pct),
