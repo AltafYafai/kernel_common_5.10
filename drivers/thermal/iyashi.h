@@ -20,6 +20,7 @@
 #ifdef CONFIG_IYASHI
 unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 				  unsigned long target);
+void iyashi_apply_profile(unsigned int profile);
 #else
 static inline unsigned long
 iyashi_clamp_target(struct thermal_cooling_device *cdev,
@@ -27,6 +28,7 @@ iyashi_clamp_target(struct thermal_cooling_device *cdev,
 {
 	return target;
 }
+static inline void iyashi_apply_profile(unsigned int profile) { }
 #endif
 
 #endif /* __IYASHI_H__ */

@@ -8181,10 +8181,19 @@ static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
  * disabled, or no thermal zone the filter accepted has been read
  * yet) -- caller treats 0 as "fall back to whatever I have".
  */
+#if IS_ENABLED(CONFIG_THERMAL)
 extern int kasumi_get_last_real_mc(void);
 extern void kasumi_apply_profile(unsigned int profile);
+#else
+static inline int kasumi_get_last_real_mc(void) { return 0; }
+static inline void kasumi_apply_profile(unsigned int profile) { }
+#endif
+
+#if IS_ENABLED(CONFIG_IYASHI)
 extern void iyashi_apply_profile(unsigned int profile);
-extern void hikari_apply_profile(unsigned int profile);
+#else
+static inline void iyashi_apply_profile(unsigned int profile) { }
+#endif
 
 /* Patch K: live skin-temp readout for the game_perf_burst guardrail.
  * Returns millidegrees C.

@@ -45,6 +45,7 @@
 #include <linux/cpufreq.h>
 #include <linux/err.h>
 #include <linux/export.h>
+#include <linux/hikari.h>
 #include <linux/init.h>
 #include <linux/jump_label.h>
 #include <linux/kobject.h>
@@ -100,8 +101,6 @@ static unsigned int iyashi_min_freq_pct       __read_mostly;
 static unsigned int iyashi_hikari_aware       __read_mostly;
 static unsigned int iyashi_hikari_window_ms   __read_mostly = 50;
 static unsigned int iyashi_hikari_boost_pct   __read_mostly = 5;
-
-extern unsigned long hikari_get_last_demand_jiffies(void);
 
 /*
  * Static key gating.  Flipped by enabled_store() so the disabled
@@ -281,7 +280,7 @@ unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 	 * Cooldown imminent: at least one trip is within near_c of
 	 * the bound zone's current temperature.  Surrender control.
 	 */
-	if (min_headroom_c != INT_MAX && (unsigned int)min_headroom_c < near_c) {
+	if (min_headroom_c != INT_MAX && min_headroom_c < (int)near_c) {
 		atomic64_inc(&iyashi_passthrough_count);
 		WRITE_ONCE(iyashi_last_target_out, target);
 		if (trace_iyashi_clamp_enabled())
@@ -700,9 +699,16 @@ static ssize_t min_freq_pct_store(struct kobject *kobj,
 
 	WRITE_ONCE(iyashi_min_freq_pct, val);
 
-	/* Re-apply on every attached policy if enforce_min is active. */
-	if (READ_ONCE(iyashi_enforce_min))
+	/*
+	 * Re-apply on every attached policy if enforce_min is active.
+	 * If enforce_min was enabled while min_freq_pct was 0, no
+	 * requests were attached yet; attach them now before updating.
+	 */
+	if (READ_ONCE(iyashi_enforce_min)) {
+		if (val)
+			iyashi_qos_attach_all();
 		iyashi_qos_update_all();
+	}
 
 	return count;
 }

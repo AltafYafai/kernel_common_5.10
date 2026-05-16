@@ -155,6 +155,12 @@ int hikari_unregister_cpufreq_notifier(struct notifier_block *nb);
 /* Master enable check, useful for callers that want to skip work. */
 bool hikari_enabled(void);
 
+/* Profile cross-link used by governors that share profile IDs. */
+void hikari_apply_profile(unsigned int profile);
+
+/* Last wake-demand timestamp, consumed by thermal policy helpers. */
+unsigned long hikari_get_last_demand_jiffies(void);
+
 /*
  * Direct query for the current wake-time frequency floor on @cpu.
  * Returns 0 when there is no active floor (Hikari off, no hint
@@ -196,6 +202,8 @@ static inline int hikari_unregister_cpufreq_notifier(struct notifier_block *nb)
 	{ return 0; }
 
 static inline bool hikari_enabled(void) { return false; }
+static inline void hikari_apply_profile(unsigned int profile) { }
+static inline unsigned long hikari_get_last_demand_jiffies(void) { return 0; }
 static inline unsigned int hikari_get_floor_khz(unsigned int cpu) { return 0; }
 
 struct seq_file;
