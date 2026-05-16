@@ -418,6 +418,115 @@ int kasumi_get_last_real_mc(void)
 }
 EXPORT_SYMBOL_GPL(kasumi_get_last_real_mc);
 
+/*
+ * Profile-aware Kasumi tuning.  Called from Zenith's
+ * zenith_apply_profile() when the active profile changes.
+ *
+ * Profile IDs mirror Zenith's ZENITH_PROFILE_* defines:
+ *   0 = CUSTOM, 1 = PERFORMANCE, 2 = BALANCED, 3 = BATTERY,
+ *   4 = LEGACY, 5 = GAMING, 6 = AUDIO, 7 = AUTO.
+ *
+ * BALANCED / CUSTOM / LEGACY / AUTO write the compile-time
+ * defaults so the cold-boot baseline is preserved byte-for-byte.
+ * PERFORMANCE / GAMING widen the dampening window (more offset,
+ * higher ramp start, enable warmup + hot-zone boost) so the
+ * framework throttles later during sustained foreground load.
+ * BATTERY tightens the window so thermal responses arrive sooner
+ * and the cooling devices can save power.  AUDIO matches
+ * BALANCED -- audio threads care about jitter, not raw freq.
+ *
+ * Every tunable written here is already individually writable via
+ * /sys/kernel/kasumi/; a subsequent sysfs write overrides the
+ * profile bake until the next profile flip.
+ */
+void kasumi_apply_profile(unsigned int profile)
+{
+	struct kasumi_profile_vals {
+		unsigned int offset_mc;
+		unsigned int ramp_mc;
+		unsigned int ceiling_mc;
+		unsigned int ramp_shape;
+		unsigned int warmup_secs;
+		unsigned int warmup_offset_mc;
+		unsigned int hot_threshold_mc;
+		unsigned int hot_extra_offset_mc;
+	};
+
+	static const struct kasumi_profile_vals profiles[] = {
+		/* PERFORMANCE (1): widen dampening for sustained load */
+		[1] = {
+			.offset_mc          = 20000,  /* 20 C */
+			.ramp_mc            = 88000,  /* 88 C */
+			.ceiling_mc         = 95000,  /* unchanged */
+			.ramp_shape         = KASUMI_RAMP_QUADRATIC,
+			.warmup_secs        = 30,
+			.warmup_offset_mc   = 25000,
+			.hot_threshold_mc   = 75000,  /* 75 C */
+			.hot_extra_offset_mc = 10000, /* 10 C */
+		},
+		/* BALANCED (2): compile-time defaults */
+		[2] = {
+			.offset_mc          = 15000,
+			.ramp_mc            = 85000,
+			.ceiling_mc         = 95000,
+			.ramp_shape         = KASUMI_RAMP_LINEAR,
+			.warmup_secs        = 0,
+			.warmup_offset_mc   = 25000,
+			.hot_threshold_mc   = 0,
+			.hot_extra_offset_mc = 10000,
+		},
+		/* BATTERY (3): tighter dampening, save power */
+		[3] = {
+			.offset_mc          = 8000,   /* 8 C */
+			.ramp_mc            = 80000,  /* 80 C */
+			.ceiling_mc         = 95000,
+			.ramp_shape         = KASUMI_RAMP_LINEAR,
+			.warmup_secs        = 0,
+			.warmup_offset_mc   = 25000,
+			.hot_threshold_mc   = 0,
+			.hot_extra_offset_mc = 10000,
+		},
+		/* GAMING (5): most aggressive dampening */
+		[5] = {
+			.offset_mc          = 22000,  /* 22 C */
+			.ramp_mc            = 90000,  /* 90 C */
+			.ceiling_mc         = 95000,
+			.ramp_shape         = KASUMI_RAMP_QUADRATIC,
+			.warmup_secs        = 30,
+			.warmup_offset_mc   = 25000,
+			.hot_threshold_mc   = 70000,  /* 70 C */
+			.hot_extra_offset_mc = 12000, /* 12 C */
+		},
+	};
+
+	const struct kasumi_profile_vals *v;
+
+	/* CUSTOM(0), LEGACY(4), AUDIO(6), AUTO(7): use BALANCED. */
+	if (profile == 0 || profile == 4 || profile == 6 || profile >= 7)
+		profile = 2;
+
+	if (profile >= ARRAY_SIZE(profiles))
+		profile = 2;
+
+	v = &profiles[profile];
+	if (!v->ceiling_mc)
+		v = &profiles[2];
+
+	WRITE_ONCE(kasumi_offset_mc, v->offset_mc);
+	WRITE_ONCE(kasumi_ramp_mc, v->ramp_mc);
+	WRITE_ONCE(kasumi_ceiling_mc, v->ceiling_mc);
+	WRITE_ONCE(kasumi_ramp_shape, v->ramp_shape);
+	WRITE_ONCE(kasumi_warmup_secs, v->warmup_secs);
+	WRITE_ONCE(kasumi_warmup_offset_mc, v->warmup_offset_mc);
+	WRITE_ONCE(kasumi_hot_threshold_mc, v->hot_threshold_mc);
+	WRITE_ONCE(kasumi_hot_extra_offset_mc, v->hot_extra_offset_mc);
+
+	pr_info_ratelimited("kasumi: profile %u applied (offset=%u ramp=%u ceiling=%u shape=%u warmup=%us hot_thresh=%u)\n",
+			    profile, v->offset_mc, v->ramp_mc, v->ceiling_mc,
+			    v->ramp_shape, v->warmup_secs,
+			    v->hot_threshold_mc);
+}
+
 int get_tz_trend(struct thermal_zone_device *tz, int trip)
 {
 	enum thermal_trend trend;
