@@ -8184,6 +8184,7 @@ static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
 extern int kasumi_get_last_real_mc(void);
 extern void kasumi_apply_profile(unsigned int profile);
 extern void iyashi_apply_profile(unsigned int profile);
+extern void hikari_apply_profile(unsigned int profile);
 
 /* Patch K: live skin-temp readout for the game_perf_burst guardrail.
  * Returns millidegrees C.
@@ -15143,6 +15144,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	 */
 	kasumi_apply_profile(prof);
 	iyashi_apply_profile(prof);
+	hikari_apply_profile(prof);
 }
 
 /* Patch B-AUTO-4: auto-selector classifier (priority cascade).
