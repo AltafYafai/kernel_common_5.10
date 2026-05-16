@@ -404,9 +404,9 @@ static inline void hikari_lazy_topapp_update(struct task_struct *p)
 	in_topapp = (strcmp(cgrp->kn->name, "top-app") == 0);
 	flags = READ_ONCE(p->hikari_flags);
 
-	if (in_topapp && !(flags & HIKARI_FLAG_FOREGROUND))
-		hikari_set_flag(p, HIKARI_FLAG_FOREGROUND | HIKARI_FLAG_OPT_IN,
-				true);
+	if (in_topapp && (!(flags & HIKARI_FLAG_FOREGROUND) ||
+			  (flags & HIKARI_FLAG_BACKGROUND)))
+		hikari_mark_foreground(p, true);
 	else if (!in_topapp && (flags & HIKARI_FLAG_FOREGROUND)) {
 		u32 clear = HIKARI_FLAG_FOREGROUND;
 
@@ -768,6 +768,8 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 	{
 		unsigned int shift = READ_ONCE(hikari_ewma_shift);
 		u32 weight;
+		u64 sum;
+		u64 next;
 
 		if (shift < hikari_ewma_shift_min)
 			shift = hikari_ewma_shift_min;
@@ -776,11 +778,9 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 		weight = (1u << shift) - 1;
 
 		ewma = READ_ONCE(p->hikari_wait_ewma_ns);
-		if (ewma > U32_MAX - delta) {
-			ewma = U32_MAX;
-		} else {
-			ewma = ((ewma * weight) + delta) >> shift;
-		}
+		sum = ((u64)ewma * weight) + delta;
+		next = sum >> shift;
+		ewma = next > U32_MAX ? U32_MAX : (u32)next;
 	}
 	WRITE_ONCE(p->hikari_wait_ewma_ns, ewma);
 	WRITE_ONCE(p->hikari_last_enqueue_ns, 0);
@@ -1393,6 +1393,15 @@ EXPORT_SYMBOL_GPL(hikari_task_get_flag);
 
 void hikari_task_set_flag(struct task_struct *p, u32 bit, bool on)
 {
+	if (bit == HIKARI_FLAG_FOREGROUND) {
+		hikari_mark_foreground(p, on);
+		return;
+	}
+	if (bit == HIKARI_FLAG_BACKGROUND) {
+		hikari_mark_background(p, on);
+		return;
+	}
+
 	hikari_set_flag(p, bit, on);
 }
 EXPORT_SYMBOL_GPL(hikari_task_set_flag);
@@ -1602,6 +1611,7 @@ static ssize_t enable_store(struct kobject *kobj,
 	WRITE_ONCE(hikari_enable_value, val);
 	if (val)
 		atomic_set(&hikari_kill_flag, 0);
+	hikari_active_key_sync();
 	return count;
 }
 
