@@ -843,11 +843,34 @@ int hikari_select_cpu(struct task_struct *p, int prev_cpu, int wake_flags)
 		return -1;
 	}
 
-	for_each_cpu_and(cpu, &hikari_big_cluster, p->cpus_ptr) {
-		if (!cpu_online(cpu))
-			continue;
-		hikari_set_skip_reason(p, HIKARI_SKIP_ACTIONED);
-		return cpu;
+	/*
+	 * Two-pass selection over the big cluster:
+	 *   1. Prefer a fully idle CPU (available_idle_cpu) -- avoids
+	 *      packing wake-demand tasks onto an already-busy core.
+	 *   2. Fall back to the first online CPU if none is idle.
+	 *
+	 * Within each pass we pick the first match; a proper
+	 * least-loaded selection would need rq->nr_running which
+	 * is scheduler-internal and not worth the coupling here.
+	 */
+	{
+		int fallback = -1;
+
+		for_each_cpu_and(cpu, &hikari_big_cluster, p->cpus_ptr) {
+			if (!cpu_online(cpu))
+				continue;
+			if (available_idle_cpu(cpu)) {
+				hikari_set_skip_reason(p, HIKARI_SKIP_ACTIONED);
+				return cpu;
+			}
+			if (fallback < 0)
+				fallback = cpu;
+		}
+
+		if (fallback >= 0) {
+			hikari_set_skip_reason(p, HIKARI_SKIP_ACTIONED);
+			return fallback;
+		}
 	}
 
 	/*
