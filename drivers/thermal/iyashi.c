@@ -85,6 +85,21 @@ static unsigned int iyashi_near_limit_offset_c __read_mostly = 5;
 static unsigned int iyashi_min_freq_pct       __read_mostly;
 
 /*
+ * Hikari cross-link tunables.  When hikari_aware is non-zero AND
+ * Hikari published a wake-demand event within the last
+ * hikari_window_ms milliseconds, Iyashi temporarily raises the
+ * effective floor_pct by hikari_boost_pct percentage points.
+ *
+ * Default: all off (hikari_aware=0).  PERFORMANCE/GAMING profiles
+ * enable it via iyashi_apply_profile().
+ */
+static unsigned int iyashi_hikari_aware       __read_mostly;
+static unsigned int iyashi_hikari_window_ms   __read_mostly = 50;
+static unsigned int iyashi_hikari_boost_pct   __read_mostly = 5;
+
+extern unsigned long hikari_get_last_demand_jiffies(void);
+
+/*
  * Static key gating.  Flipped by enabled_store() so the disabled
  * fast path is a single unlikely-branch.
  */
@@ -198,6 +213,27 @@ unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 
 	near_c    = READ_ONCE(iyashi_near_limit_offset_c);
 	floor_pct = READ_ONCE(iyashi_floor_pct);
+
+	/*
+	 * Hikari cross-link: if the scheduler is seeing sustained
+	 * wake-demand (bursty foreground load), temporarily raise
+	 * the performance floor so thermal doesn't pull freq down
+	 * during the burst.  Tunable-gated: hikari_aware == 0 on
+	 * BALANCED means this block is never entered.
+	 */
+	if (READ_ONCE(iyashi_hikari_aware)) {
+		unsigned int window = READ_ONCE(iyashi_hikari_window_ms);
+		unsigned long last = hikari_get_last_demand_jiffies();
+
+		if (last && time_is_after_jiffies(last + msecs_to_jiffies(window))) {
+			unsigned int boost = READ_ONCE(iyashi_hikari_boost_pct);
+
+			if (floor_pct + boost <= 100)
+				floor_pct += boost;
+			else
+				floor_pct = 100;
+		}
+	}
 
 	/*
 	 * thermal_cdev_update() already holds cdev->lock when we are
@@ -319,32 +355,37 @@ void iyashi_apply_profile(unsigned int profile)
 		unsigned int floor_pct;
 		unsigned int near_limit_offset_c;
 		unsigned int min_freq_pct;
+		unsigned int hikari_aware;
 	};
 
 	static const struct iyashi_profile_vals profiles[] = {
-		/* PERFORMANCE (1): higher floor, wider margin */
+		/* PERFORMANCE (1): higher floor, wider margin, hikari cross-link */
 		[1] = {
 			.floor_pct          = 95,
 			.near_limit_offset_c = 8,
 			.min_freq_pct       = 0,
+			.hikari_aware       = 1,
 		},
-		/* BALANCED (2): compile-time defaults */
+		/* BALANCED (2): compile-time defaults, hikari cross-link off */
 		[2] = {
 			.floor_pct          = 90,
 			.near_limit_offset_c = 5,
 			.min_freq_pct       = 0,
+			.hikari_aware       = 0,
 		},
 		/* BATTERY (3): lower floor, tighter margin */
 		[3] = {
 			.floor_pct          = 75,
 			.near_limit_offset_c = 3,
 			.min_freq_pct       = 0,
+			.hikari_aware       = 0,
 		},
-		/* GAMING (5): most aggressive floor */
+		/* GAMING (5): most aggressive floor, hikari cross-link */
 		[5] = {
 			.floor_pct          = 97,
 			.near_limit_offset_c = 10,
 			.min_freq_pct       = 0,
+			.hikari_aware       = 1,
 		},
 	};
 
@@ -364,10 +405,11 @@ void iyashi_apply_profile(unsigned int profile)
 	WRITE_ONCE(iyashi_floor_pct, v->floor_pct);
 	WRITE_ONCE(iyashi_near_limit_offset_c, v->near_limit_offset_c);
 	WRITE_ONCE(iyashi_min_freq_pct, v->min_freq_pct);
+	WRITE_ONCE(iyashi_hikari_aware, v->hikari_aware);
 
-	pr_info_ratelimited("iyashi: profile %u applied (floor=%u%% near_limit=%uC min_freq=%u%%)\n",
+	pr_info_ratelimited("iyashi: profile %u applied (floor=%u%% near_limit=%uC min_freq=%u%% hikari_aware=%u)\n",
 			    profile, v->floor_pct, v->near_limit_offset_c,
-			    v->min_freq_pct);
+			    v->min_freq_pct, v->hikari_aware);
 }
 
 /* --------------------------------------------------------------- *
@@ -744,6 +786,79 @@ static ssize_t cdev_filter_store(struct kobject *kobj,
 static struct kobj_attribute iyashi_cdev_filter_attr =
 	__ATTR(cdev_filter, 0644, cdev_filter_show, cdev_filter_store);
 
+/* --------------------------------------------------------------- *
+ * Hikari cross-link sysfs tunables                                *
+ * --------------------------------------------------------------- */
+
+static ssize_t hikari_aware_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(iyashi_hikari_aware));
+}
+
+static ssize_t hikari_aware_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	WRITE_ONCE(iyashi_hikari_aware, !!val);
+	return count;
+}
+
+static struct kobj_attribute iyashi_hikari_aware_attr =
+	__ATTR(hikari_aware, 0644, hikari_aware_show, hikari_aware_store);
+
+static ssize_t hikari_window_ms_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(iyashi_hikari_window_ms));
+}
+
+static ssize_t hikari_window_ms_store(struct kobject *kobj,
+				      struct kobj_attribute *attr,
+				      const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 1000)
+		return -EINVAL;
+	WRITE_ONCE(iyashi_hikari_window_ms, val);
+	return count;
+}
+
+static struct kobj_attribute iyashi_hikari_window_ms_attr =
+	__ATTR(hikari_window_ms, 0644, hikari_window_ms_show,
+	       hikari_window_ms_store);
+
+static ssize_t hikari_boost_pct_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(iyashi_hikari_boost_pct));
+}
+
+static ssize_t hikari_boost_pct_store(struct kobject *kobj,
+				      struct kobj_attribute *attr,
+				      const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	if (val > 50)
+		return -EINVAL;
+	WRITE_ONCE(iyashi_hikari_boost_pct, val);
+	return count;
+}
+
+static struct kobj_attribute iyashi_hikari_boost_pct_attr =
+	__ATTR(hikari_boost_pct, 0644, hikari_boost_pct_show,
+	       hikari_boost_pct_store);
+
 static ssize_t version_show(struct kobject *kobj,
 			    struct kobj_attribute *attr, char *buf)
 {
@@ -761,6 +876,9 @@ static struct attribute *iyashi_attrs[] = {
 	&iyashi_enforce_min_attr.attr,
 	&iyashi_near_limit_offset_c_attr.attr,
 	&iyashi_cdev_filter_attr.attr,
+	&iyashi_hikari_aware_attr.attr,
+	&iyashi_hikari_window_ms_attr.attr,
+	&iyashi_hikari_boost_pct_attr.attr,
 	&iyashi_clamped_count_attr.attr,
 	&iyashi_passthrough_count_attr.attr,
 	&iyashi_freq_floor_used_count_attr.attr,

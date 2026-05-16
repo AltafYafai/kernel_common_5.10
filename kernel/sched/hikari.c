@@ -185,6 +185,16 @@ static unsigned int hikari_force_floor_pct_little;
 static unsigned int hikari_force_floor_khz_big __read_mostly;
 static unsigned int hikari_force_floor_khz_little __read_mostly;
 static unsigned int hikari_placement_enable;
+
+/*
+ * Cross-subsystem signal: jiffies timestamp of the most recent
+ * wake-demand publish across all CPUs.  Iyashi reads this to
+ * know whether the scheduler is seeing sustained high-EWMA
+ * tasks, and optionally raises the thermal performance floor
+ * while wake-demand is active.  Lockless: updated with
+ * WRITE_ONCE on the publish path, read with READ_ONCE.
+ */
+static unsigned long hikari_last_demand_jiffies __read_mostly;
 static unsigned int hikari_audio_intensify = 1;
 static unsigned int hikari_topapp_auto_optin = 1;
 static unsigned int hikari_topapp_auto_optout;
@@ -554,6 +564,8 @@ static inline void hikari_publish_freq_hint(unsigned int cpu, u32 demand_ns)
 	WRITE_ONCE(per_cpu_ptr(&hikari_pcpu, cpu)->wake_floor_khz, floor);
 	WRITE_ONCE(per_cpu_ptr(&hikari_pcpu, cpu)->wake_floor_until_jiffies,
 		   jiffies + msecs_to_jiffies(hint.ttl_ms));
+
+	WRITE_ONCE(hikari_last_demand_jiffies, jiffies);
 
 	atomic_notifier_call_chain(&hikari_cpufreq_chain,
 				   HIKARI_NOTIFIER_WAKE_DEMAND, &hint);
@@ -946,6 +958,17 @@ void hikari_apply_profile(unsigned int profile)
 	pr_info_ratelimited("hikari: profile %u applied (force_floor big=%u%% little=%u%%)\n",
 			    profile, v->force_floor_pct_big,
 			    v->force_floor_pct_little);
+}
+
+/*
+ * Return the jiffies timestamp of the most recent wake-demand
+ * publish.  Iyashi uses this to decide whether scheduler-side
+ * wake pressure is active and optionally raise the thermal
+ * performance floor during bursty foreground load.
+ */
+unsigned long hikari_get_last_demand_jiffies(void)
+{
+	return READ_ONCE(hikari_last_demand_jiffies);
 }
 
 /* ------------------------------------------------------------ */
