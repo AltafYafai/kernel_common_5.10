@@ -288,6 +288,88 @@ unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 }
 EXPORT_SYMBOL_GPL(iyashi_clamp_target);
 
+/*
+ * Profile-aware Iyashi tuning.  Called from Zenith's
+ * zenith_apply_profile() when the active profile changes.
+ *
+ * Profile IDs mirror Zenith's ZENITH_PROFILE_* defines:
+ *   0 = CUSTOM, 1 = PERFORMANCE, 2 = BALANCED, 3 = BATTERY,
+ *   4 = LEGACY, 5 = GAMING, 6 = AUDIO, 7 = AUTO.
+ *
+ * BALANCED / CUSTOM / LEGACY / AUTO write the compile-time
+ * defaults (floor_pct=90, near_limit=5) so the cold-boot
+ * baseline is preserved byte-for-byte.
+ *
+ * PERFORMANCE / GAMING raise the floor and widen the headroom
+ * margin so cpufreq stays higher for longer during sustained
+ * foreground load.
+ *
+ * BATTERY lowers the floor and narrows the margin so thermal
+ * responses arrive sooner and the cooling devices save power.
+ *
+ * AUDIO matches BALANCED -- audio threads care about jitter
+ * not raw cpufreq headroom.
+ *
+ * Does NOT touch enforce_min or cdev_filter -- those are
+ * topology/policy-specific and belong in userspace init.
+ */
+void iyashi_apply_profile(unsigned int profile)
+{
+	struct iyashi_profile_vals {
+		unsigned int floor_pct;
+		unsigned int near_limit_offset_c;
+		unsigned int min_freq_pct;
+	};
+
+	static const struct iyashi_profile_vals profiles[] = {
+		/* PERFORMANCE (1): higher floor, wider margin */
+		[1] = {
+			.floor_pct          = 95,
+			.near_limit_offset_c = 8,
+			.min_freq_pct       = 0,
+		},
+		/* BALANCED (2): compile-time defaults */
+		[2] = {
+			.floor_pct          = 90,
+			.near_limit_offset_c = 5,
+			.min_freq_pct       = 0,
+		},
+		/* BATTERY (3): lower floor, tighter margin */
+		[3] = {
+			.floor_pct          = 75,
+			.near_limit_offset_c = 3,
+			.min_freq_pct       = 0,
+		},
+		/* GAMING (5): most aggressive floor */
+		[5] = {
+			.floor_pct          = 97,
+			.near_limit_offset_c = 10,
+			.min_freq_pct       = 0,
+		},
+	};
+
+	const struct iyashi_profile_vals *v;
+
+	/* CUSTOM(0), LEGACY(4), AUDIO(6), AUTO(7): use BALANCED. */
+	if (profile == 0 || profile == 4 || profile == 6 || profile >= 7)
+		profile = 2;
+
+	if (profile >= ARRAY_SIZE(profiles))
+		profile = 2;
+
+	v = &profiles[profile];
+	if (!v->floor_pct)
+		v = &profiles[2];
+
+	WRITE_ONCE(iyashi_floor_pct, v->floor_pct);
+	WRITE_ONCE(iyashi_near_limit_offset_c, v->near_limit_offset_c);
+	WRITE_ONCE(iyashi_min_freq_pct, v->min_freq_pct);
+
+	pr_info_ratelimited("iyashi: profile %u applied (floor=%u%% near_limit=%uC min_freq=%u%%)\n",
+			    profile, v->floor_pct, v->near_limit_offset_c,
+			    v->min_freq_pct);
+}
+
 /* --------------------------------------------------------------- *
  * Per-cpufreq-policy freq_qos MIN enforcement (enforce_min)        *
  *                                                                 *
