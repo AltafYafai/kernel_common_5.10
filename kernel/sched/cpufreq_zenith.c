@@ -22283,7 +22283,29 @@ static void zenith_exit(struct cpufreq_policy *policy)
 		mutex_destroy(&z_policy->work_lock);
 	}
 
+	/*
+	 * Publish the NULL so every subsequent vendor-hook probe
+	 * (vh_arch_set_freq_scale, vh_cpu_idle_*, vh_setscheduler_uclamp,
+	 * vh_freq_qos_update_request, vh_sched_move_task,
+	 * vh_scheduler_tick) sees it and bails out immediately.
+	 *
+	 * The probes are registered at module level (zenith_gov_init)
+	 * and fire from tracepoint callbacks which execute inside an
+	 * RCU-sched read-side critical section (preempt_disable /
+	 * rcu_read_lock_sched).  A probe that loaded z_policy before
+	 * we NULLed governor_data is still referencing valid memory
+	 * here -- the kfree has not happened yet.  synchronize_rcu()
+	 * below guarantees that every such in-flight callback has
+	 * returned before we free z_policy, closing the
+	 * load-then-use-after-free window.
+	 *
+	 * Cost: one grace period (~few ms) on the teardown path,
+	 * which only runs on governor switch -- not on the hot path.
+	 */
 	policy->governor_data = NULL;
+
+	synchronize_rcu();
+
 	cpufreq_disable_fast_switch(policy);
 	kfree(z_policy);
 }
