@@ -883,6 +883,71 @@ int hikari_select_cpu(struct task_struct *p, int prev_cpu, int wake_flags)
 }
 EXPORT_SYMBOL_GPL(hikari_select_cpu);
 
+/*
+ * Profile-aware Hikari tuning.  Called from Zenith's
+ * zenith_apply_profile() when the active profile changes.
+ *
+ * Profile IDs mirror Zenith's ZENITH_PROFILE_* defines:
+ *   0 = CUSTOM, 1 = PERFORMANCE, 2 = BALANCED, 3 = BATTERY,
+ *   4 = LEGACY, 5 = GAMING, 6 = AUDIO, 7 = AUTO.
+ *
+ * BALANCED / CUSTOM / LEGACY / AUTO write zero (the compile-time
+ * default) so the cold-boot baseline is preserved byte-for-byte
+ * — zero means "no always-on force-floor, wake-only behaviour".
+ *
+ * PERFORMANCE / GAMING set a non-zero force_floor_pct so cpufreq
+ * never drops below that fraction of the cluster's max, even
+ * when there is no recent wake event.
+ *
+ * BATTERY zeroes both to let the thermal stack pull freq down
+ * freely.  AUDIO sets a modest little-cluster floor to stabilise
+ * audio pipeline jitter without heating the big cluster.
+ */
+void hikari_apply_profile(unsigned int profile)
+{
+	struct hikari_floor_profile {
+		unsigned int force_floor_pct_big;
+		unsigned int force_floor_pct_little;
+	};
+
+	static const struct hikari_floor_profile profiles[] = {
+		/* PERFORMANCE (1) */
+		[1] = { .force_floor_pct_big = 15,
+			.force_floor_pct_little = 10 },
+		/* BALANCED (2): compile-time defaults (0/0) */
+		[2] = { .force_floor_pct_big = 0,
+			.force_floor_pct_little = 0 },
+		/* BATTERY (3) */
+		[3] = { .force_floor_pct_big = 0,
+			.force_floor_pct_little = 0 },
+		/* GAMING (5) */
+		[5] = { .force_floor_pct_big = 20,
+			.force_floor_pct_little = 10 },
+		/* AUDIO (6) */
+		[6] = { .force_floor_pct_big = 0,
+			.force_floor_pct_little = 8 },
+	};
+
+	const struct hikari_floor_profile *v;
+
+	/* CUSTOM(0), LEGACY(4), AUTO(7): use BALANCED. */
+	if (profile == 0 || profile == 4 || profile >= 7)
+		profile = 2;
+
+	if (profile >= ARRAY_SIZE(profiles))
+		profile = 2;
+
+	v = &profiles[profile];
+
+	WRITE_ONCE(hikari_force_floor_pct_big, v->force_floor_pct_big);
+	WRITE_ONCE(hikari_force_floor_pct_little, v->force_floor_pct_little);
+	hikari_recompute_force_floors();
+
+	pr_info_ratelimited("hikari: profile %u applied (force_floor big=%u%% little=%u%%)\n",
+			    profile, v->force_floor_pct_big,
+			    v->force_floor_pct_little);
+}
+
 /* ------------------------------------------------------------ */
 /* Setter API.                                                  */
 /* ------------------------------------------------------------ */
