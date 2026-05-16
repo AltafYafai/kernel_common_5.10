@@ -73,6 +73,10 @@
 
 #include "sched.h"
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/hikari.h>
+#undef CREATE_TRACE_POINTS
+
 /*
  * Per-CPU state.  All u64 timestamps are jiffies values, compared
  * with time_after / time_before helpers so wraparound is handled.
@@ -567,6 +571,9 @@ static inline void hikari_publish_freq_hint(unsigned int cpu, u32 demand_ns)
 
 	WRITE_ONCE(hikari_last_demand_jiffies, jiffies);
 
+	if (trace_hikari_freq_hint_enabled())
+		trace_hikari_freq_hint(cpu, floor, hint.ttl_ms, demand_ns);
+
 	atomic_notifier_call_chain(&hikari_cpufreq_chain,
 				   HIKARI_NOTIFIER_WAKE_DEMAND, &hint);
 }
@@ -873,6 +880,9 @@ int hikari_select_cpu(struct task_struct *p, int prev_cpu, int wake_flags)
 				continue;
 			if (available_idle_cpu(cpu)) {
 				hikari_set_skip_reason(p, HIKARI_SKIP_ACTIONED);
+				if (trace_hikari_placement_enabled())
+					trace_hikari_placement(prev_cpu, cpu,
+							       true, true);
 				return cpu;
 			}
 			if (fallback < 0)
@@ -881,6 +891,9 @@ int hikari_select_cpu(struct task_struct *p, int prev_cpu, int wake_flags)
 
 		if (fallback >= 0) {
 			hikari_set_skip_reason(p, HIKARI_SKIP_ACTIONED);
+			if (trace_hikari_placement_enabled())
+				trace_hikari_placement(prev_cpu, fallback,
+						       false, true);
 			return fallback;
 		}
 	}
@@ -954,6 +967,10 @@ void hikari_apply_profile(unsigned int profile)
 	WRITE_ONCE(hikari_force_floor_pct_big, v->force_floor_pct_big);
 	WRITE_ONCE(hikari_force_floor_pct_little, v->force_floor_pct_little);
 	hikari_recompute_force_floors();
+
+	if (trace_hikari_profile_enabled())
+		trace_hikari_profile(profile, v->force_floor_pct_big,
+				     v->force_floor_pct_little);
 
 	pr_info_ratelimited("hikari: profile %u applied (force_floor big=%u%% little=%u%%)\n",
 			    profile, v->force_floor_pct_big,

@@ -59,6 +59,10 @@
 #include <linux/sysfs.h>
 #include <linux/thermal.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/iyashi.h>
+#undef CREATE_TRACE_POINTS
+
 #include "iyashi.h"
 #include "thermal_core.h"
 
@@ -198,6 +202,7 @@ unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 	int closest_zone_mc = 0;
 	unsigned int near_c, floor_pct;
 	unsigned long max_state = 0, floor_state;
+	bool hikari_boosted = false;
 
 	if (!static_branch_unlikely(&iyashi_active_key))
 		return target;
@@ -232,6 +237,7 @@ unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 				floor_pct += boost;
 			else
 				floor_pct = 100;
+			hikari_boosted = true;
 		}
 	}
 
@@ -278,6 +284,11 @@ unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 	if (min_headroom_c != INT_MAX && (unsigned int)min_headroom_c < near_c) {
 		atomic64_inc(&iyashi_passthrough_count);
 		WRITE_ONCE(iyashi_last_target_out, target);
+		if (trace_iyashi_clamp_enabled())
+			trace_iyashi_clamp(cdev->type, target, target,
+					   floor_pct,
+					   min_headroom_c == INT_MAX ? 0 : min_headroom_c,
+					   false, hikari_boosted);
 		return target;
 	}
 
@@ -315,11 +326,21 @@ unsigned long iyashi_clamp_target(struct thermal_cooling_device *cdev,
 	if (target > floor_state) {
 		atomic64_inc(&iyashi_clamped_count);
 		WRITE_ONCE(iyashi_last_target_out, floor_state);
+		if (trace_iyashi_clamp_enabled())
+			trace_iyashi_clamp(cdev->type, target, floor_state,
+					   floor_pct,
+					   min_headroom_c == INT_MAX ? 0 : min_headroom_c,
+					   true, hikari_boosted);
 		return floor_state;
 	}
 
 	atomic64_inc(&iyashi_passthrough_count);
 	WRITE_ONCE(iyashi_last_target_out, target);
+	if (trace_iyashi_clamp_enabled())
+		trace_iyashi_clamp(cdev->type, target, target,
+				   floor_pct,
+				   min_headroom_c == INT_MAX ? 0 : min_headroom_c,
+				   false, hikari_boosted);
 	return target;
 }
 EXPORT_SYMBOL_GPL(iyashi_clamp_target);
@@ -406,6 +427,11 @@ void iyashi_apply_profile(unsigned int profile)
 	WRITE_ONCE(iyashi_near_limit_offset_c, v->near_limit_offset_c);
 	WRITE_ONCE(iyashi_min_freq_pct, v->min_freq_pct);
 	WRITE_ONCE(iyashi_hikari_aware, v->hikari_aware);
+
+	if (trace_iyashi_profile_enabled())
+		trace_iyashi_profile(profile, v->floor_pct,
+				     v->near_limit_offset_c,
+				     v->hikari_aware);
 
 	pr_info_ratelimited("iyashi: profile %u applied (floor=%u%% near_limit=%uC min_freq=%u%% hikari_aware=%u)\n",
 			    profile, v->floor_pct, v->near_limit_offset_c,

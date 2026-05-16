@@ -25,6 +25,10 @@
 
 #include <trace/events/thermal.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/kasumi.h>
+#undef CREATE_TRACE_POINTS
+
 #include "iyashi.h"
 #include "thermal_core.h"
 
@@ -405,6 +409,11 @@ static int kasumi_dampen(int real, const char *zone_type)
 	WRITE_ONCE(kasumi_last_reported_mc,  dampened);
 	WRITE_ONCE(kasumi_applied_offset_mc, real - dampened);
 
+	if (trace_kasumi_filter_enabled())
+		trace_kasumi_filter(zone_type ? zone_type : "(null)",
+				    real, dampened, offset, ramp,
+				    READ_ONCE(kasumi_ramp_shape));
+
 	return dampened;
 }
 
@@ -520,6 +529,10 @@ void kasumi_apply_profile(unsigned int profile)
 	WRITE_ONCE(kasumi_warmup_offset_mc, v->warmup_offset_mc);
 	WRITE_ONCE(kasumi_hot_threshold_mc, v->hot_threshold_mc);
 	WRITE_ONCE(kasumi_hot_extra_offset_mc, v->hot_extra_offset_mc);
+
+	if (trace_kasumi_profile_enabled())
+		trace_kasumi_profile(profile, v->offset_mc, v->ramp_mc,
+				     v->ramp_shape, v->warmup_secs);
 
 	pr_info_ratelimited("kasumi: profile %u applied (offset=%u ramp=%u ceiling=%u shape=%u warmup=%us hot_thresh=%u)\n",
 			    profile, v->offset_mc, v->ramp_mc, v->ceiling_mc,
