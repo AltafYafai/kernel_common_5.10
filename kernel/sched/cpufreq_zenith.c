@@ -8182,6 +8182,8 @@ static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
  * yet) -- caller treats 0 as "fall back to whatever I have".
  */
 extern int kasumi_get_last_real_mc(void);
+extern void kasumi_apply_profile(unsigned int profile);
+extern void iyashi_apply_profile(unsigned int profile);
 
 /* Patch K: live skin-temp readout for the game_perf_burst guardrail.
  * Returns millidegrees C.
@@ -15132,6 +15134,15 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	 * the helper.
 	 */
 	zenith_log_profile_applied(t, prof);
+
+	/* Propagate the profile to the thermal stack so Kasumi's
+	 * dampening window and Iyashi's performance floor track
+	 * the governor's intent.  BALANCED bakes the compile-time
+	 * defaults in both subsystems so this is a no-op on the
+	 * cold-boot path.
+	 */
+	kasumi_apply_profile(prof);
+	iyashi_apply_profile(prof);
 }
 
 /* Patch B-AUTO-4: auto-selector classifier (priority cascade).
