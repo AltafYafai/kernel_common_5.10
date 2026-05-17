@@ -9870,7 +9870,16 @@ brutal_entry_deferred:
 	else
 		freq = policy->cur + (policy->cur >> 2);
 
-	freq = map_util_freq(util, freq, max_cap);
+	{
+		unsigned long _vh_next_freq = 0;
+		trace_android_vh_map_util_freq(util, freq, max_cap,
+					       &_vh_next_freq, policy,
+					       &z_policy->need_freq_update);
+		if (_vh_next_freq)
+			freq = _vh_next_freq;
+		else
+			freq = map_util_freq(util, freq, max_cap);
+	}
 
 	/* 2a. Brutal-hold tail glide.  When the cliff exit above armed
 	 * a brutal_decay_ms deadline, linearly interpolate a floor
@@ -11457,7 +11466,22 @@ apply_uclamp_max_cap:
 	}
 
 	z_policy->cached_raw_freq = freq;
-	target_freq = cpufreq_driver_resolve_freq(policy, freq);
+	{
+		unsigned int _vh_idx, _vh_l_freq, _vh_h_freq;
+
+		_vh_l_freq = cpufreq_driver_resolve_freq(policy, freq);
+		_vh_idx = cpufreq_frequency_table_target(policy, freq,
+							 CPUFREQ_RELATION_H);
+		_vh_h_freq = policy->freq_table[_vh_idx].frequency;
+		_vh_h_freq = clamp(_vh_h_freq, policy->min, policy->max);
+		if (_vh_l_freq <= _vh_h_freq || _vh_l_freq == policy->min)
+			target_freq = _vh_l_freq;
+		else if (mult_frac(100, freq - _vh_h_freq,
+				   _vh_l_freq - _vh_h_freq) < 20)
+			target_freq = _vh_h_freq;
+		else
+			target_freq = _vh_l_freq;
+	}
 
 	/* 4. Efficient-frequency ladder (soft cap).
 	 *
