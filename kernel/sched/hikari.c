@@ -744,6 +744,14 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 	if (!rq)
 		return;
 
+	/*
+	 * RT and deadline tasks already preempt CFS and ignore
+	 * uclamp_min boosts, so there is nothing for Hikari to
+	 * improve -- skip the measurement and actuators entirely.
+	 */
+	if (rt_task(p) || dl_task(p))
+		return;
+
 	last = READ_ONCE(p->hikari_last_enqueue_ns);
 	if (!last)
 		return;
