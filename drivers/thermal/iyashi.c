@@ -929,12 +929,65 @@ static struct attribute_group iyashi_attr_group = {
 static struct kobject *iyashi_kobj;
 
 /* --------------------------------------------------------------- *
+ * Safety self-test                                                *
+ * --------------------------------------------------------------- */
+
+/*
+ * Verify the core floor math invariants so a misconfigured
+ * floor_pct can never produce a nonsensical floor_state.
+ * Called once at init, before exposing sysfs.
+ */
+#define IYASHI_SELFTEST_MAX 100
+
+static int __init iyashi_safety_self_test(void)
+{
+	struct {
+		unsigned int floor_pct;
+		unsigned long max_state;
+		unsigned long expected;
+	} const cases[] = {
+		{  0, IYASHI_SELFTEST_MAX, IYASHI_SELFTEST_MAX },
+		{100, IYASHI_SELFTEST_MAX, 0 },
+		{ 50, IYASHI_SELFTEST_MAX, IYASHI_SELFTEST_MAX / 2 },
+		{ 90, IYASHI_SELFTEST_MAX, IYASHI_SELFTEST_MAX * 10 / 100 },
+		{ 75, IYASHI_SELFTEST_MAX, IYASHI_SELFTEST_MAX * 25 / 100 },
+		{ 95, IYASHI_SELFTEST_MAX, IYASHI_SELFTEST_MAX * 5 / 100 },
+		{ 50, 0,                 0 },
+		{ 90, 1,                 0 },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		unsigned long floor_state =
+			cases[i].max_state * (100 - cases[i].floor_pct) / 100;
+
+		if (floor_state != cases[i].expected) {
+			pr_err("iyashi: safety self-test FAILED "
+			       "[max=%lu pct=%u]: got %lu, expected %lu\n",
+			       cases[i].max_state, cases[i].floor_pct,
+			       floor_state, cases[i].expected);
+			return -EIO;
+		}
+	}
+
+	pr_info("iyashi: safety self-test passed (%u cases)\n",
+		(unsigned int)ARRAY_SIZE(cases));
+	return 0;
+}
+
+/* --------------------------------------------------------------- *
  * Init                                                            *
  * --------------------------------------------------------------- */
 
 static int __init iyashi_init(void)
 {
 	int ret;
+
+	ret = iyashi_safety_self_test();
+	if (ret) {
+		pr_err("iyashi: refusing to register sysfs (self-test failed)\n");
+		return ret;
+	}
 
 	iyashi_kobj = kobject_create_and_add("iyashi", kernel_kobj);
 	if (!iyashi_kobj)
