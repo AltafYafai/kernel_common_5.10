@@ -1154,24 +1154,6 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 	return uc_req;
 }
 
-/*
- * Forward declaration: kernel/sched/hikari.c.  Returns 0 when no
- * boost is active or when Hikari is disabled / off / killed.
- */
-#ifdef CONFIG_HIKARI_UCLAMP
-extern unsigned int hikari_uclamp_boost_amount(struct task_struct *p);
-extern unsigned int hikari_uclamp_max_ceiling(struct task_struct *p);
-#else
-static inline unsigned int hikari_uclamp_boost_amount(struct task_struct *p)
-{
-	return 0;
-}
-static inline unsigned int hikari_uclamp_max_ceiling(struct task_struct *p)
-{
-	return 0;
-}
-#endif
-
 static inline unsigned long
 uclamp_apply_hikari_boost(struct task_struct *p, enum uclamp_id clamp_id,
 			  unsigned long base)

@@ -193,6 +193,8 @@ static inline void hikari_mark_foreground(struct task_struct *p, bool tagged) { 
 static inline void hikari_mark_background(struct task_struct *p, bool tagged) { }
 static inline unsigned int hikari_uclamp_max_ceiling(struct task_struct *p)
 	{ return 0; }
+static inline unsigned int hikari_uclamp_boost_amount(struct task_struct *p)
+	{ return 0; }
 static inline void hikari_set_opt_in(struct task_struct *p, bool opt_in) { }
 
 struct notifier_block;
