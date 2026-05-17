@@ -138,6 +138,7 @@ void hikari_mark_background(struct task_struct *p, bool tagged);
  * scaled ceiling for this task, or 0 if no ceiling should apply.
  */
 unsigned int hikari_uclamp_max_ceiling(struct task_struct *p);
+unsigned int hikari_uclamp_boost_amount(struct task_struct *p);
 
 /* Kernel-side opt-in/opt-out API. */
 void hikari_set_opt_in(struct task_struct *p, bool opt_in);
