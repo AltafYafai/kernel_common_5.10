@@ -23,18 +23,18 @@
  * zenith_resolve_profile - map a raw profile ID to a concrete profile
  * @profile: raw profile number
  *
- * Meta-profiles (CUSTOM, LEGACY, AUDIO, AUTO) and out-of-range values
+ * Meta-profiles (CUSTOM, LEGACY, AUTO) and out-of-range values
  * are resolved to BALANCED.  Concrete profiles are returned unchanged.
  *
- * This is the single source of truth for profile resolution used by
- * every apply_profile() call site.  Adding a new concrete profile
- * requires only updating this function, not three separate subsystems.
+ * Note: AUDIO (6) is NOT resolved here because Hikari treats it as
+ * a concrete profile with specific values.  Subsystems that treat
+ * AUDIO as a meta-profile (IYASHI, Kasumi) handle it naturally via
+ * their own array bounds checks.
  */
 static inline unsigned int zenith_resolve_profile(unsigned int profile)
 {
 	if (profile == ZENITH_PROFILE_CUSTOM ||
 	    profile == ZENITH_PROFILE_LEGACY ||
-	    profile == ZENITH_PROFILE_AUDIO ||
 	    profile >= ZENITH_PROFILE_AUTO)
 		return ZENITH_PROFILE_BALANCED;
 	return profile;
