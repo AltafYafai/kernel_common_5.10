@@ -46,6 +46,7 @@
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/hikari.h>
+#include <linux/zenith_profiles.h>
 #include <linux/init.h>
 #include <linux/jump_label.h>
 #include <linux/kobject.h>
@@ -411,12 +412,9 @@ void iyashi_apply_profile(unsigned int profile)
 
 	const struct iyashi_profile_vals *v;
 
-	/* CUSTOM(0), LEGACY(4), AUDIO(6), AUTO(7): use BALANCED. */
-	if (profile == 0 || profile == 4 || profile == 6 || profile >= 7)
-		profile = 2;
-
+	profile = zenith_resolve_profile(profile);
 	if (profile >= ARRAY_SIZE(profiles))
-		profile = 2;
+		profile = ZENITH_PROFILE_BALANCED;
 
 	v = &profiles[profile];
 	if (!v->floor_pct)

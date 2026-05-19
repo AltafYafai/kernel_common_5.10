@@ -51,6 +51,7 @@
 #include <linux/cpumask.h>
 #include <linux/fs.h>
 #include <linux/hikari.h>
+#include <linux/zenith_profiles.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/jump_label.h>
@@ -963,12 +964,9 @@ void hikari_apply_profile(unsigned int profile)
 
 	const struct hikari_floor_profile *v;
 
-	/* CUSTOM(0), LEGACY(4), AUTO(7): use BALANCED. */
-	if (profile == 0 || profile == 4 || profile >= 7)
-		profile = 2;
-
+	profile = zenith_resolve_profile(profile);
 	if (profile >= ARRAY_SIZE(profiles))
-		profile = 2;
+		profile = ZENITH_PROFILE_BALANCED;
 
 	v = &profiles[profile];
 

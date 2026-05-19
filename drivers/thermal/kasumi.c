@@ -20,6 +20,7 @@
 #include <linux/minmax.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/zenith_profiles.h>
 #include <linux/sysfs.h>
 #include <linux/timekeeping.h>
 
@@ -498,12 +499,9 @@ void kasumi_apply_profile(unsigned int profile)
 
 	const struct kasumi_profile_vals *v;
 
-	/* CUSTOM(0), LEGACY(4), AUDIO(6), AUTO(7): use BALANCED. */
-	if (profile == 0 || profile == 4 || profile == 6 || profile >= 7)
-		profile = 2;
-
+	profile = zenith_resolve_profile(profile);
 	if (profile >= ARRAY_SIZE(profiles))
-		profile = 2;
+		profile = ZENITH_PROFILE_BALANCED;
 
 	v = &profiles[profile];
 	if (!v->ceiling_mc)
