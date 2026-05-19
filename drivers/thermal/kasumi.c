@@ -471,7 +471,7 @@ void kasumi_apply_profile(unsigned int profile)
 			.warmup_secs        = 0,
 			.warmup_offset_mc   = 25000,
 			.hot_threshold_mc   = 0,
-			.hot_extra_offset_mc = 10000,
+			.hot_extra_offset_mc = 0,
 		},
 		/* BATTERY (3): tighter dampening, save power */
 		[3] = {
