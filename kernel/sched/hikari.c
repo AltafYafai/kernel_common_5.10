@@ -1112,24 +1112,6 @@ int hikari_unregister_cpufreq_notifier(struct notifier_block *nb)
 EXPORT_SYMBOL_GPL(hikari_unregister_cpufreq_notifier);
 
 /* ------------------------------------------------------------ */
-/* Sanity check.                                                */
-/* ------------------------------------------------------------ */
-
-static void hikari_sanity_check_pcpu(void)
-{
-	int cpu;
-
-	for_each_possible_cpu(cpu) {
-		struct hikari_pcpu *pc = per_cpu_ptr(&hikari_pcpu, cpu);
-
-		if (!pc) {
-			hikari_self_disable(HIKARI_DISABLE_SANITY_PCPU);
-			return;
-		}
-	}
-}
-
-/* ------------------------------------------------------------ */
 /* Sysctls.                                                     */
 /* ------------------------------------------------------------ */
 
@@ -1836,12 +1818,6 @@ static int __init hikari_init(void)
 	 * Hikari is still functional.  The warning is logged.
 	 */
 	(void)hikari_sysfs_init();
-
-	hikari_sanity_check_pcpu();
-	if (hikari_is_killed()) {
-		pr_err("init sanity check failed\n");
-		return -EINVAL;
-	}
 
 	smp_wmb();
 	WRITE_ONCE(hikari_init_complete, true);

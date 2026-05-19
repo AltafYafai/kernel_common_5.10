@@ -76,7 +76,6 @@ struct rq;
  * /sys/kernel/hikari/disabled_reason and recorded in dmesg once.
  */
 #define HIKARI_DISABLE_NONE		0
-#define HIKARI_DISABLE_SANITY_PCPU	1
 #define HIKARI_DISABLE_SANITY_TASK	2
 #define HIKARI_DISABLE_SANITY_BOOST	3
 #define HIKARI_DISABLE_SANITY_NOTIFIER	4
