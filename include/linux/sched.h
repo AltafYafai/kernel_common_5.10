@@ -1432,7 +1432,16 @@ struct task_struct {
 	 */
 	ANDROID_KABI_USE2(2, u32 hikari_wait_ewma_ns,    u32 hikari_flags);
 	ANDROID_KABI_USE2(3, u32 hikari_last_enqueue_ns, u32 hikari_boost_until_ns);
-	ANDROID_KABI_RESERVE(4);
+
+	/*
+	 * Preserve user-dumpable flag when mm goes away (ptrace
+	 * fix from stable 5.10.256).  Moved to KABI reserve 4 to
+	 * avoid colliding with Hikari's use of reserves 2 & 3.
+	 */
+	ANDROID_KABI_USE(4, struct {
+		unsigned	user_dumpable:1;
+		});
+
 	ANDROID_KABI_RESERVE(5);
 
 #ifdef CONFIG_SYSVIPC
