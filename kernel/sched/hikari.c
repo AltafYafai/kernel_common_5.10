@@ -787,9 +787,16 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 		weight = (1u << shift) - 1;
 
 		ewma = READ_ONCE(p->hikari_wait_ewma_ns);
-		sum = ((u64)ewma * weight) + delta;
-		next = sum >> shift;
-		ewma = next > U32_MAX ? U32_MAX : (u32)next;
+		if (unlikely(!ewma)) {
+			/* Fast-start: first sample lands immediately instead of
+			 * decaying from zero over ~8 wake events.
+			 */
+			ewma = delta > U32_MAX ? U32_MAX : delta;
+		} else {
+			sum = ((u64)ewma * weight) + delta;
+			next = sum >> shift;
+			ewma = next > U32_MAX ? U32_MAX : (u32)next;
+		}
 	}
 	WRITE_ONCE(p->hikari_wait_ewma_ns, ewma);
 	WRITE_ONCE(p->hikari_last_enqueue_ns, 0);
