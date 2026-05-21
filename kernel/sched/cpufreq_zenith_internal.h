@@ -304,6 +304,7 @@ struct gov_attr_set;
  * Profile name table (shared by sysfs and core)
  * ───────────────────────────────────────────── */
 extern const char *zenith_profile_name[];
+extern const unsigned int zenith_profile_defaults[][2];
 
 /* ─────────────────────────────────────────────
  * Enums
@@ -426,6 +427,7 @@ struct zenith_tunables {
 	unsigned int		psi_mem_cap_thresh;
 	unsigned int		psi_mem_cap_pct;
 	unsigned int		psi_mem_cap_window_ms;
+	unsigned int		up_threshold_adaptive;
 	unsigned int		climb_mode;
 	unsigned int		freq_step_pct;
 	unsigned int		freq_step_adaptive;
