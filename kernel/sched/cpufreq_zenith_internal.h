@@ -427,7 +427,8 @@ struct zenith_tunables {
 	unsigned int		psi_mem_cap_thresh;
 	unsigned int		psi_mem_cap_pct;
 	unsigned int		psi_mem_cap_window_ms;
-	unsigned int		up_threshold_adaptive;
+	unsigned int		util_math_v2;
+
 	unsigned int		climb_mode;
 	unsigned int		freq_step_pct;
 	unsigned int		freq_step_adaptive;
@@ -839,12 +840,10 @@ static inline struct zenith_tunables *to_zenith_tunables(struct gov_attr_set *at
 extern unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 					 unsigned int util,
 					 unsigned int max_cap);
-extern unsigned int zenith_eff_hispeed_freq(struct zenith_policy *z_policy);
-extern unsigned int zenith_glide_value(struct zenith_policy *z_policy,
-				       unsigned int freq);
-extern unsigned int zenith_get_util(struct zenith_cpu *z_cpu);
-extern void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time,
-				unsigned int flags);
+extern unsigned int zenith_eff_hispeed_freq(struct zenith_policy *z_policy);	extern unsigned int zenith_glide_value(struct zenith_policy *z_policy,
+				       unsigned int tunable,
+				       unsigned int local);	extern unsigned long zenith_get_util(struct zenith_cpu *z_cpu);	extern void zenith_iowait_boost(struct zenith_cpu *z_cpu, u64 time,
+				unsigned int flags, unsigned int io_is_busy);
 extern bool zenith_iowait_reset(struct zenith_cpu *z_cpu, u64 time,
 				bool set_iowait_boost);
 extern unsigned int zenith_iowait_floor(struct zenith_cpu *z_cpu);
@@ -888,9 +887,8 @@ extern int zenith_init(struct cpufreq_policy *policy);
 extern int zenith_exit(struct cpufreq_policy *policy);
 extern int zenith_start(struct cpufreq_policy *policy);
 extern void zenith_stop(struct cpufreq_policy *policy);
-extern int zenith_limits(struct cpufreq_policy *policy);
-extern void zenith_ignore_dl_rate_limit(struct zenith_cpu *z_cpu,
-					unsigned int flags);
+extern int zenith_limits(struct cpufreq_policy *policy);	extern void zenith_ignore_dl_rate_limit(struct zenith_cpu *z_cpu,
+					struct zenith_policy *z_policy);
 
 /* From cpufreq_zenith_sysfs.c (sysfs interface + adaptive tuning) */
 extern void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof);
