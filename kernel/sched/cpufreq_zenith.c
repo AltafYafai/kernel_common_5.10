@@ -23468,6 +23468,7 @@ static int __init zenith_gov_init(void)
 	 * "Hikari :" / "Kasumi :" / "Iyashi :" prefixes, so each
 	 * subsystem is individually grep-able.
 	 */
+#ifdef CONFIG_ZENITH_DEBUG_MSG
 	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
 	pr_info("Zenith :\n");
 	pr_info("Zenith :                 . . . . . . . . . . . . . . . . . . .\n");
@@ -23837,6 +23838,7 @@ static int __init zenith_gov_init(void)
 	pr_info("Zenith :                .       *           .            *\n");
 	pr_info("Zenith :\n");
 	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
+#endif /* CONFIG_ZENITH_DEBUG_MSG */
 
 	/* Allocate the initial RCU comm tables from the in-tree default
 	 * arrays.  Failure here is non-fatal: zenith_policy_has_X()

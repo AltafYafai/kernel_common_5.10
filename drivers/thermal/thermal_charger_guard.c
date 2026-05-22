@@ -16,6 +16,12 @@
  *   supply reports ONLINE, suppress both subsystems for the duration
  *   of the charging session.  Restore on unplug.
  *
+ * Enhanced features:
+ *   - Battery temperature awareness: when the battery is too hot,
+ *     suppression is skipped so thermal protection stays active.
+ *   - Debounce time is tunable via sysfs (debounce_ms).
+ *   - Stats counters track suppression on/off and battery-temp skips.
+ *
  * Layering:
  *   This module does NOT touch /sys/kernel/{kasumi,iyashi}/enabled.
  *   It carries an orthogonal "charger_suppressed" flag on each side.
@@ -27,9 +33,16 @@
  * Debouncing:
  *   PSY_EVENT_PROP_CHANGED fires often (battery SOC updates, ICL
  *   re-negotiation, temp polling) so the notifier itself just kicks
- *   a delayed_work with a HZ/4 debounce.  The worker then walks
+ *   a delayed_work with a configurable debounce.  The worker then walks
  *   every registered power_supply once and OR-reduces ONLINE across
  *   charger-typed psys to derive the aggregate state.
+ *
+ * Battery temperature awareness:
+ *   If the battery temperature exceeds batt_temp_thresh_decicelsius
+ *   (default 500 = 50.0 °C), suppression is skipped for that refresh
+ *   cycle.  This prevents the charger guard from disabling thermal
+ *   protection when the battery itself is overheating — Kasumi/Iyashi
+ *   are left active so the thermal framework can throttle.
  *
  * Boot ordering:
  *   We register at late_initcall, the same level as kasumi/iyashi
@@ -45,6 +58,8 @@
 #include <linux/device.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/notifier.h>
 #include <linux/power_supply.h>
 #include <linux/printk.h>
@@ -54,7 +69,46 @@
 #include "iyashi.h"
 #include "kasumi.h"
 
-#define THERMAL_CHARGER_GUARD_DEBOUNCE_MS 250
+/* ---- Tunables ---- */
+
+/*
+ * Debounce interval in milliseconds.  Every PSY_PROP_CHANGED event
+ * re-arms a delayed_work by this amount.  Writable via
+ * /sys/module/thermal_charger_guard/parameters/debounce_ms.
+ * Range 50..5000, default 250.
+ */
+static unsigned int debounce_ms = 250;
+module_param(debounce_ms, uint, 0644);
+MODULE_PARM_DESC(debounce_ms,
+		 "Debounce interval (ms) for charger refresh; 50..5000");
+
+/*
+ * Battery temperature threshold in deci-Celsius.  When the battery
+ * temperature exceeds this value, suppression is skipped (Kasumi and
+ * Iyashi remain active so the thermal framework can protect the
+ * hardware).  0 disables battery temperature awareness entirely
+ * (suppression always applies when a charger is online).
+ * Default 500 = 50.0 °C.
+ */
+static unsigned int batt_temp_thresh_decicelsius = 500;
+module_param(batt_temp_thresh_decicelsius, uint, 0644);
+MODULE_PARM_DESC(batt_temp_thresh_decicelsius,
+		 "Battery temp threshold (deci-Celsius); "
+		 "0 = disabled, default 500 = 50.0 C");
+
+/*
+ * Battery temperature hysteresis in deci-Celsius.  Once the battery
+ * exceeds batt_temp_thresh_decicelsius, the temperature must fall
+ * below (thresh - hyst) before suppression is re-enabled.  This
+ * prevents rapid on/off flapping near the threshold.
+ * Default 50 = 5.0 °C.
+ */
+static unsigned int batt_temp_hyst_decicelsius = 50;
+module_param(batt_temp_hyst_decicelsius, uint, 0644);
+MODULE_PARM_DESC(batt_temp_hyst_decicelsius,
+		 "Battery temp hysteresis (deci-Celsius); default 50 = 5.0 C");
+
+/* ---- Internal state ---- */
 
 /*
  * Suppression tier, by charger type:
@@ -66,7 +120,79 @@
 static unsigned int charger_tier __read_mostly;
 static DEFINE_SPINLOCK(charger_state_lock);
 
+/* Battery hot flag: true when battery temp exceeded threshold */
+static bool batt_hot __read_mostly;
+
 static struct delayed_work charger_refresh_work;
+
+/* ---- Stats counters ---- */
+static struct {
+	unsigned long suppression_on;
+	unsigned long suppression_off;
+	unsigned long batt_temp_skip;
+} stats;
+static DEFINE_SPINLOCK(stats_lock);
+
+/* ---- Helpers ---- */
+
+/*
+ * Read the battery temperature in deci-Celsius from the first
+ * registered BATTERY-type power supply.  Returns 0 on error or if
+ * the property is not available.
+ */
+static int charger_read_batt_temp_decicelsius(void)
+{
+	union power_supply_propval val;
+	struct power_supply *psy = power_supply_get_by_name("battery");
+
+	if (!psy)
+		return 0;
+
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val)) {
+		power_supply_put(psy);
+		return 0;
+	}
+	power_supply_put(psy);
+	return val.intval; /* already in deci-Celsius */
+}
+
+/*
+ * Check whether the battery is too hot for suppression to be safe.
+ * Returns true if suppression should be SKIPPED (i.e. keep Kasumi/
+ * Iyashi active).
+ */
+static bool charger_batt_hot_check(void)
+{
+	int temp;
+	unsigned int thresh = READ_ONCE(batt_temp_thresh_decicelsius);
+
+	if (!thresh)
+		return false; /* battery temp awareness disabled */
+
+	temp = charger_read_batt_temp_decicelsius();
+	if (temp <= 0)
+		return READ_ONCE(batt_hot); /* can't read; stay safe */
+
+	if (READ_ONCE(batt_hot)) {
+		/* Already hot: check if we've cooled below hyst */
+		unsigned int hyst = READ_ONCE(batt_temp_hyst_decicelsius);
+		int cool_thresh = (int)(thresh - hyst);
+
+		if (temp < cool_thresh) {
+			WRITE_ONCE(batt_hot, false);
+			return false;
+		}
+		return true;
+	}
+
+	/* Not hot yet: check if we crossed the threshold */
+	if (temp >= (int)thresh) {
+		WRITE_ONCE(batt_hot, true);
+		return true;
+	}
+
+	return false;
+}
 
 /*
  * Map a power_supply type to its suppression tier.
@@ -126,19 +252,32 @@ static int charger_psy_check(struct device *dev, void *data)
 static void charger_refresh(struct work_struct *work)
 {
 	struct charger_walk w = { .max_tier = 0 };
-	unsigned int prev;
+	unsigned int prev_tier;
+	bool skip = false;
 
 	if (class_for_each_device(power_supply_class, NULL, &w,
 				  charger_psy_check))
 		return;
 
+	/*
+	 * Check battery temperature before applying suppression.
+	 * If the battery is too hot, we skip suppression so the
+	 * thermal framework can still protect the hardware.
+	 */
+	if (w.max_tier > 0 && charger_batt_hot_check()) {
+		skip = true;
+		spin_lock(&stats_lock);
+		stats.batt_temp_skip++;
+		spin_unlock(&stats_lock);
+	}
+
 	spin_lock(&charger_state_lock);
-	prev = charger_tier;
-	charger_tier = w.max_tier;
+	prev_tier = charger_tier;
+	charger_tier = skip ? 0 : w.max_tier;
 	spin_unlock(&charger_state_lock);
 
-	if (prev == w.max_tier)
-		return;
+	if (prev_tier == charger_tier && prev_tier == w.max_tier)
+		return; /* no change in effective state */
 
 	/*
 	 * Tier 1: suppress Kasumi only (fixes Transsion battery-manager
@@ -146,13 +285,25 @@ static void charger_refresh(struct work_struct *work)
 	 * Tier 2: suppress both Kasumi and Iyashi.
 	 * Tier 0: restore both.
 	 */
-	kasumi_set_charger_suppressed(w.max_tier >= 1);
-	iyashi_set_charger_suppressed(w.max_tier >= 2);
-
-	pr_info("charger tier %u -> kasumi %s, iyashi %s\n",
-		w.max_tier,
-		w.max_tier >= 1 ? "suppressed" : "restored",
-		w.max_tier >= 2 ? "suppressed" : "restored");
+	if (charger_tier > 0) {
+		kasumi_set_charger_suppressed(true);
+		if (charger_tier >= 2)
+			iyashi_set_charger_suppressed(true);
+		spin_lock(&stats_lock);
+		stats.suppression_on++;
+		spin_unlock(&stats_lock);
+		pr_info("charger tier %u active -> kasumi suppressed%s\n",
+			charger_tier,
+			charger_tier >= 2 ? ", iyashi suppressed" : "");
+	} else {
+		kasumi_set_charger_suppressed(false);
+		iyashi_set_charger_suppressed(false);
+		spin_lock(&stats_lock);
+		stats.suppression_off++;
+		spin_unlock(&stats_lock);
+		pr_info("charger offline -> kasumi restored, iyashi restored%s\n",
+			skip ? " (battery temp threshold exceeded)" : "");
+	}
 }
 
 static int charger_psy_notify(struct notifier_block *nb, unsigned long event,
@@ -164,18 +315,18 @@ static int charger_psy_notify(struct notifier_block *nb, unsigned long event,
 		return NOTIFY_DONE;
 
 	/*
-	 * Battery-only psys never change our aggregate, but their SOC /
-	 * temperature props churn the most.  Filter them out to keep
-	 * this off the hot path entirely.  An unknown-type psy still
-	 * triggers a refresh -- we'd rather re-walk once than miss a
-	 * charger that mis-typed itself as UNKNOWN.
+	 * Battery-only psys never change our aggregate charger state,
+	 * but their SOC / temperature props churn the most.  Filter
+	 * them out to keep this off the hot path entirely.  Note: we
+	 * still need battery temp reads for batt_hot_check, but those
+	 * happen in the worker, not here.
 	 */
 	if (psy && psy->desc &&
 	    psy->desc->type == POWER_SUPPLY_TYPE_BATTERY)
 		return NOTIFY_DONE;
 
 	mod_delayed_work(system_wq, &charger_refresh_work,
-			 msecs_to_jiffies(THERMAL_CHARGER_GUARD_DEBOUNCE_MS));
+			 msecs_to_jiffies(READ_ONCE(debounce_ms)));
 	return NOTIFY_OK;
 }
 
@@ -202,8 +353,12 @@ static int __init thermal_charger_guard_init(void)
 	 */
 	mod_delayed_work(system_wq, &charger_refresh_work, 0);
 
-	pr_info("registered (debounce=%ums)\n",
-		THERMAL_CHARGER_GUARD_DEBOUNCE_MS);
+	pr_info("registered (debounce=%ums batt_temp_thresh=%u.%uC hyst=%u.%uC)\n",
+		READ_ONCE(debounce_ms),
+		READ_ONCE(batt_temp_thresh_decicelsius) / 10,
+		READ_ONCE(batt_temp_thresh_decicelsius) % 10,
+		READ_ONCE(batt_temp_hyst_decicelsius) / 10,
+		READ_ONCE(batt_temp_hyst_decicelsius) % 10);
 	return 0;
 }
 late_initcall(thermal_charger_guard_init);
@@ -216,11 +371,120 @@ static ssize_t tier_show(struct kobject *kobj,
 	return sysfs_emit(buf, "%u\n", READ_ONCE(charger_tier));
 }
 
+static ssize_t debounce_ms_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(debounce_ms));
+}
+
+static ssize_t debounce_ms_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	if (val < 50 || val > 5000)
+		return -EINVAL;
+
+	WRITE_ONCE(debounce_ms, val);
+	return count;
+}
+
+static ssize_t batt_temp_thresh_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(batt_temp_thresh_decicelsius));
+}
+
+static ssize_t batt_temp_thresh_store(struct kobject *kobj,
+				      struct kobj_attribute *attr,
+				      const char *buf, size_t count)
+{
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	/* 0 = disabled; 100..1000 deci-Celsius (10.0C..100.0C) */
+	if (val != 0 && (val < 100 || val > 1000))
+		return -EINVAL;
+
+	WRITE_ONCE(batt_temp_thresh_decicelsius, val);
+	return count;
+}
+
+static ssize_t batt_temp_hyst_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(batt_temp_hyst_decicelsius));
+}
+
+static ssize_t batt_temp_hyst_store(struct kobject *kobj,
+				    struct kobj_attribute *attr,
+				    const char *buf, size_t count)
+{
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	if (val > 200) /* max 20.0 C hysteresis */
+		return -EINVAL;
+
+	WRITE_ONCE(batt_temp_hyst_decicelsius, val);
+	return count;
+}
+
+static ssize_t stats_show(struct kobject *kobj,
+			  struct kobj_attribute *attr, char *buf)
+{
+	unsigned long on, off, skip;
+
+	spin_lock(&stats_lock);
+	on  = stats.suppression_on;
+	off = stats.suppression_off;
+	skip = stats.batt_temp_skip;
+	spin_unlock(&stats_lock);
+
+	return sysfs_emit(buf,
+			  "suppression_on   %lu\n"
+			  "suppression_off  %lu\n"
+			  "batt_temp_skip   %lu\n",
+			  on, off, skip);
+}
+
 static struct kobj_attribute thermal_charger_guard_tier_attr =
 	__ATTR(tier, 0444, tier_show, NULL);
 
+static struct kobj_attribute thermal_charger_guard_debounce_attr =
+	__ATTR(debounce_ms, 0644, debounce_ms_show, debounce_ms_store);
+
+static struct kobj_attribute thermal_charger_guard_batt_temp_thresh_attr =
+	__ATTR(batt_temp_thresh, 0644,
+	       batt_temp_thresh_show, batt_temp_thresh_store);
+
+static struct kobj_attribute thermal_charger_guard_batt_temp_hyst_attr =
+	__ATTR(batt_temp_hyst, 0644,
+	       batt_temp_hyst_show, batt_temp_hyst_store);
+
+static struct kobj_attribute thermal_charger_guard_stats_attr =
+	__ATTR(stats, 0444, stats_show, NULL);
+
 static struct attribute *thermal_charger_guard_attrs[] = {
 	&thermal_charger_guard_tier_attr.attr,
+	&thermal_charger_guard_debounce_attr.attr,
+	&thermal_charger_guard_batt_temp_thresh_attr.attr,
+	&thermal_charger_guard_batt_temp_hyst_attr.attr,
+	&thermal_charger_guard_stats_attr.attr,
 	NULL,
 };
 
