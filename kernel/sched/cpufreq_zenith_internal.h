@@ -2669,6 +2669,11 @@ struct zenith_pmu_state {
 #if IS_ENABLED(CONFIG_PERF_EVENTS)
 	struct perf_event	*inst_event;
 	struct perf_event	*cycle_event;
+#endif
+	u64			last_inst;
+	u64			last_cycles;
+	unsigned int		ipc_pct;
+};
 
 /*
  * Global variables and static keys -- shared across all .c files
@@ -2741,11 +2746,6 @@ extern bool zenith_policy_has_game_auto(struct zenith_policy *z_policy);
 extern unsigned int zenith_policy_thermal_pressure_pct(struct zenith_policy *z_policy);
 extern unsigned int zenith_tunable_or_local(unsigned int *tunable, unsigned int local);
 
-#endif
-	u64			last_inst;
-	u64			last_cycles;
-	unsigned int		ipc_pct;
-};
 
 
 struct zenith_comm_table {
@@ -2880,10 +2880,4 @@ struct zenith_at_guardrails {
 		 */
 		const char *psi_cgroup_path;
 	};
-	static const struct zenith_profile_defaults profiles[] = {
-
-/*
- * Cross-file function declarations
- * (Functions with -static removed for multi-file access)
- */
-
+#endif /* _CPUFREQ_ZENITH_INTERNAL_H */
