@@ -35,7 +35,10 @@
  *   re-negotiation, temp polling) so the notifier itself just kicks
  *   a delayed_work with a configurable debounce.  The worker then walks
  *   every registered power_supply once and OR-reduces ONLINE across
- *   charger-typed psys to derive the aggregate state.
+ *   charger-typed psys to derive the aggregate state.  Battery-only events
+ *   are ignored unless a charger is online or the battery-hot latch is set,
+ *   because those events are the only way to notice that the safety gate
+ *   should trip or clear while the cable stays plugged in.
  *
  * Battery temperature awareness:
  *   If the battery temperature exceeds batt_temp_thresh_decicelsius
@@ -117,6 +120,7 @@ MODULE_PARM_DESC(batt_temp_hyst_decicelsius,
  *       battery-manager band check on USB/DCP/MAINS)
  *   2 = fast / wireless charger (suppress both Kasumi and Iyashi)
  */
+static unsigned int charger_raw_tier __read_mostly;
 static unsigned int charger_tier __read_mostly;
 static DEFINE_SPINLOCK(charger_state_lock);
 
@@ -135,25 +139,48 @@ static DEFINE_SPINLOCK(stats_lock);
 
 /* ---- Helpers ---- */
 
-/*
- * Read the battery temperature in deci-Celsius from the first
- * registered BATTERY-type power supply.  Returns 0 on error or if
- * the property is not available.
- */
-static int charger_read_batt_temp_decicelsius(void)
+struct charger_batt_walk {
+	int temp;
+	bool found;
+};
+
+static int charger_batt_temp_check(struct device *dev, void *data)
 {
+	struct charger_batt_walk *w = data;
+	struct power_supply *psy = dev_get_drvdata(dev);
 	union power_supply_propval val;
-	struct power_supply *psy = power_supply_get_by_name("battery");
 
-	if (!psy)
+	if (!psy || !psy->desc ||
+	    psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
 		return 0;
 
-	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val)) {
-		power_supply_put(psy);
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val))
 		return 0;
-	}
-	power_supply_put(psy);
-	return val.intval; /* already in deci-Celsius */
+
+	w->temp = val.intval;
+	w->found = true;
+	return 1;
+}
+
+/*
+ * Read the battery temperature in deci-Celsius from the first registered
+ * BATTERY-type power supply that exposes POWER_SUPPLY_PROP_TEMP.  Returns
+ * 0 on error or if the property is not available.
+ */
+static bool charger_read_batt_temp_decicelsius(int *temp)
+{
+	struct charger_batt_walk w = { };
+
+	if (!temp || !power_supply_class)
+		return false;
+
+	class_for_each_device(power_supply_class, NULL, &w,
+			      charger_batt_temp_check);
+	if (!w.found)
+		return false;
+
+	*temp = w.temp; /* already in deci-Celsius */
+	return true;
 }
 
 /*
@@ -169,14 +196,13 @@ static bool charger_batt_hot_check(void)
 	if (!thresh)
 		return false; /* battery temp awareness disabled */
 
-	temp = charger_read_batt_temp_decicelsius();
-	if (temp <= 0)
+	if (!charger_read_batt_temp_decicelsius(&temp))
 		return READ_ONCE(batt_hot); /* can't read; stay safe */
 
 	if (READ_ONCE(batt_hot)) {
 		/* Already hot: check if we've cooled below hyst */
 		unsigned int hyst = READ_ONCE(batt_temp_hyst_decicelsius);
-		int cool_thresh = (int)(thresh - hyst);
+		int cool_thresh = (hyst >= thresh) ? 0 : (int)(thresh - hyst);
 
 		if (temp < cool_thresh) {
 			WRITE_ONCE(batt_hot, false);
@@ -253,6 +279,7 @@ static void charger_refresh(struct work_struct *work)
 {
 	struct charger_walk w = { .max_tier = 0 };
 	unsigned int prev_tier;
+	unsigned int tier;
 	bool skip = false;
 
 	if (class_for_each_device(power_supply_class, NULL, &w,
@@ -272,11 +299,13 @@ static void charger_refresh(struct work_struct *work)
 	}
 
 	spin_lock(&charger_state_lock);
-	prev_tier = charger_tier;
-	charger_tier = skip ? 0 : w.max_tier;
+	prev_tier = READ_ONCE(charger_tier);
+	tier = skip ? 0 : w.max_tier;
+	WRITE_ONCE(charger_raw_tier, w.max_tier);
+	WRITE_ONCE(charger_tier, tier);
 	spin_unlock(&charger_state_lock);
 
-	if (prev_tier == charger_tier && prev_tier == w.max_tier)
+	if (prev_tier == tier)
 		return; /* no change in effective state */
 
 	/*
@@ -285,23 +314,21 @@ static void charger_refresh(struct work_struct *work)
 	 * Tier 2: suppress both Kasumi and Iyashi.
 	 * Tier 0: restore both.
 	 */
-	if (charger_tier > 0) {
+	if (tier > 0) {
 		kasumi_set_charger_suppressed(true);
-		if (charger_tier >= 2)
-			iyashi_set_charger_suppressed(true);
+		iyashi_set_charger_suppressed(tier >= 2);
 		spin_lock(&stats_lock);
 		stats.suppression_on++;
 		spin_unlock(&stats_lock);
 		pr_info("charger tier %u active -> kasumi suppressed%s\n",
-			charger_tier,
-			charger_tier >= 2 ? ", iyashi suppressed" : "");
+			tier, tier >= 2 ? ", iyashi suppressed" : "");
 	} else {
 		kasumi_set_charger_suppressed(false);
 		iyashi_set_charger_suppressed(false);
 		spin_lock(&stats_lock);
 		stats.suppression_off++;
 		spin_unlock(&stats_lock);
-		pr_info("charger offline -> kasumi restored, iyashi restored%s\n",
+		pr_info("charger guard inactive -> kasumi restored, iyashi restored%s\n",
 			skip ? " (battery temp threshold exceeded)" : "");
 	}
 }
@@ -322,8 +349,11 @@ static int charger_psy_notify(struct notifier_block *nb, unsigned long event,
 	 * happen in the worker, not here.
 	 */
 	if (psy && psy->desc &&
-	    psy->desc->type == POWER_SUPPLY_TYPE_BATTERY)
-		return NOTIFY_DONE;
+	    psy->desc->type == POWER_SUPPLY_TYPE_BATTERY) {
+		if (!READ_ONCE(batt_temp_thresh_decicelsius) ||
+		    (!READ_ONCE(charger_raw_tier) && !READ_ONCE(batt_hot)))
+			return NOTIFY_DONE;
+	}
 
 	mod_delayed_work(system_wq, &charger_refresh_work,
 			 msecs_to_jiffies(READ_ONCE(debounce_ms)));
@@ -496,13 +526,22 @@ static struct kobject *thermal_charger_guard_kobj;
 
 static int __init thermal_charger_guard_sysfs_init(void)
 {
-	thermal_charger_guard_kobj = kobject_create_and_add(
-		"thermal_charger_guard", kernel_kobj);
+	int ret;
+
+	thermal_charger_guard_kobj =
+		kobject_create_and_add("thermal_charger_guard", kernel_kobj);
 	if (!thermal_charger_guard_kobj)
 		return -ENOMEM;
 
-	return sysfs_create_group(thermal_charger_guard_kobj,
-				  &thermal_charger_guard_attr_group);
+	ret = sysfs_create_group(thermal_charger_guard_kobj,
+				 &thermal_charger_guard_attr_group);
+	if (ret) {
+		kobject_put(thermal_charger_guard_kobj);
+		thermal_charger_guard_kobj = NULL;
+	}
+
+	return ret;
 }
+
 /* later_initcall_sync to guarantee kasumi/iyashi sysfs init ran first */
 late_initcall_sync(thermal_charger_guard_sysfs_init);
