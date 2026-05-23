@@ -8181,7 +8181,7 @@ static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
  * disabled, or no thermal zone the filter accepted has been read
  * yet) -- caller treats 0 as "fall back to whatever I have".
  */
-#if IS_ENABLED(CONFIG_THERMAL)
+#if IS_ENABLED(CONFIG_KASUMI)
 extern int kasumi_get_last_real_mc(void);
 extern void kasumi_apply_profile(unsigned int profile);
 #else
