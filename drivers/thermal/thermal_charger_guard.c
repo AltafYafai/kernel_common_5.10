@@ -447,6 +447,7 @@ static ssize_t batt_temp_thresh_store(struct kobject *kobj,
 		return -EINVAL;
 
 	WRITE_ONCE(batt_temp_thresh_decicelsius, val);
+	mod_delayed_work(system_wq, &charger_refresh_work, 0);
 	return count;
 }
 
@@ -471,6 +472,7 @@ static ssize_t batt_temp_hyst_store(struct kobject *kobj,
 		return -EINVAL;
 
 	WRITE_ONCE(batt_temp_hyst_decicelsius, val);
+	mod_delayed_work(system_wq, &charger_refresh_work, 0);
 	return count;
 }
 
