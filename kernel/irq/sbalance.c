@@ -29,23 +29,17 @@
 
 #include <linux/freezer.h>
 #include <linux/irq.h>
+#include <linux/kobject.h>
 #include <linux/list_sort.h>
 #include <linux/sched/cputime.h>
 #include "../sched/sched.h"
 #include "internals.h"
 
-/* Perform IRQ balancing every POLL_MS milliseconds */
-#define POLL_MS CONFIG_IRQ_SBALANCE_POLL_MSEC
-
-/*
- * There needs to be a difference of at least this many new interrupts between
- * the heaviest and least-heavy CPUs during the last polling window in order for
- * balancing to occur. This is to avoid balancing when the system is quiet.
- *
- * This threshold is compared to the _scaled_ interrupt counts per CPU; i.e.,
- * the number of interrupts scaled to the CPU's capacity.
- */
-#define IRQ_SCALED_THRESH CONFIG_IRQ_SBALANCE_THRESH
+/* Runtime tunables (updated via /sys/kernel/irq/sbalance/) */
+static unsigned int sbalance_poll_ms = CONFIG_IRQ_SBALANCE_POLL_MSEC;
+static unsigned int sbalance_thresh = CONFIG_IRQ_SBALANCE_THRESH;
+static cpumask_t sbalance_exclude_cpus;
+static DEFINE_SPINLOCK(sbalance_lock);
 
 struct bal_irq {
 	struct list_head node;
@@ -68,8 +62,6 @@ static LIST_HEAD(bal_irq_list);
 static DEFINE_SPINLOCK(bal_irq_lock);
 static DEFINE_PER_CPU(struct bal_domain, balance_data);
 static DEFINE_PER_CPU(unsigned long, cpu_cap);
-static cpumask_t cpu_exclude_mask __read_mostly;
-
 void sbalance_desc_add(struct irq_desc *desc)
 {
 	struct bal_irq *bi;
@@ -195,7 +187,7 @@ static bool find_min_bd(const cpumask_t *mask, unsigned int max_intrs,
 			return true;
 
 		/* Don't consider moving IRQs to this CPU if it's excluded */
-		if (cpumask_test_cpu(cpu, &cpu_exclude_mask))
+		if (cpumask_test_cpu(cpu, &sbalance_exclude_cpus))
 			continue;
 
 		/* Find the CPU with the lowest relative number of interrupts */
@@ -210,7 +202,7 @@ static bool find_min_bd(const cpumask_t *mask, unsigned int max_intrs,
 		return true;
 
 	/* Don't balance if IRQs are already balanced evenly enough */
-	return max_intrs - min_intrs < IRQ_SCALED_THRESH;
+	return max_intrs - min_intrs < READ_ONCE(sbalance_thresh);
 }
 
 static void balance_irqs(void)
@@ -387,13 +379,12 @@ static void sbalance_wait(long poll_jiffies)
 
 static int __noreturn sbalance_thread(void *data)
 {
-	long poll_jiffies = msecs_to_jiffies(POLL_MS);
 	struct bal_domain *bd;
 	int cpu;
 
 	/* Parse the list of CPUs to exclude, if any */
-	if (cpulist_parse(CONFIG_SBALANCE_EXCLUDE_CPUS, &cpu_exclude_mask))
-		cpu_exclude_mask = CPU_MASK_NONE;
+	if (cpulist_parse(CONFIG_SBALANCE_EXCLUDE_CPUS, &sbalance_exclude_cpus))
+		cpumask_clear(&sbalance_exclude_cpus);
 
 	/* Initialize the data used for balancing */
 	for_each_possible_cpu(cpu) {
@@ -404,13 +395,117 @@ static int __noreturn sbalance_thread(void *data)
 
 	set_freezable();
 	while (1) {
-		sbalance_wait(poll_jiffies);
+		sbalance_wait(msecs_to_jiffies(READ_ONCE(sbalance_poll_ms)));
 		balance_irqs();
 	}
 }
 
+static struct kobject *sbalance_kobj;
+
+static ssize_t poll_ms_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
+{
+	return sprintf(buf, "%u\n", READ_ONCE(sbalance_poll_ms));
+}
+
+static ssize_t poll_ms_store(struct kobject *kobj, struct kobj_attribute *attr,
+			     const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) || !val)
+		return -EINVAL;
+
+	WRITE_ONCE(sbalance_poll_ms, val);
+	return count;
+}
+static struct kobj_attribute poll_ms_attr = __ATTR_RW(poll_ms);
+
+static ssize_t thresh_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	return sprintf(buf, "%u\n", READ_ONCE(sbalance_thresh));
+}
+
+static ssize_t thresh_store(struct kobject *kobj, struct kobj_attribute *attr,
+			    const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+
+	WRITE_ONCE(sbalance_thresh, val);
+	return count;
+}
+static struct kobj_attribute thresh_attr = __ATTR_RW(thresh);
+
+static ssize_t exclude_cpus_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return cpumap_print_to_pagebuf(true, buf, &sbalance_exclude_cpus);
+}
+
+static ssize_t exclude_cpus_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	cpumask_var_t new_mask;
+	int ret;
+
+	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL))
+		return -ENOMEM;
+
+	ret = cpulist_parse(buf, new_mask);
+	if (ret)
+		goto out_free;
+
+	spin_lock(&sbalance_lock);
+	cpumask_copy(&sbalance_exclude_cpus, new_mask);
+	spin_unlock(&sbalance_lock);
+
+	ret = count;
+out_free:
+	free_cpumask_var(new_mask);
+	return ret;
+}
+static struct kobj_attribute exclude_cpus_attr = __ATTR_RW(exclude_cpus);
+
+static struct attribute *sbalance_attrs[] = {
+	&poll_ms_attr.attr,
+	&thresh_attr.attr,
+	&exclude_cpus_attr.attr,
+	NULL
+};
+static struct attribute_group sbalance_attr_group = {
+	.attrs = sbalance_attrs,
+};
+
+static int __init sbalance_sysfs_init(void)
+{
+	int ret;
+
+	sbalance_kobj = kobject_create_and_add("sbalance", kernel_kobj);
+	if (!sbalance_kobj)
+		return -ENOMEM;
+
+	ret = sysfs_create_group(sbalance_kobj, &sbalance_attr_group);
+	if (ret) {
+		kobject_put(sbalance_kobj);
+		sbalance_kobj = NULL;
+	}
+
+	return ret;
+}
+
 static int __init sbalance_init(void)
 {
+	int ret;
+
+	ret = sbalance_sysfs_init();
+	if (ret)
+		return ret;
+
 	BUG_ON(IS_ERR(kthread_run(sbalance_thread, NULL, "sbalanced")));
 
 	return 0;
