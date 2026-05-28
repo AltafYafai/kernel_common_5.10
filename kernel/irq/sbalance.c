@@ -150,6 +150,8 @@ static int move_irq_to_cpu(struct bal_irq *bi, int cpu)
 					      false);
 	} else {
 		bi->prev_cpu = prev_cpu;
+		pr_info("IRQ%d skip: prev_cpu changed %d->%d\n",
+			irq_desc_get_irq(desc), prev_cpu, bi->prev_cpu);
 		ret = -EINVAL;
 	}
 	raw_spin_unlock_irq(&desc->lock);
@@ -157,8 +159,8 @@ static int move_irq_to_cpu(struct bal_irq *bi, int cpu)
 	if (!ret) {
 		/* Update the old interrupt count using the new CPU */
 		bi->old_nr = *per_cpu_ptr(desc->kstat_irqs, cpu);
-		pr_debug("Moved IRQ%d (CPU%d -> CPU%d)\n",
-			 irq_desc_get_irq(desc), prev_cpu, cpu);
+		pr_info("Moved IRQ%d (CPU%d -> CPU%d)\n",
+			irq_desc_get_irq(desc), prev_cpu, cpu);
 	}
 
 	return ret;
@@ -202,6 +204,10 @@ static bool find_min_bd(const cpumask_t *mask, unsigned int max_intrs,
 		return true;
 
 	/* Don't balance if IRQs are already balanced evenly enough */
+	if (max_intrs - min_intrs < READ_ONCE(sbalance_thresh))
+		pr_info("skip: max %u min %u diff %u < thresh %u\n",
+			max_intrs, min_intrs,
+			max_intrs - min_intrs, READ_ONCE(sbalance_thresh));
 	return max_intrs - min_intrs < READ_ONCE(sbalance_thresh);
 }
 
@@ -269,6 +275,9 @@ static void balance_irqs(void)
 				max_bd = bd;
 			}
 		}
+
+		pr_info("cycle: max_cpu=%u max_intrs=%u\n",
+			max_bd ? max_bd->cpu : -1, max_intrs);
 
 		/* No balancing to do if there aren't any movable IRQs */
 		if (unlikely(!max_intrs))
