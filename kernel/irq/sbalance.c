@@ -149,10 +149,9 @@ static int move_irq_to_cpu(struct bal_irq *bi, int cpu)
 		ret = irq_set_affinity_locked(&desc->irq_data, cpumask_of(cpu),
 					      false);
 	} else {
-		int old_prev = bi->prev_cpu;
 		bi->prev_cpu = prev_cpu;
 		pr_info("IRQ%d skip: prev_cpu changed %d->%d\n",
-			irq_desc_get_irq(desc), old_prev, bi->prev_cpu);
+			irq_desc_get_irq(desc), prev_cpu, bi->prev_cpu);
 		ret = -EINVAL;
 	}
 	raw_spin_unlock_irq(&desc->lock);
@@ -277,8 +276,8 @@ static void balance_irqs(void)
 			}
 		}
 
-		pr_info("cycle: max_cpu=%d max_intrs=%u\n",
-			max_bd->cpu, max_intrs);
+		pr_info("cycle: max_cpu=%u max_intrs=%u\n",
+			max_bd ? max_bd->cpu : -1, max_intrs);
 
 		/* No balancing to do if there aren't any movable IRQs */
 		if (unlikely(!max_intrs))
