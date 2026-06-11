@@ -5171,6 +5171,42 @@ void zenith_gpu_load_event(unsigned int gpu_load_pct)
 EXPORT_SYMBOL_GPL(zenith_gpu_load_event);
 
 
+/**
+ * zenith_gpu_freq_event - notify zenith of high GPU frequency
+ * @freq_pct: GPU frequency as percentage of max (0-100)
+ *
+ * Companion to zenith_gpu_load_event().  While load-based boost
+ * reacts to current GPU utilization, freq-based boost anticipates
+ * future CPU demand: a GPU that has ramped to a high OPP is a
+ * leading indicator that a render workload is about to hit the CPU
+ * (frame submission, buffer sync).
+ *
+ * Uses a longer window (80ms vs 50ms) because the predictive
+ * signal needs to bridge the gap between GPU ramp-up and CPU
+ * workload arrival, which can span multiple devfreq ticks.
+ *
+ * Lock-free; safe to call from any context including atomic.
+ * Same fail-safe shape as zenith_gpu_load_event().
+ */
+#define ZENITH_GPU_FREQ_THRESH_PCT	70
+#define ZENITH_GPU_FREQ_WINDOW_MS	80
+
+void zenith_gpu_freq_event(unsigned int freq_pct)
+{
+
+	u64 now_ns, deadline, current;
+	/* Only fire when GPU is at a high OPP */
+	if (freq_pct < ZENITH_GPU_FREQ_THRESH_PCT)
+		return;
+	now_ns = ktime_get_ns();
+	deadline = now_ns + (u64)ZENITH_GPU_FREQ_WINDOW_MS * NSEC_PER_MSEC;
+	current = (u64)atomic64_read(&zenith_input_boost_until_ns);
+	/* Use a longer window than load-based boost */
+	if (deadline > current)
+		atomic64_set(&zenith_input_boost_until_ns, (s64)deadline);
+}
+EXPORT_SYMBOL_GPL(zenith_gpu_freq_event);
+
 static unsigned int zenith_input_boost_active_ms = ZENITH_DEFAULT_INPUT_BOOST_MS;
 
 /* Governor-wide cache for the touchdown-extra knob (Patch C).

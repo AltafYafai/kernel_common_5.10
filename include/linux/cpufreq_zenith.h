@@ -25,10 +25,12 @@
 extern void zenith_set_drm_vblank_us(unsigned int us);
 void zenith_drm_vblank_event(void);
 void zenith_gpu_load_event(unsigned int gpu_load_pct);
+void zenith_gpu_freq_event(unsigned int freq_pct);
 #else
 static inline void zenith_set_drm_vblank_us(unsigned int us) { }
 static inline void zenith_drm_vblank_event(void) { }
 static inline void zenith_gpu_load_event(unsigned int gpu_load_pct) { }
+static inline void zenith_gpu_freq_event(unsigned int freq_pct) { }
 #endif
 
 #endif /* _LINUX_CPUFREQ_ZENITH_H */

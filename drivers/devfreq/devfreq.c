@@ -1005,6 +1005,54 @@ struct devfreq *devm_devfreq_add_device(struct device *dev,
 }
 EXPORT_SYMBOL(devm_devfreq_add_device);
 
+/**
+ * devfreq_set_governor - Switch a devfreq device's governor at runtime
+ * @df:   the devfreq device
+ * @name: name of the target governor (e.g. "performance", "powersave",
+ *        "simple_ondemand")
+ *
+ * Safely stops the current governor, swaps in the new one, and starts
+ * it.  Returns 0 on success, negative errno on failure (governor not
+ * found, immutable, or event_handler error).
+ */
+int devfreq_set_governor(struct devfreq *df, const char *name)
+{
+	struct devfreq_governor *governor;
+	int ret = 0;
+
+	if (!df->governor)
+		return -EINVAL;
+
+	mutex_lock(&devfreq_list_lock);
+	governor = find_devfreq_governor(name);
+	if (!governor) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (df->governor == governor)
+		goto out;
+	if (df->governor->immutable || governor->immutable) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = df->governor->event_handler(df, DEVFREQ_GOV_STOP, NULL);
+	if (ret)
+		goto out;
+	df->governor = governor;
+	ret = df->governor->event_handler(df, DEVFREQ_GOV_START, NULL);
+	if (ret) {
+		/* Start failed; try to roll back to previous governor */
+		df->governor->event_handler(df, DEVFREQ_GOV_STOP, NULL);
+		goto out;
+	}
+
+out:
+	mutex_unlock(&devfreq_list_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(devfreq_set_governor);
+
 #ifdef CONFIG_OF
 /*
  * devfreq_get_devfreq_by_node - Get the devfreq device from devicetree

@@ -225,6 +225,9 @@ void devm_devfreq_remove_device(struct device *dev, struct devfreq *devfreq);
 int devfreq_suspend_device(struct devfreq *devfreq);
 int devfreq_resume_device(struct devfreq *devfreq);
 
+/* Switch devfreq governor at runtime */
+int devfreq_set_governor(struct devfreq *df, const char *name);
+
 void devfreq_suspend(void);
 void devfreq_resume(void);
 
