@@ -18,9 +18,63 @@
 #include <linux/sched/task.h>
 #include <linux/cpufreq_zenith.h>
 #include <linux/workqueue.h>
+#include <linux/device.h>
 
-#define GPU_GOVERNOR_IDLE_MS		5000
-#define GPU_GOVERNOR_CHECK_MS		2000
+/* GPU governor auto-switching defaults (tunable via sysfs) */
+#define GPU_GOVERNOR_IDLE_MS_DEFAULT	5000
+#define GPU_GOVERNOR_CHECK_MS_DEFAULT	2000
+
+static unsigned int gpu_governor_idle_ms = GPU_GOVERNOR_IDLE_MS_DEFAULT;
+static unsigned int gpu_governor_check_ms = GPU_GOVERNOR_CHECK_MS_DEFAULT;
+
+static ssize_t gpu_governor_idle_ms_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(gpu_governor_idle_ms));
+}
+
+static ssize_t gpu_governor_idle_ms_store(struct device *dev,
+					   struct device_attribute *attr,
+					   const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 0, &val) || val < 100)
+		return -EINVAL;
+
+	WRITE_ONCE(gpu_governor_idle_ms, val);
+	return count;
+}
+static DEVICE_ATTR_RW(gpu_governor_idle_ms);
+
+static ssize_t gpu_governor_check_ms_show(struct device *dev,
+					   struct device_attribute *attr,
+					   char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(gpu_governor_check_ms));
+}
+
+static ssize_t gpu_governor_check_ms_store(struct device *dev,
+					    struct device_attribute *attr,
+					    const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 0, &val) || val < 100)
+		return -EINVAL;
+
+	WRITE_ONCE(gpu_governor_check_ms, val);
+	return count;
+}
+static DEVICE_ATTR_RW(gpu_governor_check_ms);
+
+static struct attribute *gpu_governor_attrs[] = {
+	&dev_attr_gpu_governor_idle_ms.attr,
+	&dev_attr_gpu_governor_check_ms.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(gpu_governor);
 
 /*
  * Power Management:
@@ -843,7 +897,7 @@ static void gpu_governor_work(struct work_struct *work)
 		/* Game mode overrides idle detection -> performance governor */
 		if (strcmp(df->governor_name, "performance"))
 			devfreq_set_governor(df, "performance");
-	} else if (idle_ms >= GPU_GOVERNOR_IDLE_MS) {
+	} else if (idle_ms >= READ_ONCE(gpu_governor_idle_ms)) {
 		/* GPU idle -> switch to powersave */
 		if (strcmp(df->governor_name, "powersave"))
 			devfreq_set_governor(df, "powersave");
@@ -856,7 +910,7 @@ static void gpu_governor_work(struct work_struct *work)
 resched:
 	queue_delayed_work(system_unbound_wq,
 			   &gpu->devfreq_governor_work,
-			   msecs_to_jiffies(GPU_GOVERNOR_CHECK_MS));
+			   msecs_to_jiffies(READ_ONCE(gpu_governor_check_ms)));
 }
 
 /*
@@ -935,7 +989,7 @@ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 	gpu->devfreq_last_submit = jiffies;
 	queue_delayed_work(system_unbound_wq,
 			   &gpu->devfreq_governor_work,
-			   msecs_to_jiffies(GPU_GOVERNOR_CHECK_MS));
+			   msecs_to_jiffies(READ_ONCE(gpu_governor_check_ms)));
 
 
 	timer_setup(&gpu->hangcheck_timer, hangcheck_handler, 0);
@@ -988,6 +1042,10 @@ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 	gpu->pdev = pdev;
 	platform_set_drvdata(pdev, &gpu->adreno_smmu);
 
+	ret = device_add_groups(&pdev->dev, gpu_governor_groups);
+	if (ret)
+		DRM_DEV_ERROR(drm->dev, "failed to create GPU governor sysfs files: %d\n", ret);
+
 	msm_devfreq_init(gpu);
 
 
@@ -1036,9 +1094,8 @@ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 
 	gpu->nr_rings = nr_rings;
 
-	return 0;
-
-fail:
+	return 0;	fail:
+	device_remove_groups(&gpu->pdev->dev, gpu_governor_groups);
 	cancel_delayed_work_sync(&gpu->devfreq_governor_work);
 
 	for (i = 0; i < ARRAY_SIZE(gpu->rb); i++)  {
@@ -1057,6 +1114,8 @@ void msm_gpu_cleanup(struct msm_gpu *gpu)
 	int i;
 
 	DBG("%s", gpu->name);
+
+	device_remove_groups(&gpu->pdev->dev, gpu_governor_groups);
 
 	cancel_delayed_work_sync(&gpu->devfreq_governor_work);
 
