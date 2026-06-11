@@ -4932,6 +4932,25 @@ static inline unsigned int zenith_eff_game_mode(unsigned int base_gm)
 		return 1;
 	return base_gm;
 }
+/**
+ * zenith_is_game_mode_active - query whether Zenith auto-detected a game
+ *
+ * Returns true when the in-kernel game-engine thread detector has
+ * identified a game workload and the auto-detection latch is still
+ * valid.  Intended for external drivers (GPU, thermal, etc.) that
+ * want to synchronise their own policy with Zenith's game mode.
+ *
+ * Safe to call from any context.  Returns false when the governor
+ * is not built, when game_auto is disabled, or when the latch has
+ * expired -- same fail-safe shape as every other exported hook.
+ */
+bool zenith_is_game_mode_active(void)
+{
+	if (!static_branch_likely(&zenith_game_auto_key))
+		return false;
+	return zenith_game_auto_active();
+}
+EXPORT_SYMBOL_GPL(zenith_is_game_mode_active);
 
 /**
  * zenith_set_drm_vblank_us - publish active panel vblank period to zenith

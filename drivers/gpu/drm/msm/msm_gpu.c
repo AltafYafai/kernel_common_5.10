@@ -839,12 +839,16 @@ static void gpu_governor_work(struct work_struct *work)
 
 	idle_ms = jiffies_to_msecs(jiffies - gpu->devfreq_last_submit);
 
-	if (idle_ms >= GPU_GOVERNOR_IDLE_MS) {
+	if (zenith_is_game_mode_active()) {
+		/* Game mode overrides idle detection -> performance governor */
+		if (strcmp(df->governor_name, "performance"))
+			devfreq_set_governor(df, "performance");
+	} else if (idle_ms >= GPU_GOVERNOR_IDLE_MS) {
 		/* GPU idle -> switch to powersave */
 		if (strcmp(df->governor_name, "powersave"))
 			devfreq_set_governor(df, "powersave");
 	} else {
-		/* GPU active -> switch to simple_ondemand */
+		/* GPU active, not gaming -> simple_ondemand */
 		if (strcmp(df->governor_name, "simple_ondemand"))
 			devfreq_set_governor(df, "simple_ondemand");
 	}
