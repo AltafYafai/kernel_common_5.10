@@ -16,6 +16,7 @@
 #include <linux/devfreq.h>
 #include <linux/devcoredump.h>
 #include <linux/sched/task.h>
+#include <linux/cpufreq_zenith.h>
 
 /*
  * Power Management:
@@ -60,6 +61,13 @@ static int msm_devfreq_get_dev_status(struct device *dev,
 	time = ktime_get();
 	status->total_time = ktime_us_delta(time, gpu->devfreq.time);
 	gpu->devfreq.time = time;
+
+	/* Notify cpufreq governor of GPU load for CPU frequency coupling */
+	if (status->total_time > 0) {
+		unsigned int gpu_load_pct = (unsigned int)
+			(status->busy_time * 100 / status->total_time);
+		zenith_gpu_load_event(gpu_load_pct);
+	}
 
 	return 0;
 }
