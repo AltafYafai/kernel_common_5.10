@@ -5173,7 +5173,7 @@ EXPORT_SYMBOL_GPL(zenith_drm_vblank_event);
 void zenith_gpu_load_event(unsigned int gpu_load_pct)
 {
 
-	u64 now_ns, deadline, current;
+	u64 now_ns, deadline, boost_until;
 	/* Only fire when GPU is meaningfully loaded */
 	if (gpu_load_pct < ZENITH_GPU_LOAD_THRESH_PCT)
 
@@ -5181,10 +5181,10 @@ void zenith_gpu_load_event(unsigned int gpu_load_pct)
 	now_ns = ktime_get_ns();
 
 	deadline = now_ns + (u64)ZENITH_GPU_LOAD_WINDOW_MS * NSEC_PER_MSEC;
-	current = (u64)atomic64_read(&zenith_input_boost_until_ns);
+	boost_until = (u64)atomic64_read(&zenith_input_boost_until_ns);
 	/* Only extend the deadline, never shorten it */
 
-	if (deadline > current)
+	if (deadline > boost_until)
 		atomic64_set(&zenith_input_boost_until_ns, (s64)deadline);
 }
 EXPORT_SYMBOL_GPL(zenith_gpu_load_event);
@@ -5213,15 +5213,15 @@ EXPORT_SYMBOL_GPL(zenith_gpu_load_event);
 void zenith_gpu_freq_event(unsigned int freq_pct)
 {
 
-	u64 now_ns, deadline, current;
+	u64 now_ns, deadline, boost_until;
 	/* Only fire when GPU is at a high OPP */
 	if (freq_pct < ZENITH_GPU_FREQ_THRESH_PCT)
 		return;
 	now_ns = ktime_get_ns();
 	deadline = now_ns + (u64)ZENITH_GPU_FREQ_WINDOW_MS * NSEC_PER_MSEC;
-	current = (u64)atomic64_read(&zenith_input_boost_until_ns);
+	boost_until = (u64)atomic64_read(&zenith_input_boost_until_ns);
 	/* Use a longer window than load-based boost */
-	if (deadline > current)
+	if (deadline > boost_until)
 		atomic64_set(&zenith_input_boost_until_ns, (s64)deadline);
 }
 EXPORT_SYMBOL_GPL(zenith_gpu_freq_event);
