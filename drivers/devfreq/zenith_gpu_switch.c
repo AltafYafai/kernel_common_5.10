@@ -105,7 +105,7 @@ static void gpu_governor_worker(struct work_struct *work)
 	}
 
 	/* Only switch if the governor actually changed */
-	if (strcmp(df->governor->name, target))
+	if (strcmp(df->governor_name, target))
 		devfreq_set_governor(df, target);
 
 resched:

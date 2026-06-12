@@ -163,7 +163,7 @@ static struct request *zios_find_nearest(struct list_head *list,
 					 unsigned int limit)
 {
 	struct request *rq, *best = NULL;
-	sector_t best_delta = SECTOR_MAX;
+	sector_t best_delta = U64_MAX;
 	unsigned int scanned = 0;
 
 	list_for_each_entry(rq, list, queuelist) {
