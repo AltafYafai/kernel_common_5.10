@@ -370,8 +370,8 @@
  * a vendor renames it, set top_app_aware=0 and use the comm-walk
  * floors instead.
  */
-#define ZENITH_DEFAULT_TOP_APP_AWARE			0
-#define ZENITH_DEFAULT_TOP_APP_FLOOR_PCT		0
+#define ZENITH_DEFAULT_TOP_APP_AWARE			1
+#define ZENITH_DEFAULT_TOP_APP_FLOOR_PCT		50
 #define ZENITH_TOP_APP_FLOOR_PCT_MAX			100
 #define ZENITH_TOP_APP_CACHE_TTL_NS			(4 * NSEC_PER_MSEC)
 #define ZENITH_TOP_APP_CGROUP_NAME			"top-app"
