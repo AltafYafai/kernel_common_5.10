@@ -1126,6 +1126,81 @@ EXPORT_SYMBOL_GPL(devfreq_get_devfreq_by_node);
 EXPORT_SYMBOL_GPL(devfreq_get_devfreq_by_phandle);
 
 /**
+ * devfreq_get_devfreq_by_name - Find a devfreq device by its device name
+ * @name: device name string (e.g. "13040000.mali")
+ *
+ * Iterates the devfreq list and returns the matching devfreq instance.
+ * The caller must not hold devfreq_list_lock. Returns a pointer on
+ * success, ERR_PTR(-ENODEV) if no match is found.
+ */
+struct devfreq *devfreq_get_devfreq_by_name(const char *name)
+{
+	struct devfreq *devfreq;
+
+	if (!name)
+		return ERR_PTR(-EINVAL);
+
+	mutex_lock(&devfreq_list_lock);
+	list_for_each_entry(devfreq, &devfreq_list, node) {
+		if (!strcmp(dev_name(&devfreq->dev), name)) {
+			mutex_unlock(&devfreq_list_lock);
+			return devfreq;
+		}
+	}
+	mutex_unlock(&devfreq_list_lock);
+
+	return ERR_PTR(-ENODEV);
+}
+EXPORT_SYMBOL_GPL(devfreq_get_devfreq_by_name);
+
+/*
+ * GPU devfreq device name keywords used by devfreq_find_gpu_devfreq().
+ * Matched case-insensitively against the devfreq device name.
+ */
+static const char * const gpu_devfreq_keywords[] = {
+	"mali",
+	"gpu",
+	"kgsl",
+	"adreno",
+	"panfrost",
+	"gc7000",  /* Vivante */
+	"pvr",	    /* PowerVR */
+	NULL,
+};
+
+/**
+ * devfreq_find_gpu_devfreq - Auto-detect the GPU devfreq device
+ *
+ * Scans all registered devfreq devices and returns the first one whose
+ * name contains a known GPU keyword (mali, gpu, kgsl, adreno, panfrost,
+ * etc.). This eliminates the need to hardcode a device-specific name.
+ *
+ * Returns a pointer on success, ERR_PTR(-ENODEV) if no GPU devfreq
+ * device is found.
+ */
+struct devfreq *devfreq_find_gpu_devfreq(void)
+{
+	struct devfreq *devfreq;
+	const char * const *kw;
+
+	mutex_lock(&devfreq_list_lock);
+	list_for_each_entry(devfreq, &devfreq_list, node) {
+		const char *name = dev_name(&devfreq->dev);
+
+		for (kw = gpu_devfreq_keywords; *kw; kw++) {
+			if (strstr(name, *kw)) {
+				mutex_unlock(&devfreq_list_lock);
+				return devfreq;
+			}
+		}
+	}
+	mutex_unlock(&devfreq_list_lock);
+
+	return ERR_PTR(-ENODEV);
+}
+EXPORT_SYMBOL_GPL(devfreq_find_gpu_devfreq);
+
+/**
  * devm_devfreq_remove_device() - Resource-managed devfreq_remove_device()
  * @dev:	the device from which to remove devfreq feature.
  * @devfreq:	the devfreq instance to be removed
