@@ -23,6 +23,16 @@
 #include <linux/string.h>
 #include <linux/slab.h>
 #include <linux/compaction.h>
+#include <linux/dcache.h>
+
+/*
+ * Exported VM tunables we adjust during game mode:
+ *   vm_dirty_ratio          — max dirty page % before throttling writers
+ *   dirty_background_ratio  — % at which background writeback starts
+ *   sysctl_vfs_cache_pressure — how aggressively inode/dentry cache is reclaimed
+ */
+extern int vm_dirty_ratio;
+extern int dirty_background_ratio;
 
 /*
  * Debug logging gated behind CONFIG_ZENITH_DEBUG_MSG.
@@ -75,6 +85,26 @@ module_param(gpu_idle_ms, uint, 0644);
 MODULE_PARM_DESC(gpu_idle_ms,
 		 "Idle timeout in ms before powersave (default: 5000, 0=skip)");
 
+/***** Game-mode memory tuning save state *****/
+
+static int saved_dirty_ratio;
+static int saved_dirty_bg_ratio;
+static int saved_vfs_cache_pressure;
+static bool game_tuning_active;
+
+/*
+ * During game mode, tighten dirty ratios and reduce VFS cache pressure
+ * so that:
+ *   - Writeback starts earlier and stays gentler  (smaller bursts)
+ *   - File-backed pages (game assets) are evicted less aggressively
+ *
+ * The normal defaults are dirty_ratio=20, dirty_bg=10, vfs_cache=100.
+ * User-modified values are saved on game-enter and restored on game-exit.
+ */
+#define GAME_DIRTY_RATIO               10
+#define GAME_DIRTY_BG_RATIO             5
+#define GAME_VFS_CACHE_PRESSURE        50
+
 /***** Internal state *****/
 
 static struct delayed_work gpu_governor_work;
@@ -116,6 +146,42 @@ static void gpu_governor_worker(struct work_struct *work)
 	 */
 	if (game_active && !gpu_prev_game_active)
 		wakeup_all_kcompactd();
+
+	/*
+	 * Game-mode memory tuning: tighten dirty ratios and reduce VFS cache
+	 * pressure so writeback stays gentle and game assets remain cached.
+	 */
+	if (game_active && !game_tuning_active) {
+		/* Save current values */
+		saved_dirty_ratio = vm_dirty_ratio;
+		saved_dirty_bg_ratio = dirty_background_ratio;
+		saved_vfs_cache_pressure = sysctl_vfs_cache_pressure;
+
+		/* Apply game-mode values */
+		vm_dirty_ratio = GAME_DIRTY_RATIO;
+		dirty_background_ratio = GAME_DIRTY_BG_RATIO;
+		sysctl_vfs_cache_pressure = GAME_VFS_CACHE_PRESSURE;
+
+		game_tuning_active = true;
+
+		gpu_debug("game mode mem tuning ON "
+			 "(dirty_ratio=%d, dirty_bg=%d, vfs_cache=%d)\n",
+			 vm_dirty_ratio, dirty_background_ratio,
+			 sysctl_vfs_cache_pressure);
+	} else if (!game_active && game_tuning_active) {
+		/* Restore saved values */
+		vm_dirty_ratio = saved_dirty_ratio;
+		dirty_background_ratio = saved_dirty_bg_ratio;
+		sysctl_vfs_cache_pressure = saved_vfs_cache_pressure;
+
+		game_tuning_active = false;
+
+		gpu_debug("game mode mem tuning OFF "
+			 "(dirty_ratio=%d, dirty_bg=%d, vfs_cache=%d)\n",
+			 vm_dirty_ratio, dirty_background_ratio,
+			 sysctl_vfs_cache_pressure);
+	}
+
 	gpu_prev_game_active = game_active;
 
 	if (game_active) {
