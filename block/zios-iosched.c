@@ -953,7 +953,7 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 		sizeof(zd->thermal_zone_name));
 	zd->last_thermal_check = jiffies;
 
-	zd->boost_rt_prio = true;
+	zd->boost_rt_prio = false;
 
 	zd->debug_log = false;
 	zd->sample_interval_ms = 500;
