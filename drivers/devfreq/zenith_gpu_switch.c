@@ -22,6 +22,7 @@
 #include <linux/jiffies.h>
 #include <linux/string.h>
 #include <linux/slab.h>
+#include <linux/compaction.h>
 
 /*
  * Debug logging gated behind CONFIG_ZENITH_DEBUG_MSG.
@@ -78,6 +79,7 @@ MODULE_PARM_DESC(gpu_idle_ms,
 
 static struct delayed_work gpu_governor_work;
 static unsigned long gpu_last_game_active_jiffies;
+static bool gpu_prev_game_active;
 
 /*
  * Resolve the GPU devfreq device.  If gpu_devfreq_name is set (non-empty),
@@ -106,6 +108,15 @@ static void gpu_governor_worker(struct work_struct *work)
 	}
 
 	game_active = zenith_is_game_mode_active();
+
+	/*
+	 * Proactively wake kcompactd when game mode first activates.
+	 * This pre-compacts memory before game assets need high-order
+	 * (DMA/GPU) allocations, reducing launch-time stalls.
+	 */
+	if (game_active && !gpu_prev_game_active)
+		wakeup_all_kcompactd();
+	gpu_prev_game_active = game_active;
 
 	if (game_active) {
 		target = gpu_game_governor;

@@ -46,6 +46,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/cred.h>
 #include <linux/nmi.h>
+#include <linux/cpufreq_zenith.h>
 
 #include <asm/tlb.h>
 #include "internal.h"
@@ -240,6 +241,15 @@ long oom_badness(struct task_struct *p, unsigned long totalpages)
 	/* Normalize to oom_score_adj units */
 	adj *= totalpages / 1000;
 	points += adj;
+
+	/*
+	 * During game mode, protect foreground tasks with low oom_score_adj
+	 * (Android sets -950..-900 for top-app) by significantly reducing
+	 * their badness score.  This makes games and UI processes far less
+	 * likely to be killed under memory pressure.
+	 */
+	if (zenith_is_game_mode_active() && p->signal->oom_score_adj < 100)
+		points -= points / 2;
 
 	return points;
 }

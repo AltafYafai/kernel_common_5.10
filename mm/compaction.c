@@ -2832,9 +2832,7 @@ static void kcompactd_do_work(pg_data_t *pgdat)
 		pgdat->kcompactd_max_order = 0;
 	if (pgdat->kcompactd_highest_zoneidx >= cc.highest_zoneidx)
 		pgdat->kcompactd_highest_zoneidx = pgdat->nr_zones - 1;
-}
-
-void wakeup_kcompactd(pg_data_t *pgdat, int order, int highest_zoneidx)
+}void wakeup_kcompactd(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
 	if (!order)
 		return;
@@ -2856,9 +2854,27 @@ void wakeup_kcompactd(pg_data_t *pgdat, int order, int highest_zoneidx)
 		return;
 
 	trace_mm_compaction_wakeup_kcompactd(pgdat->node_id, order,
-							highest_zoneidx);
+						highest_zoneidx);
 	wake_up_interruptible(&pgdat->kcompactd_wait);
 }
+
+/*
+ * wakeup_all_kcompactd - proactively wake kcompactd on all online nodes
+ *
+ * Intended to be called when game mode activates, so memory is compacted
+ * preemptively before game assets need high-order (DMA/GPU) allocations.
+ */
+void wakeup_all_kcompactd(void)
+{
+	int nid;
+
+	for_each_online_node(nid) {
+		pg_data_t *pgdat = NODE_DATA(nid);
+
+		wakeup_kcompactd(pgdat, COMPACTION_HPAGE_ORDER, MAX_NR_ZONES - 1);
+	}
+}
+EXPORT_SYMBOL_GPL(wakeup_all_kcompactd);
 
 /*
  * The background compaction daemon, started as a kernel thread
