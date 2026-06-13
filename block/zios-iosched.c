@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ZIOS I/O Scheduler — Zenith I/O Scheduler
+ * ZIOS I/O Scheduler v2.0.0 — Zenith I/O Scheduler
  *
  * A game-aware, top-app-cgroup-aware multi-queue I/O scheduler for
  * mobile devices (UFS / NVMe).  Designed for the Zenith kernel.
@@ -12,8 +12,13 @@
  *   - Read-first dispatch that becomes aggressive during gaming
  *   - Write absorption / batching during game mode
  *   - Sector-aware dispatch for better sequential throughput
- *
- * Copyright (C) 2026
+ *   - Workload auto-detection (sequential, random, write-heavy)
+ *   - Power-efficiency mode with auto battery detection
+ *   - Writeback throttling (flusher threads at lowest priority)
+ *   - Boot-time performance profile (aggressive flush first 30s)
+ *   - Swap I/O detection and deprioritization
+ *   - Thermal awareness (throttle I/O when device is hot)
+ *   - Latency-sensitive process tracking (RT/FIFO priority)
  */
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -25,9 +30,11 @@
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/sched.h>
+#include <linux/sched/rt.h>
 #include <linux/cgroup.h>
 #include <linux/cpufreq_zenith.h>
 #include <linux/power_supply.h>
+#include <linux/thermal.h>
 #include <linux/list_sort.h>
 
 #include "blk.h"
@@ -35,7 +42,17 @@
 #include "blk-mq-sched.h"
 #include "blk-mq-debugfs.h"
 
-#define ZIOS_VERSION "1.2.0"
+#define ZIOS_VERSION "2.0.0"
+
+/*
+ * Debug logging gated behind CONFIG_ZENITH_DEBUG_MSG.
+ * Production (community) builds compile these out entirely.
+ */
+#ifdef CONFIG_ZENITH_DEBUG_MSG
+#define zios_debug(fmt, ...)	pr_debug("zios: " fmt, ##__VA_ARGS__)
+#else
+#define zios_debug(fmt, ...)	no_printk(KERN_DEBUG "zios: " fmt, ##__VA_ARGS__)
+#endif
 
 /* Per-request scheduler data */
 struct zios_rq_data {
@@ -52,6 +69,7 @@ struct zios_data {
 	struct list_head	async_read_list;
 	struct list_head	write_list;
 	struct list_head	writeback_list;
+	struct list_head	swap_list;
 	struct list_head	top_app_list;
 
 	/* Counters */
@@ -59,58 +77,55 @@ struct zios_data {
 	unsigned int		nr_async_reads;
 	unsigned int		nr_writes;
 	unsigned int		nr_writeback;
+	unsigned int		nr_swap;
 	unsigned int		nr_top_app;
 
-	/* Stats (for diagnostics) */
+	/* Stats */
 	atomic64_t		dispatched_reads;
 	atomic64_t		dispatched_writes;
 	atomic64_t		merged_requests;
 
-	/* Last dispatched sector (elevator hint) */
+	/* Last dispatched sector */
 	sector_t		last_sector;
 	bool			last_sector_valid;
 
 	/* Dispatch accounting */
 	unsigned int		dispensed;
-	unsigned int		write_starve_count; /* nr of read dispatches while writes pending */
-	unsigned int		writeback_starve_count; /* nr of dispatches while writeback pending */
-	unsigned int		writeback_starve_max; /* starve limit before flushing writeback */
+	unsigned int		write_starve_count;
+	unsigned int		writeback_starve_count;
+	unsigned int		writeback_starve_max;
 	bool			writeback_dirty;
+	unsigned int		swap_starve_count;
+	unsigned int		swap_starve_max;
+	bool			swap_dirty;
 
-	/* Game mode — cached from governor, rechecked every 100ms */
+	/* Game mode */
 	bool			game_mode;
 	unsigned long		last_game_check;
 
-	/* Parameter sets — game vs normal */
+	/* Parameter sets */
 	struct {
 		unsigned int	read_batch_max;
 		unsigned int	write_batch_max;
 		unsigned int	top_app_bias_pct;
 		unsigned int	write_starve_max;
-	} game_params, normal_params;
+	} game_params, normal_params, boot_params, thermal_params;
 
-	/* Sector coalescing — scan up to N entries for near-sector match */
 	unsigned int		read_coalesce_limit;
-
-	/* Write pressure cap — max pending writes before forced flush */
 	unsigned int		max_write_pending;
-
-	/* Write list sort flag — set when batch needs sorting */
 	bool			writes_dirty;
-
-	/* Async queue depth */
 	unsigned int		async_depth;
-
-	/* Top-app cgroup name */
 	char			top_app_cgroup_name[256];
-
-	/* Per-request data slab */
 	struct kmem_cache	*rq_data_cache;
-
 	struct request_queue	*queue;
 	spinlock_t		lock;
 
-	/* ---------- Power efficiency ---------- */
+	/* Boot-time profile */
+	bool			boot_mode;
+	unsigned int		boot_duration_ms;
+	unsigned long		boot_start;
+
+	/* Power efficiency */
 	bool			power_efficient;
 	bool			auto_power_efficient;
 	unsigned int		power_efficient_battery_pct;
@@ -122,31 +137,29 @@ struct zios_data {
 		unsigned int	write_starve_max;
 	} power_efficient_params;
 
-	/* ---------- Workload detection ---------- */
+	/* Thermal throttling */
+	bool			thermal_throttle;
+	bool			auto_thermal_throttle;
+	unsigned int		thermal_throttle_temp;
+	char			thermal_zone_name[64];
+	unsigned long		last_thermal_check;
 
-	/* Debug logging toggle */
+	/* Latency-sensitive process tracking */
+	bool			boost_rt_prio;
+
+	/* Workload detection */
 	bool			debug_log;
-
-	/* Sampling interval (ms) */
 	unsigned int		sample_interval_ms;
 	unsigned long		last_sample;
-
-	/* I/O size tracking in current window */
 	u64			window_read_sectors;
 	u64			window_write_sectors;
 	u64			window_read_ops;
 	u64			window_write_ops;
-
-	/* Sequential vs random detection — compare each dispatch to last */
 	sector_t		last_dispatch_sector;
 	bool			last_dispatch_valid;
 	u64			window_seq_ops;
 	u64			window_rand_ops;
-
-	/* Write pressure in current window */
 	unsigned int		window_peak_write_pending;
-
-	/* Current detected workload profile */
 	enum {
 		ZIOS_WORKLOAD_BALANCED	= 0,
 		ZIOS_WORKLOAD_SEQUENTIAL,
@@ -203,11 +216,6 @@ static int zios_cmp_write_lba(void *priv, struct list_head *a,
 	       (int)(blk_rq_pos(rq_a) < blk_rq_pos(rq_b));
 }
 
-/*
- * Scan a list for the request with sector nearest to @target.
- * Scans at most @limit entries. Returns the closest match or
- * the first entry if limit is 1.
- */
 static struct request *zios_find_nearest(struct list_head *list,
 					 sector_t target,
 					 unsigned int limit)
@@ -264,8 +272,9 @@ static void zios_finish_request(struct request *rq)
 	}
 }
 
-/* Forward declaration for workload analysis */
+/* Forward declarations */
 static void zios_analyze_workload(struct zios_data *zd);
+static void zios_check_thermal(struct zios_data *zd);
 
 /* ---------- insert / classify ---------- */
 
@@ -285,7 +294,6 @@ static void zios_insert_request(struct blk_mq_hw_ctx *hctx,
 	if (!rd)
 		return;
 
-	/* Try merge first */
 	if (blk_mq_sched_try_insert_merge(q, rq))
 		return;
 
@@ -294,7 +302,14 @@ static void zios_insert_request(struct blk_mq_hw_ctx *hctx,
 	is_sync = rq->cmd_flags & REQ_SYNC;
 	is_write = op_is_write(req_op(rq));
 
+	/* Check top-app cgroup */
 	is_top_app = task_in_cgroup_named(current, zd->top_app_cgroup_name);
+
+	/* Also boost RT/FIFO tasks if enabled */
+	if (!is_top_app && zd->boost_rt_prio) {
+		if (rt_task(current))
+			is_top_app = true;
+	}
 
 	if (at_head) {
 		list_add(&rq->queuelist, &zd->sync_read_list);
@@ -309,8 +324,13 @@ static void zios_insert_request(struct blk_mq_hw_ctx *hctx,
 	} else if (!is_write) {
 		list_add_tail(&rq->queuelist, &zd->async_read_list);
 		zd->nr_async_reads++;
+	} else if (rq->bio && (rq->bio->bi_opf & REQ_SWAP)) {
+		/* Swap I/O — lowest priority */
+		list_add_tail(&rq->queuelist, &zd->swap_list);
+		zd->nr_swap++;
+		zd->swap_dirty = true;
 	} else if (current->flags & PF_SWAPWRITE) {
-		/* Writeback (flusher thread) — lowest priority */
+		/* Writeback (flusher thread) */
 		list_add_tail(&rq->queuelist, &zd->writeback_list);
 		zd->nr_writeback++;
 		zd->writeback_dirty = true;
@@ -337,12 +357,39 @@ static void zios_insert_requests(struct blk_mq_hw_ctx *hctx,
 	spin_unlock(&zd->lock);
 }
 
-/* ---------- power efficiency helpers ---------- */
+/* ---------- thermal check ---------- */
 
-/*
- * Check battery level and update power_efficient flag.
- * Called from dispatch context, throttled to every 60 seconds.
- */
+static void zios_check_thermal(struct zios_data *zd)
+{
+	struct thermal_zone_device *tz;
+	int temp, ret;
+
+	if (time_before(jiffies, zd->last_thermal_check + 30 * HZ))
+		return;
+	zd->last_thermal_check = jiffies;
+
+	tz = thermal_zone_get_zone_by_name(zd->thermal_zone_name);
+	if (IS_ERR(tz))
+		return;
+
+	ret = thermal_zone_get_temp(tz, &temp);
+	if (ret)
+		return;
+
+	if (temp >= (int)zd->thermal_throttle_temp * 1000 && !zd->thermal_throttle) {
+		zd->thermal_throttle = true;
+		zios_debug("thermal: %d mC >= %u C -> throttle ON\n",
+			   temp, zd->thermal_throttle_temp);
+	} else if (temp < (int)(zd->thermal_throttle_temp - 5) * 1000 &&
+		   zd->thermal_throttle) {
+		zd->thermal_throttle = false;
+		zios_debug("thermal: %d mC < %u C -> throttle OFF\n",
+			   temp, zd->thermal_throttle_temp - 5);
+	}
+}
+
+/* ---------- power efficiency ---------- */
+
 static void zios_check_battery(struct zios_data *zd)
 {
 	struct power_supply *psy;
@@ -366,17 +413,14 @@ static void zios_check_battery(struct zios_data *zd)
 
 		if (!on_ac && low && !zd->power_efficient) {
 			zd->power_efficient = true;
-			if (zd->debug_log)
-				pr_debug("zios: battery %d%% <= %u%% -> power efficient ON\n",
-					 val.intval, zd->power_efficient_battery_pct);
+			zios_debug("battery %d%% <= %u%% -> power efficient ON\n",
+				   val.intval, zd->power_efficient_battery_pct);
 		} else if ((on_ac || !low) && zd->power_efficient) {
 			zd->power_efficient = false;
-			if (zd->debug_log)
-				pr_debug("zios: battery %d%% > %u%% or AC -> power efficient OFF\n",
-					 val.intval, zd->power_efficient_battery_pct);
+			zios_debug("battery %d%% > %u%% or AC -> power efficient OFF\n",
+				   val.intval, zd->power_efficient_battery_pct);
 		}
 	} else if (zd->power_efficient) {
-		/* Can't read battery — disable auto mode */
 		zd->power_efficient = false;
 	}
 
@@ -392,21 +436,22 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	bool game_mode;
 	unsigned int rbatch, wbatch, bias_pct, starve_max;
 	unsigned int coalesce;
+	bool boot_mode;
 
-	/* Refresh game mode every 100 ms */
 	if (time_after(jiffies, zd->last_game_check + HZ / 10)) {
 		zd->game_mode = zenith_is_game_mode_active();
 		zd->last_game_check = jiffies;
 	}
 	game_mode = zd->game_mode;
+	boot_mode = zd->boot_mode;
 
-	/*
-	 * Check battery before taking spinlock — power supply API may sleep.
-	 * Auto-detection is throttled to every 60 seconds.
-	 */
 	if (zd->auto_power_efficient &&
 	    time_after(jiffies, zd->last_power_check + 60 * HZ))
 		zios_check_battery(zd);
+
+	if (zd->auto_thermal_throttle &&
+	    time_after(jiffies, zd->last_thermal_check + 30 * HZ))
+		zios_check_thermal(zd);
 
 	spin_lock(&zd->lock);
 
@@ -415,8 +460,17 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		wbatch    = zd->game_params.write_batch_max;
 		bias_pct  = zd->game_params.top_app_bias_pct;
 		starve_max = zd->game_params.write_starve_max;
+	} else if (boot_mode) {
+		rbatch    = zd->boot_params.read_batch_max;
+		wbatch    = zd->boot_params.write_batch_max;
+		bias_pct  = zd->boot_params.top_app_bias_pct;
+		starve_max = zd->boot_params.write_starve_max;
+	} else if (zd->thermal_throttle) {
+		rbatch    = zd->thermal_params.read_batch_max;
+		wbatch    = zd->thermal_params.write_batch_max;
+		bias_pct  = zd->thermal_params.top_app_bias_pct;
+		starve_max = zd->thermal_params.write_starve_max;
 	} else if (zd->power_efficient) {
-		/* Power-efficient mode: conservative settings to save battery */
 		rbatch    = zd->power_efficient_params.read_batch_max;
 		wbatch    = zd->power_efficient_params.write_batch_max;
 		bias_pct  = zd->power_efficient_params.top_app_bias_pct;
@@ -431,7 +485,7 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		min(zd->read_coalesce_limit, 4u) :
 		zd->read_coalesce_limit;
 
-	/* ----- Tier 0: Top-app priority ----- */
+	/* Tier 0: Top-app */
 	if (zd->nr_top_app > 0) {
 		unsigned int reserve = (zd->dispensed * bias_pct) / 100;
 
@@ -452,7 +506,7 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		}
 	}
 
-	/* ----- Tier 1: Sync reads (sector-aware) ----- */
+	/* Tier 1: Sync reads */
 	if (zd->nr_sync_reads > 0) {
 		if (game_mode || zd->write_starve_count < starve_max) {
 			if (coalesce > 1 && zd->last_sector_valid)
@@ -460,7 +514,7 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 						       zd->last_sector, coalesce);
 			else
 				rq = list_first_entry_or_null(&zd->sync_read_list,
-						    struct request, queuelist);
+						struct request, queuelist);
 
 			if (rq) {
 				list_del_init(&rq->queuelist);
@@ -472,7 +526,7 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		}
 	}
 
-	/* ----- Tier 2: Async reads (sector-aware) ----- */
+	/* Tier 2: Async reads */
 	if (zd->nr_async_reads > 0) {
 		if (game_mode || zd->write_starve_count < starve_max) {
 			if (coalesce > 1 && zd->last_sector_valid)
@@ -480,7 +534,7 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 						       zd->last_sector, coalesce);
 			else
 				rq = list_first_entry_or_null(&zd->async_read_list,
-						    struct request, queuelist);
+						struct request, queuelist);
 
 			if (rq) {
 				list_del_init(&rq->queuelist);
@@ -492,14 +546,13 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		}
 	}
 
-	/* ----- Tier 3: Writes (LBA-sorted flush) ----- */
+	/* Tier 3: Regular writes */
 	if (zd->nr_writes > 0) {
 		if (zd->write_starve_count >= starve_max ||
 		    zd->nr_writes >= wbatch ||
 		    zd->nr_writes >= zd->max_write_pending ||
 		    (!zd->nr_sync_reads && !zd->nr_async_reads && !zd->nr_top_app)) {
 
-			/* Sort writes by LBA for sequential throughput */
 			if (zd->writes_dirty && zd->nr_writes > 1) {
 				list_sort(NULL, &zd->write_list,
 					  zios_cmp_write_lba);
@@ -507,7 +560,7 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 			}
 
 			rq = list_first_entry_or_null(&zd->write_list,
-						      struct request, queuelist);
+						struct request, queuelist);
 			if (rq) {
 				list_del_init(&rq->queuelist);
 				zd->nr_writes--;
@@ -517,14 +570,11 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		}
 	}
 
-	/*
-	 * ----- Tier 4: Writeback (absolute lowest priority) -----
-	 * Dispatched only when nothing else pending OR starved beyond limit.
-	 */
+	/* Tier 4: Writeback */
 	if (zd->nr_writeback > 0) {
 		if (zd->writeback_starve_count >= zd->writeback_starve_max ||
 		    (!zd->nr_sync_reads && !zd->nr_async_reads &&
-		     !zd->nr_writes && !zd->nr_top_app)) {
+		     !zd->nr_writes && !zd->nr_top_app && !zd->nr_swap)) {
 
 			if (zd->writeback_dirty && zd->nr_writeback > 1) {
 				list_sort(NULL, &zd->writeback_list,
@@ -533,7 +583,7 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 			}
 
 			rq = list_first_entry_or_null(&zd->writeback_list,
-						      struct request, queuelist);
+						struct request, queuelist);
 			if (rq) {
 				list_del_init(&rq->queuelist);
 				zd->nr_writeback--;
@@ -541,9 +591,31 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 				goto done;
 			}
 		}
-
-		/* Bump writeback starve count on every dispatch when pending */
 		zd->writeback_starve_count++;
+	}
+
+	/* Tier 5: Swap I/O */
+	if (zd->nr_swap > 0) {
+		if (zd->swap_starve_count >= zd->swap_starve_max ||
+		    (!zd->nr_sync_reads && !zd->nr_async_reads &&
+		     !zd->nr_writes && !zd->nr_top_app && !zd->nr_writeback)) {
+
+			if (zd->swap_dirty && zd->nr_swap > 1) {
+				list_sort(NULL, &zd->swap_list,
+					  zios_cmp_write_lba);
+				zd->swap_dirty = false;
+			}
+
+			rq = list_first_entry_or_null(&zd->swap_list,
+						struct request, queuelist);
+			if (rq) {
+				list_del_init(&rq->queuelist);
+				zd->nr_swap--;
+				zd->swap_starve_count = 0;
+				goto done;
+			}
+		}
+		zd->swap_starve_count++;
 	}
 
 done:
@@ -552,32 +624,25 @@ done:
 		if (zd->dispensed > 256)
 			zd->dispensed = 0;
 
-		/* Track last sector for elevator hint */
 		zd->last_sector = blk_rq_pos(rq) + blk_rq_sectors(rq);
 		zd->last_sector_valid = true;
 
-		/* Update stats */
 		if (op_is_write(req_op(rq))) {
 			atomic64_inc(&zd->dispatched_writes);
-
-			/* Workload: track write I/O size */
 			zd->window_write_sectors += blk_rq_sectors(rq);
 			zd->window_write_ops++;
 		} else {
 			atomic64_inc(&zd->dispatched_reads);
-
-			/* Workload: track read I/O size */
 			zd->window_read_sectors += blk_rq_sectors(rq);
 			zd->window_read_ops++;
 		}
 
-		/* Workload: sequential vs random detection */
 		if (zd->last_dispatch_valid) {
 			sector_t pos = blk_rq_pos(rq);
 			sector_t last = zd->last_dispatch_sector;
 			sector_t delta = (pos > last) ? (pos - last) : (last - pos);
 
-			if (delta <= 32) /* within 16KB = sequential */
+			if (delta <= 32)
 				zd->window_seq_ops++;
 			else
 				zd->window_rand_ops++;
@@ -585,14 +650,17 @@ done:
 		zd->last_dispatch_sector = blk_rq_pos(rq) + blk_rq_sectors(rq);
 		zd->last_dispatch_valid = true;
 
-		/* Workload: peak write pressure */
 		if (zd->nr_writes > zd->window_peak_write_pending)
 			zd->window_peak_write_pending = zd->nr_writes;
 
-		/*
-		 * Sample workload periodically.
-		 * Skip during game mode — game_params already tune for gaming.
-		 */
+		/* Check boot mode expiry */
+		if (zd->boot_mode && time_after(jiffies, zd->boot_start +
+						msecs_to_jiffies(zd->boot_duration_ms))) {
+			zd->boot_mode = false;
+			zios_debug("boot mode finished after %u ms\n",
+				   zd->boot_duration_ms);
+		}
+
 		if (!zd->game_mode &&
 		    time_after(jiffies, zd->last_sample +
 			       msecs_to_jiffies(zd->sample_interval_ms))) {
@@ -620,6 +688,7 @@ static bool zios_has_work(struct blk_mq_hw_ctx *hctx)
 	       !list_empty_careful(&zd->async_read_list) ||
 	       !list_empty_careful(&zd->write_list) ||
 	       !list_empty_careful(&zd->writeback_list) ||
+	       !list_empty_careful(&zd->swap_list) ||
 	       !list_empty_careful(&zd->top_app_list);
 }
 
@@ -631,9 +700,10 @@ static void zios_limit_depth(unsigned int op, struct blk_mq_alloc_data *data)
 	if (op_is_sync(op) && !op_is_write(op))
 		return;
 
-	/* When battery-saving, cap queue depth to reduce I/O concurrency */
 	depth = zd->async_depth;
 	if (zd->power_efficient)
+		depth = min(depth, zd->async_depth / 2);
+	if (zd->thermal_throttle)
 		depth = min(depth, zd->async_depth / 2);
 
 	data->shallow_depth = zios_to_word_depth(data->hctx, depth);
@@ -655,7 +725,7 @@ static int zios_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
 	return 0;
 }
 
-/* ---------- merge & completion callbacks ---------- */
+/* ---------- merge & completion ---------- */
 
 static bool zios_bio_merge(struct request_queue *q, struct bio *bio,
 			   unsigned int nr_segs)
@@ -695,10 +765,6 @@ static void zios_completed_request(struct request *rq, u64 now)
 
 /* ---------- workload analysis ---------- */
 
-/*
- * zios_analyze_workload - analyze recent I/O patterns and tune params.
- * Called periodically from dispatch context holding zd->lock.
- */
 static void zios_analyze_workload(struct zios_data *zd)
 {
 	u64 total_read_sz, total_write_sz;
@@ -713,10 +779,8 @@ static void zios_analyze_workload(struct zios_data *zd)
 	write_ops = zd->window_write_ops;
 	total_ops = read_ops + write_ops;
 
-	if (total_ops < 8) {
-		/* Not enough data — keep previous profile */
+	if (total_ops < 8)
 		goto reset_window;
-	}
 
 	seq_ratio  = zd->window_seq_ops * 100 / total_ops;
 	rand_ratio = zd->window_rand_ops * 100 / total_ops;
@@ -725,63 +789,45 @@ static void zios_analyze_workload(struct zios_data *zd)
 	avg_read_sz_kb  = read_ops  ? (total_read_sz  * 512 / 1024 / read_ops)  : 0;
 	avg_write_sz_kb = write_ops ? (total_write_sz * 512 / 1024 / write_ops) : 0;
 
-	if (zd->debug_log)
-		pr_debug("zios: workload: seq=%u%% rand=%u%% write=%u%% "
-			 "avg_r=%uKB avg_w=%uKB peak_w=%u\n",
-			 seq_ratio, rand_ratio, write_ratio,
-			 avg_read_sz_kb, avg_write_sz_kb,
-			 zd->window_peak_write_pending);
-
-	/* ---- heuristics ---- */
+	zios_debug("workload: seq=%u%% rand=%u%% write=%u%% "
+		   "avg_r=%uKB avg_w=%uKB peak_w=%u\n",
+		   seq_ratio, rand_ratio, write_ratio,
+		   avg_read_sz_kb, avg_write_sz_kb,
+		   zd->window_peak_write_pending);
 
 	if (seq_ratio > 70 && write_ratio < 40) {
-		/* Strong sequential read pattern — benchmark / streaming */
 		zd->workload = ZIOS_WORKLOAD_SEQUENTIAL;
 		zd->read_coalesce_limit = 24;
 		zd->normal_params.read_batch_max = 32;
-
-		if (zd->debug_log)
-			pr_debug("zios: -> SEQUENTIAL (read coalesce=%u, rbatch=%u)\n",
-				 zd->read_coalesce_limit,
-				 zd->normal_params.read_batch_max);
-
+		zios_debug("-> SEQUENTIAL (coalesce=%u, rbatch=%u)\n",
+			   zd->read_coalesce_limit,
+			   zd->normal_params.read_batch_max);
 	} else if (rand_ratio > 60 && read_ops > write_ops) {
-		/* Random-read dominated — app launch, UI */
 		zd->workload = ZIOS_WORKLOAD_RANDOM;
 		zd->read_coalesce_limit = 4;
 		zd->normal_params.read_batch_max = 8;
 		zd->normal_params.write_starve_max = 5;
-
-		if (zd->debug_log)
-			pr_debug("zios: -> RANDOM (coalesce=%u, rbatch=%u, starve=%u)\n",
-				 zd->read_coalesce_limit,
-				 zd->normal_params.read_batch_max,
-				 zd->normal_params.write_starve_max);
-
+		zios_debug("-> RANDOM (coalesce=%u, rbatch=%u, starve=%u)\n",
+			   zd->read_coalesce_limit,
+			   zd->normal_params.read_batch_max,
+			   zd->normal_params.write_starve_max);
 	} else if (write_ratio > 55 && total_write_sz > 0) {
-		/* Write-heavy — install, download, file copy */
 		zd->workload = ZIOS_WORKLOAD_WRITE_HEAVY;
 		zd->normal_params.write_batch_max = 32;
 		zd->normal_params.write_starve_max = 2;
 		zd->max_write_pending = 128;
-
-		if (zd->debug_log)
-			pr_debug("zios: -> WRITE_HEAVY (wbatch=%u, starve=%u, maxw=%u)\n",
-				 zd->normal_params.write_batch_max,
-				 zd->normal_params.write_starve_max,
-				 zd->max_write_pending);
-
+		zios_debug("-> WRITE_HEAVY (wbatch=%u, starve=%u, maxw=%u)\n",
+			   zd->normal_params.write_batch_max,
+			   zd->normal_params.write_starve_max,
+			   zd->max_write_pending);
 	} else {
-		/* Mixed — balanced defaults */
 		if (zd->workload != ZIOS_WORKLOAD_BALANCED) {
 			zd->read_coalesce_limit = 8;
 			zd->normal_params.read_batch_max = 16;
 			zd->normal_params.write_batch_max = 16;
 			zd->normal_params.write_starve_max = 3;
 			zd->max_write_pending = 64;
-
-			if (zd->debug_log)
-				pr_debug("zios: -> BALANCED (restored defaults)\n");
+			zios_debug("-> BALANCED (restored defaults)\n");
 		}
 		zd->workload = ZIOS_WORKLOAD_BALANCED;
 	}
@@ -807,6 +853,7 @@ static void zios_exit_sched(struct elevator_queue *e)
 	WARN_ON_ONCE(!list_empty(&zd->async_read_list));
 	WARN_ON_ONCE(!list_empty(&zd->write_list));
 	WARN_ON_ONCE(!list_empty(&zd->writeback_list));
+	WARN_ON_ONCE(!list_empty(&zd->swap_list));
 	WARN_ON_ONCE(!list_empty(&zd->top_app_list));
 
 	kmem_cache_destroy(zd->rq_data_cache);
@@ -841,26 +888,31 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	INIT_LIST_HEAD(&zd->async_read_list);
 	INIT_LIST_HEAD(&zd->write_list);
 	INIT_LIST_HEAD(&zd->writeback_list);
+	INIT_LIST_HEAD(&zd->swap_list);
 	INIT_LIST_HEAD(&zd->top_app_list);
 
-	/* Game mode defaults — read-firehose */
 	zd->game_params.read_batch_max   = 64;
 	zd->game_params.write_batch_max  = 4;
 	zd->game_params.top_app_bias_pct = 80;
 	zd->game_params.write_starve_max = 10;
 
-	/* Normal mode defaults — balanced */
 	zd->normal_params.read_batch_max   = 16;
 	zd->normal_params.write_batch_max  = 16;
 	zd->normal_params.top_app_bias_pct = 50;
 	zd->normal_params.write_starve_max = 3;
 
-	/* Sector coalescing — scan 8 entries for near-sector match */
+	zd->boot_params.read_batch_max   = 24;
+	zd->boot_params.write_batch_max  = 4;
+	zd->boot_params.top_app_bias_pct = 60;
+	zd->boot_params.write_starve_max = 1;
+
+	zd->thermal_params.read_batch_max   = 8;
+	zd->thermal_params.write_batch_max  = 24;
+	zd->thermal_params.top_app_bias_pct = 30;
+	zd->thermal_params.write_starve_max = 10;
+
 	zd->read_coalesce_limit = 8;
-
-	/* Write pressure cap — flush writes when 64 queued */
 	zd->max_write_pending = 64;
-
 	zd->async_depth = q->nr_requests;
 
 	strscpy(zd->top_app_cgroup_name, "top-app",
@@ -870,12 +922,21 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	zd->game_mode = false;
 	zd->last_sector_valid = false;
 	zd->writes_dirty = false;
+
 	zd->nr_writeback = 0;
 	zd->writeback_starve_count = 0;
 	zd->writeback_starve_max = 20;
 	zd->writeback_dirty = false;
 
-	/* Power efficiency */
+	zd->nr_swap = 0;
+	zd->swap_starve_count = 0;
+	zd->swap_starve_max = 30;
+	zd->swap_dirty = false;
+
+	zd->boot_mode = true;
+	zd->boot_duration_ms = 30000;
+	zd->boot_start = jiffies;
+
 	zd->power_efficient = false;
 	zd->auto_power_efficient = true;
 	zd->power_efficient_battery_pct = 15;
@@ -885,7 +946,15 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	zd->power_efficient_params.top_app_bias_pct = 30;
 	zd->power_efficient_params.write_starve_max = 8;
 
-	/* Workload detection */
+	zd->thermal_throttle = false;
+	zd->auto_thermal_throttle = true;
+	zd->thermal_throttle_temp = 55;
+	strscpy(zd->thermal_zone_name, "cpu-thermal",
+		sizeof(zd->thermal_zone_name));
+	zd->last_thermal_check = jiffies;
+
+	zd->boost_rt_prio = true;
+
 	zd->debug_log = false;
 	zd->sample_interval_ms = 500;
 	zd->last_sample = jiffies;
@@ -948,33 +1017,73 @@ ZIOS_RW(normal_write_batch_max,  normal_params.write_batch_max,  1, 256)
 ZIOS_RW(normal_top_app_bias_pct, normal_params.top_app_bias_pct, 0, 100)
 ZIOS_RW(normal_write_starve_max, normal_params.write_starve_max, 1, 100)
 
-ZIOS_RW(power_efficient_read_batch_max,	power_efficient_params.read_batch_max,	1, 256)
-ZIOS_RW(power_efficient_write_batch_max,	power_efficient_params.write_batch_max,	1, 256)
-ZIOS_RW(power_efficient_top_app_bias_pct,	power_efficient_params.top_app_bias_pct,	0, 100)
-ZIOS_RW(power_efficient_write_starve_max,	power_efficient_params.write_starve_max,	1, 100)
+ZIOS_RW(boot_read_batch_max,     boot_params.read_batch_max,     1, 256)
+ZIOS_RW(boot_write_batch_max,    boot_params.write_batch_max,    1, 256)
+ZIOS_RW(boot_top_app_bias_pct,   boot_params.top_app_bias_pct,   0, 100)
+ZIOS_RW(boot_write_starve_max,   boot_params.write_starve_max,   1, 100)
+
+ZIOS_RW(thermal_read_batch_max,     thermal_params.read_batch_max,     1, 256)
+ZIOS_RW(thermal_write_batch_max,    thermal_params.write_batch_max,    1, 256)
+ZIOS_RW(thermal_top_app_bias_pct,   thermal_params.top_app_bias_pct,   0, 100)
+ZIOS_RW(thermal_write_starve_max,   thermal_params.write_starve_max,   1, 100)
+
+ZIOS_RW(power_efficient_read_batch_max,  power_efficient_params.read_batch_max,   1, 256)
+ZIOS_RW(power_efficient_write_batch_max, power_efficient_params.write_batch_max,  1, 256)
+ZIOS_RW(power_efficient_top_app_bias_pct,power_efficient_params.top_app_bias_pct, 0, 100)
+ZIOS_RW(power_efficient_write_starve_max,power_efficient_params.write_starve_max, 1, 100)
 
 ZIOS_RO(game_mode, game_mode)
 ZIOS_RO(nr_sync_reads,  nr_sync_reads)
 ZIOS_RO(nr_async_reads, nr_async_reads)
 ZIOS_RO(nr_writes, nr_writes)
 ZIOS_RO(nr_writeback, nr_writeback)
+ZIOS_RO(nr_swap, nr_swap)
 ZIOS_RO(nr_top_app, nr_top_app)
+ZIOS_RO(boot_mode, boot_mode)
+ZIOS_RO(thermal_throttle, thermal_throttle)
 
 ZIOS_RW(read_coalesce_limit, read_coalesce_limit, 1, 64)
 ZIOS_RW(max_write_pending, max_write_pending, 1, 4096)
 ZIOS_RW(async_depth, async_depth, 1, INT_MAX)
 
 ZIOS_RW(writeback_starve_max, writeback_starve_max, 1, 100)
+ZIOS_RW(swap_starve_max, swap_starve_max, 1, 100)
+
+ZIOS_RW(boot_duration_ms, boot_duration_ms, 1000, 120000)
 
 ZIOS_RW(power_efficient_battery_pct, power_efficient_battery_pct, 1, 100)
+ZIOS_RW(thermal_throttle_temp, thermal_throttle_temp, 30, 100)
 
-/* Version (need a real function since version is a macro constant) */
+/* Thermal zone name (string) */
+static ssize_t zios_thermal_zone_name_show(struct elevator_queue *e, char *page)
+{
+	struct zios_data *zd = e->elevator_data;
+	return sysfs_emit(page, "%s\n", zd->thermal_zone_name);
+}
+
+static ssize_t zios_thermal_zone_name_store(struct elevator_queue *e,
+					    const char *page, size_t count)
+{
+	struct zios_data *zd = e->elevator_data;
+	char buf[64];
+	int ret;
+
+	ret = sscanf(page, "%63s", buf);
+	if (ret != 1)
+		return -EINVAL;
+
+	strscpy(zd->thermal_zone_name, buf,
+		sizeof(zd->thermal_zone_name));
+	return count;
+}
+
+/* Version */
 static ssize_t zios_version_show(struct elevator_queue *e, char *page)
 {
 	return sysfs_emit(page, "%s\n", ZIOS_VERSION);
 }
 
-/* Stats (read-only, atomic64) */
+/* Stats */
 static ssize_t zios_dispatched_reads_show(struct elevator_queue *e, char *page)
 {
 	struct zios_data *zd = e->elevator_data;
@@ -993,7 +1102,7 @@ static ssize_t zios_merged_requests_show(struct elevator_queue *e, char *page)
 	return sysfs_emit(page, "%llu\n", atomic64_read(&zd->merged_requests));
 }
 
-/* Workload profile (read-only) */
+/* Workload profile */
 static ssize_t zios_workload_show(struct elevator_queue *e, char *page)
 {
 	struct zios_data *zd = e->elevator_data;
@@ -1036,12 +1145,10 @@ static ssize_t zios_power_efficient_store(struct elevator_queue *e,
 		return -EINVAL;
 
 	zd->power_efficient = val;
-	if (zd->debug_log)
-		pr_debug("zios: power_efficient set to %d\n", val);
 	return count;
 }
 
-/* Auto power efficiency toggle */
+/* Auto power efficiency */
 static ssize_t zios_auto_power_efficient_show(struct elevator_queue *e, char *page)
 {
 	struct zios_data *zd = e->elevator_data;
@@ -1060,12 +1167,55 @@ static ssize_t zios_auto_power_efficient_store(struct elevator_queue *e,
 		return -EINVAL;
 
 	zd->auto_power_efficient = val;
-	if (zd->debug_log)
-		pr_debug("zios: auto_power_efficient set to %d\n", val);
 	return count;
 }
 
-/* Debug log toggle */
+/* Auto thermal throttle */
+static ssize_t zios_auto_thermal_throttle_show(struct elevator_queue *e, char *page)
+{
+	struct zios_data *zd = e->elevator_data;
+	return sysfs_emit(page, "%d\n", zd->auto_thermal_throttle);
+}
+
+static ssize_t zios_auto_thermal_throttle_store(struct elevator_queue *e,
+						const char *page, size_t count)
+{
+	struct zios_data *zd = e->elevator_data;
+	bool val;
+	int ret;
+
+	ret = kstrtobool(page, &val);
+	if (ret)
+		return -EINVAL;
+
+	zd->auto_thermal_throttle = val;
+	return count;
+}
+
+/* Boost RT/FIFO */
+static ssize_t zios_boost_rt_prio_show(struct elevator_queue *e, char *page)
+{
+	struct zios_data *zd = e->elevator_data;
+	return sysfs_emit(page, "%d\n", zd->boost_rt_prio);
+}
+
+static ssize_t zios_boost_rt_prio_store(struct elevator_queue *e,
+					const char *page, size_t count)
+{
+	struct zios_data *zd = e->elevator_data;
+	bool val;
+	int ret;
+
+	ret = kstrtobool(page, &val);
+	if (ret)
+		return -EINVAL;
+
+	zd->boost_rt_prio = val;
+	return count;
+}
+
+/* Debug log toggle (engineering builds only) */
+#ifdef CONFIG_ZENITH_DEBUG_MSG
 static ssize_t zios_debug_log_show(struct elevator_queue *e, char *page)
 {
 	struct zios_data *zd = e->elevator_data;
@@ -1086,6 +1236,18 @@ static ssize_t zios_debug_log_store(struct elevator_queue *e,
 	zd->debug_log = val;
 	return count;
 }
+#else
+static ssize_t zios_debug_log_show(struct elevator_queue *e, char *page)
+{
+	return sysfs_emit(page, "0\n");
+}
+
+static ssize_t zios_debug_log_store(struct elevator_queue *e,
+				    const char *page, size_t count)
+{
+	return count;
+}
+#endif
 
 /* Top-app cgroup name */
 static ssize_t zios_top_app_cgroup_name_show(struct elevator_queue *e,
@@ -1114,19 +1276,26 @@ static ssize_t zios_top_app_cgroup_name_store(struct elevator_queue *e,
 #define ZIOS_ATTR(name) __ATTR(name, 0644, zios_##name##_show, zios_##name##_store)
 
 static struct elv_fs_entry zios_attrs[] = {
-	/* Game mode params */
 	ZIOS_ATTR(game_read_batch_max),
 	ZIOS_ATTR(game_write_batch_max),
 	ZIOS_ATTR(game_top_app_bias_pct),
 	ZIOS_ATTR(game_write_starve_max),
 
-	/* Normal mode params */
 	ZIOS_ATTR(normal_read_batch_max),
 	ZIOS_ATTR(normal_write_batch_max),
 	ZIOS_ATTR(normal_top_app_bias_pct),
 	ZIOS_ATTR(normal_write_starve_max),
 
-	/* Power efficiency params */
+	ZIOS_ATTR(boot_read_batch_max),
+	ZIOS_ATTR(boot_write_batch_max),
+	ZIOS_ATTR(boot_top_app_bias_pct),
+	ZIOS_ATTR(boot_write_starve_max),
+
+	ZIOS_ATTR(thermal_read_batch_max),
+	ZIOS_ATTR(thermal_write_batch_max),
+	ZIOS_ATTR(thermal_top_app_bias_pct),
+	ZIOS_ATTR(thermal_write_starve_max),
+
 	ZIOS_ATTR(power_efficient),
 	ZIOS_ATTR(auto_power_efficient),
 	ZIOS_ATTR(power_efficient_battery_pct),
@@ -1135,33 +1304,36 @@ static struct elv_fs_entry zios_attrs[] = {
 	ZIOS_ATTR(power_efficient_top_app_bias_pct),
 	ZIOS_ATTR(power_efficient_write_starve_max),
 
-	/* Runtime state */
 	__ATTR(game_mode, 0444, zios_game_mode_show, NULL),
 	__ATTR(nr_sync_reads, 0444, zios_nr_sync_reads_show, NULL),
 	__ATTR(nr_async_reads, 0444, zios_nr_async_reads_show, NULL),
 	__ATTR(nr_writes, 0444, zios_nr_writes_show, NULL),
 	__ATTR(nr_writeback, 0444, zios_nr_writeback_show, NULL),
+	__ATTR(nr_swap, 0444, zios_nr_swap_show, NULL),
 	__ATTR(nr_top_app, 0444, zios_nr_top_app_show, NULL),
+	__ATTR(boot_mode, 0444, zios_boot_mode_show, NULL),
+	__ATTR(thermal_throttle, 0444, zios_thermal_throttle_show, NULL),
 
-	/* Sector coalescing & write pressure */
 	ZIOS_ATTR(read_coalesce_limit),
 	ZIOS_ATTR(max_write_pending),
 	ZIOS_ATTR(writeback_starve_max),
+	ZIOS_ATTR(swap_starve_max),
 
-	/* Workload & debugging */
-	__ATTR(workload, 0444, zios_workload_show, NULL),
-	ZIOS_ATTR(debug_log),
-
-	/* Config */
+	ZIOS_ATTR(boot_duration_ms),
+	ZIOS_ATTR(thermal_throttle_temp),
+	ZIOS_ATTR(thermal_zone_name),
+	ZIOS_ATTR(auto_thermal_throttle),
+	ZIOS_ATTR(boost_rt_prio),
 	ZIOS_ATTR(async_depth),
 	ZIOS_ATTR(top_app_cgroup_name),
 
-	/* Stats */
+	__ATTR(workload, 0444, zios_workload_show, NULL),
+	ZIOS_ATTR(debug_log),
+
 	__ATTR(dispatched_reads, 0444, zios_dispatched_reads_show, NULL),
 	__ATTR(dispatched_writes, 0444, zios_dispatched_writes_show, NULL),
 	__ATTR(merged_requests, 0444, zios_merged_requests_show, NULL),
 
-	/* Info */
 	__ATTR(version, 0444, zios_version_show, NULL),
 
 	__ATTR_NULL
@@ -1211,4 +1383,4 @@ module_exit(zios_exit);
 
 MODULE_AUTHOR("Zenith Kernel");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("ZIOS - Zenith I/O Scheduler, game-aware and top-app-aware");
+MODULE_DESCRIPTION("ZIOS - Zenith I/O Scheduler, game-aware, top-app-aware, boot-optimized, thermal-aware");

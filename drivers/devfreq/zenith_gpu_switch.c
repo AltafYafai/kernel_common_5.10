@@ -4,8 +4,8 @@
  *
  * Watches for zenith game-mode transitions via zenith_is_game_mode_active()
  * and automatically switches the GPU's devfreq governor:
- *   - game mode active  → "performance"
- *   - game mode stopped → "simple_ondemand" (with configurable idle timeout
+ *   - game mode active  -> "performance"
+ *   - game mode stopped -> "simple_ondemand" (with configurable idle timeout
  *     before falling to "powersave")
  *
  * Works with ANY GPU driver (Mali, Adreno, Panfrost, etc.) that registers
@@ -23,11 +23,20 @@
 #include <linux/string.h>
 #include <linux/slab.h>
 
-/***** Tunables *****/
-
+/*
+ * Debug logging gated behind CONFIG_ZENITH_DEBUG_MSG.
+ * Production (community) builds compile these out entirely.
+ */
+#ifdef CONFIG_ZENITH_DEBUG_MSG
 static bool debug_log;
 module_param(debug_log, bool, 0644);
 MODULE_PARM_DESC(debug_log, "Enable verbose dmesg logging (default: false)");
+
+#define gpu_debug(fmt, ...)	pr_debug("zenith_gpu_switch: " fmt, ##__VA_ARGS__)
+#else
+static const bool debug_log = false;
+#define gpu_debug(fmt, ...)	no_printk(KERN_DEBUG "zenith_gpu_switch: " fmt, ##__VA_ARGS__)
+#endif
 
 /***** Tunables *****/
 
@@ -92,7 +101,7 @@ static void gpu_governor_worker(struct work_struct *work)
 
 	df = gpu_resolve_devfreq();
 	if (IS_ERR(df)) {
-		/* GPU not probed yet — retry later */
+		/* GPU not probed yet -- retry later */
 		goto resched;
 	}
 
@@ -116,9 +125,9 @@ static void gpu_governor_worker(struct work_struct *work)
 			dev_name(&df->dev), df->governor_name, target,
 			game_active ? " (game on)" : "");
 		devfreq_set_governor(df, target);
-	} else if (debug_log) {
-		pr_debug("zenith_gpu_switch: %s: already %s (game=%d)\n",
-			 dev_name(&df->dev), target, game_active);
+	} else {
+		gpu_debug("%s: already %s (game=%d)\n",
+			  dev_name(&df->dev), target, game_active);
 	}
 
 resched:
@@ -133,8 +142,8 @@ static int __init zenith_gpu_switch_init(void)
 	queue_delayed_work(system_unbound_wq, &gpu_governor_work,
 			   msecs_to_jiffies(gpu_check_ms));
 
-	pr_info("zenith_gpu_switch: watching '%s' every %u ms, debug=%d\n",
-		gpu_devfreq_name, gpu_check_ms, debug_log);
+	pr_info("zenith_gpu_switch: watching '%s' every %u ms\n",
+		gpu_devfreq_name, gpu_check_ms);
 	return 0;
 }
 
