@@ -51,12 +51,14 @@ struct zios_data {
 	struct list_head	sync_read_list;
 	struct list_head	async_read_list;
 	struct list_head	write_list;
+	struct list_head	writeback_list;
 	struct list_head	top_app_list;
 
 	/* Counters */
 	unsigned int		nr_sync_reads;
 	unsigned int		nr_async_reads;
 	unsigned int		nr_writes;
+	unsigned int		nr_writeback;
 	unsigned int		nr_top_app;
 
 	/* Stats (for diagnostics) */
@@ -71,6 +73,9 @@ struct zios_data {
 	/* Dispatch accounting */
 	unsigned int		dispensed;
 	unsigned int		write_starve_count; /* nr of read dispatches while writes pending */
+	unsigned int		writeback_starve_count; /* nr of dispatches while writeback pending */
+	unsigned int		writeback_starve_max; /* starve limit before flushing writeback */
+	bool			writeback_dirty;
 
 	/* Game mode — cached from governor, rechecked every 100ms */
 	bool			game_mode;
@@ -304,6 +309,11 @@ static void zios_insert_request(struct blk_mq_hw_ctx *hctx,
 	} else if (!is_write) {
 		list_add_tail(&rq->queuelist, &zd->async_read_list);
 		zd->nr_async_reads++;
+	} else if (current->flags & PF_SWAPWRITE) {
+		/* Writeback (flusher thread) — lowest priority */
+		list_add_tail(&rq->queuelist, &zd->writeback_list);
+		zd->nr_writeback++;
+		zd->writeback_dirty = true;
 	} else {
 		list_add_tail(&rq->queuelist, &zd->write_list);
 		zd->nr_writes++;
@@ -507,6 +517,35 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		}
 	}
 
+	/*
+	 * ----- Tier 4: Writeback (absolute lowest priority) -----
+	 * Dispatched only when nothing else pending OR starved beyond limit.
+	 */
+	if (zd->nr_writeback > 0) {
+		if (zd->writeback_starve_count >= zd->writeback_starve_max ||
+		    (!zd->nr_sync_reads && !zd->nr_async_reads &&
+		     !zd->nr_writes && !zd->nr_top_app)) {
+
+			if (zd->writeback_dirty && zd->nr_writeback > 1) {
+				list_sort(NULL, &zd->writeback_list,
+					  zios_cmp_write_lba);
+				zd->writeback_dirty = false;
+			}
+
+			rq = list_first_entry_or_null(&zd->writeback_list,
+						      struct request, queuelist);
+			if (rq) {
+				list_del_init(&rq->queuelist);
+				zd->nr_writeback--;
+				zd->writeback_starve_count = 0;
+				goto done;
+			}
+		}
+
+		/* Bump writeback starve count on every dispatch when pending */
+		zd->writeback_starve_count++;
+	}
+
 done:
 	if (rq) {
 		zd->dispensed++;
@@ -580,6 +619,7 @@ static bool zios_has_work(struct blk_mq_hw_ctx *hctx)
 	return !list_empty_careful(&zd->sync_read_list) ||
 	       !list_empty_careful(&zd->async_read_list) ||
 	       !list_empty_careful(&zd->write_list) ||
+	       !list_empty_careful(&zd->writeback_list) ||
 	       !list_empty_careful(&zd->top_app_list);
 }
 
@@ -766,6 +806,7 @@ static void zios_exit_sched(struct elevator_queue *e)
 	WARN_ON_ONCE(!list_empty(&zd->sync_read_list));
 	WARN_ON_ONCE(!list_empty(&zd->async_read_list));
 	WARN_ON_ONCE(!list_empty(&zd->write_list));
+	WARN_ON_ONCE(!list_empty(&zd->writeback_list));
 	WARN_ON_ONCE(!list_empty(&zd->top_app_list));
 
 	kmem_cache_destroy(zd->rq_data_cache);
@@ -799,6 +840,7 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	INIT_LIST_HEAD(&zd->sync_read_list);
 	INIT_LIST_HEAD(&zd->async_read_list);
 	INIT_LIST_HEAD(&zd->write_list);
+	INIT_LIST_HEAD(&zd->writeback_list);
 	INIT_LIST_HEAD(&zd->top_app_list);
 
 	/* Game mode defaults — read-firehose */
@@ -828,6 +870,10 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	zd->game_mode = false;
 	zd->last_sector_valid = false;
 	zd->writes_dirty = false;
+	zd->nr_writeback = 0;
+	zd->writeback_starve_count = 0;
+	zd->writeback_starve_max = 20;
+	zd->writeback_dirty = false;
 
 	/* Power efficiency */
 	zd->power_efficient = false;
@@ -911,11 +957,14 @@ ZIOS_RO(game_mode, game_mode)
 ZIOS_RO(nr_sync_reads,  nr_sync_reads)
 ZIOS_RO(nr_async_reads, nr_async_reads)
 ZIOS_RO(nr_writes, nr_writes)
+ZIOS_RO(nr_writeback, nr_writeback)
 ZIOS_RO(nr_top_app, nr_top_app)
 
 ZIOS_RW(read_coalesce_limit, read_coalesce_limit, 1, 64)
 ZIOS_RW(max_write_pending, max_write_pending, 1, 4096)
 ZIOS_RW(async_depth, async_depth, 1, INT_MAX)
+
+ZIOS_RW(writeback_starve_max, writeback_starve_max, 1, 100)
 
 ZIOS_RW(power_efficient_battery_pct, power_efficient_battery_pct, 1, 100)
 
@@ -1091,11 +1140,13 @@ static struct elv_fs_entry zios_attrs[] = {
 	__ATTR(nr_sync_reads, 0444, zios_nr_sync_reads_show, NULL),
 	__ATTR(nr_async_reads, 0444, zios_nr_async_reads_show, NULL),
 	__ATTR(nr_writes, 0444, zios_nr_writes_show, NULL),
+	__ATTR(nr_writeback, 0444, zios_nr_writeback_show, NULL),
 	__ATTR(nr_top_app, 0444, zios_nr_top_app_show, NULL),
 
 	/* Sector coalescing & write pressure */
 	ZIOS_ATTR(read_coalesce_limit),
 	ZIOS_ATTR(max_write_pending),
+	ZIOS_ATTR(writeback_starve_max),
 
 	/* Workload & debugging */
 	__ATTR(workload, 0444, zios_workload_show, NULL),
