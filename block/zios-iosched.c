@@ -146,6 +146,8 @@ struct zios_data {
 
 	/* Latency-sensitive process tracking */
 	bool			boost_rt_prio;
+	bool			priority_inheritance;
+	unsigned long		last_top_app_jiffies;
 
 	/* Workload detection */
 	bool			debug_log;
@@ -309,6 +311,19 @@ static void zios_insert_request(struct blk_mq_hw_ctx *hctx,
 	if (!is_top_app && zd->boost_rt_prio) {
 		if (rt_task(current))
 			is_top_app = true;
+	}
+
+	/*
+	 * Priority inheritance heuristic: if a top-app request was dispatched
+	 * recently (within 50ms), boost I/O from other processes too.
+	 * This catches helper threads doing I/O on behalf of the foreground app
+	 * (content providers, binder threads, etc.).
+	 */
+	if (!is_top_app && zd->priority_inheritance &&
+	    zd->last_top_app_jiffies &&
+	    time_before(jiffies, zd->last_top_app_jiffies +
+			msecs_to_jiffies(50))) {
+		is_top_app = true;
 	}
 
 	if (at_head) {
@@ -501,6 +516,9 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 
 			if (zd->nr_writes > 0)
 				zd->write_starve_count++;
+
+			/* Track for priority inheritance */
+			zd->last_top_app_jiffies = jiffies;
 
 			goto done;
 		}
@@ -799,18 +817,24 @@ static void zios_analyze_workload(struct zios_data *zd)
 		zd->workload = ZIOS_WORKLOAD_SEQUENTIAL;
 		zd->read_coalesce_limit = 24;
 		zd->normal_params.read_batch_max = 32;
-		zios_debug("-> SEQUENTIAL (coalesce=%u, rbatch=%u)\n",
+		/* Increase read-ahead for sequential throughput */
+		zd->queue->backing_dev_info->ra_pages = 256 >> (PAGE_SHIFT - 10);
+		zios_debug("-> SEQUENTIAL (coalesce=%u, rbatch=%u, ra=%luKB)\n",
 			   zd->read_coalesce_limit,
-			   zd->normal_params.read_batch_max);
+			   zd->normal_params.read_batch_max,
+			   zd->queue->backing_dev_info->ra_pages << (PAGE_SHIFT - 10));
 	} else if (rand_ratio > 60 && read_ops > write_ops) {
 		zd->workload = ZIOS_WORKLOAD_RANDOM;
 		zd->read_coalesce_limit = 4;
 		zd->normal_params.read_batch_max = 8;
 		zd->normal_params.write_starve_max = 5;
-		zios_debug("-> RANDOM (coalesce=%u, rbatch=%u, starve=%u)\n",
+		/* Decrease read-ahead for random I/O (save memory/cache) */
+		zd->queue->backing_dev_info->ra_pages = 32 >> (PAGE_SHIFT - 10);
+		zios_debug("-> RANDOM (coalesce=%u, rbatch=%u, starve=%u, ra=%luKB)\n",
 			   zd->read_coalesce_limit,
 			   zd->normal_params.read_batch_max,
-			   zd->normal_params.write_starve_max);
+			   zd->normal_params.write_starve_max,
+			   zd->queue->backing_dev_info->ra_pages << (PAGE_SHIFT - 10));
 	} else if (write_ratio > 55 && total_write_sz > 0) {
 		zd->workload = ZIOS_WORKLOAD_WRITE_HEAVY;
 		zd->normal_params.write_batch_max = 32;
@@ -827,7 +851,10 @@ static void zios_analyze_workload(struct zios_data *zd)
 			zd->normal_params.write_batch_max = 16;
 			zd->normal_params.write_starve_max = 3;
 			zd->max_write_pending = 64;
-			zios_debug("-> BALANCED (restored defaults)\n");
+			/* Restore default read-ahead */
+			zd->queue->backing_dev_info->ra_pages = 128 >> (PAGE_SHIFT - 10);
+			zios_debug("-> BALANCED (restored defaults, ra=%luKB)\n",
+				   zd->queue->backing_dev_info->ra_pages << (PAGE_SHIFT - 10));
 		}
 		zd->workload = ZIOS_WORKLOAD_BALANCED;
 	}
@@ -954,6 +981,8 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	zd->last_thermal_check = jiffies;
 
 	zd->boost_rt_prio = false;
+	zd->priority_inheritance = true;
+	zd->last_top_app_jiffies = 0;
 
 	zd->debug_log = false;
 	zd->sample_interval_ms = 500;
@@ -1190,6 +1219,50 @@ static ssize_t zios_auto_thermal_throttle_store(struct elevator_queue *e,
 
 	zd->auto_thermal_throttle = val;
 	return count;
+}	/* Priority inheritance toggle */
+static ssize_t zios_priority_inheritance_show(struct elevator_queue *e, char *page)
+{
+	struct zios_data *zd = e->elevator_data;
+	return sysfs_emit(page, "%d\n", zd->priority_inheritance);
+}
+
+static ssize_t zios_priority_inheritance_store(struct elevator_queue *e,
+						const char *page, size_t count)
+{
+	struct zios_data *zd = e->elevator_data;
+	bool val;
+	int ret;
+
+	ret = kstrtobool(page, &val);
+	if (ret)
+		return -EINVAL;
+
+	zd->priority_inheritance = val;
+	return count;
+}
+
+/* Read-ahead KB (shows/sets the backing_dev_info ra_pages, rounded) */
+static ssize_t zios_read_ahead_kb_show(struct elevator_queue *e, char *page)
+{
+	struct zios_data *zd = e->elevator_data;
+	unsigned long ra_kb = zd->queue->backing_dev_info->ra_pages <<
+				(PAGE_SHIFT - 10);
+	return sysfs_emit(page, "%lu\n", ra_kb);
+}
+
+static ssize_t zios_read_ahead_kb_store(struct elevator_queue *e,
+					 const char *page, size_t count)
+{
+	struct zios_data *zd = e->elevator_data;
+	unsigned long ra_kb;
+	int ret;
+
+	ret = kstrtoul(page, 10, &ra_kb);
+	if (ret || ra_kb > 4096)
+		return -EINVAL;
+
+	zd->queue->backing_dev_info->ra_pages = ra_kb >> (PAGE_SHIFT - 10);
+	return count;
 }
 
 /* Boost RT/FIFO */
@@ -1324,6 +1397,8 @@ static struct elv_fs_entry zios_attrs[] = {
 	ZIOS_ATTR(thermal_zone_name),
 	ZIOS_ATTR(auto_thermal_throttle),
 	ZIOS_ATTR(boost_rt_prio),
+	ZIOS_ATTR(priority_inheritance),
+	ZIOS_ATTR(read_ahead_kb),
 	ZIOS_ATTR(async_depth),
 	ZIOS_ATTR(top_app_cgroup_name),
 
