@@ -307,8 +307,8 @@ static void zios_insert_request(struct blk_mq_hw_ctx *hctx,
 	/* Check top-app cgroup */
 	is_top_app = task_in_cgroup_named(current, zd->top_app_cgroup_name);
 
-	/* Also boost RT/FIFO tasks if enabled */
-	if (!is_top_app && zd->boost_rt_prio) {
+	/* Also boost RT/FIFO tasks if enabled (skip during boot to avoid I/O deadlocks) */
+	if (!is_top_app && zd->boost_rt_prio && !zd->boot_mode) {
 		if (rt_task(current))
 			is_top_app = true;
 	}
@@ -980,7 +980,7 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 		sizeof(zd->thermal_zone_name));
 	zd->last_thermal_check = jiffies;
 
-	zd->boost_rt_prio = false;
+	zd->boost_rt_prio = true;
 	zd->priority_inheritance = true;
 	zd->last_top_app_jiffies = 0;
 
