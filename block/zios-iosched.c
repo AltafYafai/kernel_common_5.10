@@ -27,6 +27,7 @@
 #include <linux/sched.h>
 #include <linux/cgroup.h>
 #include <linux/cpufreq_zenith.h>
+#include <linux/power_supply.h>
 #include <linux/list_sort.h>
 
 #include "blk.h"
@@ -103,6 +104,18 @@ struct zios_data {
 
 	struct request_queue	*queue;
 	spinlock_t		lock;
+
+	/* ---------- Power efficiency ---------- */
+	bool			power_efficient;
+	bool			auto_power_efficient;
+	unsigned int		power_efficient_battery_pct;
+	unsigned long		last_power_check;
+	struct {
+		unsigned int	read_batch_max;
+		unsigned int	write_batch_max;
+		unsigned int	top_app_bias_pct;
+		unsigned int	write_starve_max;
+	} power_efficient_params;
 
 	/* ---------- Workload detection ---------- */
 
@@ -314,6 +327,52 @@ static void zios_insert_requests(struct blk_mq_hw_ctx *hctx,
 	spin_unlock(&zd->lock);
 }
 
+/* ---------- power efficiency helpers ---------- */
+
+/*
+ * Check battery level and update power_efficient flag.
+ * Called from dispatch context, throttled to every 60 seconds.
+ */
+static void zios_check_battery(struct zios_data *zd)
+{
+	struct power_supply *psy;
+	union power_supply_propval val;
+	int ret;
+
+	if (time_before(jiffies, zd->last_power_check + 60 * HZ))
+		return;
+	zd->last_power_check = jiffies;
+
+	psy = power_supply_get_by_name("battery");
+	if (IS_ERR_OR_NULL(psy))
+		return;
+
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val);
+	if (ret == 0) {
+		bool low = val.intval <= (int)zd->power_efficient_battery_pct;
+		bool on_ac;
+
+		on_ac = power_supply_is_system_supplied() > 0;
+
+		if (!on_ac && low && !zd->power_efficient) {
+			zd->power_efficient = true;
+			if (zd->debug_log)
+				pr_debug("zios: battery %d%% <= %u%% -> power efficient ON\n",
+					 val.intval, zd->power_efficient_battery_pct);
+		} else if ((on_ac || !low) && zd->power_efficient) {
+			zd->power_efficient = false;
+			if (zd->debug_log)
+				pr_debug("zios: battery %d%% > %u%% or AC -> power efficient OFF\n",
+					 val.intval, zd->power_efficient_battery_pct);
+		}
+	} else if (zd->power_efficient) {
+		/* Can't read battery — disable auto mode */
+		zd->power_efficient = false;
+	}
+
+	power_supply_put(psy);
+}
+
 /* ---------- dispatch ---------- */
 
 static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
@@ -324,8 +383,6 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	unsigned int rbatch, wbatch, bias_pct, starve_max;
 	unsigned int coalesce;
 
-	spin_lock(&zd->lock);
-
 	/* Refresh game mode every 100 ms */
 	if (time_after(jiffies, zd->last_game_check + HZ / 10)) {
 		zd->game_mode = zenith_is_game_mode_active();
@@ -333,18 +390,36 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	}
 	game_mode = zd->game_mode;
 
+	/*
+	 * Check battery before taking spinlock — power supply API may sleep.
+	 * Auto-detection is throttled to every 60 seconds.
+	 */
+	if (zd->auto_power_efficient &&
+	    time_after(jiffies, zd->last_power_check + 60 * HZ))
+		zios_check_battery(zd);
+
+	spin_lock(&zd->lock);
+
 	if (game_mode) {
 		rbatch    = zd->game_params.read_batch_max;
 		wbatch    = zd->game_params.write_batch_max;
 		bias_pct  = zd->game_params.top_app_bias_pct;
 		starve_max = zd->game_params.write_starve_max;
+	} else if (zd->power_efficient) {
+		/* Power-efficient mode: conservative settings to save battery */
+		rbatch    = zd->power_efficient_params.read_batch_max;
+		wbatch    = zd->power_efficient_params.write_batch_max;
+		bias_pct  = zd->power_efficient_params.top_app_bias_pct;
+		starve_max = zd->power_efficient_params.write_starve_max;
 	} else {
 		rbatch    = zd->normal_params.read_batch_max;
 		wbatch    = zd->normal_params.write_batch_max;
 		bias_pct  = zd->normal_params.top_app_bias_pct;
 		starve_max = zd->normal_params.write_starve_max;
 	}
-	coalesce = zd->read_coalesce_limit;
+	coalesce = zd->power_efficient ?
+		min(zd->read_coalesce_limit, 4u) :
+		zd->read_coalesce_limit;
 
 	/* ----- Tier 0: Top-app priority ----- */
 	if (zd->nr_top_app > 0) {
@@ -511,11 +586,17 @@ static bool zios_has_work(struct blk_mq_hw_ctx *hctx)
 static void zios_limit_depth(unsigned int op, struct blk_mq_alloc_data *data)
 {
 	struct zios_data *zd = data->q->elevator->elevator_data;
+	unsigned int depth;
 
 	if (op_is_sync(op) && !op_is_write(op))
 		return;
 
-	data->shallow_depth = zios_to_word_depth(data->hctx, zd->async_depth);
+	/* When battery-saving, cap queue depth to reduce I/O concurrency */
+	depth = zd->async_depth;
+	if (zd->power_efficient)
+		depth = min(depth, zd->async_depth / 2);
+
+	data->shallow_depth = zios_to_word_depth(data->hctx, depth);
 }
 
 static void zios_depth_updated(struct blk_mq_hw_ctx *hctx)
@@ -748,6 +829,16 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	zd->last_sector_valid = false;
 	zd->writes_dirty = false;
 
+	/* Power efficiency */
+	zd->power_efficient = false;
+	zd->auto_power_efficient = true;
+	zd->power_efficient_battery_pct = 15;
+	zd->last_power_check = jiffies;
+	zd->power_efficient_params.read_batch_max   = 8;
+	zd->power_efficient_params.write_batch_max  = 24;
+	zd->power_efficient_params.top_app_bias_pct = 30;
+	zd->power_efficient_params.write_starve_max = 8;
+
 	/* Workload detection */
 	zd->debug_log = false;
 	zd->sample_interval_ms = 500;
@@ -811,6 +902,11 @@ ZIOS_RW(normal_write_batch_max,  normal_params.write_batch_max,  1, 256)
 ZIOS_RW(normal_top_app_bias_pct, normal_params.top_app_bias_pct, 0, 100)
 ZIOS_RW(normal_write_starve_max, normal_params.write_starve_max, 1, 100)
 
+ZIOS_RW(power_efficient_read_batch_max,	power_efficient_params.read_batch_max,	1, 256)
+ZIOS_RW(power_efficient_write_batch_max,	power_efficient_params.write_batch_max,	1, 256)
+ZIOS_RW(power_efficient_top_app_bias_pct,	power_efficient_params.top_app_bias_pct,	0, 100)
+ZIOS_RW(power_efficient_write_starve_max,	power_efficient_params.write_starve_max,	1, 100)
+
 ZIOS_RO(game_mode, game_mode)
 ZIOS_RO(nr_sync_reads,  nr_sync_reads)
 ZIOS_RO(nr_async_reads, nr_async_reads)
@@ -820,6 +916,8 @@ ZIOS_RO(nr_top_app, nr_top_app)
 ZIOS_RW(read_coalesce_limit, read_coalesce_limit, 1, 64)
 ZIOS_RW(max_write_pending, max_write_pending, 1, 4096)
 ZIOS_RW(async_depth, async_depth, 1, INT_MAX)
+
+ZIOS_RW(power_efficient_battery_pct, power_efficient_battery_pct, 1, 100)
 
 /* Version (need a real function since version is a macro constant) */
 static ssize_t zios_version_show(struct elevator_queue *e, char *page)
@@ -868,6 +966,54 @@ static ssize_t zios_workload_show(struct elevator_queue *e, char *page)
 	}
 
 	return sysfs_emit(page, "%s\n", profile);
+}
+
+/* Power efficiency toggle */
+static ssize_t zios_power_efficient_show(struct elevator_queue *e, char *page)
+{
+	struct zios_data *zd = e->elevator_data;
+	return sysfs_emit(page, "%d\n", zd->power_efficient);
+}
+
+static ssize_t zios_power_efficient_store(struct elevator_queue *e,
+					  const char *page, size_t count)
+{
+	struct zios_data *zd = e->elevator_data;
+	bool val;
+	int ret;
+
+	ret = kstrtobool(page, &val);
+	if (ret)
+		return -EINVAL;
+
+	zd->power_efficient = val;
+	if (zd->debug_log)
+		pr_debug("zios: power_efficient set to %d\n", val);
+	return count;
+}
+
+/* Auto power efficiency toggle */
+static ssize_t zios_auto_power_efficient_show(struct elevator_queue *e, char *page)
+{
+	struct zios_data *zd = e->elevator_data;
+	return sysfs_emit(page, "%d\n", zd->auto_power_efficient);
+}
+
+static ssize_t zios_auto_power_efficient_store(struct elevator_queue *e,
+					       const char *page, size_t count)
+{
+	struct zios_data *zd = e->elevator_data;
+	bool val;
+	int ret;
+
+	ret = kstrtobool(page, &val);
+	if (ret)
+		return -EINVAL;
+
+	zd->auto_power_efficient = val;
+	if (zd->debug_log)
+		pr_debug("zios: auto_power_efficient set to %d\n", val);
+	return count;
 }
 
 /* Debug log toggle */
@@ -930,6 +1076,15 @@ static struct elv_fs_entry zios_attrs[] = {
 	ZIOS_ATTR(normal_write_batch_max),
 	ZIOS_ATTR(normal_top_app_bias_pct),
 	ZIOS_ATTR(normal_write_starve_max),
+
+	/* Power efficiency params */
+	ZIOS_ATTR(power_efficient),
+	ZIOS_ATTR(auto_power_efficient),
+	ZIOS_ATTR(power_efficient_battery_pct),
+	ZIOS_ATTR(power_efficient_read_batch_max),
+	ZIOS_ATTR(power_efficient_write_batch_max),
+	ZIOS_ATTR(power_efficient_top_app_bias_pct),
+	ZIOS_ATTR(power_efficient_write_starve_max),
 
 	/* Runtime state */
 	__ATTR(game_mode, 0444, zios_game_mode_show, NULL),
