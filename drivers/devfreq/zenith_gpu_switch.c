@@ -27,12 +27,18 @@
 
 /*
  * Exported VM tunables we adjust during game mode:
- *   vm_dirty_ratio          — max dirty page % before throttling writers
- *   dirty_background_ratio  — % at which background writeback starts
- *   sysctl_vfs_cache_pressure — how aggressively inode/dentry cache is reclaimed
+ *   vm_dirty_ratio              — max dirty page % before throttling writers
+ *   dirty_background_ratio      — % at which background writeback starts
+ *   dirty_writeback_interval    — periodic flusher wakeup interval (cs)
+ *   dirty_expire_interval       — max age of dirty pages before writeback (cs)
+ *   min_free_kbytes             — reserved free page pool size
+ *   sysctl_vfs_cache_pressure   — how aggressively inode/dentry cache is reclaimed
  */
 extern int vm_dirty_ratio;
 extern int dirty_background_ratio;
+extern unsigned int dirty_writeback_interval;
+extern unsigned int dirty_expire_interval;
+extern int min_free_kbytes;
 
 /*
  * Debug logging gated behind CONFIG_ZENITH_DEBUG_MSG.
@@ -90,6 +96,9 @@ MODULE_PARM_DESC(gpu_idle_ms,
 static int saved_dirty_ratio;
 static int saved_dirty_bg_ratio;
 static int saved_vfs_cache_pressure;
+static unsigned int saved_dirty_writeback_interval;
+static unsigned int saved_dirty_expire_interval;
+static int saved_min_free_kbytes;
 static bool game_tuning_active;
 
 /*
@@ -97,13 +106,18 @@ static bool game_tuning_active;
  * so that:
  *   - Writeback starts earlier and stays gentler  (smaller bursts)
  *   - File-backed pages (game assets) are evicted less aggressively
+ *   - Dirty pages are flushed sooner to avoid a post-game fsync storm
+ *   - More free memory is reserved for atomic allocations
  *
- * The normal defaults are dirty_ratio=20, dirty_bg=10, vfs_cache=100.
+ * The normal defaults are dirty_ratio=20, dirty_bg=10, dirty_wb=1500cs,
+ * dirty_expire=3000cs, min_free=~8-16MB, vfs_cache=100.
  * User-modified values are saved on game-enter and restored on game-exit.
  */
 #define GAME_DIRTY_RATIO               10
 #define GAME_DIRTY_BG_RATIO             5
 #define GAME_VFS_CACHE_PRESSURE        50
+#define GAME_DIRTY_WB_INTERVAL       300  /* 3 seconds in cs */
+#define GAME_DIRTY_EXPIRE_INTERVAL   500  /* 5 seconds in cs */
 
 /***** Internal state *****/
 
@@ -156,30 +170,45 @@ static void gpu_governor_worker(struct work_struct *work)
 		saved_dirty_ratio = vm_dirty_ratio;
 		saved_dirty_bg_ratio = dirty_background_ratio;
 		saved_vfs_cache_pressure = sysctl_vfs_cache_pressure;
+		saved_dirty_writeback_interval = dirty_writeback_interval;
+		saved_dirty_expire_interval = dirty_expire_interval;
+		saved_min_free_kbytes = min_free_kbytes;
 
 		/* Apply game-mode values */
 		vm_dirty_ratio = GAME_DIRTY_RATIO;
 		dirty_background_ratio = GAME_DIRTY_BG_RATIO;
 		sysctl_vfs_cache_pressure = GAME_VFS_CACHE_PRESSURE;
+		dirty_writeback_interval = GAME_DIRTY_WB_INTERVAL;
+		dirty_expire_interval = GAME_DIRTY_EXPIRE_INTERVAL;
+		min_free_kbytes += 5120;  /* reserve 5 MB more */
 
 		game_tuning_active = true;
 
 		gpu_debug("game mode mem tuning ON "
-			 "(dirty_ratio=%d, dirty_bg=%d, vfs_cache=%d)\n",
+			 "(dirty_ratio=%d, dirty_bg=%d, vfs_cache=%d, "
+			 "wb=%ucs, expire=%ucs, min_free=%d)\n",
 			 vm_dirty_ratio, dirty_background_ratio,
-			 sysctl_vfs_cache_pressure);
+			 sysctl_vfs_cache_pressure,
+			 dirty_writeback_interval, dirty_expire_interval,
+			 min_free_kbytes);
 	} else if (!game_active && game_tuning_active) {
 		/* Restore saved values */
 		vm_dirty_ratio = saved_dirty_ratio;
 		dirty_background_ratio = saved_dirty_bg_ratio;
 		sysctl_vfs_cache_pressure = saved_vfs_cache_pressure;
+		dirty_writeback_interval = saved_dirty_writeback_interval;
+		dirty_expire_interval = saved_dirty_expire_interval;
+		min_free_kbytes = saved_min_free_kbytes;
 
 		game_tuning_active = false;
 
 		gpu_debug("game mode mem tuning OFF "
-			 "(dirty_ratio=%d, dirty_bg=%d, vfs_cache=%d)\n",
+			 "(dirty_ratio=%d, dirty_bg=%d, vfs_cache=%d, "
+			 "wb=%ucs, expire=%ucs, min_free=%d)\n",
 			 vm_dirty_ratio, dirty_background_ratio,
-			 sysctl_vfs_cache_pressure);
+			 sysctl_vfs_cache_pressure,
+			 dirty_writeback_interval, dirty_expire_interval,
+			 min_free_kbytes);
 	}
 
 	gpu_prev_game_active = game_active;

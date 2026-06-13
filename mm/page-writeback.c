@@ -127,6 +127,7 @@ EXPORT_SYMBOL_GPL(dirty_writeback_interval);
  * wakeup can collect them, defeating the point of the longer interval.
  */
 unsigned int dirty_expire_interval = 30 * 100; /* centiseconds */
+EXPORT_SYMBOL_GPL(dirty_expire_interval);
 
 /*
  * Flag that makes the machine dump writes/reads and block dirtyings.
