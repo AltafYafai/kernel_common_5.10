@@ -25,6 +25,12 @@
 
 /***** Tunables *****/
 
+static bool debug_log;
+module_param(debug_log, bool, 0644);
+MODULE_PARM_DESC(debug_log, "Enable verbose dmesg logging (default: false)");
+
+/***** Tunables *****/
+
 static char gpu_devfreq_name[DEVFREQ_NAME_LEN] = "";
 module_param_string(gpu_devfreq_name, gpu_devfreq_name,
 		    sizeof(gpu_devfreq_name), 0644);
@@ -105,8 +111,15 @@ static void gpu_governor_worker(struct work_struct *work)
 	}
 
 	/* Only switch if the governor actually changed */
-	if (strcmp(df->governor_name, target))
+	if (strcmp(df->governor_name, target)) {
+		pr_info("zenith_gpu_switch: %s: %s -> %s%s\n",
+			dev_name(&df->dev), df->governor_name, target,
+			game_active ? " (game on)" : "");
 		devfreq_set_governor(df, target);
+	} else if (debug_log) {
+		pr_debug("zenith_gpu_switch: %s: already %s (game=%d)\n",
+			 dev_name(&df->dev), target, game_active);
+	}
 
 resched:
 	queue_delayed_work(system_unbound_wq, &gpu_governor_work,
@@ -120,8 +133,8 @@ static int __init zenith_gpu_switch_init(void)
 	queue_delayed_work(system_unbound_wq, &gpu_governor_work,
 			   msecs_to_jiffies(gpu_check_ms));
 
-	pr_info("zenith_gpu_switch: watching '%s' every %u ms\n",
-		gpu_devfreq_name, gpu_check_ms);
+	pr_info("zenith_gpu_switch: watching '%s' every %u ms, debug=%d\n",
+		gpu_devfreq_name, gpu_check_ms, debug_log);
 	return 0;
 }
 

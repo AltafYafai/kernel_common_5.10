@@ -34,7 +34,7 @@
 #include "blk-mq-sched.h"
 #include "blk-mq-debugfs.h"
 
-#define ZIOS_VERSION "1.1.0"
+#define ZIOS_VERSION "1.2.0"
 
 /* Per-request scheduler data */
 struct zios_rq_data {
@@ -103,6 +103,38 @@ struct zios_data {
 
 	struct request_queue	*queue;
 	spinlock_t		lock;
+
+	/* ---------- Workload detection ---------- */
+
+	/* Debug logging toggle */
+	bool			debug_log;
+
+	/* Sampling interval (ms) */
+	unsigned int		sample_interval_ms;
+	unsigned long		last_sample;
+
+	/* I/O size tracking in current window */
+	u64			window_read_sectors;
+	u64			window_write_sectors;
+	u64			window_read_ops;
+	u64			window_write_ops;
+
+	/* Sequential vs random detection — compare each dispatch to last */
+	sector_t		last_dispatch_sector;
+	bool			last_dispatch_valid;
+	u64			window_seq_ops;
+	u64			window_rand_ops;
+
+	/* Write pressure in current window */
+	unsigned int		window_peak_write_pending;
+
+	/* Current detected workload profile */
+	enum {
+		ZIOS_WORKLOAD_BALANCED	= 0,
+		ZIOS_WORKLOAD_SEQUENTIAL,
+		ZIOS_WORKLOAD_RANDOM,
+		ZIOS_WORKLOAD_WRITE_HEAVY,
+	} workload;
 };
 
 static int zios_to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth)
@@ -213,6 +245,9 @@ static void zios_finish_request(struct request *rq)
 		kmem_cache_free(zd->rq_data_cache, rd);
 	}
 }
+
+/* Forward declaration for workload analysis */
+static void zios_analyze_workload(struct zios_data *zd);
 
 /* ---------- insert / classify ---------- */
 
@@ -408,10 +443,48 @@ done:
 		zd->last_sector_valid = true;
 
 		/* Update stats */
-		if (op_is_write(req_op(rq)))
+		if (op_is_write(req_op(rq))) {
 			atomic64_inc(&zd->dispatched_writes);
-		else
+
+			/* Workload: track write I/O size */
+			zd->window_write_sectors += blk_rq_sectors(rq);
+			zd->window_write_ops++;
+		} else {
 			atomic64_inc(&zd->dispatched_reads);
+
+			/* Workload: track read I/O size */
+			zd->window_read_sectors += blk_rq_sectors(rq);
+			zd->window_read_ops++;
+		}
+
+		/* Workload: sequential vs random detection */
+		if (zd->last_dispatch_valid) {
+			sector_t pos = blk_rq_pos(rq);
+			sector_t last = zd->last_dispatch_sector;
+			sector_t delta = (pos > last) ? (pos - last) : (last - pos);
+
+			if (delta <= 32) /* within 16KB = sequential */
+				zd->window_seq_ops++;
+			else
+				zd->window_rand_ops++;
+		}
+		zd->last_dispatch_sector = blk_rq_pos(rq) + blk_rq_sectors(rq);
+		zd->last_dispatch_valid = true;
+
+		/* Workload: peak write pressure */
+		if (zd->nr_writes > zd->window_peak_write_pending)
+			zd->window_peak_write_pending = zd->nr_writes;
+
+		/*
+		 * Sample workload periodically.
+		 * Skip during game mode — game_params already tune for gaming.
+		 */
+		if (!zd->game_mode &&
+		    time_after(jiffies, zd->last_sample +
+			       msecs_to_jiffies(zd->sample_interval_ms))) {
+			zios_analyze_workload(zd);
+			zd->last_sample = jiffies;
+		}
 
 		blk_req_zone_write_lock(rq);
 		rq->rq_flags |= RQF_STARTED;
@@ -499,6 +572,110 @@ static void zios_completed_request(struct request *rq, u64 now)
 {
 }
 
+/* ---------- workload analysis ---------- */
+
+/*
+ * zios_analyze_workload - analyze recent I/O patterns and tune params.
+ * Called periodically from dispatch context holding zd->lock.
+ */
+static void zios_analyze_workload(struct zios_data *zd)
+{
+	u64 total_read_sz, total_write_sz;
+	u64 total_ops, read_ops, write_ops;
+	unsigned int seq_ratio, rand_ratio;
+	unsigned int write_ratio;
+	unsigned int avg_read_sz_kb, avg_write_sz_kb;
+
+	total_read_sz  = zd->window_read_sectors;
+	total_write_sz = zd->window_write_sectors;
+	read_ops  = zd->window_read_ops;
+	write_ops = zd->window_write_ops;
+	total_ops = read_ops + write_ops;
+
+	if (total_ops < 8) {
+		/* Not enough data — keep previous profile */
+		goto reset_window;
+	}
+
+	seq_ratio  = zd->window_seq_ops * 100 / total_ops;
+	rand_ratio = zd->window_rand_ops * 100 / total_ops;
+	write_ratio = write_ops * 100 / total_ops;
+
+	avg_read_sz_kb  = read_ops  ? (total_read_sz  * 512 / 1024 / read_ops)  : 0;
+	avg_write_sz_kb = write_ops ? (total_write_sz * 512 / 1024 / write_ops) : 0;
+
+	if (zd->debug_log)
+		pr_debug("zios: workload: seq=%u%% rand=%u%% write=%u%% "
+			 "avg_r=%uKB avg_w=%uKB peak_w=%u\n",
+			 seq_ratio, rand_ratio, write_ratio,
+			 avg_read_sz_kb, avg_write_sz_kb,
+			 zd->window_peak_write_pending);
+
+	/* ---- heuristics ---- */
+
+	if (seq_ratio > 70 && write_ratio < 40) {
+		/* Strong sequential read pattern — benchmark / streaming */
+		zd->workload = ZIOS_WORKLOAD_SEQUENTIAL;
+		zd->read_coalesce_limit = 24;
+		zd->normal_params.read_batch_max = 32;
+
+		if (zd->debug_log)
+			pr_debug("zios: -> SEQUENTIAL (read coalesce=%u, rbatch=%u)\n",
+				 zd->read_coalesce_limit,
+				 zd->normal_params.read_batch_max);
+
+	} else if (rand_ratio > 60 && read_ops > write_ops) {
+		/* Random-read dominated — app launch, UI */
+		zd->workload = ZIOS_WORKLOAD_RANDOM;
+		zd->read_coalesce_limit = 4;
+		zd->normal_params.read_batch_max = 8;
+		zd->normal_params.write_starve_max = 5;
+
+		if (zd->debug_log)
+			pr_debug("zios: -> RANDOM (coalesce=%u, rbatch=%u, starve=%u)\n",
+				 zd->read_coalesce_limit,
+				 zd->normal_params.read_batch_max,
+				 zd->normal_params.write_starve_max);
+
+	} else if (write_ratio > 55 && total_write_sz > 0) {
+		/* Write-heavy — install, download, file copy */
+		zd->workload = ZIOS_WORKLOAD_WRITE_HEAVY;
+		zd->normal_params.write_batch_max = 32;
+		zd->normal_params.write_starve_max = 2;
+		zd->max_write_pending = 128;
+
+		if (zd->debug_log)
+			pr_debug("zios: -> WRITE_HEAVY (wbatch=%u, starve=%u, maxw=%u)\n",
+				 zd->normal_params.write_batch_max,
+				 zd->normal_params.write_starve_max,
+				 zd->max_write_pending);
+
+	} else {
+		/* Mixed — balanced defaults */
+		if (zd->workload != ZIOS_WORKLOAD_BALANCED) {
+			zd->read_coalesce_limit = 8;
+			zd->normal_params.read_batch_max = 16;
+			zd->normal_params.write_batch_max = 16;
+			zd->normal_params.write_starve_max = 3;
+			zd->max_write_pending = 64;
+
+			if (zd->debug_log)
+				pr_debug("zios: -> BALANCED (restored defaults)\n");
+		}
+		zd->workload = ZIOS_WORKLOAD_BALANCED;
+	}
+
+reset_window:
+	zd->window_read_sectors  = 0;
+	zd->window_write_sectors = 0;
+	zd->window_read_ops      = 0;
+	zd->window_write_ops     = 0;
+	zd->window_seq_ops       = 0;
+	zd->window_rand_ops      = 0;
+	zd->window_peak_write_pending = 0;
+	zd->last_dispatch_valid  = false;
+}
+
 /* ---------- init / exit ---------- */
 
 static void zios_exit_sched(struct elevator_queue *e)
@@ -570,6 +747,21 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	zd->game_mode = false;
 	zd->last_sector_valid = false;
 	zd->writes_dirty = false;
+
+	/* Workload detection */
+	zd->debug_log = false;
+	zd->sample_interval_ms = 500;
+	zd->last_sample = jiffies;
+	zd->window_read_sectors = 0;
+	zd->window_write_sectors = 0;
+	zd->window_read_ops = 0;
+	zd->window_write_ops = 0;
+	zd->window_seq_ops = 0;
+	zd->window_rand_ops = 0;
+	zd->window_peak_write_pending = 0;
+	zd->last_dispatch_sector = 0;
+	zd->last_dispatch_valid = false;
+	zd->workload = ZIOS_WORKLOAD_BALANCED;
 
 	spin_lock_init(&zd->lock);
 	zd->queue = q;
@@ -654,6 +846,52 @@ static ssize_t zios_merged_requests_show(struct elevator_queue *e, char *page)
 	return sysfs_emit(page, "%llu\n", atomic64_read(&zd->merged_requests));
 }
 
+/* Workload profile (read-only) */
+static ssize_t zios_workload_show(struct elevator_queue *e, char *page)
+{
+	struct zios_data *zd = e->elevator_data;
+	const char *profile;
+
+	switch (zd->workload) {
+	case ZIOS_WORKLOAD_SEQUENTIAL:
+		profile = "sequential";
+		break;
+	case ZIOS_WORKLOAD_RANDOM:
+		profile = "random";
+		break;
+	case ZIOS_WORKLOAD_WRITE_HEAVY:
+		profile = "write_heavy";
+		break;
+	default:
+		profile = "balanced";
+		break;
+	}
+
+	return sysfs_emit(page, "%s\n", profile);
+}
+
+/* Debug log toggle */
+static ssize_t zios_debug_log_show(struct elevator_queue *e, char *page)
+{
+	struct zios_data *zd = e->elevator_data;
+	return sysfs_emit(page, "%d\n", zd->debug_log);
+}
+
+static ssize_t zios_debug_log_store(struct elevator_queue *e,
+				    const char *page, size_t count)
+{
+	struct zios_data *zd = e->elevator_data;
+	bool val;
+	int ret;
+
+	ret = kstrtobool(page, &val);
+	if (ret)
+		return -EINVAL;
+
+	zd->debug_log = val;
+	return count;
+}
+
 /* Top-app cgroup name */
 static ssize_t zios_top_app_cgroup_name_show(struct elevator_queue *e,
 					     char *page)
@@ -703,6 +941,10 @@ static struct elv_fs_entry zios_attrs[] = {
 	/* Sector coalescing & write pressure */
 	ZIOS_ATTR(read_coalesce_limit),
 	ZIOS_ATTR(max_write_pending),
+
+	/* Workload & debugging */
+	__ATTR(workload, 0444, zios_workload_show, NULL),
+	ZIOS_ATTR(debug_log),
 
 	/* Config */
 	ZIOS_ATTR(async_depth),
