@@ -2934,6 +2934,24 @@ static void commit_charge(struct page *page, struct mem_cgroup *memcg)
 #define OBJCGS_CLEAR_MASK	(__GFP_DMA | __GFP_RECLAIMABLE | \
 				 __GFP_ACCOUNT | __GFP_NOFAIL)
 
+
+#ifdef CONFIG_LRU_GEN
+/*
+ * Lock the page's memcg for stable page_memcg() during MGLRU
+ * page table walks. Uses RCU to keep the memcg alive.
+ */
+bool mem_cgroup_trylock_pages(struct mem_cgroup *memcg)
+{
+	rcu_read_lock();
+	return true;
+}
+
+void mem_cgroup_unlock_pages(void)
+{
+	rcu_read_unlock();
+}
+#endif
+
 int memcg_alloc_page_obj_cgroups(struct page *page, struct kmem_cache *s,
 				 gfp_t gfp)
 {

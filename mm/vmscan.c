@@ -45,6 +45,7 @@
 #include <linux/memcontrol.h>
 #include <linux/delayacct.h>
 #include <linux/pagewalk.h>
+#include <linux/ctype.h>
 #include <linux/sysctl.h>
 #include <linux/oom.h>
 #include <linux/pagevec.h>
@@ -2559,6 +2560,25 @@ out:
 		nr[lru] = scan;
 	}
 }
+
+#ifdef CONFIG_CMA
+/*
+ * It is waste of effort to scan and reclaim CMA pages if it is not available
+ * for current allocation context. Kswapd can not be enrolled as it can not
+ * distinguish this scenario by using sc->gfp_mask = GFP_KERNEL
+ */
+static bool skip_cma(struct page *page, struct scan_control *sc)
+{
+	return !current_is_kswapd() &&
+			gfp_migratetype(sc->gfp_mask) != MIGRATE_MOVABLE &&
+			get_pageblock_migratetype(page) == MIGRATE_CMA;
+}
+#else
+static bool skip_cma(struct page *page, struct scan_control *sc)
+{
+	return false;
+}
+#endif
 
 static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
 
@@ -6834,7 +6854,7 @@ static void lru_gen_change_state(bool enabled)
 
 	struct mem_cgroup *memcg;
 
-	cgroup_lock();
+	mutex_lock(&cgroup_mutex);
 	cpus_read_lock();
 	get_online_mems();
 	mutex_lock(&state_mutex);
@@ -6880,7 +6900,7 @@ unlock:
 	mutex_unlock(&state_mutex);
 	put_online_mems();
 	cpus_read_unlock();
-	cgroup_unlock();
+	mutex_unlock(&cgroup_mutex);
 }
 
 /******************************************************************************
