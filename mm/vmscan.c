@@ -44,6 +44,7 @@
 #include <linux/freezer.h>
 #include <linux/memcontrol.h>
 #include <linux/delayacct.h>
+#include <linux/pagewalk.h>
 #include <linux/sysctl.h>
 #include <linux/oom.h>
 #include <linux/pagevec.h>
@@ -2803,6 +2804,8 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 
 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, NULL)));
 }
+
+static void prepare_scan_count(pg_data_t *pgdat, struct scan_control *sc);
 
 static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
