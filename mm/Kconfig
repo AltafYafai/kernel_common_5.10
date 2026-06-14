@@ -896,6 +896,34 @@ config ARCH_HAS_HUGEPD
 config MAPPING_DIRTY_HELPERS
         bool
 
+config LRU_GEN
+	bool "Multi-Gen LRU"
+	depends on MMU
+	# MGLRU needs space for 4 generation + 10 refs bits in page->flags
+	depends on 64BIT || !SPARSEMEM || SPARSEMEM_VMEMMAP
+	help
+	  A high-performance LRU implementation that uses multiple generations
+	  to track page access patterns. When enabled, it replaces the
+	  traditional active/inactive LRU for eviction decisions.
+
+	  If unsure, say N.
+
+config LRU_GEN_ENABLED
+	bool "Enable Multi-Gen LRU by default"
+	depends on LRU_GEN
+	default y
+	help
+	  Say Y here to enable MGLRU at boot time, N to enable it
+	  dynamically via /sys/kernel/mm/lru_gen/enabled.
+
+config LRU_GEN_STATS
+	bool "Multi-Gen LRU historical stats"
+	depends on LRU_GEN
+	default n
+	help
+	  Maintain per-generation statistics to profile MGLRU behavior.
+	  Adds some memory overhead and may be useful for debugging.
+
 source "mm/damon/Kconfig"
 
 endmenu

@@ -132,4 +132,154 @@ static __always_inline enum lru_list page_lru(struct page *page)
 	}
 	return lru;
 }
+
+#ifdef CONFIG_LRU_GEN
+
+#ifdef CONFIG_LRU_GEN_ENABLED
+static inline bool lru_gen_enabled(void)
+{
+	DECLARE_STATIC_KEY_TRUE(lru_gen_caps[NR_LRU_GEN_CAPS]);
+	return static_branch_likely(&lru_gen_caps[LRU_GEN_CORE]);
+}
+#else
+static inline bool lru_gen_enabled(void)
+{
+	DECLARE_STATIC_KEY_FALSE(lru_gen_caps[NR_LRU_GEN_CAPS]);
+	return static_branch_unlikely(&lru_gen_caps[LRU_GEN_CORE]);
+}
+#endif
+
+static inline bool lru_gen_in_fault(void)
+{
+	return current->in_lru_fault;
+}
+
+static inline int lru_gen_from_seq(unsigned long seq)
+{
+	return seq % MAX_NR_GENS;
+}
+
+static inline int lru_hist_from_seq(unsigned long seq)
+{
+	return seq % NR_HIST_GENS;
+}
+
+static inline int lru_tier_from_refs(int refs)
+{
+	VM_WARN_ON_ONCE(refs > BIT(LRU_REFS_WIDTH));
+	return order_base_2(refs + 1);
+}
+
+static inline int page_lru_refs(struct page *page)
+{
+	unsigned long flags = READ_ONCE(page->flags);
+	bool workingset = flags & BIT(PG_workingset);
+	return ((flags & LRU_REFS_MASK) >> LRU_REFS_PGOFF) + workingset;
+}
+
+static inline int page_lru_gen(struct page *page)
+{
+	unsigned long flags = READ_ONCE(page->flags);
+	return ((flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
+}
+
+static inline bool lru_gen_is_active(struct lruvec *lruvec, int gen)
+{
+	unsigned long max_seq = lruvec->lrugen.max_seq;
+	VM_WARN_ON_ONCE(gen >= MAX_NR_GENS);
+	return gen == lru_gen_from_seq(max_seq) || gen == lru_gen_from_seq(max_seq - 1);
+}
+
+static inline void lru_gen_update_size(struct lruvec *lruvec, struct page *page,
+				       int old_gen, int new_gen)
+{
+	int type = page_is_file_lru(page);
+	int zone = page_zonenum(page);
+	int delta = thp_nr_pages(page);
+	enum lru_list lru = type * LRU_INACTIVE_FILE;
+	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+
+	VM_WARN_ON_ONCE(old_gen != -1 && old_gen >= MAX_NR_GENS);
+	VM_WARN_ON_ONCE(new_gen != -1 && new_gen >= MAX_NR_GENS);
+	VM_WARN_ON_ONCE(old_gen == -1 && new_gen == -1);
+
+	if (old_gen >= 0)
+		WRITE_ONCE(lrugen->nr_pages[old_gen][type][zone],
+			   lrugen->nr_pages[old_gen][type][zone] - delta);
+	if (new_gen >= 0)
+		WRITE_ONCE(lrugen->nr_pages[new_gen][type][zone],
+			   lrugen->nr_pages[new_gen][type][zone] + delta);
+
+	if (old_gen < 0) {
+		if (lru_gen_is_active(lruvec, new_gen))
+			lru += LRU_ACTIVE;
+		__update_lru_size(lruvec, lru, zone, delta);
+		return;
+	}
+	if (new_gen < 0) {
+		if (lru_gen_is_active(lruvec, old_gen))
+			lru += LRU_ACTIVE;
+		__update_lru_size(lruvec, lru, zone, -delta);
+		return;
+	}
+	if (!lru_gen_is_active(lruvec, old_gen) && lru_gen_is_active(lruvec, new_gen)) {
+		__update_lru_size(lruvec, lru, zone, -delta);
+		__update_lru_size(lruvec, lru + LRU_ACTIVE, zone, delta);
+	}
+	VM_WARN_ON_ONCE(lru_gen_is_active(lruvec, old_gen) && !lru_gen_is_active(lruvec, new_gen));
+}
+
+static inline bool lru_gen_add_page(struct lruvec *lruvec, struct page *page, bool reclaiming)
+{
+	int gen, type, zone;
+	unsigned long seq, flags;
+	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+
+	VM_WARN_ON_ONCE_PAGE(page_lru_gen(page) != -1, page);
+	if (PageUnevictable(page) || !lrugen->enabled)
+		return false;
+
+	if (PageActive(page))
+		seq = lrugen->max_seq;
+	else if ((type == LRU_GEN_ANON && !PageSwapCache(page)) ||
+		 (PageReclaim(page) && (PageDirty(page) || PageWriteback(page))))
+		seq = lrugen->min_seq[type] + 1;
+	else
+		seq = lrugen->min_seq[type];
+
+	type = page_is_file_lru(page);
+	zone = page_zonenum(page);
+	gen = lru_gen_from_seq(seq);
+	flags = (gen + 1UL) << LRU_GEN_PGOFF;
+	set_mask_bits(&page->flags, LRU_GEN_MASK | BIT(PG_active), flags);
+
+	lru_gen_update_size(lruvec, page, -1, gen);
+	if (reclaiming)
+		list_add_tail(&page->lru, &lrugen->lists[gen][type][zone]);
+	else
+		list_add(&page->lru, &lrugen->lists[gen][type][zone]);
+
+	return true;
+}
+
+static inline bool lru_gen_del_page(struct lruvec *lruvec, struct page *page, bool reclaiming)
+{
+	int gen;
+	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+
+	VM_WARN_ON_ONCE_PAGE(PageActive(page), page);
+	VM_WARN_ON_ONCE_PAGE(PageUnevictable(page), page);
+
+	gen = page_lru_gen(page);
+	if (gen < 0)
+		return false;
+
+	if (!reclaiming)
+		lru_gen_update_size(lruvec, page, gen, -1);
+	list_del(&page->lru);
+
+	return true;
+}
+
+#endif /* CONFIG_LRU_GEN */
 #endif

@@ -281,6 +281,9 @@ struct swap_info_struct {
 					 */
 	struct work_struct discard_work; /* discard worker */
 	struct swap_cluster_list discard_clusters; /* discard clusters list */
+#ifdef CONFIG_LRU_GEN
+	struct lru_gen_mm_walk *mm_walk; /* MGLRU mm walk data */
+#endif
 	struct plist_node avail_lists[]; /*
 					   * entries in swap_avail_heads, one
 					   * entry per node.
