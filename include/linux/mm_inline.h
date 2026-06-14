@@ -231,7 +231,7 @@ static inline void lru_gen_update_size(struct lruvec *lruvec, struct page *page,
 
 static inline bool lru_gen_add_page(struct lruvec *lruvec, struct page *page, bool reclaiming)
 {
-	int gen, type, zone;
+	int gen, type = page_is_file_lru(page), zone = page_zonenum(page);
 	unsigned long seq, flags;
 	struct lru_gen_struct *lrugen = &lruvec->lrugen;
 
@@ -247,8 +247,6 @@ static inline bool lru_gen_add_page(struct lruvec *lruvec, struct page *page, bo
 	else
 		seq = lrugen->min_seq[type];
 
-	type = page_is_file_lru(page);
-	zone = page_zonenum(page);
 	gen = lru_gen_from_seq(seq);
 	flags = (gen + 1UL) << LRU_GEN_PGOFF;
 	set_mask_bits(&page->flags, LRU_GEN_MASK | BIT(PG_active), flags);
