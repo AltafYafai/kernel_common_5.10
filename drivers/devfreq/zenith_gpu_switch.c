@@ -217,6 +217,25 @@ static void gpu_governor_worker(struct work_struct *work)
 		target = gpu_game_governor;
 		gpu_last_game_active_jiffies = jiffies;
 	} else {
+		/*
+		 * GPU activity detection: if the GPU's current frequency is
+		 * above the minimum OPP, the GPU is doing real work even
+		 * outside of game mode (scrolling, camera, UI rendering).
+		 * Reset the idle timer so the governor stays on
+		 * simple_ondemand instead of falling to powersave while the
+		 * GPU is busy.
+		 *
+		 * Without this check, powersave would latch permanently once
+		 * the idle timeout expires — the worker only resets the timer
+		 * on game-mode activation, not on general GPU activity.
+		 */
+		if (df->previous_freq > df->scaling_min_freq) {
+			gpu_last_game_active_jiffies = jiffies;
+			gpu_debug("%s: GPU busy (freq=%lu > min=%lu), reset idle\n",
+				  dev_name(&df->dev),
+				  df->previous_freq, df->scaling_min_freq);
+		}
+
 		idle_jiffies = jiffies - gpu_last_game_active_jiffies;
 		if (gpu_idle_ms > 0 &&
 		    jiffies_to_msecs(idle_jiffies) >= gpu_idle_ms)

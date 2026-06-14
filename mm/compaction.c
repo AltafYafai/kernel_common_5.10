@@ -2832,7 +2832,9 @@ static void kcompactd_do_work(pg_data_t *pgdat)
 		pgdat->kcompactd_max_order = 0;
 	if (pgdat->kcompactd_highest_zoneidx >= cc.highest_zoneidx)
 		pgdat->kcompactd_highest_zoneidx = pgdat->nr_zones - 1;
-}void wakeup_kcompactd(pg_data_t *pgdat, int order, int highest_zoneidx)
+}
+
+void wakeup_kcompactd(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
 	if (!order)
 		return;

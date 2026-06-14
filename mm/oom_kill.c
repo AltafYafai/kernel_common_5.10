@@ -244,12 +244,14 @@ long oom_badness(struct task_struct *p, unsigned long totalpages)
 
 	/*
 	 * During game mode, protect foreground tasks with low oom_score_adj
-	 * (Android sets -950..-900 for top-app) by significantly reducing
-	 * their badness score.  This makes games and UI processes far less
-	 * likely to be killed under memory pressure.
+	 * (Android sets -950..-900 for top-app) by reducing their badness
+	 * score by 25% (not 50%).  The full 50% reduction masked too much
+	 * memory pressure — when combined with game-mode swap throttling
+	 * and min_free_kbytes inflation, the OOM killer could fail to find
+	 * a usable victim under extreme pressure and panic.
 	 */
 	if (zenith_is_game_mode_active() && p->signal->oom_score_adj < 100)
-		points -= points / 2;
+		points -= points / 4;
 
 	return points;
 }
