@@ -37,6 +37,13 @@
 #include <linux/cpu.h>
 #include <linux/cpuset.h>
 #include <linux/cgroup.h>
+
+/*
+ * cgroup_mutex is only declared in cgroup.h when CONFIG_PROVE_RCU=y,
+ * but it's always available at link time. Declare it directly here.
+ */
+extern struct mutex cgroup_mutex;
+
 #include <linux/compaction.h>
 #include <linux/notifier.h>
 #include <linux/rwsem.h>
