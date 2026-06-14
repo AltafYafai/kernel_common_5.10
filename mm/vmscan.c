@@ -160,6 +160,11 @@ struct scan_control {
 		unsigned int taken;
 	} nr;
 
+#ifdef CONFIG_LRU_GEN
+	unsigned long last_reclaimed;
+	bool memcgs_need_aging;
+#endif
+
 	/* for recording the reclaimed slab by now */
 	struct reclaim_state reclaim_state;
 };
@@ -2554,6 +2559,8 @@ out:
 		nr[lru] = scan;
 	}
 }
+
+static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
 
 static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
@@ -6255,7 +6262,7 @@ static bool sort_page(struct lruvec *lruvec, struct page *page, struct scan_cont
 		success = lru_gen_del_page(lruvec, page, true);
 		VM_WARN_ON_ONCE_PAGE(!success, page);
 		SetPageSwapBacked(page);
-		add_page_to_lru_list_tail(page, lruvec);
+		add_page_to_lru_list_tail(page, lruvec, page_lru(page));
 		return true;
 	}
 
@@ -7071,7 +7078,7 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
 static int lru_gen_seq_show(struct seq_file *m, void *v)
 {
 	unsigned long seq;
-	bool full = !debugfs_real_fops(m->file)->write;
+	bool full = true;/* seq_file.file type mismatch in 5.10 */
 	struct lruvec *lruvec = v;
 	struct lru_gen_struct *lrugen = &lruvec->lrugen;
 	int nid = lruvec_pgdat(lruvec)->node_id;
