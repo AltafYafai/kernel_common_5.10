@@ -4897,6 +4897,10 @@ unlock:
  * The mmap_lock may have been released depending on flags and our
  * return value.  See filemap_fault() and __lock_page_or_retry().
  */
+#ifdef CONFIG_LRU_GEN
+static void lru_gen_enter_fault(struct vm_area_struct *vma);
+static void lru_gen_exit_fault(void);
+#endif
 static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 		unsigned long address, unsigned int flags)
 {
@@ -4954,11 +4958,6 @@ retry_pud:
 	/* Huge pud page fault raced with pmd_alloc? */
 	if (pud_trans_unstable(vmf.pud))
 		goto retry_pud;
-
-#ifdef CONFIG_LRU_GEN
-static void lru_gen_enter_fault(struct vm_area_struct *vma);
-static void lru_gen_exit_fault(void);
-#endif
 
 #ifdef CONFIG_SPECULATIVE_PAGE_FAULT
 	vmf.sequence = raw_read_seqcount(&vma->vm_sequence);
