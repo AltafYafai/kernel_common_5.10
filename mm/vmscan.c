@@ -36,6 +36,7 @@
 #include <linux/topology.h>
 #include <linux/cpu.h>
 #include <linux/cpuset.h>
+#include <linux/cgroup.h>
 #include <linux/compaction.h>
 #include <linux/notifier.h>
 #include <linux/rwsem.h>
