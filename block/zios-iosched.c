@@ -384,8 +384,11 @@ static void zios_check_thermal(struct zios_data *zd)
 	zd->last_thermal_check = jiffies;
 
 	tz = thermal_zone_get_zone_by_name(zd->thermal_zone_name);
-	if (IS_ERR(tz))
+	if (IS_ERR(tz)) {
+		pr_warn_once("zios: thermal zone '%s' not found, thermal throttling disabled\n",
+			     zd->thermal_zone_name);
 		return;
+	}
 
 	ret = thermal_zone_get_temp(tz, &temp);
 	if (ret)

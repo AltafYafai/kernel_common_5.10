@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/compaction.h>
 #include <linux/dcache.h>
+#include <linux/mm.h>
 
 /*
  * Exported VM tunables we adjust during game mode:
@@ -144,6 +145,7 @@ static void gpu_governor_worker(struct work_struct *work)
 	const char *target;
 	bool game_active;
 	unsigned long idle_jiffies;
+	unsigned long total_ram_kb;
 
 	df = gpu_resolve_devfreq();
 	if (IS_ERR(df)) {
@@ -164,6 +166,11 @@ static void gpu_governor_worker(struct work_struct *work)
 	/*
 	 * Game-mode memory tuning: tighten dirty ratios and reduce VFS cache
 	 * pressure so writeback stays gentle and game assets remain cached.
+	 *
+	 * Safety: the min_free_kbytes boost is capped to never exceed 5% of
+	 * total RAM.  On a 4 GB device that's ~200 MB -- the 5 MB bump is
+	 * well within range, but the cap prevents pathological over-reservation
+	 * on very low-RAM or misconfigured systems.
 	 */
 	if (game_active && !game_tuning_active) {
 		/* Save current values */
@@ -180,7 +187,10 @@ static void gpu_governor_worker(struct work_struct *work)
 		sysctl_vfs_cache_pressure = GAME_VFS_CACHE_PRESSURE;
 		dirty_writeback_interval = GAME_DIRTY_WB_INTERVAL;
 		dirty_expire_interval = GAME_DIRTY_EXPIRE_INTERVAL;
-		min_free_kbytes += 5120;  /* reserve 5 MB more */
+
+		total_ram_kb = (unsigned long)totalram_pages() * (PAGE_SIZE / 1024);
+		min_free_kbytes = min(min_free_kbytes + 5120,
+				       (int)(total_ram_kb * 5 / 100));
 
 		game_tuning_active = true;
 
