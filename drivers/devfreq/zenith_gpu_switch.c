@@ -6,7 +6,7 @@
  * and automatically switches the GPU's devfreq governor:
  *   - game mode active  -> "performance"
  *   - game mode stopped -> "simple_ondemand" (with configurable idle timeout
- *     before falling to "powersave")
+ *     before falling to "simple_ondemand")
  *
  * Works with ANY GPU driver (Mali, Adreno, Panfrost, etc.) that registers
  * a devfreq device, not just Qualcomm's msm_gpu.
@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/compaction.h>
 #include <linux/dcache.h>
+#include <linux/mm.h>
 
 /*
  * Exported VM tunables we adjust during game mode:
@@ -63,10 +64,10 @@ module_param_string(gpu_devfreq_name, gpu_devfreq_name,
 MODULE_PARM_DESC(gpu_devfreq_name,
 		 "GPU devfreq device name (empty = auto-detect)");
 
-static unsigned int gpu_check_ms = 2000;
+static unsigned int gpu_check_ms = 1000;
 module_param(gpu_check_ms, uint, 0644);
 MODULE_PARM_DESC(gpu_check_ms,
-		 "Poll interval in ms (default: 2000)");
+		 "Poll interval in ms (default: 1000)");
 
 static char gpu_game_governor[DEVFREQ_NAME_LEN] = "performance";
 module_param_string(gpu_game_governor, gpu_game_governor,
@@ -80,16 +81,16 @@ module_param_string(gpu_active_governor, gpu_active_governor,
 MODULE_PARM_DESC(gpu_active_governor,
 		 "Governor while GPU active, not gaming (default: simple_ondemand)");
 
-static char gpu_idle_governor[DEVFREQ_NAME_LEN] = "powersave";
+static char gpu_idle_governor[DEVFREQ_NAME_LEN] = "simple_ondemand";
 module_param_string(gpu_idle_governor, gpu_idle_governor,
 		    sizeof(gpu_idle_governor), 0644);
 MODULE_PARM_DESC(gpu_idle_governor,
-		 "Governor after idle timeout (default: powersave)");
+		 "Governor after idle timeout (default: simple_ondemand)");
 
 static unsigned int gpu_idle_ms = 5000;
 module_param(gpu_idle_ms, uint, 0644);
 MODULE_PARM_DESC(gpu_idle_ms,
-		 "Idle timeout in ms before powersave (default: 5000, 0=skip)");
+		 "Idle timeout in ms before idle governor (default: 5000, 0=skip)");
 
 /***** Game-mode memory tuning save state *****/
 
@@ -123,7 +124,6 @@ static bool game_tuning_active;
 
 static struct delayed_work gpu_governor_work;
 static unsigned long gpu_last_game_active_jiffies;
-static unsigned long gpu_last_powersave_entry_jiffies;
 static bool gpu_prev_game_active;
 
 /*
@@ -145,6 +145,7 @@ static void gpu_governor_worker(struct work_struct *work)
 	const char *target;
 	bool game_active;
 	unsigned long idle_jiffies;
+	unsigned long total_ram_kb;
 
 	df = gpu_resolve_devfreq();
 	if (IS_ERR(df)) {
@@ -165,6 +166,11 @@ static void gpu_governor_worker(struct work_struct *work)
 	/*
 	 * Game-mode memory tuning: tighten dirty ratios and reduce VFS cache
 	 * pressure so writeback stays gentle and game assets remain cached.
+	 *
+	 * Safety: the min_free_kbytes boost is capped to never exceed 5% of
+	 * total RAM.  On a 4 GB device that's ~200 MB -- the 5 MB bump is
+	 * well within range, but the cap prevents pathological over-reservation
+	 * on very low-RAM or misconfigured systems.
 	 */
 	if (game_active && !game_tuning_active) {
 		/* Save current values */
@@ -181,7 +187,10 @@ static void gpu_governor_worker(struct work_struct *work)
 		sysctl_vfs_cache_pressure = GAME_VFS_CACHE_PRESSURE;
 		dirty_writeback_interval = GAME_DIRTY_WB_INTERVAL;
 		dirty_expire_interval = GAME_DIRTY_EXPIRE_INTERVAL;
-		min_free_kbytes += 5120;  /* reserve 5 MB more */
+
+		total_ram_kb = (unsigned long)totalram_pages() * (PAGE_SIZE / 1024);
+		min_free_kbytes = min(min_free_kbytes + 5120,
+				       (int)(total_ram_kb * 5 / 100));
 
 		game_tuning_active = true;
 
@@ -223,12 +232,11 @@ static void gpu_governor_worker(struct work_struct *work)
 		 * above the minimum OPP, the GPU is doing real work even
 		 * outside of game mode (scrolling, camera, UI rendering).
 		 * Reset the idle timer so the governor stays on
-		 * simple_ondemand instead of falling to powersave while the
-		 * GPU is busy.
+		 * simple_ondemand instead of falling to the idle governor.
 		 *
-		 * Without this check, powersave would latch permanently once
-		 * the idle timeout expires — the worker only resets the timer
-		 * on game-mode activation, not on general GPU activity.
+		 * This works correctly with simple_ondemand as the idle
+		 * governor because ondemand scales frequency dynamically —
+		 * it won't keep the GPU stuck at minimum when there's work.
 		 */
 		if (df->previous_freq > df->scaling_min_freq) {
 			gpu_last_game_active_jiffies = jiffies;
@@ -243,49 +251,10 @@ static void gpu_governor_worker(struct work_struct *work)
 			target = gpu_idle_governor;
 		else
 			target = gpu_active_governor;
-
-		/*
-		 * Powersave escape hatch: when the idle timeout has elapsed
-		 * AND the current governor is already the idle (powersave)
-		 * governor, try switching back to the active governor.
-		 *
-		 * The powersave governor pins the GPU frequency at the minimum
-		 * OPP, which makes the frequency-based activity check above
-		 * (df->previous_freq > df->scaling_min_freq) always return
-		 * false. Without this escape, powersave would latch permanently
-		 * once engaged — the user could resume scrolling/camera/UI
-		 * but the GPU would stay stuck at minimum frequency.
-		 *
-		 * The active governor (simple_ondemand) keeps the GPU at
-		 * minimum frequency when truly idle, so there's no power cost.
-		 * If the GPU has resumed work, ondemand will ramp up the
-		 * frequency and the freq-based check will keep the governor
-		 * on the active target for subsequent cycles.
-		 *
-		 * We rate-limit escape attempts to one full idle timeout
-		 * after entering powersave, to avoid unnecessary ping-pong
-		 * on a truly idle GPU.
-		 */
-		if (target == gpu_idle_governor &&
-		    !strcmp(df->governor_name, gpu_idle_governor)) {
-			unsigned long entry_jiffies =
-				jiffies - gpu_last_powersave_entry_jiffies;
-			if (jiffies_to_msecs(entry_jiffies) >= gpu_idle_ms) {
-				target = gpu_active_governor;
-				gpu_last_powersave_entry_jiffies = jiffies;
-				gpu_debug("%s: escape from %s latch, trying %s\n",
-					dev_name(&df->dev),
-					gpu_idle_governor, target);
-			}
-		}
 	}
 
 	/* Only switch if the governor actually changed */
 	if (strcmp(df->governor_name, target)) {
-		/* Record when we enter powersave for the escape hatch */
-		if (!strcmp(target, gpu_idle_governor))
-			gpu_last_powersave_entry_jiffies = jiffies;
-
 		pr_info("zenith_gpu_switch: %s: %s -> %s%s\n",
 			dev_name(&df->dev), df->governor_name, target,
 			game_active ? " (game on)" : "");
