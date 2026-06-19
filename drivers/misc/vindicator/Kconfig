@@ -18,11 +18,10 @@ config VINDICATOR
 	  Say Y/M here — other Vindicator drivers depend on this.
 
 config VINDICATOR_NOCTURNE
-	tristate "Nocturne — screen-state power saving"
-	depends on VINDICATOR && PM_SLEEP
+	tristate "Nocturne — screen-state power saving"	depends on VINDICATOR && PM_SLEEP && CPU_FREQ_GOV_ZENITH
 	help
-	  Nocturne detects screen-on/off transitions via the PM
-	  suspend notifier chain and applies configurable CPU/cpuset
+	  Nocturne detects screen-on/off transitions via the PM suspend
+	  notifier chain and applies configurable CPU/cpuset
 	  throttling when the display is off.
 	  
 	  Integrates with the Zenith profile system so that GAMING
