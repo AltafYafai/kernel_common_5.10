@@ -88,6 +88,26 @@ static int noct_write_file(const char *path, const char *buf)
 /* ------------------------------------------------------------------ */
 /* freq_qos management                                                */
 /* ------------------------------------------------------------------ */
+static void noct_qos_remove_all(void)
+{
+	unsigned int cpu;
+	struct cpufreq_policy *policy;
+
+	cpus_read_lock();
+	for_each_online_cpu(cpu) {
+		if (noct_qos_min && freq_qos_request_active(&noct_qos_min[cpu]))
+			freq_qos_remove_request(&noct_qos_min[cpu]);
+		if (noct_qos_max && freq_qos_request_active(&noct_qos_max[cpu]))
+			freq_qos_remove_request(&noct_qos_max[cpu]);
+		/* Also release missing QoS on policies we didn't init */
+		policy = cpufreq_cpu_get(cpu);
+		if (policy) {
+			cpufreq_cpu_put(policy);
+		}
+	}
+	cpus_read_unlock();
+}
+
 static int noct_qos_init(void)
 {
 	unsigned int cpu;
@@ -264,6 +284,7 @@ static void __exit nocturne_exit(void)
 {
 	unregister_pm_notifier(&noct_pm_nb);
 	noct_screen_on(); /* restore any throttled resources */
+	noct_qos_remove_all();
 	kfree(noct_qos_min);
 	kfree(noct_qos_max);
 	pr_info("unloaded\n");
