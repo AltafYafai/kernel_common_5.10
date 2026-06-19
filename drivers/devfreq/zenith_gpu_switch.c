@@ -123,6 +123,7 @@ static bool game_tuning_active;
 
 static struct delayed_work gpu_governor_work;
 static unsigned long gpu_last_game_active_jiffies;
+static unsigned long gpu_last_powersave_entry_jiffies;
 static bool gpu_prev_game_active;
 
 /*
@@ -242,10 +243,49 @@ static void gpu_governor_worker(struct work_struct *work)
 			target = gpu_idle_governor;
 		else
 			target = gpu_active_governor;
+
+		/*
+		 * Powersave escape hatch: when the idle timeout has elapsed
+		 * AND the current governor is already the idle (powersave)
+		 * governor, try switching back to the active governor.
+		 *
+		 * The powersave governor pins the GPU frequency at the minimum
+		 * OPP, which makes the frequency-based activity check above
+		 * (df->previous_freq > df->scaling_min_freq) always return
+		 * false. Without this escape, powersave would latch permanently
+		 * once engaged — the user could resume scrolling/camera/UI
+		 * but the GPU would stay stuck at minimum frequency.
+		 *
+		 * The active governor (simple_ondemand) keeps the GPU at
+		 * minimum frequency when truly idle, so there's no power cost.
+		 * If the GPU has resumed work, ondemand will ramp up the
+		 * frequency and the freq-based check will keep the governor
+		 * on the active target for subsequent cycles.
+		 *
+		 * We rate-limit escape attempts to one full idle timeout
+		 * after entering powersave, to avoid unnecessary ping-pong
+		 * on a truly idle GPU.
+		 */
+		if (target == gpu_idle_governor &&
+		    !strcmp(df->governor_name, gpu_idle_governor)) {
+			unsigned long entry_jiffies =
+				jiffies - gpu_last_powersave_entry_jiffies;
+			if (jiffies_to_msecs(entry_jiffies) >= gpu_idle_ms) {
+				target = gpu_active_governor;
+				gpu_last_powersave_entry_jiffies = jiffies;
+				gpu_debug("%s: escape from %s latch, trying %s\n",
+					dev_name(&df->dev),
+					gpu_idle_governor, target);
+			}
+		}
 	}
 
 	/* Only switch if the governor actually changed */
 	if (strcmp(df->governor_name, target)) {
+		/* Record when we enter powersave for the escape hatch */
+		if (!strcmp(target, gpu_idle_governor))
+			gpu_last_powersave_entry_jiffies = jiffies;
+
 		pr_info("zenith_gpu_switch: %s: %s -> %s%s\n",
 			dev_name(&df->dev), df->governor_name, target,
 			game_active ? " (game on)" : "");
