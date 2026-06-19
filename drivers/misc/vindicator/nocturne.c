@@ -38,9 +38,15 @@ module_param_named(enabled, noct_enabled, bool, 0644);
 MODULE_PARM_DESC(enabled, "Master enable");
 
 /* Frequency cap (KHz) applied when screen is off; 0 = no cap */
-static unsigned int noct_freq_cap_khz;
+/* Frequency cap (KHz) applied when screen is off; 0 = no cap */
+static unsigned int noct_freq_cap_khz = 1516800;
 module_param_named(freq_cap_khz, noct_freq_cap_khz, uint, 0644);
-MODULE_PARM_DESC(freq_cap_khz, "Max CPU frequency (KHz) when screen off; 0 = no cap");
+MODULE_PARM_DESC(freq_cap_khz, "Max CPU freq (KHz) when screen off; 0 = no cap");
+
+/* More aggressive cap for BATTERY/POWER_SAVE profile */
+static unsigned int noct_freq_cap_powersave_khz = 902400;
+module_param_named(freq_cap_powersave_khz, noct_freq_cap_powersave_khz, uint, 0644);
+MODULE_PARM_DESC(freq_cap_powersave_khz, "Max CPU freq (KHz) when screen off + BATTERY profile; 0 = use freq_cap_khz");
 
 /* Cpuset restriction: restrict background + system-background to CPU0 */
 static bool noct_restrict_cpusets = true;
@@ -58,6 +64,9 @@ MODULE_PARM_DESC(respect_gaming, "Skip throttling if GAMING profile is active");
 static bool screen_off;
 static DEFINE_MUTEX(noct_lock);
 
+/* Last-known profile from zenith_apply_profile() chain */
+static unsigned int noct_current_profile = 2; /* ZENITH_PROFILE_BALANCED */
+
 /* freq_qos requests per policy */
 static struct freq_qos_request *noct_qos_min;
 static struct freq_qos_request *noct_qos_max;
@@ -66,6 +75,7 @@ static unsigned int noct_qos_nr_cpus;
 /* ------------------------------------------------------------------ */
 /* Forward declarations                                                */
 /* ------------------------------------------------------------------ */
+#include <linux/zenith_profiles.h>
 extern bool zenith_is_game_mode_active(void);
 
 /* ------------------------------------------------------------------ */
@@ -209,6 +219,8 @@ static void noct_screen_on(void)
 
 static void noct_screen_off(void)
 {
+	unsigned int effective_cap;
+
 	if (screen_off)
 		return;
 
@@ -222,6 +234,15 @@ static void noct_screen_off(void)
 		return;
 	}
 
+	/* Profile-aware freq cap: BATTERY gets more aggressive throttle */
+	if (noct_freq_cap_powersave_khz &&
+	    zenith_resolve_profile(noct_current_profile) == ZENITH_PROFILE_BATTERY)
+		effective_cap = noct_freq_cap_powersave_khz;
+	else
+		effective_cap = noct_freq_cap_khz;
+
+	/* Override module param for qos throttle, then restore */
+	noct_freq_cap_khz = effective_cap;
 	noct_qos_throttle();
 
 	/* Restrict background cpusets */
@@ -257,6 +278,14 @@ static int noct_pm_notifier(struct notifier_block *nb, unsigned long event, void
 static struct notifier_block noct_pm_nb = {
 	.notifier_call = noct_pm_notifier,
 };
+
+/* ------------------------------------------------------------------ */
+/* Profile notifier (called by zenith_apply_profile)                   */
+/* ------------------------------------------------------------------ */
+void nocturne_apply_profile(unsigned int profile)
+{
+	noct_current_profile = profile;
+}
 
 /* ------------------------------------------------------------------ */
 /* Module init / exit                                                  */
@@ -295,4 +324,4 @@ module_exit(nocturne_exit);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("GrayRavens");
-MODULE_DESCRIPTION("Nocturne — screen-state power saving");
+MODULE_DESCRIPTION("Nocturne — screen-state power saving with profile-aware throttling");

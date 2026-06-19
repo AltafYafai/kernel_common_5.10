@@ -8301,6 +8301,12 @@ extern void equilibrium_apply_profile(unsigned int profile);
 #else
 static inline void equilibrium_apply_profile(unsigned int profile) { }
 #endif
+#if IS_ENABLED(CONFIG_VINDICATOR_NOCTURNE)
+extern void nocturne_apply_profile(unsigned int profile);
+#else
+static inline void nocturne_apply_profile(unsigned int profile) { }
+#endif
+
 /* Patch K: live skin-temp readout for the game_perf_burst guardrail.
  * Returns millidegrees C.
  *
@@ -15285,6 +15291,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	iyashi_apply_profile(prof);
 	hikari_apply_profile(prof);
 	equilibrium_apply_profile(prof);
+	nocturne_apply_profile(prof);
 }
 
 /* Patch B-AUTO-4: auto-selector classifier (priority cascade).
