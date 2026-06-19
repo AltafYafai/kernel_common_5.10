@@ -161,6 +161,9 @@ int herald_set_prop(const char *name, const char *val)
 	if (atomic_read(&herald_queue_depth) >= HERALD_QUEUE_MAX)
 		return -ENOMEM;
 
+	/* Remove existing entry with same name before adding */
+	herald_del_prop(name);
+
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
 	if (!e)
 		return -ENOMEM;
