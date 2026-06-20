@@ -19,12 +19,6 @@
 #include <linux/sched.h>
 #include <linux/delay.h>
 
-#define KIRYUU_TIMEOUT_MS	5000
-
-static unsigned int kiryuu_timeout_ms = KIRYUU_TIMEOUT_MS;
-module_param_named(timeout_ms, kiryuu_timeout_ms, uint, 0644);
-MODULE_PARM_DESC(timeout_ms, "Command execution timeout in ms (default: 5000)");
-
 /**
  * kiryuu_exec - Execute a shell command as root (blocking)
  * @cmd: The shell command string to execute
