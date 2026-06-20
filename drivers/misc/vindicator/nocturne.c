@@ -38,7 +38,6 @@ module_param_named(enabled, noct_enabled, bool, 0644);
 MODULE_PARM_DESC(enabled, "Master enable");
 
 /* Frequency cap (KHz) applied when screen is off; 0 = no cap */
-/* Frequency cap (KHz) applied when screen is off; 0 = no cap */
 static unsigned int noct_freq_cap_khz = 1516800;
 module_param_named(freq_cap_khz, noct_freq_cap_khz, uint, 0644);
 MODULE_PARM_DESC(freq_cap_khz, "Max CPU freq (KHz) when screen off; 0 = no cap");
@@ -153,12 +152,12 @@ fail:
 	return -ENOMEM;
 }
 
-static void noct_qos_throttle(void)
+static void noct_qos_throttle(unsigned int cap_khz)
 {
 	unsigned int cpu;
 	struct cpufreq_policy *policy;
 
-	if (!noct_freq_cap_khz)
+	if (!cap_khz)
 		return;
 
 	cpus_read_lock();
@@ -169,7 +168,7 @@ static void noct_qos_throttle(void)
 		if (policy->cpu == cpu) {
 			/* Clamp max first, then raise min — avoids transient */
 			freq_qos_update_request(&noct_qos_max[cpu],
-				min(policy->cpuinfo.max_freq, noct_freq_cap_khz));
+				min(policy->cpuinfo.max_freq, cap_khz));
 			freq_qos_update_request(&noct_qos_min[cpu],
 				policy->cpuinfo.min_freq);
 		}
@@ -182,9 +181,6 @@ static void noct_qos_restore(void)
 {
 	unsigned int cpu;
 	struct cpufreq_policy *policy;
-
-	if (!noct_freq_cap_khz)
-		return;
 
 	cpus_read_lock();
 	for_each_online_cpu(cpu) {
@@ -241,9 +237,7 @@ static void noct_screen_off(void)
 	else
 		effective_cap = noct_freq_cap_khz;
 
-	/* Override module param for qos throttle, then restore */
-	noct_freq_cap_khz = effective_cap;
-	noct_qos_throttle();
+	noct_qos_throttle(effective_cap);
 
 	/* Restrict background cpusets */
 	if (noct_restrict_cpusets) {
