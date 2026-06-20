@@ -26,17 +26,17 @@ module_param_named(timeout_ms, kiryuu_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(timeout_ms, "Command execution timeout in ms (default: 5000)");
 
 /**
- * kiryuu_exec - Execute a shell command as root
- * @cmd:    The shell command string to execute
- * @timeout: Timeout in jiffies, 0 = use module default
+ * kiryuu_exec - Execute a shell command as root (blocking)
+ * @cmd: The shell command string to execute
  *
  * Returns: exit code of the command (0 = success), negative errno on error
  *
- * This runs call_usermodehelper() with a minimal environment that grants
- * PATH access to standard Android binaries. The calling module must ensure
- * @cmd is not attacker-controlled; no quoting/escaping is performed.
+ * Runs call_usermodehelper() with UMH_WAIT_PROC and a minimal environment
+ * that grants PATH access to standard Android binaries. Blocks until the
+ * command completes. The calling module must ensure @cmd is not
+ * attacker-controlled; no quoting/escaping is performed.
  */
-int kiryuu_exec(const char *cmd, unsigned long timeout)
+int kiryuu_exec(const char *cmd)
 {
 	char *argv[] = { "/system/bin/sh", "-c", (char *)cmd, NULL };
 	char *envp[] = {
@@ -46,14 +46,10 @@ int kiryuu_exec(const char *cmd, unsigned long timeout)
 		"ANDROID_DATA=/data",
 		NULL
 	};
-	unsigned long actual_timeout;
 	int ret;
 
 	if (!cmd)
 		return -EINVAL;
-
-	actual_timeout = timeout ? msecs_to_jiffies(timeout)
-				 : msecs_to_jiffies(kiryuu_timeout_ms);
 
 	pr_debug("kiryuu: executing: %s\n", cmd);
 

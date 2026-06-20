@@ -20,7 +20,7 @@
 #include <linux/list.h>
 #include <linux/string.h>
 
-extern int kiryuu_exec(const char *cmd, unsigned long timeout);
+extern int kiryuu_exec(const char *cmd);
 
 #define TSUKI_QUEUE_MAX	64
 
@@ -102,7 +102,7 @@ static void tsuki_process_queue(struct work_struct *work)
 			 job->prop, job->val);
 
 		pr_debug("tsuki: applying '%s' = '%s'\n", job->prop, job->val);
-		ret = kiryuu_exec(cmd, 0);
+		ret = kiryuu_exec(cmd);
 		if (ret < 0)
 			pr_warn("tsuki: failed to set '%s' (err=%d)\n",
 				job->prop, ret);

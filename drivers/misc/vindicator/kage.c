@@ -16,7 +16,7 @@
 #include <linux/init.h>
 #include <linux/slab.h>
 
-extern int kiryuu_exec(const char *cmd, unsigned long timeout);
+extern int kiryuu_exec(const char *cmd);
 
 /**
  * kage_hide_path - Hide a filesystem path via SUSFS
@@ -34,7 +34,7 @@ int kage_hide_path(const char *path)
 	snprintf(cmd, sizeof(cmd), "/data/adb/ksud susfs add_sus_path '%s'", path);
 	pr_info("kage: hiding path via SUSFS -> %s\n", path);
 
-	return kiryuu_exec(cmd, 0);
+	return kiryuu_exec(cmd);
 }
 EXPORT_SYMBOL_GPL(kage_hide_path);
 
@@ -54,7 +54,7 @@ int kage_unhide_path(const char *path)
 	snprintf(cmd, sizeof(cmd), "/data/adb/ksud susfs rm_sus_path '%s'", path);
 	pr_info("kage: unhiding path via SUSFS -> %s\n", path);
 
-	return kiryuu_exec(cmd, 0);
+	return kiryuu_exec(cmd);
 }
 EXPORT_SYMBOL_GPL(kage_unhide_path);
 
@@ -74,7 +74,7 @@ int kage_hide_mount(const char *path)
 	snprintf(cmd, sizeof(cmd), "/data/adb/ksud susfs add_sus_mount '%s'", path);
 	pr_info("kage: hiding mount via SUSFS -> %s\n", path);
 
-	return kiryuu_exec(cmd, 0);
+	return kiryuu_exec(cmd);
 }
 EXPORT_SYMBOL_GPL(kage_hide_mount);
 
@@ -94,7 +94,7 @@ int kage_unhide_mount(const char *path)
 	snprintf(cmd, sizeof(cmd), "/data/adb/ksud susfs rm_sus_mount '%s'", path);
 	pr_info("kage: unhiding mount via SUSFS -> %s\n", path);
 
-	return kiryuu_exec(cmd, 0);
+	return kiryuu_exec(cmd);
 }
 EXPORT_SYMBOL_GPL(kage_unhide_mount);
 

@@ -103,7 +103,7 @@ config VINDICATOR_OTO
 
 config VINDICATOR_SEN
 	tristate "Sen — touch-based gaming frequency boost"
-	depends on VINDICATOR && CPU_FREQ
+	depends on VINDICATOR && CPU_FREQ && ANDROID_VENDOR_HOOKS
 	help
 	  Sen intercepts touch input events and temporarily boosts CPU
 	  frequency to maximum via the schedutil vendor hook.
