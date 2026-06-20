@@ -117,4 +117,23 @@ config VINDICATOR_SHUN
 	  configurable duration after boot using PM QoS requests.
 	  Gracefully releases the lock after the boost period expires.
 
+config VINDICATOR_KAISEI
+	tristate "Kaisei — panic-to-recovery redirector"
+	depends on VINDICATOR
+	help
+	  Kaisei registers a panic notifier that intercepts kernel panics
+	  and BUG() conditions, redirecting the subsequent reboot into
+	  recovery mode via do_kernel_restart().
+
+	  On supported platforms (Qualcomm, MTK, Exynos, etc.), the
+	  platform restart handler writes the appropriate magic values
+	  to PMIC/RTC registers that the bootloader checks — causing
+	  a boot into recovery mode instead of a normal reboot.
+
+	  The reboot command and enable/disable are configurable via
+	  module parameters at /sys/module/kaisei/parameters/.
+
+	  Say Y here to ensure kernel panics land you in recovery
+	  instead of a bootloop.
+
 endmenu
