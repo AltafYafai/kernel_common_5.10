@@ -94,8 +94,7 @@ EXPORT_SYMBOL_GPL(kiryuu_exec_async);
 
 static int __init kiryuu_init(void)
 {
-	pr_info("kiryuu: Native root execution engine initialized"
-		" (timeout=%ums)\n", kiryuu_timeout_ms);
+	pr_info("kiryuu: Native root execution engine initialized\n");
 	return 0;
 }
 late_initcall(kiryuu_init);
