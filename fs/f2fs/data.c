@@ -363,7 +363,7 @@ static void f2fs_write_end_io(struct bio *bio)
 				wq_has_sleeper(&sbi->cp_wait))
 			wake_up(&sbi->cp_wait);
 
-		clear_cold_data(page);
+		clear_page_private_gcing(page);
 		end_page_writeback(page);
 	}
 

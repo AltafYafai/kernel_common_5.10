@@ -122,8 +122,8 @@ int vindicator_register(const struct vindicator_enforce_ops *ops)
 	/* debugfs entry */
 	if (vind_dbg_dir) {
 		dbg = debugfs_create_dir(ops->name, vind_dbg_dir);
-		debugfs_create_atomic("enforcements", 0444, dbg, &tgt->enforc_cnt);
-		debugfs_create_atomic("skipped",      0444, dbg, &tgt->skip_cnt);
+		debugfs_create_atomic_t("enforcements", 0444, dbg, &tgt->enforc_cnt);
+		debugfs_create_atomic_t("skipped",      0444, dbg, &tgt->skip_cnt);
 		debugfs_create_u32("interval_ms",     0444, dbg, &tgt->interval_ms);
 		tgt->dbg_dentry = dbg;
 	}
