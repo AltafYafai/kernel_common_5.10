@@ -13,8 +13,11 @@
  * log can be read from /sys/kernel/kensho/last_panic. This is invaluable
  * for developers debugging boot-time crashes that don't leave serial traces.
  *
- * For cross-reboot persistence, Kenshō can be extended to write to pstore
- * (v2).
+ * When CONFIG_VINDICATOR_KENSHO_PERSIST is enabled, the log is also written
+ * to a reserved DRAM region that survives reboots. On the next boot, the
+ * log is automatically imported and exposed via sysfs.  The physical address
+ * of the reserved region is printed at boot so bootloader engineers can
+ * implement fastboot oem kensho dump.
  *
  * Author: GrayRavens
  * Co-authored-by: Kanagawa Yamada <albert.wesley.dion@gmail.com>
@@ -148,136 +151,6 @@ static void kensho_write_metadata(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* kmsg dumper callback                                               */
-/* ------------------------------------------------------------------ */
-
-/*
- * Called from panic() context — the kernel log buffer is still intact.
- * We drain it into the remaining space after our metadata header.
- */
-static void kensho_dump_cb(struct kmsg_dumper *dumper,
-			   enum kmsg_dump_reason reason)
-{
-	size_t len;
-	size_t remaining;
-
-	/* Only capture panics (and optionally oopses — check KMSG_DUMP_OOPS) */
-	if (reason > KMSG_DUMP_PANIC)
-		return;
-
-	/* Write metadata header first */
-	kensho_write_metadata();
-
-	/* Fill the rest of the buffer with the kernel log */
-	remaining = KENSHO_BUF_SIZE - kensho_panic_len;
-	if (remaining < 64)
-		return;	/* header alone filled it — unusual but possible */
-
-	if (!kmsg_dump_get_buffer(dumper, true,
-				  kensho_panic_buf + kensho_panic_len,
-				  remaining - 1, &len))
-		return;
-
-	kensho_panic_len += len;
-	kensho_panic_buf[kensho_panic_len] = '\0';
-}
-
-/* ------------------------------------------------------------------ */
-/* Panic notifier                                                      */
-/* ------------------------------------------------------------------ */
-
-/*
- * Fires before kmsg_dump in the panic() sequence. We save the panic
- * reason string so kensho_write_metadata can include it.
- * Priority INT_MAX means we run first.
- */
-static int kensho_panic_cb(struct notifier_block *nb,
-			   unsigned long action, void *data)
-{
-	if (data)
-		strscpy(kensho_reason, (const char *)data,
-			sizeof(kensho_reason));
-	return NOTIFY_DONE;
-}
-
-/* ------------------------------------------------------------------ */
-/* Sysfs                                                               */
-/* ------------------------------------------------------------------ */
-
-/*
- * Use bin_attribute for last_panic so the entire 128 kB buffer is
- * accessible via read(), not truncated to PAGE_SIZE (4 kB).
- */
-static ssize_t last_panic_read(struct file *filp, struct kobject *kobj,
-			       struct bin_attribute *attr,
-			       char *buf, loff_t off, size_t count)
-{
-	static const char no_crash[] = "No panic captured since boot.\n";
-
-	if (!kensho_crashed) {
-		if (off >= (loff_t)sizeof(no_crash))
-			return 0;
-		count = min_t(size_t, sizeof(no_crash) - (size_t)off, count);
-		memcpy(buf, no_crash + off, count);
-		return count;
-	}
-
-	if (off >= (loff_t)kensho_panic_len)
-		return 0;
-
-	count = min_t(size_t, count, kensho_panic_len - (size_t)off);
-	memcpy(buf, kensho_panic_buf + off, count);
-	return count;
-}
-
-static ssize_t crashed_show(struct kobject *kobj,
-			    struct kobj_attribute *attr, char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE, "%d\n", kensho_crashed ? 1 : 0);
-}
-
-static ssize_t info_show(struct kobject *kobj,
-			 struct kobj_attribute *attr, char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE,
-		"Kenshō v%s\n"
-		"Status: %s\n"
-		"Buffer: %u bytes\n",
-		KENSHO_VERSION,
-		kensho_crashed ? "CRASH CAPTURED" : "Standing by",
-		(unsigned int)KENSHO_BUF_SIZE);
-}
-
-/* last_panic as a binary attribute — no PAGE_SIZE limit */
-static BIN_ATTR(last_panic, 0444, last_panic_read, NULL);
-
-static struct kobj_attribute kensho_crashed_attr =
-	__ATTR_RO(crashed);
-static struct kobj_attribute kensho_info_attr =
-	__ATTR_RO(info);
-
-/* bin_attrs must be in a separate list from regular attrs */
-static struct attribute *kensho_attrs[] = {
-	&kensho_crashed_attr.attr,
-	&kensho_info_attr.attr,
-	NULL,
-};
-
-static struct bin_attribute *kensho_bin_attrs[] = {
-	&bin_attr_last_panic,
-	NULL,
-};
-
-static const struct attribute_group kensho_group = {
-	.attrs = kensho_attrs,
-	.bin_attrs = kensho_bin_attrs,
-};
-static const struct attribute_group *kensho_groups[] = {
-	&kensho_group,
-	NULL,
-};
-
-/* ------------------------------------------------------------------ */
 /* Persistent memory (survives reboots via reserved DRAM)              */
 /* ------------------------------------------------------------------ */
 
@@ -403,7 +276,7 @@ static void kensho_persist_save(void)  { }
 #endif /* CONFIG_VINDICATOR_KENSHO_PERSIST */
 
 /* ------------------------------------------------------------------ */
-/* kmsg dumper callback (updated — persist save)                      */
+/* kmsg dumper callback                                               */
 /* ------------------------------------------------------------------ */
 
 /*
