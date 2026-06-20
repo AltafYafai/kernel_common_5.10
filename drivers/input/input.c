@@ -32,10 +32,11 @@ MODULE_LICENSE("GPL");
 
 /*
  * Sen touch boost hook — set by drivers/misc/vindicator/sen.c
- * Called on every input event so the gaming boost driver can
- * detect touch activity and trigger a CPU frequency ramp.
+ * Called on every input event with the event type and code so
+ * the gaming boost driver can filter for touch events only
+ * and trigger a CPU frequency ramp.
  */
-void (*sen_touch_hook)(void);
+void (*sen_touch_hook)(unsigned int type, unsigned int code);
 EXPORT_SYMBOL_GPL(sen_touch_hook);
 
 #define INPUT_MAX_CHAR_DEVICES		1024
@@ -392,7 +393,7 @@ static void input_handle_event(struct input_dev *dev,
 		add_input_randomness(type, code, value);
 
 	if (sen_touch_hook)
-		sen_touch_hook();
+		sen_touch_hook(type, code);
 
 	if ((disposition & INPUT_PASS_TO_DEVICE) && dev->event)
 		dev->event(dev, type, code, value);

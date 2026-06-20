@@ -90,11 +90,12 @@ static void oto_apply_cpuset_override(void)
 	snprintf(oto_cpu_mask, sizeof(oto_cpu_mask),
 		 "0-%d", total_cores - 1);
 
+	/* Ignore errors — cpuset may not exist on cgroup v2 */
 	oto_write_file("/dev/cpuset/foreground/cpus", oto_cpu_mask);
 	oto_write_file("/dev/cpuset/top-app/cpus", oto_cpu_mask);
 	oto_write_file("/dev/cpuset/boost-app/cpus", oto_cpu_mask);
 
-	pr_debug("oto: cpuset override applied -> %s\n", oto_cpu_mask);
+	pr_debug("oto: cpuset override attempted -> %s\n", oto_cpu_mask);
 }
 
 static void oto_boost_audio_threads(void)
@@ -170,15 +171,19 @@ static int oto_worker(void *data)
 			struct file *f;
 			char current_mask[32] = {0};
 			char *cleaned;
+			loff_t pos = 0;
 
 			f = filp_open("/dev/cpuset/foreground/cpus",
 				      O_RDONLY, 0);
-			if (!IS_ERR(f)) {
-				loff_t pos = 0;
-				kernel_read(f, current_mask,
-					    sizeof(current_mask) - 1, &pos);
-				filp_close(f, NULL);
+			if (IS_ERR(f)) {
+				/* cpuset may not exist on cgroup v2 systems */
+				oto_apply_cpuset_override();
+				goto skip_watchdog;
 			}
+
+			kernel_read(f, current_mask,
+				    sizeof(current_mask) - 1, &pos);
+			filp_close(f, NULL);
 
 			cleaned = strim(current_mask);
 			if (strlen(cleaned) > 0 &&
@@ -187,6 +192,8 @@ static int oto_worker(void *data)
 					" ('%s') — re-enforcing\n", cleaned);
 				oto_apply_cpuset_override();
 			}
+		skip_watchdog:
+			;
 		}
 
 		msleep_interruptible(OTO_SCAN_MS);

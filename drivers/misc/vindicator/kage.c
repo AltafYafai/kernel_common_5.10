@@ -15,8 +15,57 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/fs.h>
 
 extern int kiryuu_exec(const char *cmd);
+
+/*
+ * Path to the ksud binary. Override via module param if KernelSU
+ * is installed at a non-default location.
+ */
+static char ksud_path[256] = "/data/adb/ksud";
+module_param_string(ksud_path, ksud_path, sizeof(ksud_path), 0644);
+MODULE_PARM_DESC(ksud_path, "Path to the ksud binary");
+
+/*
+ * Lazy KSU availability check: cached after first probe.
+ * 0 = not checked, 1 = available, -1 = not found.
+ */
+static int ksu_available;
+static DEFINE_SPINLOCK(ksu_check_lock);
+
+static bool ksu_is_available(void)
+{
+	struct file *f;
+	unsigned long flags;
+	int cached;
+
+	spin_lock_irqsave(&ksu_check_lock, flags);
+	cached = ksu_available;
+	spin_unlock_irqrestore(&ksu_check_lock, flags);
+
+	if (cached)
+		return cached > 0;
+
+	/* Probe once at first use */
+	f = filp_open(ksud_path, O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		spin_lock_irqsave(&ksu_check_lock, flags);
+		ksu_available = -1;
+		spin_unlock_irqrestore(&ksu_check_lock, flags);
+		return false;
+	}
+	filp_close(f, NULL);
+
+	spin_lock_irqsave(&ksu_check_lock, flags);
+	ksu_available = 1;
+	spin_unlock_irqrestore(&ksu_check_lock, flags);
+	return true;
+}
+
+#define kage_pr_cmd_result(fmt, ...) \
+	pr_debug("kage: " fmt, ##__VA_ARGS__)
 
 /**
  * kage_hide_path - Hide a filesystem path via SUSFS
@@ -31,9 +80,12 @@ int kage_hide_path(const char *path)
 	if (!path)
 		return -EINVAL;
 
-	snprintf(cmd, sizeof(cmd), "/data/adb/ksud susfs add_sus_path '%s'", path);
-	pr_info("kage: hiding path via SUSFS -> %s\n", path);
+	snprintf(cmd, sizeof(cmd), "%s susfs add_sus_path '%s'", ksud_path, path);
 
+	if (!ksu_is_available())
+		return -ENOENT;
+
+	kage_pr_cmd_result("hiding path via SUSFS -> %s\n", path);
 	return kiryuu_exec(cmd);
 }
 EXPORT_SYMBOL_GPL(kage_hide_path);
@@ -51,9 +103,12 @@ int kage_unhide_path(const char *path)
 	if (!path)
 		return -EINVAL;
 
-	snprintf(cmd, sizeof(cmd), "/data/adb/ksud susfs rm_sus_path '%s'", path);
-	pr_info("kage: unhiding path via SUSFS -> %s\n", path);
+	snprintf(cmd, sizeof(cmd), "%s susfs rm_sus_path '%s'", ksud_path, path);
 
+	if (!ksu_is_available())
+		return -ENOENT;
+
+	kage_pr_cmd_result("unhiding path via SUSFS -> %s\n", path);
 	return kiryuu_exec(cmd);
 }
 EXPORT_SYMBOL_GPL(kage_unhide_path);
@@ -71,9 +126,12 @@ int kage_hide_mount(const char *path)
 	if (!path)
 		return -EINVAL;
 
-	snprintf(cmd, sizeof(cmd), "/data/adb/ksud susfs add_sus_mount '%s'", path);
-	pr_info("kage: hiding mount via SUSFS -> %s\n", path);
+	snprintf(cmd, sizeof(cmd), "%s susfs add_sus_mount '%s'", ksud_path, path);
 
+	if (!ksu_is_available())
+		return -ENOENT;
+
+	kage_pr_cmd_result("hiding mount via SUSFS -> %s\n", path);
 	return kiryuu_exec(cmd);
 }
 EXPORT_SYMBOL_GPL(kage_hide_mount);
@@ -91,9 +149,12 @@ int kage_unhide_mount(const char *path)
 	if (!path)
 		return -EINVAL;
 
-	snprintf(cmd, sizeof(cmd), "/data/adb/ksud susfs rm_sus_mount '%s'", path);
-	pr_info("kage: unhiding mount via SUSFS -> %s\n", path);
+	snprintf(cmd, sizeof(cmd), "%s susfs rm_sus_mount '%s'", ksud_path, path);
 
+	if (!ksu_is_available())
+		return -ENOENT;
+
+	kage_pr_cmd_result("unhiding mount via SUSFS -> %s\n", path);
 	return kiryuu_exec(cmd);
 }
 EXPORT_SYMBOL_GPL(kage_unhide_mount);
@@ -114,8 +175,12 @@ int kage_hide_package(const char *pkg_name)
 		return -EINVAL;
 
 	snprintf(cmd, sizeof(cmd),
-		 "/data/adb/ksud susfs add_sus_package '%s'", pkg_name);
-	pr_info("kage: hiding root from package -> %s\n", pkg_name);
+		 "%s susfs add_sus_package '%s'", ksud_path, pkg_name);
+
+	if (!ksu_is_available())
+		return -ENOENT;
+
+	kage_pr_cmd_result("hiding root from package -> %s\n", pkg_name);
 	ret = kiryuu_exec(cmd);
 
 	return ret;
@@ -125,9 +190,10 @@ EXPORT_SYMBOL_GPL(kage_hide_package);
 
 static int __init kage_init(void)
 {
-	pr_info("kage: SUSFS path/mount hiding helper initialized\n");
+	pr_debug("kage: SUSFS path/mount hiding helper initialized\n");
 	return 0;
 }
+
 late_initcall(kage_init);
 
 static void __exit kage_exit(void)

@@ -16,6 +16,7 @@
 #include <linux/workqueue.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/input.h>
 #include <trace/hooks/sched.h>
 
 #define SEN_BOOST_DURATION_MS	1000
@@ -33,7 +34,7 @@ static DEFINE_SPINLOCK(sen_lock);
 static struct delayed_work sen_boost_off_work;
 
 /* Hook pointer exported by the input subsystem */
-extern void (*sen_touch_hook)(void);
+extern void (*sen_touch_hook)(unsigned int type, unsigned int code);
 
 static void sen_vh_map_util_freq(void *data, unsigned long util,
 				 unsigned long freq, unsigned long cap,
@@ -68,11 +69,23 @@ static void sen_boost_off(struct work_struct *work)
 	pr_debug("sen: touch boost OFF\n");
 }
 
-static void sen_trigger_boost(void)
+static void sen_trigger_boost(unsigned int type, unsigned int code)
 {
 	unsigned long flags;
 
 	if (!sen_enabled)
+		return;
+
+	/*
+	 * Only fire on actual touch events, not on keyboard,
+	 * gamepad, power button, or other non-touch inputs.
+	 * Filter for absolute multi-touch position events.
+	 */
+	if (type != EV_ABS)
+		return;
+	if (code != ABS_MT_POSITION_X && code != ABS_MT_POSITION_Y &&
+	    code != ABS_MT_TRACKING_ID && code != ABS_MT_TOUCH_MAJOR &&
+	    code != ABS_MT_WIDTH_MAJOR && code != ABS_PRESSURE)
 		return;
 
 	spin_lock_irqsave(&sen_lock, flags);

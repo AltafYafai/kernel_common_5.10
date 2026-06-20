@@ -25,6 +25,7 @@
 #include <linux/cpufreq.h>
 #include <linux/pm_qos.h>
 #include <linux/suspend.h>
+#include <linux/fb.h>
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/fs.h>
@@ -252,7 +253,7 @@ static void noct_screen_off(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* PM notifier                                                         */
+/* PM notifier (legacy fallback — works on older kernels)             */
 /* ------------------------------------------------------------------ */
 static int noct_pm_notifier(struct notifier_block *nb, unsigned long event, void *data)
 {
@@ -271,6 +272,40 @@ static int noct_pm_notifier(struct notifier_block *nb, unsigned long event, void
 
 static struct notifier_block noct_pm_nb = {
 	.notifier_call = noct_pm_notifier,
+};
+
+/* ------------------------------------------------------------------ */
+/* FB notifier (works on modern DRM/KMS kernels)                      */
+/* ------------------------------------------------------------------ */
+static int noct_fb_notifier(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct fb_event *ev = data;
+	int blank;
+
+	if (event != FB_EVENT_BLANK)
+		return NOTIFY_OK;
+
+	if (!ev || !ev->data)
+		return NOTIFY_OK;
+
+	blank = *(int *)ev->data;
+
+	switch (blank) {
+	case FB_BLANK_UNBLANK:
+		noct_screen_on();
+		break;
+	case FB_BLANK_POWERDOWN:
+	case FB_BLANK_HSYNC_SUSPEND:
+	case FB_BLANK_VSYNC_SUSPEND:
+	case FB_BLANK_NORMAL:
+		noct_screen_off();
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block noct_fb_nb = {
+	.notifier_call = noct_fb_notifier,
 };
 
 /* ------------------------------------------------------------------ */
@@ -298,19 +333,23 @@ static int __init nocturne_init(void)
 		return ret;
 
 	register_pm_notifier(&noct_pm_nb);
+	fb_register_client(&noct_fb_nb);
 	pr_info("loaded (freq_cap=%u kHz, gaming_respect=%d, cpuset_restrict=%d)\n",
 		noct_freq_cap_khz, noct_respect_gaming, noct_restrict_cpusets);
 	return 0;
+
 }
 
 static void __exit nocturne_exit(void)
 {
 	unregister_pm_notifier(&noct_pm_nb);
+	fb_unregister_client(&noct_fb_nb);
 	noct_screen_on(); /* restore any throttled resources */
 	noct_qos_remove_all();
 	kfree(noct_qos_min);
 	kfree(noct_qos_max);
 	pr_info("unloaded\n");
+
 }
 
 module_init(nocturne_init);

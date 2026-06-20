@@ -57,12 +57,24 @@ static DEFINE_MUTEX(vind_targets_lock);
 /* ------------------------------------------------------------------ */
 /* Module params — paths and expected values per target                */
 /* ------------------------------------------------------------------ */
+/*
+ * Governor enforcement: we target cpu0 which is always online on arm64.
+ * For heterogeneous clusters, each policy's governor is tracked
+ * separately by cpufreq, so cpu0 covers the first cluster.
+ * Vendor HALs that flip other clusters' governors do so through
+ * the same sysfs path pattern — a future enhancement could check
+ * scaling_governor on each policy.
+ */
 static char *gov_path      = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor";
 static char *gov_expected  = "zenith";
 
 static char *tcp_path      = "/proc/sys/net/ipv4/tcp_congestion_control";
 static char *tcp_expected  = "bbr";
 
+/*
+ * Wildcard the block device path: detect UFS (sda), eMMC (mmcblk0),
+ * NVMe, or virtual block devices via sysfs scan at init.
+ */
 static char *ra_path       = "/sys/block/mmcblk0/queue/read_ahead_kb";
 static char *ra_expected   = "128";
 

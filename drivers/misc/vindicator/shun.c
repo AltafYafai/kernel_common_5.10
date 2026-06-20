@@ -16,6 +16,7 @@
 #include <linux/workqueue.h>
 #include <linux/cpu.h>
 #include <linux/pm_qos.h>
+#include <linux/slab.h>
 
 #define SHUN_BOOST_DELAY_MS	10000
 #define SHUN_REVERT_DELAY_MS	30000
@@ -37,9 +38,48 @@ MODULE_PARM_DESC(shun_revert_ms,
 static struct delayed_work shun_boost_work;
 static struct delayed_work shun_revert_work;
 
-static struct freq_qos_request shun_min_req[NR_CPUS];
-static struct freq_qos_request shun_max_req[NR_CPUS];
-static bool shun_qos_init[NR_CPUS];
+/* Dynamic per-policy QoS tracking */
+struct shun_qos_entry {
+	unsigned int cpu;
+	struct freq_qos_request min_req;
+	struct freq_qos_request max_req;
+	bool init;
+};
+
+static struct shun_qos_entry *shun_entries;
+static unsigned int shun_nr_entries;
+
+static struct shun_qos_entry *shun_find_entry(unsigned int cpu)
+{
+	unsigned int i;
+
+	for (i = 0; i < shun_nr_entries; i++) {
+		if (shun_entries[i].cpu == cpu && shun_entries[i].init)
+			return &shun_entries[i];
+	}
+	return NULL;
+}
+
+static struct shun_qos_entry *shun_add_entry(unsigned int cpu,
+					      struct cpufreq_policy *policy)
+{
+	struct shun_qos_entry *new_entries;
+	unsigned int new_nr;
+
+	new_nr = shun_nr_entries + 1;
+	new_entries = krealloc(shun_entries,
+			      new_nr * sizeof(*new_entries),
+			      GFP_KERNEL);
+	if (!new_entries)
+		return NULL;
+
+	shun_entries = new_entries;
+	new_entries[shun_nr_entries].cpu = cpu;
+	new_entries[shun_nr_entries].init = false;
+	shun_nr_entries = new_nr;
+
+	return &new_entries[shun_nr_entries - 1];
+}
 
 static void shun_do_boost(struct work_struct *work)
 {
@@ -49,25 +89,35 @@ static void shun_do_boost(struct work_struct *work)
 	pr_info("shun: locking min=max via QoS\n");
 
 	for_each_online_cpu(cpu) {
+		struct shun_qos_entry *entry;
+
 		policy = cpufreq_cpu_get(cpu);
 		if (!policy)
 			continue;
 
 		if (policy->cpu == cpu) {
-			if (!shun_qos_init[cpu]) {
+			entry = shun_find_entry(cpu);
+			if (!entry)
+				entry = shun_add_entry(cpu, policy);
+			if (!entry) {
+				cpufreq_cpu_put(policy);
+				continue;
+			}
+
+			if (!entry->init) {
 				freq_qos_add_request(&policy->constraints,
-					&shun_max_req[cpu],
+					&entry->max_req,
 					FREQ_QOS_MAX,
 					policy->cpuinfo.max_freq);
 				freq_qos_add_request(&policy->constraints,
-					&shun_min_req[cpu],
+					&entry->min_req,
 					FREQ_QOS_MIN,
 					policy->cpuinfo.max_freq);
-				shun_qos_init[cpu] = true;
+				entry->init = true;
 			} else {
-				freq_qos_update_request(&shun_max_req[cpu],
+				freq_qos_update_request(&entry->max_req,
 					policy->cpuinfo.max_freq);
-				freq_qos_update_request(&shun_min_req[cpu],
+				freq_qos_update_request(&entry->min_req,
 					policy->cpuinfo.max_freq);
 			}
 			pr_debug("shun: policy%u locked to %u KHz\n",
@@ -82,40 +132,49 @@ static void shun_do_boost(struct work_struct *work)
 
 static void shun_do_revert(struct work_struct *work)
 {
-	unsigned int cpu;
+	unsigned int i;
 	struct cpufreq_policy *policy;
 
 	pr_info("shun: restoring — releasing QoS locks\n");
 
-	for_each_online_cpu(cpu) {
-		policy = cpufreq_cpu_get(cpu);
+	for (i = 0; i < shun_nr_entries; i++) {
+		struct shun_qos_entry *entry = &shun_entries[i];
+
+		if (!entry->init)
+			continue;
+
+		policy = cpufreq_cpu_get(entry->cpu);
 		if (!policy)
 			continue;
 
-		if (policy->cpu == cpu && shun_qos_init[cpu]) {
-			freq_qos_update_request(&shun_min_req[cpu],
-				policy->cpuinfo.min_freq);
-			freq_qos_update_request(&shun_max_req[cpu],
-				policy->cpuinfo.max_freq);
-			pr_debug("shun: policy%u restored min=%u max=%u KHz\n",
-				 cpu, policy->cpuinfo.min_freq,
-				 policy->cpuinfo.max_freq);
-		}
+		freq_qos_update_request(&entry->min_req,
+			policy->cpuinfo.min_freq);
+		freq_qos_update_request(&entry->max_req,
+			policy->cpuinfo.max_freq);
+		pr_debug("shun: policy%u restored min=%u max=%u KHz\n",
+			 entry->cpu, policy->cpuinfo.min_freq,
+			 policy->cpuinfo.max_freq);
 		cpufreq_cpu_put(policy);
 	}
 }
 
 static void shun_qos_cleanup(void)
 {
-	unsigned int cpu;
+	unsigned int i;
 
-	for_each_possible_cpu(cpu) {
-		if (shun_qos_init[cpu]) {
-			freq_qos_remove_request(&shun_min_req[cpu]);
-			freq_qos_remove_request(&shun_max_req[cpu]);
-			shun_qos_init[cpu] = false;
-		}
+	for (i = 0; i < shun_nr_entries; i++) {
+		struct shun_qos_entry *entry = &shun_entries[i];
+
+		if (!entry->init)
+			continue;
+		freq_qos_remove_request(&entry->min_req);
+		freq_qos_remove_request(&entry->max_req);
+		entry->init = false;
 	}
+
+	kfree(shun_entries);
+	shun_entries = NULL;
+	shun_nr_entries = 0;
 }
 
 static int __init shun_init(void)
@@ -125,7 +184,8 @@ static int __init shun_init(void)
 		return 0;
 	}
 
-	memset(shun_qos_init, 0, sizeof(shun_qos_init));
+	shun_entries = NULL;
+	shun_nr_entries = 0;
 
 	INIT_DELAYED_WORK(&shun_boost_work, shun_do_boost);
 	INIT_DELAYED_WORK(&shun_revert_work, shun_do_revert);

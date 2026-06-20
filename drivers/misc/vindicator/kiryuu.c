@@ -29,6 +29,11 @@
  * that grants PATH access to standard Android binaries. Blocks until the
  * command completes. The calling module must ensure @cmd is not
  * attacker-controlled; no quoting/escaping is performed.
+ *
+ * WARNING: This function BLOCKS the caller until the command completes.
+ * It MUST NOT be called from atomic context, interrupt handlers,
+ * while holding a spinlock, or from any context where sleeping is
+ * forbidden. Use kiryuu_exec_async() for fire-and-forget cases.
  */
 int kiryuu_exec(const char *cmd)
 {
@@ -65,8 +70,9 @@ EXPORT_SYMBOL_GPL(kiryuu_exec);
  *
  * The command runs as UMH_NO_WAIT — no return code is collected.
  * Useful for one-shot property changes where the exit status is
- * not critical.
+ * not critical. Safe to call from any context.
  */
+
 int kiryuu_exec_async(const char *cmd)
 {
 	char *argv[] = { "/system/bin/sh", "-c", (char *)cmd, NULL };

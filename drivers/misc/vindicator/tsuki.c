@@ -19,8 +19,51 @@
 #include <linux/spinlock.h>
 #include <linux/list.h>
 #include <linux/string.h>
+#include <linux/fs.h>
 
 extern int kiryuu_exec(const char *cmd);
+
+/*
+ * Path to the ksud binary. Override via module param if KernelSU
+ * is installed at a non-default location.
+ */
+static char ksud_path[256] = "/data/adb/ksud";
+module_param_string(ksud_path, ksud_path, sizeof(ksud_path), 0644);
+MODULE_PARM_DESC(ksud_path, "Path to the ksud binary");
+
+/*
+ * Lazy KSU availability check: cached after first probe.
+ */
+static int ksu_available;
+static DEFINE_SPINLOCK(ksu_check_lock);
+
+static bool ksu_is_available(void)
+{
+	struct file *f;
+	unsigned long flags;
+	int cached;
+
+	spin_lock_irqsave(&ksu_check_lock, flags);
+	cached = ksu_available;
+	spin_unlock_irqrestore(&ksu_check_lock, flags);
+
+	if (cached)
+		return cached > 0;
+
+	f = filp_open(ksud_path, O_RDONLY, 0);
+	if (IS_ERR(f)) {
+		spin_lock_irqsave(&ksu_check_lock, flags);
+		ksu_available = -1;
+		spin_unlock_irqrestore(&ksu_check_lock, flags);
+		return false;
+	}
+	filp_close(f, NULL);
+
+	spin_lock_irqsave(&ksu_check_lock, flags);
+	ksu_available = 1;
+	spin_unlock_irqrestore(&ksu_check_lock, flags);
+	return true;
+}
 
 #define TSUKI_QUEUE_MAX	64
 
@@ -95,11 +138,12 @@ static void tsuki_process_queue(struct work_struct *work)
 
 	list_for_each_entry_safe(job, tmp, &batch, list) {
 		char cmd[512];
-		int ret;
+		int ret;	if (!ksu_is_available())
+			goto skip;
 
 		snprintf(cmd, sizeof(cmd),
-			 "/data/adb/ksud resetprop -n '%s' '%s'",
-			 job->prop, job->val);
+			 "%s resetprop -n '%s' '%s'",
+			 ksud_path, job->prop, job->val);
 
 		pr_debug("tsuki: applying '%s' = '%s'\n", job->prop, job->val);
 		ret = kiryuu_exec(cmd);
@@ -107,6 +151,13 @@ static void tsuki_process_queue(struct work_struct *work)
 			pr_warn("tsuki: failed to set '%s' (err=%d)\n",
 				job->prop, ret);
 
+		list_del(&job->list);
+		kfree(job->prop);
+		kfree(job->val);
+		kfree(job);
+		continue;
+
+	skip:
 		list_del(&job->list);
 		kfree(job->prop);
 		kfree(job->val);
@@ -131,8 +182,11 @@ int tsuki_setprop_sync(const char *prop, const char *val)
 	if (!prop || !val)
 		return -EINVAL;
 
+	if (!ksu_is_available())
+		return -ENOENT;
+
 	snprintf(cmd, sizeof(cmd),
-		 "/data/adb/ksud resetprop -n '%s' '%s'", prop, val);
+		 "%s resetprop -n '%s' '%s'", ksud_path, prop, val);
 
 	pr_info("tsuki: sync setprop '%s' = '%s'\n", prop, val);
 	return kiryuu_exec(cmd);

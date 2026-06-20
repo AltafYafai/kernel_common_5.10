@@ -75,37 +75,53 @@ static const struct equil_profile_tune equil_tunes[] = {
 /* ------------------------------------------------------------------ */
 /* Module parameters — override per-profile values at runtime          */
 /* ------------------------------------------------------------------ */
-static unsigned int equil_swappiness_battery   = 10;
-static unsigned int equil_swappiness_balanced  = 60;
-static unsigned int equil_swappiness_gaming    = 20;
+static unsigned int equil_swappiness_performance = 20;
+static unsigned int equil_swappiness_battery    = 10;
+static unsigned int equil_swappiness_balanced   = 60;
+static unsigned int equil_swappiness_gaming     = 20;
+static unsigned int equil_swappiness_audio      = 20;
 
-static unsigned int equil_dirty_bg_battery     = 3;
-static unsigned int equil_dirty_bg_balanced    = 5;
-static unsigned int equil_dirty_bg_gaming      = 10;
+static unsigned int equil_dirty_bg_performance   = 10;
+static unsigned int equil_dirty_bg_battery       = 3;
+static unsigned int equil_dirty_bg_balanced      = 5;
+static unsigned int equil_dirty_bg_gaming        = 10;
+static unsigned int equil_dirty_bg_audio         = 10;
 
-static unsigned int equil_dirty_ratio_battery  = 10;
-static unsigned int equil_dirty_ratio_balanced = 20;
-static unsigned int equil_dirty_ratio_gaming   = 30;
+static unsigned int equil_dirty_ratio_performance  = 30;
+static unsigned int equil_dirty_ratio_battery     = 10;
+static unsigned int equil_dirty_ratio_balanced    = 20;
+static unsigned int equil_dirty_ratio_gaming      = 30;
+static unsigned int equil_dirty_ratio_audio       = 30;
 
-static unsigned int equil_vfs_cache_battery    = 200;
-static unsigned int equil_vfs_cache_balanced   = 100;
-static unsigned int equil_vfs_cache_gaming     = 50;
+static unsigned int equil_vfs_cache_performance   = 50;
+static unsigned int equil_vfs_cache_battery       = 200;
+static unsigned int equil_vfs_cache_balanced      = 100;
+static unsigned int equil_vfs_cache_gaming        = 50;
+static unsigned int equil_vfs_cache_audio         = 50;
 
-module_param_named(swappiness_battery,   equil_swappiness_battery,   uint, 0644);
-module_param_named(swappiness_balanced,  equil_swappiness_balanced,  uint, 0644);
-module_param_named(swappiness_gaming,    equil_swappiness_gaming,    uint, 0644);
+module_param_named(swappiness_performance, equil_swappiness_performance, uint, 0644);
+module_param_named(swappiness_battery,     equil_swappiness_battery,     uint, 0644);
+module_param_named(swappiness_balanced,    equil_swappiness_balanced,    uint, 0644);
+module_param_named(swappiness_gaming,      equil_swappiness_gaming,      uint, 0644);
+module_param_named(swappiness_audio,       equil_swappiness_audio,       uint, 0644);
 
+module_param_named(dirty_bg_performance, equil_dirty_bg_performance, uint, 0644);
 module_param_named(dirty_bg_battery,     equil_dirty_bg_battery,     uint, 0644);
 module_param_named(dirty_bg_balanced,    equil_dirty_bg_balanced,    uint, 0644);
 module_param_named(dirty_bg_gaming,      equil_dirty_bg_gaming,      uint, 0644);
+module_param_named(dirty_bg_audio,       equil_dirty_bg_audio,       uint, 0644);
 
-module_param_named(dirty_ratio_battery,  equil_dirty_ratio_battery,  uint, 0644);
-module_param_named(dirty_ratio_balanced, equil_dirty_ratio_balanced, uint, 0644);
-module_param_named(dirty_ratio_gaming,   equil_dirty_ratio_gaming,   uint, 0644);
+module_param_named(dirty_ratio_performance, equil_dirty_ratio_performance, uint, 0644);
+module_param_named(dirty_ratio_battery,     equil_dirty_ratio_battery,     uint, 0644);
+module_param_named(dirty_ratio_balanced,    equil_dirty_ratio_balanced,    uint, 0644);
+module_param_named(dirty_ratio_gaming,      equil_dirty_ratio_gaming,      uint, 0644);
+module_param_named(dirty_ratio_audio,       equil_dirty_ratio_audio,       uint, 0644);
 
-module_param_named(vfs_cache_battery,    equil_vfs_cache_battery,    uint, 0644);
-module_param_named(vfs_cache_balanced,   equil_vfs_cache_balanced,   uint, 0644);
-module_param_named(vfs_cache_gaming,     equil_vfs_cache_gaming,     uint, 0644);
+module_param_named(vfs_cache_performance, equil_vfs_cache_performance, uint, 0644);
+module_param_named(vfs_cache_battery,     equil_vfs_cache_battery,     uint, 0644);
+module_param_named(vfs_cache_balanced,    equil_vfs_cache_balanced,    uint, 0644);
+module_param_named(vfs_cache_gaming,      equil_vfs_cache_gaming,      uint, 0644);
+module_param_named(vfs_cache_audio,       equil_vfs_cache_audio,       uint, 0644);
 
 /* ------------------------------------------------------------------ */
 /* State                                                              */
@@ -147,9 +163,11 @@ static unsigned int equil_override_swappiness(unsigned int profile)
 	case ZENITH_PROFILE_BATTERY:
 		return equil_swappiness_battery;
 	case ZENITH_PROFILE_GAMING:
-	case ZENITH_PROFILE_PERFORMANCE:
-	case ZENITH_PROFILE_AUDIO:
 		return equil_swappiness_gaming;
+	case ZENITH_PROFILE_PERFORMANCE:
+		return equil_swappiness_performance;
+	case ZENITH_PROFILE_AUDIO:
+		return equil_swappiness_audio;
 	default:
 		return equil_swappiness_balanced;
 	}
@@ -161,9 +179,11 @@ static unsigned int equil_override_dirty_bg(unsigned int profile)
 	case ZENITH_PROFILE_BATTERY:
 		return equil_dirty_bg_battery;
 	case ZENITH_PROFILE_GAMING:
-	case ZENITH_PROFILE_PERFORMANCE:
-	case ZENITH_PROFILE_AUDIO:
 		return equil_dirty_bg_gaming;
+	case ZENITH_PROFILE_PERFORMANCE:
+		return equil_dirty_bg_performance;
+	case ZENITH_PROFILE_AUDIO:
+		return equil_dirty_bg_audio;
 	default:
 		return equil_dirty_bg_balanced;
 	}
@@ -175,9 +195,11 @@ static unsigned int equil_override_dirty_ratio(unsigned int profile)
 	case ZENITH_PROFILE_BATTERY:
 		return equil_dirty_ratio_battery;
 	case ZENITH_PROFILE_GAMING:
-	case ZENITH_PROFILE_PERFORMANCE:
-	case ZENITH_PROFILE_AUDIO:
 		return equil_dirty_ratio_gaming;
+	case ZENITH_PROFILE_PERFORMANCE:
+		return equil_dirty_ratio_performance;
+	case ZENITH_PROFILE_AUDIO:
+		return equil_dirty_ratio_audio;
 	default:
 		return equil_dirty_ratio_balanced;
 	}
@@ -189,9 +211,11 @@ static unsigned int equil_override_vfs_cache(unsigned int profile)
 	case ZENITH_PROFILE_BATTERY:
 		return equil_vfs_cache_battery;
 	case ZENITH_PROFILE_GAMING:
-	case ZENITH_PROFILE_PERFORMANCE:
-	case ZENITH_PROFILE_AUDIO:
 		return equil_vfs_cache_gaming;
+	case ZENITH_PROFILE_PERFORMANCE:
+		return equil_vfs_cache_performance;
+	case ZENITH_PROFILE_AUDIO:
+		return equil_vfs_cache_audio;
 	default:
 		return equil_vfs_cache_balanced;
 	}
@@ -247,33 +271,49 @@ static int __init equilibrium_init(void)
 	debugfs_create_u32("current_profile",   0444, equil_dbg_dir,
 			   &equil_current_profile);
 
-	debugfs_create_u32("swappiness_battery",  0644, equil_dbg_dir,
+	debugfs_create_u32("swappiness_performance", 0644, equil_dbg_dir,
+			   &equil_swappiness_performance);
+	debugfs_create_u32("swappiness_battery",   0644, equil_dbg_dir,
 			   &equil_swappiness_battery);
-	debugfs_create_u32("swappiness_balanced", 0644, equil_dbg_dir,
+	debugfs_create_u32("swappiness_balanced",  0644, equil_dbg_dir,
 			   &equil_swappiness_balanced);
-	debugfs_create_u32("swappiness_gaming",   0644, equil_dbg_dir,
+	debugfs_create_u32("swappiness_gaming",    0644, equil_dbg_dir,
 			   &equil_swappiness_gaming);
+	debugfs_create_u32("swappiness_audio",     0644, equil_dbg_dir,
+			   &equil_swappiness_audio);
 
-	debugfs_create_u32("dirty_bg_battery",  0644, equil_dbg_dir,
+	debugfs_create_u32("dirty_bg_performance", 0644, equil_dbg_dir,
+			   &equil_dirty_bg_performance);
+	debugfs_create_u32("dirty_bg_battery",   0644, equil_dbg_dir,
 			   &equil_dirty_bg_battery);
-	debugfs_create_u32("dirty_bg_balanced", 0644, equil_dbg_dir,
+	debugfs_create_u32("dirty_bg_balanced",  0644, equil_dbg_dir,
 			   &equil_dirty_bg_balanced);
-	debugfs_create_u32("dirty_bg_gaming",   0644, equil_dbg_dir,
+	debugfs_create_u32("dirty_bg_gaming",    0644, equil_dbg_dir,
 			   &equil_dirty_bg_gaming);
+	debugfs_create_u32("dirty_bg_audio",     0644, equil_dbg_dir,
+			   &equil_dirty_bg_audio);
 
-	debugfs_create_u32("dirty_ratio_battery",  0644, equil_dbg_dir,
+	debugfs_create_u32("dirty_ratio_performance", 0644, equil_dbg_dir,
+			   &equil_dirty_ratio_performance);
+	debugfs_create_u32("dirty_ratio_battery",   0644, equil_dbg_dir,
 			   &equil_dirty_ratio_battery);
-	debugfs_create_u32("dirty_ratio_balanced", 0644, equil_dbg_dir,
+	debugfs_create_u32("dirty_ratio_balanced",  0644, equil_dbg_dir,
 			   &equil_dirty_ratio_balanced);
-	debugfs_create_u32("dirty_ratio_gaming",   0644, equil_dbg_dir,
+	debugfs_create_u32("dirty_ratio_gaming",    0644, equil_dbg_dir,
 			   &equil_dirty_ratio_gaming);
+	debugfs_create_u32("dirty_ratio_audio",     0644, equil_dbg_dir,
+			   &equil_dirty_ratio_audio);
 
-	debugfs_create_u32("vfs_cache_battery",  0644, equil_dbg_dir,
+	debugfs_create_u32("vfs_cache_performance", 0644, equil_dbg_dir,
+			   &equil_vfs_cache_performance);
+	debugfs_create_u32("vfs_cache_battery",   0644, equil_dbg_dir,
 			   &equil_vfs_cache_battery);
-	debugfs_create_u32("vfs_cache_balanced", 0644, equil_dbg_dir,
+	debugfs_create_u32("vfs_cache_balanced",  0644, equil_dbg_dir,
 			   &equil_vfs_cache_balanced);
-	debugfs_create_u32("vfs_cache_gaming",   0644, equil_dbg_dir,
+	debugfs_create_u32("vfs_cache_gaming",    0644, equil_dbg_dir,
 			   &equil_vfs_cache_gaming);
+	debugfs_create_u32("vfs_cache_audio",     0644, equil_dbg_dir,
+			   &equil_vfs_cache_audio);
 
 	/* Apply initial tuning (BALANCED) */
 	equilibrium_apply_profile(ZENITH_PROFILE_BALANCED);
