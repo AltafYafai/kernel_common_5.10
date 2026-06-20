@@ -117,36 +117,4 @@ config VINDICATOR_SHUN
 	  configurable duration after boot using PM QoS requests.
 	  Gracefully releases the lock after the boost period expires.
 
-config VINDICATOR_KENSHO
-	tristate "Kenshō — kernel panic capture and forensic logging"
-	depends on VINDICATOR
-	help
-	  Kenshō captures kernel panics at the moment they occur by
-	  hooking into the panic notifier chain and the kmsg dump
-	  infrastructure. The captured log (metadata header + full
-	  kernel log buffer) is exposed at /sys/kernel/kensho/last_panic.
-	  
-	  This is invaluable for debugging boot-time crashes, random
-	  reboots, and kernel bugs that don't leave serial traces.
-
-config VINDICATOR_KENSHO_PERSIST
-	bool "Kenshō persistent storage (reserved DRAM)"
-	depends on VINDICATOR_KENSHO = y
-	default y
-	help
-	  Reserves 128 KB of physical DRAM at boot for crash log
-	  persistence. Kenshō writes the full panic log to this
-	  reserved region, allowing it to survive reboots.
-	  
-	  On the next boot, Kenshō automatically detects the previous
-	  crash log and exposes it via /sys/kernel/kensho/last_panic.
-	  The log can also be read from recovery (via the anykernel
-	  script) or from the bootloader (via fastboot if the
-	  bootloader knows the physical address).
-	  
-	  The physical address is printed at boot:
-	    "kensho: persistent region at 0x<addr>"
-	  
-	  This requires VINDICATOR_KENSHO to be built-in (=y).
-
 endmenu
