@@ -135,7 +135,8 @@ int tsuki_setprop_sync(const char *prop, const char *val)
 		 "/data/adb/ksud resetprop -n '%s' '%s'", prop, val);
 
 	pr_info("tsuki: sync setprop '%s' = '%s'\n", prop, val);
-	return kiryuu_exec(cmd, 0);
+	return kiryuu_exec(cmd);
+
 }
 EXPORT_SYMBOL_GPL(tsuki_setprop_sync);
 

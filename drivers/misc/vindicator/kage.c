@@ -116,9 +116,10 @@ int kage_hide_package(const char *pkg_name)
 	snprintf(cmd, sizeof(cmd),
 		 "/data/adb/ksud susfs add_sus_package '%s'", pkg_name);
 	pr_info("kage: hiding root from package -> %s\n", pkg_name);
-	ret = kiryuu_exec(cmd, 0);
+	ret = kiryuu_exec(cmd);
 
 	return ret;
+
 }
 EXPORT_SYMBOL_GPL(kage_hide_package);
 
