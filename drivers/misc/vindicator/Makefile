@@ -14,3 +14,4 @@ obj-$(CONFIG_VINDICATOR_TSUKI)		+= tsuki.o
 obj-$(CONFIG_VINDICATOR_OTO)		+= oto.o
 obj-$(CONFIG_VINDICATOR_SEN)		+= sen.o
 obj-$(CONFIG_VINDICATOR_SHUN)		+= shun.o
+obj-$(CONFIG_VINDICATOR_KENSHO)		+= kensho.o

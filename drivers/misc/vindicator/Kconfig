@@ -117,4 +117,20 @@ config VINDICATOR_SHUN
 	  configurable duration after boot using PM QoS requests.
 	  Gracefully releases the lock after the boost period expires.
 
+config VINDICATOR_KENSHO
+	tristate "Kenshō — kernel panic capture and forensic logging"
+	depends on VINDICATOR
+	help
+	  Kenshō captures kernel panics at the moment they occur by
+	  hooking into the panic notifier chain and the kmsg dump
+	  infrastructure. The captured log (metadata header + full
+	  kernel log buffer) is exposed at /sys/kernel/kensho/last_panic.
+	  
+	  This is invaluable for debugging boot-time crashes, random
+	  reboots, and kernel bugs that don't leave serial traces.
+	  
+	  For cross-reboot persistence, Kenshō can be paired with
+	  pstore (requires CONFIG_PSTORE). Future versions will
+	  include pstore backend support.
+
 endmenu
