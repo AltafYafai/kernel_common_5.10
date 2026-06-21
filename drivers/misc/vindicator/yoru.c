@@ -33,9 +33,9 @@
 /* Tunables                                                           */
 /* ------------------------------------------------------------------ */
 
-static bool yoru_enabled = true;
+static bool yoru_enabled;
 module_param_named(enabled, yoru_enabled, bool, 0644);
-MODULE_PARM_DESC(enabled, "Enable Yoru watchdog (default: true)");
+MODULE_PARM_DESC(enabled, "Enable Yoru watchdog (default: false)");
 
 static unsigned int yoru_timeout = 60;
 module_param_named(timeout, yoru_timeout, uint, 0644);
@@ -97,8 +97,11 @@ static int __init yoru_init(void)
 	timer_setup(&yoru_timer, yoru_timer_cb, 0);
 	yoru_start();
 
-	pr_info("active (timeout=%us)%s\n", yoru_timeout,
-		yoru_enabled ? "" : " — disabled at boot");
+	if (yoru_enabled)
+		pr_info("active (timeout=%us) — enable init.rc pet to activate\n",
+			yoru_timeout);
+	else
+		pr_info("disabled — set yoru.enabled=1 and configure pet to activate\n");
 	return 0;
 }
 late_initcall(yoru_init);

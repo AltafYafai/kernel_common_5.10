@@ -150,6 +150,12 @@ config VINDICATOR_YORU
 	    - Kernel panic  → Kaisei redirects to recovery
 	    - Kernel hang    → Yoru triggers panic → Kaisei redirects
 
+	  DISABLED BY DEFAULT (yoru.enabled=0).  To use Yoru, set
+	  yoru.enabled=1 AND configure an init.rc script to
+	  periodically write to /sys/module/yoru/parameters/pet.
+	  Without a userspace pet, the watchdog will fire after the
+	  default 60-second timeout.
+
 	  The timeout and enable/disable are configurable via module
 	  parameters at /sys/module/yoru/parameters/.
 
