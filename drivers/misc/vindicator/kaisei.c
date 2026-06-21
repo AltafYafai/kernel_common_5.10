@@ -103,9 +103,10 @@ static const char * const kaisei_fallback_cmds[] = {
  */
 struct kaisei_persistent {
 	u32 magic;		/* KAISEI_PERSISTENT_MAGIC */
-	u32 version;		/* struct version (1) */
+	u32 version;		/* struct version (2) */
 	u32 cross_counter;	/* consecutive cross-reboot failed-recovery boots */
 	u32 last_panic;		/* 1 = previous boot ended in failed recovery */
+	char last_reason[48];	/* truncated panic reason (persisted cross-reboot) */
 };
 
 /* Mapped pointer, NULL = not available / not found */
@@ -197,6 +198,18 @@ static inline void kaisei_pwrite(u32 *field, u32 val)
 		return;
 	smp_wmb();
 	WRITE_ONCE(*field, val);
+}
+
+/*
+ * Write a buffer to persistent memory.  Used to persist the panic
+ * reason string across reboots.  Safe for panic context.
+ */
+static inline void kaisei_pwrite_buf(void *dst, const void *src, size_t len)
+{
+	if (!kaisei_persistent)
+		return;
+	smp_wmb();
+	memcpy(dst, src, len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -330,11 +343,17 @@ static void kaisei_check_cross_bootloop(void)
 	/* Prepare for THIS boot: clear the panic flag */
 	kaisei_pwrite(&kaisei_persistent->last_panic, 0);
 
-	/* Write magic on first use */
+	/* Write magic on first use, or migrate from v1 */
 	if (magic != KAISEI_PERSISTENT_MAGIC) {
 		kaisei_pwrite(&kaisei_persistent->magic,
 			      KAISEI_PERSISTENT_MAGIC);
-		kaisei_pwrite(&kaisei_persistent->version, 1);
+		kaisei_pwrite(&kaisei_persistent->version, 2);
+	} else if (magic == KAISEI_PERSISTENT_MAGIC &&
+		   kaisei_pread(&kaisei_persistent->version) < 2) {
+		/* Old v1 struct: clear the new last_reason field */
+		memset(kaisei_persistent->last_reason, 0,
+		       sizeof(kaisei_persistent->last_reason));
+		kaisei_pwrite(&kaisei_persistent->version, 2);
 	}
 }
 
@@ -399,6 +418,15 @@ static int kaisei_panic_cb(struct notifier_block *nb,
 
 	/* Persist the failure for cross-reboot detection */
 	kaisei_pwrite(&kaisei_persistent->last_panic, 1);
+
+	/*
+	 * Persist the panic reason string so it can be published via
+	 * Herald on the next boot.
+	 */
+	kaisei_pwrite_buf(kaisei_persistent->last_reason,
+			  kaisei_last_reason,
+			  min(sizeof(kaisei_persistent->last_reason),
+			      sizeof(kaisei_last_reason)));
 
 	return NOTIFY_DONE;
 }
@@ -470,19 +498,30 @@ create_sysfs:
 	}
 
 #ifdef CONFIG_VINDICATOR_HERALD
-	if (!kaisei_disabled) {
+	{
 		char buf[32];
 
-		herald_set_prop("sys.kaisei.status", "active");
+		if (kaisei_disabled)
+			herald_set_prop("sys.kaisei.status",
+				       "disabled (bootloop)");
+		else
+			herald_set_prop("sys.kaisei.status", "active");
+
 		herald_set_prop("sys.kaisei.cmd", kaisei_cmd);
 
 		snprintf(buf, sizeof(buf), "%u",
 			 READ_ONCE(kaisei_max_failures));
 		herald_set_prop("sys.kaisei.max_failures", buf);
 
-		snprintf(buf, sizeof(buf), "%d",
-			 atomic_read(&kaisei_trigger_count));
-		herald_set_prop("sys.kaisei.trigger_count", buf);
+		snprintf(buf, sizeof(buf), "%u",
+			 kaisei_pread(&kaisei_persistent->cross_counter));
+		herald_set_prop("sys.kaisei.cross_counter", buf);
+
+		/* Publish last panic reason from persistent storage */
+		if (kaisei_persistent &&
+		    kaisei_persistent->last_reason[0])
+			herald_set_prop("sys.kaisei.last_reason",
+				       kaisei_persistent->last_reason);
 
 		pr_info("herald properties published\n");
 	}

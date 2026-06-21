@@ -15,3 +15,4 @@ obj-$(CONFIG_VINDICATOR_OTO)		+= oto.o
 obj-$(CONFIG_VINDICATOR_SEN)		+= sen.o
 obj-$(CONFIG_VINDICATOR_SHUN)		+= shun.o
 obj-$(CONFIG_VINDICATOR_KAISEI)		+= kaisei.o
+obj-$(CONFIG_VINDICATOR_YORU)			+= yoru.o

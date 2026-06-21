@@ -136,4 +136,23 @@ config VINDICATOR_KAISEI
 	  Say Y here to ensure kernel panics land you in recovery
 	  instead of a bootloop.
 
+config VINDICATOR_YORU
+	tristate "Yoru — watchdog panic generator"
+	depends on VINDICATOR
+	help
+	  Yoru starts a kernel timer on boot.  Userspace must pet the
+	  watchdog periodically by writing to
+	  /sys/module/yoru/parameters/pet.  If the timer expires,
+	  Yoru calls panic() — which Kaisei (回生) intercepts and
+	  redirects into recovery mode.
+
+	  Together Yoru + Kaisei cover both kernel panics AND hangs:
+	    - Kernel panic  → Kaisei redirects to recovery
+	    - Kernel hang    → Yoru triggers panic → Kaisei redirects
+
+	  The timeout and enable/disable are configurable via module
+	  parameters at /sys/module/yoru/parameters/.
+
+	  Say Y here if you want hung systems to also land in recovery.
+
 endmenu
