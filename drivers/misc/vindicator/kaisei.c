@@ -122,6 +122,84 @@ static char     kaisei_last_reason[256];
 static bool     kaisei_disabled;	/* bootloop protection tripped */
 
 /* ------------------------------------------------------------------ */
+/* Persistent-memory helpers                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Map the last 64 bytes of the ramoops reserved-memory region so we can
+ * persist a bootloop counter across reboots.
+ */
+static void *kaisei_map_persistent(void)
+{
+	struct device_node *np;
+	struct resource res;
+	void *base;
+	phys_addr_t offset;
+
+	np = of_find_compatible_node(NULL, NULL, "ramoops");
+	if (!np) {
+		pr_info("no ramoops DT node found — cross-reboot bootloop "
+			"protection unavailable\n");
+		return NULL;
+	}
+
+	if (of_address_to_resource(np, 0, &res)) {
+		pr_warn("failed to read ramoops resource\n");
+		of_node_put(np);
+		return NULL;
+	}
+	of_node_put(np);
+
+	if (resource_size(&res) < KAISEI_PERSISTENT_SIZE) {
+		pr_warn("ramoops region too small (%llu bytes) — bootloop "
+			"protection unavailable\n",
+			resource_size(&res));
+		return NULL;
+	}
+
+	offset = resource_size(&res) - KAISEI_PERSISTENT_SIZE;
+	base = memremap(res.start + offset, KAISEI_PERSISTENT_SIZE,
+			MEMREMAP_WB);
+	if (!base) {
+		pr_warn("failed to memremap ramoops tail — bootloop "
+			"protection unavailable\n");
+		return NULL;
+	}
+
+	return base;
+}
+
+static void kaisei_unmap_persistent(void *ptr)
+{
+	if (ptr)
+		memunmap(ptr);
+}
+
+/*
+ * Read a u32 from persistent memory.  Returns 0 if mapping is unavailable.
+ */
+static inline u32 kaisei_pread(u32 *field)
+{
+	if (!kaisei_persistent)
+		return 0;
+	return READ_ONCE(*field);
+}
+
+/*
+ * Write a u32 to persistent memory.  Safe for panic context (no
+ * allocations, no locking).  Uses smp_wmb() to ensure the store is
+ * visible before emergency_restart() performs the PSCI reset.
+ * Silent no-op if mapping is unavailable.
+ */
+static inline void kaisei_pwrite(u32 *field, u32 val)
+{
+	if (!kaisei_persistent)
+		return;
+	smp_wmb();
+	WRITE_ONCE(*field, val);
+}
+
+/* ------------------------------------------------------------------ */
 /* Sysfs                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -194,90 +272,6 @@ static struct attribute *kaisei_attrs[] = {
 	NULL,
 };
 ATTRIBUTE_GROUPS(kaisei);
-
-/* ------------------------------------------------------------------ */
-/* Persistent-memory helpers                                          */
-/* ------------------------------------------------------------------ */
-
-/*
- * Map the last 64 bytes of the ramoops reserved-memory region so we can
- * persist a bootloop counter across reboots.
- */
-static void *kaisei_map_persistent(void)
-{
-	struct device_node *np;
-	struct resource res;
-	void *base;
-	phys_addr_t offset;
-
-	np = of_find_compatible_node(NULL, NULL, "ramoops");
-	if (!np) {
-		pr_info("no ramoops DT node found — cross-reboot bootloop "
-			"protection unavailable\n");
-		return NULL;
-	}
-
-	if (of_address_to_resource(np, 0, &res)) {
-		pr_warn("failed to read ramoops resource\n");
-		of_node_put(np);
-		return NULL;
-	}
-	of_node_put(np);
-
-	if (resource_size(&res) < KAISEI_PERSISTENT_SIZE) {
-		pr_warn("ramoops region too small (%llu bytes) — bootloop "
-			"protection unavailable\n",
-			resource_size(&res));
-		return NULL;
-	}
-
-	/*
-	 * Map the last KAISEI_PERSISTENT_SIZE bytes with write-back
-	 * caching (same attributes as the kernel's linear mapping and
-	 * ramoops' own memremap), avoiding aliased-mapping hazards on
-	 * ARM64.
-	 */
-	offset = resource_size(&res) - KAISEI_PERSISTENT_SIZE;
-	base = memremap(res.start + offset, KAISEI_PERSISTENT_SIZE,
-			MEMREMAP_WB);
-	if (!base) {
-		pr_warn("failed to memremap ramoops tail — bootloop "
-			"protection unavailable\n");
-		return NULL;
-	}
-
-	return base;
-}
-
-static void kaisei_unmap_persistent(void *ptr)
-{
-	if (ptr)
-		memunmap(ptr);
-}
-
-/*
- * Read a u32 from persistent memory.  Returns 0 if mapping is unavailable.
- */
-static inline u32 kaisei_pread(u32 *field)
-{
-	if (!kaisei_persistent)
-		return 0;
-	return READ_ONCE(*field);
-}
-
-/*
- * Write a u32 to persistent memory.  Safe for panic context (no
- * allocations, no locking).  Uses smp_wmb() to ensure the store is
- * visible before emergency_restart() performs the PSCI reset.
- * Silent no-op if mapping is unavailable.
- */
-static inline void kaisei_pwrite(u32 *field, u32 val)
-{
-	if (!kaisei_persistent)
-		return;
-	smp_wmb();
-	WRITE_ONCE(*field, val);
-}
 
 /* ------------------------------------------------------------------ */
 /* Cross-reboot bootloop detection                                     */
