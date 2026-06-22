@@ -44,7 +44,7 @@ static const struct equil_profile_tune equil_tunes[] = {
 		.swappiness         = 60,
 		.dirty_bg_ratio     = 5,
 		.dirty_ratio        = 20,
-		.vfs_cache_pressure = 100,
+		.vfs_cache_pressure = 200,
 	},
 	[ZENITH_PROFILE_PERFORMANCE] = {
 		.swappiness         = 20,
