@@ -19,7 +19,7 @@
 #include <linux/input.h>
 #include <trace/hooks/sched.h>
 
-#define SEN_BOOST_DURATION_MS	1000
+#define SEN_BOOST_DURATION_MS	500
 
 static bool sen_enabled = true;
 module_param(sen_enabled, bool, 0644);

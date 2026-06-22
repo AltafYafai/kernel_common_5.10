@@ -18,8 +18,8 @@
 #include <linux/pm_qos.h>
 
 
-#define SHUN_BOOST_DELAY_MS	10000
-#define SHUN_REVERT_DELAY_MS	30000
+#define SHUN_BOOST_DELAY_MS	5000
+#define SHUN_REVERT_DELAY_MS	15000
 
 static bool shun_enabled = true;
 module_param(shun_enabled, bool, 0644);
