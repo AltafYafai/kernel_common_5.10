@@ -36,11 +36,11 @@
 /* ------------------------------------------------------------------ */
 /* Tunables                                                           */
 /* ------------------------------------------------------------------ */
-static unsigned int vind_interval_min_ms = 250;   /* highest frequency */
+static unsigned int vind_interval_min_ms = 2000;   /* highest frequency */
 module_param_named(interval_min_ms, vind_interval_min_ms, uint, 0644);
 MODULE_PARM_DESC(interval_min_ms, "Minimum enforcement interval (ms)");
 
-static unsigned int vind_interval_max_ms = 5000;  /* after full backoff */
+static unsigned int vind_interval_max_ms = 10000;  /* after full backoff */
 module_param_named(interval_max_ms, vind_interval_max_ms, uint, 0644);
 MODULE_PARM_DESC(interval_max_ms, "Maximum enforcement interval (ms) after backoff");
 

@@ -33,11 +33,11 @@
 
 #define OTO_ENGAGE_DELAY_MS	20000
 #define OTO_SCAN_MS		5000
-#define OTO_PM_QOS_LATENCY_US	500
+#define OTO_PM_QOS_LATENCY_US	2000
 #define OTO_MAX_AUDIO_PIDS	64
 #define OTO_FIFO_PRIORITY	2
 
-static bool oto_enabled = true;
+static bool oto_enabled;
 module_param(oto_enabled, bool, 0644);
 MODULE_PARM_DESC(oto_enabled, "Enable Oto audio boost (default: true)");
 
