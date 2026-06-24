@@ -200,16 +200,72 @@ static void noct_qos_restore(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Saved cpuset masks — restored on screen-on                          */
+/* ------------------------------------------------------------------ */
+#define NOCT_CPUSET_PATH_MAX	64
+#define NOCT_CPUSET_BUF_MAX	64
+
+struct noct_saved_cpuset {
+	char	path[NOCT_CPUSET_PATH_MAX];
+	char	value[NOCT_CPUSET_BUF_MAX];
+	bool	saved;
+};
+
+static struct noct_saved_cpuset noct_cpusets[] = {
+	{ .path = "/dev/cpuset/background/cpus" },
+	{ .path = "/dev/cpuset/system-background/cpus" },
+};
+
+/*
+ * Read the current value of a cpuset file into buf.  Returns 0 on
+ * success, negative errno on failure.  Strips trailing newline.
+ */
+static int noct_read_cpuset(const char *path, char *buf, size_t size)
+{
+	struct file *f;
+	loff_t pos = 0;
+	int ret;
+
+	f = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+
+	ret = kernel_read(f, buf, size - 1, &pos);
+	filp_close(f, NULL);
+	if (ret < 0)
+		return ret;
+
+	buf[ret] = '\0';
+	if (ret > 0 && buf[ret - 1] == '\n')
+		buf[ret - 1] = '\0';
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Screen state transition                                            */
 /* ------------------------------------------------------------------ */
 static void noct_screen_on(void)
 {
+	int i;
+
 	if (!screen_off)
 		return;
 
 	mutex_lock(&noct_lock);
 	screen_off = false;
 	noct_qos_restore();
+
+	/* Restore saved cpuset masks */
+	for (i = 0; i < ARRAY_SIZE(noct_cpusets); i++) {
+		if (!noct_cpusets[i].saved)
+			continue;
+		noct_write_file(noct_cpusets[i].path, noct_cpusets[i].value);
+		noct_cpusets[i].saved = false;
+		pr_debug("nocturne: restored cpuset '%s' -> %s\n",
+			 noct_cpusets[i].path, noct_cpusets[i].value);
+	}
+
 	pr_info("screen ON — frequency limits restored\n");
 	mutex_unlock(&noct_lock);
 }
@@ -217,6 +273,7 @@ static void noct_screen_on(void)
 static void noct_screen_off(void)
 {
 	unsigned int effective_cap;
+	int i;
 
 	if (screen_off)
 		return;
@@ -240,8 +297,21 @@ static void noct_screen_off(void)
 
 	noct_qos_throttle(effective_cap);
 
-	/* Restrict background cpusets */
+	/* Save and restrict background cpusets */
 	if (noct_restrict_cpusets) {
+		/* Save current masks first so they can be restored on screen-on */
+		for (i = 0; i < ARRAY_SIZE(noct_cpusets); i++) {
+			noct_cpusets[i].saved = false;
+			if (noct_read_cpuset(noct_cpusets[i].path,
+					    noct_cpusets[i].value,
+					    sizeof(noct_cpusets[i].value)) == 0) {
+				noct_cpusets[i].saved = true;
+				pr_debug("nocturne: saved cpuset '%s' = %s\n",
+					 noct_cpusets[i].path,
+					 noct_cpusets[i].value);
+			}
+		}
+
 		noct_write_file("/dev/cpuset/background/cpus", "0");
 		noct_write_file("/dev/cpuset/system-background/cpus", "0");
 		pr_info("background cpusets restricted to CPU0\n");
