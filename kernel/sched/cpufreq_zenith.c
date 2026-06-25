@@ -8296,16 +8296,7 @@ extern void iyashi_apply_profile(unsigned int profile);
 static inline void iyashi_apply_profile(unsigned int profile) { }
 #endif
 
-#if IS_ENABLED(CONFIG_VINDICATOR_EQUILIBRIUM)
-extern void equilibrium_apply_profile(unsigned int profile);
-#else
-static inline void equilibrium_apply_profile(unsigned int profile) { }
-#endif
-#if IS_ENABLED(CONFIG_VINDICATOR_NOCTURNE)
-extern void nocturne_apply_profile(unsigned int profile);
-#else
-static inline void nocturne_apply_profile(unsigned int profile) { }
-#endif
+	static inline void equilibrium_apply_profile(unsigned int profile) { }\n\tstatic inline void nocturne_apply_profile(unsigned int profile) { }
 
 /* Patch K: live skin-temp readout for the game_perf_burst guardrail.
  * Returns millidegrees C.
