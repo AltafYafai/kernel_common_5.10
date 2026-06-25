@@ -158,8 +158,8 @@ static unsigned int hikari_uclamp_ttl_ms = 16;
  * anyway for paranoia.
  */
 static unsigned int hikari_uclamp_max_pct;
-static unsigned int hikari_floor_khz_cluster0 = 800000;
-static unsigned int hikari_floor_khz_cluster1 = 1200000;
+static unsigned int hikari_floor_khz_cluster0 = 500000;
+static unsigned int hikari_floor_khz_cluster1 = 800000;
 static unsigned int hikari_floor_ttl_ms = 50;
 /*
  * Per-cluster floor-TTL overrides.  Zero (default) means "fall back to

@@ -1612,7 +1612,7 @@
  * requested preset before any userspace can write to the profile sysfs
  * node. Defaults to CUSTOM, which means "no cmdline override".
  */
-static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
+static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_BALANCED;
 
 /* Optional per-policy cmdline profile overrides parsed from
  * zenith.policy_profile=N:prof,M:prof,...  Indexed by the "policy
