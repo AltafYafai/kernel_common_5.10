@@ -25,7 +25,6 @@
 #include <linux/cpufreq.h>
 #include <linux/pm_qos.h>
 #include <linux/suspend.h>
-#include <linux/fb.h>
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/fs.h>
@@ -38,6 +37,7 @@ static bool noct_enabled = true;
 module_param_named(enabled, noct_enabled, bool, 0644);
 MODULE_PARM_DESC(enabled, "Master enable");
 
+/* Frequency cap (KHz) applied when screen is off; 0 = no cap */
 /* Frequency cap (KHz) applied when screen is off; 0 = no cap */
 static unsigned int noct_freq_cap_khz = 1516800;
 module_param_named(freq_cap_khz, noct_freq_cap_khz, uint, 0644);
@@ -153,12 +153,12 @@ fail:
 	return -ENOMEM;
 }
 
-static void noct_qos_throttle(unsigned int cap_khz)
+static void noct_qos_throttle(void)
 {
 	unsigned int cpu;
 	struct cpufreq_policy *policy;
 
-	if (!cap_khz)
+	if (!noct_freq_cap_khz)
 		return;
 
 	cpus_read_lock();
@@ -169,7 +169,7 @@ static void noct_qos_throttle(unsigned int cap_khz)
 		if (policy->cpu == cpu) {
 			/* Clamp max first, then raise min — avoids transient */
 			freq_qos_update_request(&noct_qos_max[cpu],
-				min(policy->cpuinfo.max_freq, cap_khz));
+				min(policy->cpuinfo.max_freq, noct_freq_cap_khz));
 			freq_qos_update_request(&noct_qos_min[cpu],
 				policy->cpuinfo.min_freq);
 		}
@@ -182,6 +182,9 @@ static void noct_qos_restore(void)
 {
 	unsigned int cpu;
 	struct cpufreq_policy *policy;
+
+	if (!noct_freq_cap_khz)
+		return;
 
 	cpus_read_lock();
 	for_each_online_cpu(cpu) {
@@ -200,72 +203,16 @@ static void noct_qos_restore(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* Saved cpuset masks — restored on screen-on                          */
-/* ------------------------------------------------------------------ */
-#define NOCT_CPUSET_PATH_MAX	64
-#define NOCT_CPUSET_BUF_MAX	64
-
-struct noct_saved_cpuset {
-	char	path[NOCT_CPUSET_PATH_MAX];
-	char	value[NOCT_CPUSET_BUF_MAX];
-	bool	saved;
-};
-
-static struct noct_saved_cpuset noct_cpusets[] = {
-	{ .path = "/dev/cpuset/background/cpus" },
-	{ .path = "/dev/cpuset/system-background/cpus" },
-};
-
-/*
- * Read the current value of a cpuset file into buf.  Returns 0 on
- * success, negative errno on failure.  Strips trailing newline.
- */
-static int noct_read_cpuset(const char *path, char *buf, size_t size)
-{
-	struct file *f;
-	loff_t pos = 0;
-	int ret;
-
-	f = filp_open(path, O_RDONLY, 0);
-	if (IS_ERR(f))
-		return PTR_ERR(f);
-
-	ret = kernel_read(f, buf, size - 1, &pos);
-	filp_close(f, NULL);
-	if (ret < 0)
-		return ret;
-
-	buf[ret] = '\0';
-	if (ret > 0 && buf[ret - 1] == '\n')
-		buf[ret - 1] = '\0';
-
-	return 0;
-}
-
-/* ------------------------------------------------------------------ */
 /* Screen state transition                                            */
 /* ------------------------------------------------------------------ */
 static void noct_screen_on(void)
 {
-	int i;
-
 	if (!screen_off)
 		return;
 
 	mutex_lock(&noct_lock);
 	screen_off = false;
 	noct_qos_restore();
-
-	/* Restore saved cpuset masks */
-	for (i = 0; i < ARRAY_SIZE(noct_cpusets); i++) {
-		if (!noct_cpusets[i].saved)
-			continue;
-		noct_write_file(noct_cpusets[i].path, noct_cpusets[i].value);
-		noct_cpusets[i].saved = false;
-		pr_debug("nocturne: restored cpuset '%s' -> %s\n",
-			 noct_cpusets[i].path, noct_cpusets[i].value);
-	}
-
 	pr_info("screen ON — frequency limits restored\n");
 	mutex_unlock(&noct_lock);
 }
@@ -273,7 +220,6 @@ static void noct_screen_on(void)
 static void noct_screen_off(void)
 {
 	unsigned int effective_cap;
-	int i;
 
 	if (screen_off)
 		return;
@@ -295,23 +241,12 @@ static void noct_screen_off(void)
 	else
 		effective_cap = noct_freq_cap_khz;
 
-	noct_qos_throttle(effective_cap);
+	/* Override module param for qos throttle, then restore */
+	noct_freq_cap_khz = effective_cap;
+	noct_qos_throttle();
 
-	/* Save and restrict background cpusets */
+	/* Restrict background cpusets */
 	if (noct_restrict_cpusets) {
-		/* Save current masks first so they can be restored on screen-on */
-		for (i = 0; i < ARRAY_SIZE(noct_cpusets); i++) {
-			noct_cpusets[i].saved = false;
-			if (noct_read_cpuset(noct_cpusets[i].path,
-					    noct_cpusets[i].value,
-					    sizeof(noct_cpusets[i].value)) == 0) {
-				noct_cpusets[i].saved = true;
-				pr_debug("nocturne: saved cpuset '%s' = %s\n",
-					 noct_cpusets[i].path,
-					 noct_cpusets[i].value);
-			}
-		}
-
 		noct_write_file("/dev/cpuset/background/cpus", "0");
 		noct_write_file("/dev/cpuset/system-background/cpus", "0");
 		pr_info("background cpusets restricted to CPU0\n");
@@ -323,7 +258,7 @@ static void noct_screen_off(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* PM notifier (legacy fallback — works on older kernels)             */
+/* PM notifier                                                         */
 /* ------------------------------------------------------------------ */
 static int noct_pm_notifier(struct notifier_block *nb, unsigned long event, void *data)
 {
@@ -342,40 +277,6 @@ static int noct_pm_notifier(struct notifier_block *nb, unsigned long event, void
 
 static struct notifier_block noct_pm_nb = {
 	.notifier_call = noct_pm_notifier,
-};
-
-/* ------------------------------------------------------------------ */
-/* FB notifier (works on modern DRM/KMS kernels)                      */
-/* ------------------------------------------------------------------ */
-static int noct_fb_notifier(struct notifier_block *nb, unsigned long event, void *data)
-{
-	struct fb_event *ev = data;
-	int blank;
-
-	if (event != FB_EVENT_BLANK)
-		return NOTIFY_OK;
-
-	if (!ev || !ev->data)
-		return NOTIFY_OK;
-
-	blank = *(int *)ev->data;
-
-	switch (blank) {
-	case FB_BLANK_UNBLANK:
-		noct_screen_on();
-		break;
-	case FB_BLANK_POWERDOWN:
-	case FB_BLANK_HSYNC_SUSPEND:
-	case FB_BLANK_VSYNC_SUSPEND:
-	case FB_BLANK_NORMAL:
-		noct_screen_off();
-		break;
-	}
-	return NOTIFY_OK;
-}
-
-static struct notifier_block noct_fb_nb = {
-	.notifier_call = noct_fb_notifier,
 };
 
 /* ------------------------------------------------------------------ */
@@ -403,23 +304,19 @@ static int __init nocturne_init(void)
 		return ret;
 
 	register_pm_notifier(&noct_pm_nb);
-	fb_register_client(&noct_fb_nb);
 	pr_info("loaded (freq_cap=%u kHz, gaming_respect=%d, cpuset_restrict=%d)\n",
 		noct_freq_cap_khz, noct_respect_gaming, noct_restrict_cpusets);
 	return 0;
-
 }
 
 static void __exit nocturne_exit(void)
 {
 	unregister_pm_notifier(&noct_pm_nb);
-	fb_unregister_client(&noct_fb_nb);
 	noct_screen_on(); /* restore any throttled resources */
 	noct_qos_remove_all();
 	kfree(noct_qos_min);
 	kfree(noct_qos_max);
 	pr_info("unloaded\n");
-
 }
 
 module_init(nocturne_init);

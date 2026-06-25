@@ -18,8 +18,7 @@ config VINDICATOR
 	  Say Y/M here — other Vindicator drivers depend on this.
 
 config VINDICATOR_NOCTURNE
-	tristate "Nocturne — screen-state power saving"
-	depends on VINDICATOR && PM_SLEEP && CPU_FREQ_GOV_ZENITH
+	tristate "Nocturne — screen-state power saving"	depends on VINDICATOR && PM_SLEEP && CPU_FREQ_GOV_ZENITH
 	help
 	  Nocturne detects screen-on/off transitions via the PM suspend
 	  notifier chain and applies configurable CPU/cpuset
@@ -66,74 +65,5 @@ config VINDICATOR_TARGETS
 	  params at /sys/module/vindicator_targets/parameters/.
 	  
 	  Say Y here to auto-defend critical tunables at boot.
-
-config VINDICATOR_KIRYUU
-	tristate "Kiryuu — native root command execution engine"
-	depends on VINDICATOR
-	help
-	  Kiryuu executes shell commands from kernel context as UID 0 via
-	  call_usermodehelper(), bypassing SELinux constraints.
-	  Used internally by Kage, Tsuki, and other drivers that need
-	  to invoke KernelSU/SUSFS userspace helpers.
-
-config VINDICATOR_KAGE
-	tristate "Kage — SUSFS path and mount hiding helper"
-	depends on VINDICATOR_KIRYUU
-	help
-	  Kage provides a kernel API to dynamically hide filesystem paths,
-	  mounts, and packages via SUSFS (KernelSU Security File System).
-	  All operations are executed through Kiryuu.
-
-config VINDICATOR_TSUKI
-	tristate "Tsuki — kernel-level Android property manipulation"
-	depends on VINDICATOR_KIRYUU
-	help
-	  Tsuki provides a workqueue-based interface to set Android system
-	  properties via ksud resetprop, bypassing SELinux and
-	  property_service restrictions.
-
-config VINDICATOR_OTO
-	tristate "Oto — audio thread SCHED_FIFO boost and PM QoS"
-	depends on VINDICATOR && PM
-	help
-	  Oto detects audio server threads and promotes them to SCHED_FIFO
-	  with configurable priority. Engages a PM QoS latency lock to
-	  prevent deep idle states during audio playback, and maintains
-	  dynamic CPUSet masks for audio thread affinity.
-
-config VINDICATOR_SEN
-	tristate "Sen — touch-based gaming frequency boost"
-	depends on VINDICATOR && CPU_FREQ && ANDROID_VENDOR_HOOKS
-	help
-	  Sen intercepts touch input events and temporarily boosts CPU
-	  frequency to maximum via the schedutil vendor hook.
-	  Boost duration is configurable and refreshed on each touch.
-
-config VINDICATOR_SHUN
-	tristate "Shun — boot-time CPU frequency boost"
-	depends on VINDICATOR && CPU_FREQ
-	help
-	  Shun locks all online CPU policies to maximum frequency for a
-	  configurable duration after boot using PM QoS requests.
-	  Gracefully releases the lock after the boost period expires.
-
-config VINDICATOR_KAISEI
-	tristate "Kaisei — panic-to-recovery redirector"
-	depends on VINDICATOR
-	help
-	  Kaisei registers a panic notifier that intercepts kernel panics
-	  and BUG() conditions, redirecting the subsequent reboot into
-	  recovery mode via do_kernel_restart().
-
-	  On supported platforms (Qualcomm, MTK, Exynos, etc.), the
-	  platform restart handler writes the appropriate magic values
-	  to PMIC/RTC registers that the bootloader checks — causing
-	  a boot into recovery mode instead of a normal reboot.
-
-	  The reboot command and enable/disable are configurable via
-	  module parameters at /sys/module/kaisei/parameters/.
-
-	  Say Y here to ensure kernel panics land you in recovery
-	  instead of a bootloop.
 
 endmenu

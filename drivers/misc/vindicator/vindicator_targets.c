@@ -13,11 +13,6 @@
  *   - TCP congestion    → "bbr"
  *   - read_ahead_kb     → 128
  *   - sched_boost       → 0
- *   - sched_latency_ns  → 10000000
- *   - sched_rt_runtime  → 950000
- *   - hung_task_timeout → 120
- *   - mmap_min_addr     → 32768
- *   - pm_freeze_timeout → 2000
  *
  * All paths and expected values are configurable via module params.
  *
@@ -40,7 +35,7 @@
 #define VIND_TARGET_NAME_MAX    32
 #define VIND_TARGET_PATH_MAX    128
 #define VIND_TARGET_VAL_MAX     32
-#define VIND_TARGET_COUNT       9
+#define VIND_TARGET_COUNT       4
 
 /* ------------------------------------------------------------------ */
 /* Per-target state                                                    */
@@ -62,49 +57,17 @@ static DEFINE_MUTEX(vind_targets_lock);
 /* ------------------------------------------------------------------ */
 /* Module params — paths and expected values per target                */
 /* ------------------------------------------------------------------ */
-/*
- * Governor enforcement: we target cpu0 which is always online on arm64.
- * For heterogeneous clusters, each policy's governor is tracked
- * separately by cpufreq, so cpu0 covers the first cluster.
- * Vendor HALs that flip other clusters' governors do so through
- * the same sysfs path pattern — a future enhancement could check
- * scaling_governor on each policy.
- */
 static char *gov_path      = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor";
 static char *gov_expected  = "zenith";
 
 static char *tcp_path      = "/proc/sys/net/ipv4/tcp_congestion_control";
 static char *tcp_expected  = "bbr";
 
-/*
- * Wildcard the block device path: detect UFS (sda), eMMC (mmcblk0),
- * NVMe, or virtual block devices via sysfs scan at init.
- */
 static char *ra_path       = "/sys/block/mmcblk0/queue/read_ahead_kb";
 static char *ra_expected   = "128";
 
 static char *boost_path    = "/sys/module/cpu_boost/parameters/sched_boost";
 static char *boost_expected= "0";
-
-/* Scheduler latency — prevents pnpmgr from changing targeted preemption latency */
-static char *latency_path     = "/proc/sys/kernel/sched_latency_ns";
-static char *latency_expected = "10000000";
-
-/* RT scheduler runtime — keeps RT tasks from starving cfs */
-static char *rt_path          = "/proc/sys/kernel/sched_rt_runtime_us";
-static char *rt_expected      = "950000";
-
-/* Hung task timeout — prevent vendor from disabling hung task detection */
-static char *hung_path        = "/proc/sys/kernel/hung_task_timeout_secs";
-static char *hung_expected    = "120";
-
-/* mmap_min_addr — security: prevent vendors from lowering it */
-static char *mmap_path        = "/proc/sys/vm/mmap_min_addr";
-static char *mmap_expected    = "32768";
-
-/* PM freeze timeout — prevent vendors from setting it too high (battery drain) */
-static char *pm_path          = "/sys/power/pm_freeze_timeout";
-static char *pm_expected      = "2000";
 
 module_param_named(gov_path,      gov_path,      charp, 0644);
 module_param_named(gov_expected,  gov_expected,  charp, 0644);
@@ -114,16 +77,6 @@ module_param_named(ra_path,       ra_path,       charp, 0644);
 module_param_named(ra_expected,   ra_expected,   charp, 0644);
 module_param_named(boost_path,    boost_path,    charp, 0644);
 module_param_named(boost_expected,boost_expected, charp, 0644);
-module_param_named(latency_path,      latency_path,      charp, 0644);
-module_param_named(latency_expected,  latency_expected,  charp, 0644);
-module_param_named(rt_path,           rt_path,           charp, 0644);
-module_param_named(rt_expected,       rt_expected,       charp, 0644);
-module_param_named(hung_path,         hung_path,         charp, 0644);
-module_param_named(hung_expected,     hung_expected,     charp, 0644);
-module_param_named(mmap_path,         mmap_path,         charp, 0644);
-module_param_named(mmap_expected,     mmap_expected,     charp, 0644);
-module_param_named(pm_path,           pm_path,           charp, 0644);
-module_param_named(pm_expected,       pm_expected,       charp, 0644);
 
 /* ------------------------------------------------------------------ */
 /* VFS helpers                                                        */
@@ -279,26 +232,6 @@ static int __init vindicator_targets_init(void)
 	if (ret && ret != -ENOMEM)
 		pr_warn("sched_boost target not available (path may not exist)\n");
 
-	ret = register_target("sched_latency", latency_path, latency_expected, 4);
-	if (ret && ret != -ENOMEM)
-		pr_warn("sched_latency target not available\n");
-
-	ret = register_target("sched_rt_runtime", rt_path, rt_expected, 5);
-	if (ret && ret != -ENOMEM)
-		pr_warn("sched_rt_runtime target not available\n");
-
-	ret = register_target("hung_task", hung_path, hung_expected, 6);
-	if (ret && ret != -ENOMEM)
-		pr_warn("hung_task target not available\n");
-
-	ret = register_target("mmap_min_addr", mmap_path, mmap_expected, 7);
-	if (ret && ret != -ENOMEM)
-		pr_warn("mmap_min_addr target not available\n");
-
-	ret = register_target("pm_freeze", pm_path, pm_expected, 8);
-	if (ret && ret != -ENOMEM)
-		pr_warn("pm_freeze target not available\n");
-
 	pr_info("loaded with %d targets\n", VIND_TARGET_COUNT);
 	return 0;
 }
@@ -329,4 +262,4 @@ module_exit(vindicator_targets_exit);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("GrayRavens");
-MODULE_DESCRIPTION("Vindicator enforcement targets — governor, TCP, read_ahead, sched_boost, latency, rt, hung, mmap, pm");
+MODULE_DESCRIPTION("Vindicator enforcement targets — governor, TCP, read_ahead, sched_boost");

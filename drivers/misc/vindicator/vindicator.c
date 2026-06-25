@@ -12,10 +12,6 @@
  *   - RCU-protected target list (lock-free read in timer callback).
  *   - Adaptive backoff: starts at 50 ms, doubles to 5 s max.
  *   - Per-target max-retries (default 120) + auto-deregister.
- *     Retries are only counted when vindicator_report_enforcement()
- *     is called — i.e., when a target work function actually
- *     performed a write.  Timer ticks that find the value already
- *     matching do NOT consume the retry budget.
  *   - debugfs statistics per target.
  *
  * Author: GrayRavens
@@ -36,17 +32,17 @@
 /* ------------------------------------------------------------------ */
 /* Tunables                                                           */
 /* ------------------------------------------------------------------ */
-static unsigned int vind_interval_min_ms = 2000;   /* highest frequency */
+static unsigned int vind_interval_min_ms = 50;    /* highest frequency */
 module_param_named(interval_min_ms, vind_interval_min_ms, uint, 0644);
 MODULE_PARM_DESC(interval_min_ms, "Minimum enforcement interval (ms)");
 
-static unsigned int vind_interval_max_ms = 10000;  /* after full backoff */
+static unsigned int vind_interval_max_ms = 5000;  /* after full backoff */
 module_param_named(interval_max_ms, vind_interval_max_ms, uint, 0644);
 MODULE_PARM_DESC(interval_max_ms, "Maximum enforcement interval (ms) after backoff");
 
-static unsigned int vind_max_retries = 120;
+static unsigned int vind_max_retries = 120;       /* ~35 min @ max interval */
 module_param_named(max_retries, vind_max_retries, uint, 0644);
-MODULE_PARM_DESC(max_retries, "Actual enforcement writes before auto-deregister (0 = infinite)");
+MODULE_PARM_DESC(max_retries, "Enforcements before auto-deregister (0 = infinite)");
 
 static unsigned int vind_enabled = 1;
 module_param_named(enabled, vind_enabled, uint, 0644);
@@ -58,10 +54,10 @@ MODULE_PARM_DESC(enabled, "Master enable (0 = pause all enforcement)");
 struct vind_target {
 	const struct vindicator_enforce_ops *ops;
 	struct hrtimer              timer;
-	atomic_t                    enforc_cnt;     /* total timer ticks */
+	atomic_t                    enforc_cnt;     /* total enforcements */
 	atomic_t                    skip_cnt;       /* skipped (disabled) */
 	unsigned int                interval_ms;    /* current interval */
-	unsigned int                retries_done;   /* actual writes performed */
+	unsigned int                retries_done;
 	struct list_head            list;           /* protected by vind_lock + RCU */
 	struct dentry              *dbg_dentry;     /* debugfs directory */
 };
@@ -86,13 +82,13 @@ static enum hrtimer_restart vind_timer_cb(struct hrtimer *timer)
 	tgt->ops->enforce(tgt->ops->data);
 	atomic_inc(&tgt->enforc_cnt);
 
-	/*
-	 * Retry counting is NOT done here — the timer fires regardless of
-	 * whether the value changed.  Only actual enforcement writes
-	 * (signalled via vindicator_report_enforcement()) consume the
-	 * max-retries budget.  This prevents targets with stable values
-	 * from burning through all retries and deregistering prematurely.
-	 */
+	/* Retry bookkeeping */
+	if (READ_ONCE(vind_max_retries) &&
+	    ++tgt->retries_done >= READ_ONCE(vind_max_retries)) {
+		pr_info("'%s' reached max retries (%u), deregistering\n",
+			tgt->ops->name, vind_max_retries);
+		return HRTIMER_NORESTART; /* timer stops itself */
+	}
 
 	/* Adaptive backoff: double interval until max */
 	tgt->interval_ms = min(tgt->interval_ms * 2, READ_ONCE(vind_interval_max_ms));
@@ -177,57 +173,6 @@ void vindicator_unregister(const struct vindicator_enforce_ops *ops)
 		ops->name ? ops->name : "(null)");
 }
 EXPORT_SYMBOL_GPL(vindicator_unregister);
-
-/*
- * vindicator_report_enforcement - Called by target work functions after
- * they have performed an actual enforcement write.  Resets the adaptive
- * backoff interval and counts this as one retry.  Deregisters the target
- * if max retries is reached.
- *
- * @ops: Must match the & passed to vindicator_register().
- */
-void vindicator_report_enforcement(const struct vindicator_enforce_ops *ops)
-{
-	struct vind_target *tgt;
-
-	if (!ops)
-		return;
-
-	mutex_lock(&vind_lock);
-	list_for_each_entry_rcu(tgt, &vind_targets, list,
-				lockdep_is_held(&vind_lock)) {
-		if (tgt->ops == ops) {
-			/*
-			 * Reset backoff: if someone is actively overriding this
-			 * value, we want to check at the highest frequency so the
-			 * window of misbehaviour is minimised.
-			 */
-			WRITE_ONCE(tgt->interval_ms,
-				   READ_ONCE(vind_interval_min_ms));
-
-			/* Retry bookkeeping */
-			if (READ_ONCE(vind_max_retries) &&
-			    ++tgt->retries_done >= READ_ONCE(vind_max_retries)) {
-				mutex_unlock(&vind_lock);
-				pr_info("'%s' reached max retries (%u), deregistering\n",
-					ops->name, vind_max_retries);
-				/*
-				 * Cancel the timer BEFORE unregistering to prevent
-				 * a concurrent timer tick from queueing work into
-				 * the workqueue after we've freed the target.
-				 */
-				hrtimer_cancel(&tgt->timer);
-				vindicator_unregister(ops);
-				return;
-			}
-
-			mutex_unlock(&vind_lock);
-			return;
-		}
-	}
-	mutex_unlock(&vind_lock);
-}
-EXPORT_SYMBOL_GPL(vindicator_report_enforcement);
 
 /* ------------------------------------------------------------------ */
 /* Module init / exit                                                  */

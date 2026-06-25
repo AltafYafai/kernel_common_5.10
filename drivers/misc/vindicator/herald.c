@@ -15,8 +15,16 @@
  *   - Each entry is pairs of files (name + value) for easy parsing.
  *   - Supports deletion (herald_del_prop) for cancelling pending props.
  *
- * Userspace: poll /sys/kernel/herald/queue/<name>/{name,value,commit}
- * and call setprop(name, value). Each entry's commit file consumes it.
+ * Userspace usage (in init.rc or daemon):
+ *   while true; do
+ *     for d in /sys/kernel/herald/queue/*/; do
+ *       name=$(cat $d/name)
+ *       val=$(cat $d/value)
+ *       setprop $name $val
+ *       echo 1 > $d/commit
+ *     done
+ *     sleep 2
+ *   done
  *
  * Author: GrayRavens
  */
@@ -67,7 +75,7 @@ static ssize_t herald_entry_name_show(struct kobject *kobj,
 	struct herald_entry *e = container_of(kobj, struct herald_entry, kobj);
 	return sysfs_emit(buf, "%s\n", e->name);
 }
-static struct kobj_attribute herald_attr_name = __ATTR(name, 0444, herald_entry_name_show, NULL);
+static struct kobj_attribute herald_attr_name = __ATTR_RO(name);
 
 static ssize_t herald_entry_val_show(struct kobject *kobj,
 				     struct kobj_attribute *attr, char *buf)
@@ -75,7 +83,7 @@ static ssize_t herald_entry_val_show(struct kobject *kobj,
 	struct herald_entry *e = container_of(kobj, struct herald_entry, kobj);
 	return sysfs_emit(buf, "%s\n", e->val);
 }
-static struct kobj_attribute herald_attr_val = __ATTR(value, 0444, herald_entry_val_show, NULL);
+static struct kobj_attribute herald_attr_val = __ATTR_RO(value);
 
 static ssize_t herald_entry_commit_store(struct kobject *kobj,
 					 struct kobj_attribute *attr,
@@ -96,7 +104,7 @@ static ssize_t herald_entry_commit_store(struct kobject *kobj,
 	}
 	return count;
 }
-static struct kobj_attribute herald_attr_commit = __ATTR(commit, 0200, NULL, herald_entry_commit_store);
+static struct kobj_attribute herald_attr_commit = __ATTR_WO(commit);
 
 static struct attribute *herald_entry_attrs[] = {
 	&herald_attr_name.attr,
@@ -126,7 +134,7 @@ static ssize_t herald_depth_show(struct kobject *kobj,
 {
 	return sysfs_emit(buf, "%d\n", atomic_read(&herald_queue_depth));
 }
-static struct kobj_attribute herald_attr_depth = __ATTR(queue_depth, 0444, herald_depth_show, NULL);
+static struct kobj_attribute herald_attr_depth = __ATTR_RO(queue_depth);
 
 static struct attribute *herald_attrs[] = {
 	&herald_attr_depth.attr,
