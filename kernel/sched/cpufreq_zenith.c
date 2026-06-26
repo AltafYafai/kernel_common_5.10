@@ -4952,6 +4952,28 @@ bool zenith_is_game_mode_active(void)
 }
 EXPORT_SYMBOL_GPL(zenith_is_game_mode_active);
 
+/*
+ * File-scope mirror of the active profile for external consumers.
+ * Updated by zenith_apply_profile() whenever the profile changes.
+ * Read via READ_ONCE so external callers (GPU switcher, etc.) get
+ * a consistent value.
+ */
+static unsigned int zenith_active_profile = ZENITH_PROFILE_BALANCED;
+
+/*
+ * zenith_get_active_profile - query the currently active Zenith profile
+ *
+ * Returns the concrete profile number the governor is currently
+ * running (ZENITH_PROFILE_BALANCED, ZENITH_PROFILE_PERFORMANCE, etc.).
+ * Safe to call from any context.  When the governor is not built the
+ * stub in <linux/cpufreq_zenith.h> returns ZENITH_PROFILE_BALANCED.
+ */
+unsigned int zenith_get_active_profile(void)
+{
+	return READ_ONCE(zenith_active_profile);
+}
+EXPORT_SYMBOL_GPL(zenith_get_active_profile);
+
 /**
  * zenith_set_drm_vblank_us - publish active panel vblank period to zenith
  * @us: vblank period in microseconds; 0 clears the cache.
@@ -15283,6 +15305,11 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	hikari_apply_profile(prof);
 	equilibrium_apply_profile(prof);
 	nocturne_apply_profile(prof);
+	/* Update the file-scope profile mirror so external consumers
+	 * (GPU devfreq switcher, etc.) can observe the active profile
+	 * without reaching into governor-private data structures.
+	 */
+	WRITE_ONCE(zenith_active_profile, prof);
 }
 
 /* Patch B-AUTO-4: auto-selector classifier (priority cascade).
