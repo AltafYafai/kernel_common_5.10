@@ -4992,6 +4992,13 @@ extern struct zenith_tunables *global_tunables;
 extern struct mutex global_tunables_lock;
 static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof);
 
+/*
+ * Actual definitions — the extern declarations above let the
+ * compiler see these before zenith_set_profile() uses them.
+ */
+static struct zenith_tunables *global_tunables;
+static DEFINE_MUTEX(global_tunables_lock);
+
 void zenith_set_profile(unsigned int profile)
 {
 	struct zenith_tunables *t;
