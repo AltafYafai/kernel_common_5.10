@@ -512,6 +512,45 @@ config ZENITH_WAKE_BLOCK
 
 	  Tunables at /sys/module/zenith_wake_block/parameters/.
 
+config ZENITH_CSTATE_TUNE
+	tristate "Zenith C-State Tuning — automatic PM QoS latency"
+	depends on CGROUPS
+	help
+	  When top-app cgroup is active, raises the PM QoS CPU_DMA_LATENCY
+	  requirement so cpuidle avoids deep C-states.  When idle, releases
+	  the requirement for power saving.
+
+	  Fully automatic — lower wake latency during use, saves power
+	  when idle.
+
+	  Tunables at /sys/module/zenith_cstate_tune/parameters/.
+
+config ZENITH_READAHEAD
+	tristate "Zenith Dynamic Readahead — per-profile readahead"
+	depends on CPU_FREQ_GOV_ZENITH
+	help
+	  Adjusts the block device readahead size based on the active
+	  Zenith profile.  GAMING gets 512 KB, PERFORMANCE gets 256 KB,
+	  BATTERY gets 64 KB.  Improves game asset loading speed.
+
+	  Fully automatic — zero configuration required.
+
+	  Tunables at /sys/module/zenith_readahead/parameters/.
+
+config ZENITH_NET_PRIO
+	tristate "Zenith Per-App Network Priority"
+	depends on CPU_FREQ_GOV_ZENITH && CGROUPS && NETPRIO_CGROUP
+	help
+	  When GAMING or PERFORMANCE profile is active, raises the
+	  network priority of top-app tasks so game traffic is queued
+	  ahead of background sync.
+
+	  Requires CONFIG_NETPRIO_CGROUP for /proc/<pid>/net_prio.
+
+	  Fully automatic — reduces lag during online gameplay.
+
+	  Tunables at /sys/module/zenith_net_prio/parameters/.
+
 config UID_SYS_STATS
 	bool "Per-UID statistics"
 	depends on PROFILING && TASK_XACCT && TASK_IO_ACCOUNTING
