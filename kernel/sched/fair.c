@@ -25,6 +25,7 @@
  */
 #include "sched.h"
 #include <linux/hikari.h>
+#include <linux/zenith_per_app.h>
 #include <linux/prefer_silver.h>
 #include <linux/xarray.h>
 
@@ -5947,6 +5948,13 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	 * Cheap no-op when Hikari is disabled (one READ_ONCE).
 	 */
 	hikari_on_enqueue(p, rq);
+
+	/*
+	 * Zenith Per-App: auto-switch governor profile when top-app
+	 * tasks match a built-in or user-defined rule.
+	 * Cheap no-op when ZENITH_PER_APP is disabled.
+	 */
+	zenith_per_app_hook_enqueue(p);
 
 	/*
 	 * The code below (indirectly) updates schedutil which looks at
