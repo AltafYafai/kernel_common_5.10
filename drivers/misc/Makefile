@@ -59,5 +59,6 @@ obj-$(CONFIG_UACCE)		+= uacce/
 obj-$(CONFIG_XILINX_SDFEC)	+= xilinx_sdfec.o
 obj-$(CONFIG_HISI_HIKEY_USB)	+= hisi_hikey_usb.o
 obj-$(CONFIG_DYNAMIC_FSYNC)	+= dynamic_fsync.o
+obj-$(CONFIG_ZENITH_INPUT_BOOST)	+= zenith_input_boost.o
 obj-$(CONFIG_UID_SYS_STATS)	+= uid_sys_stats.o
 

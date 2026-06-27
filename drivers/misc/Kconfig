@@ -471,6 +471,19 @@ config DYNAMIC_FSYNC
 	  This driver can also be built as a module. If so, the module
 	  will be called dynamic_fsync.
 
+config ZENITH_INPUT_BOOST
+	tristate "Zenith input boost — boost CPU on touch"
+	depends on CPU_FREQ && INPUT
+	help
+	  Boosts all online CPUs to a configurable frequency for a short
+	  duration when a touchscreen event is detected.  Ensures cpufreq
+	  is already ramped up by the time the app processes the touch.
+
+	  Tunables at /sys/module/zenith_input_boost/parameters/.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called zenith_input_boost.
+
 config UID_SYS_STATS
 	bool "Per-UID statistics"
 	depends on PROFILING && TASK_XACCT && TASK_IO_ACCOUNTING
