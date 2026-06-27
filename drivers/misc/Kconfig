@@ -498,6 +498,20 @@ config ZENITH_STUNE_BOOST
 	  This driver can also be built as a module. If so, the module
 	  will be called zenith_stune_boost.
 
+config ZENITH_WAKE_BLOCK
+	tristate "Zenith wake block — automatic wakelock blocker"
+	depends on CGROUPS
+	help
+	  Automatically blocks known battery-draining wakelocks using
+	  a kprobe on __pm_stay_awake plus a periodic userspace
+	  /sys/power/wake_lock scanner.  Blocks wlan, radio, bluedroid,
+	  NFC, location, and other common battery-draining wakelocks
+	  by default.
+
+	  Fully automatic — battery life improvement out of the box.
+
+	  Tunables at /sys/module/zenith_wake_block/parameters/.
+
 config UID_SYS_STATS
 	bool "Per-UID statistics"
 	depends on PROFILING && TASK_XACCT && TASK_IO_ACCOUNTING
