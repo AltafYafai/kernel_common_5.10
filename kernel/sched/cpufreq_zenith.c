@@ -4990,6 +4990,7 @@ EXPORT_SYMBOL_GPL(zenith_get_active_profile);
  */
 extern struct zenith_tunables *global_tunables;
 extern struct mutex global_tunables_lock;
+static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof);
 
 void zenith_set_profile(unsigned int profile)
 {
