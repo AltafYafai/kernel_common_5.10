@@ -71,12 +71,11 @@ static int cstate_worker(void *data)
 			bool active = cstate_has_top_app();
 
 			if (active && !cstate_boost_active) {
-				pm_qos_add_request(&cstate_qos_req,
-						   PM_QOS_CPU_DMA_LATENCY,
-						   READ_ONCE(cstate_latency_us));
+				cpu_latency_qos_add_request(&cstate_qos_req,
+							    READ_ONCE(cstate_latency_us));
 				cstate_boost_active = true;
 			} else if (!active && cstate_boost_active) {
-				pm_qos_remove_request(&cstate_qos_req);
+				cpu_latency_qos_remove_request(&cstate_qos_req);
 				cstate_boost_active = false;
 			}
 		}
@@ -106,7 +105,7 @@ static void __exit cstate_exit(void)
 	if (cstate_thread && !IS_ERR(cstate_thread)) {
 		kthread_stop(cstate_thread);
 		if (cstate_boost_active)
-			pm_qos_remove_request(&cstate_qos_req);
+			cpu_latency_qos_remove_request(&cstate_qos_req);
 	}
 }
 
