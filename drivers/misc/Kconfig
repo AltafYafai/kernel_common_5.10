@@ -484,6 +484,20 @@ config ZENITH_INPUT_BOOST
 	  This driver can also be built as a module. If so, the module
 	  will be called zenith_input_boost.
 
+config ZENITH_STUNE_BOOST
+	tristate "Zenith stune boost — boost top-app schedtune"
+	depends on CGROUPS
+	help
+	  Boosts the schedtune.boost value for the top-app cgroup when
+	  foreground tasks are active, making EAS prefer higher
+	  frequencies for foreground tasks.  Works alongside Hikari's
+	  wake-delay engine.
+
+	  Tunables at /sys/module/zenith_stune_boost/parameters/.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called zenith_stune_boost.
+
 config UID_SYS_STATS
 	bool "Per-UID statistics"
 	depends on PROFILING && TASK_XACCT && TASK_IO_ACCOUNTING
