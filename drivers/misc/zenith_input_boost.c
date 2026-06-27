@@ -17,6 +17,7 @@
 #include <linux/cpufreq.h>
 #include <linux/workqueue.h>
 #include <linux/cpumask.h>
+#include <linux/slab.h>
 
 static bool input_boost_enabled __read_mostly = true;
 static unsigned int input_boost_ms __read_mostly = 50;
@@ -74,8 +75,12 @@ static void ib_boost_trigger(void)
 		/*
 		 * Cancel any pending boost-end work so we extend the
 		 * boost window rather than stacking timers.
+		 *
+		 * Use cancel_delayed_work() (non-sleeping) because this
+		 * is called from the input_handler->event callback which
+		 * runs in interrupt/softirq context.
 		 */
-		cancel_delayed_work_sync(&ib->work);
+		cancel_delayed_work(&ib->work);
 
 		if (ib->policy->min != ib->saved_min)
 			ib->saved_min = ib->policy->min;
@@ -97,25 +102,84 @@ static void ib_boost_trigger(void)
 	}
 }
 
-static int ib_input_notifier(struct notifier_block *nb,
-			     unsigned int type, void *data)
+/*
+ * Input handler to catch touch events.  Replaces the unavailable
+ * input_register_notifier() API with the standard input_handler
+ * pattern where the ->event callback fires on every input event.
+ *
+ * Uses cancel_delayed_work() (non-sleeping) instead of
+ * cancel_delayed_work_sync() because the ->event callback runs
+ * in interrupt/softirq context where sleeping is not permitted.
+ */
+static int ib_input_connect(struct input_handler *handler,
+			    struct input_dev *dev,
+			    const struct input_device_id *id)
 {
-	struct input_handle *handle = data;
+	struct input_handle *handle;
+	int ret;
 
-	if (type != INPUT_EVENT_HANDLER_CONNECT)
-		return NOTIFY_OK;
+	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!handle)
+		return -ENOMEM;
 
-	/* Match touchscreen input devices */
-	if (handle && handle->dev &&
-	    (handle->dev->evbit & BIT_MASK(EV_ABS)) &&
-	    test_bit(ABS_MT_POSITION_X, handle->dev->absbit))
-		ib_boost_trigger();
+	handle->dev = dev;
+	handle->handler = handler;
+	handle->name = "zenith_input_boost";
 
-	return NOTIFY_OK;
+	ret = input_register_handle(handle);
+	if (ret) {
+		kfree(handle);
+		return ret;
+	}
+
+	ret = input_open_device(handle);
+	if (ret) {
+		input_unregister_handle(handle);
+		kfree(handle);
+		return ret;
+	}
+
+	return 0;
 }
 
-static struct notifier_block ib_input_nb = {
-	.notifier_call = ib_input_notifier,
+static void ib_input_disconnect(struct input_handle *handle)
+{
+	input_close_device(handle);
+	input_unregister_handle(handle);
+	kfree(handle);
+}
+
+static void ib_input_event(struct input_handle *handle,
+			   unsigned int type, unsigned int code, int value)
+{
+	/*
+	 * Only trigger on touch events.  For EV_KEY it's a tap (BTN_TOUCH=1).
+	 * For EV_ABS, fire once per touch start on ABS_MT_TRACKING_ID
+	 * to avoid triggering on every coordinate update (X,Y,pressure)
+	 * during a single gesture.
+	 */
+	if (type == EV_KEY && value == 1)
+		ib_boost_trigger();
+	else if (type == EV_ABS && code == ABS_MT_TRACKING_ID && value >= 0)
+		ib_boost_trigger();
+}
+
+static const struct input_device_id ib_input_ids[] = {
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
+			 INPUT_DEVICE_ID_MATCH_ABSBIT,
+		.evbit = { BIT_MASK(EV_ABS) },
+		.absbit = { BIT_MASK(ABS_MT_POSITION_X) },
+	},
+	{ },
+};
+
+static struct input_handler ib_input_handler = {
+	.event		= ib_input_event,
+	.connect	= ib_input_connect,
+	.disconnect	= ib_input_disconnect,
+	.name		= "zenith_input_boost",
+	.id_table	= ib_input_ids,
 };
 
 static void ib_cpufreq_policy_notifier(struct notifier_block *nb,
@@ -198,9 +262,9 @@ static int __init ib_init(void)
 		}
 	}
 
-	ret = input_register_notifier(&ib_input_nb);
+	ret = input_register_handler(&ib_input_handler);
 	if (ret) {
-		pr_err("zenith_input_boost: input_register_notifier failed (%d)\n", ret);
+		pr_err("zenith_input_boost: input_register_handler failed (%d)\n", ret);
 		goto free_policies;
 	}
 
@@ -221,7 +285,7 @@ static void __exit ib_exit(void)
 {
 	int i;
 
-	input_unregister_notifier(&ib_input_nb);
+	input_unregister_handler(&ib_input_handler);
 
 	for (i = 0; i < ib_nr_policies; i++)
 		cancel_delayed_work_sync(&ib_policies[i].work);
