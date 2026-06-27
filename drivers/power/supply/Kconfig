@@ -759,6 +759,20 @@ config CHARGER_BD99954
 	  information and altering charger configurations from the ROHM
 	  BD99954 charger IC.
 
+config ZENITH_CHARGE_LIMITER
+	tristate "Zenith charge limiter — battery longevity"
+	depends on POWER_SUPPLY
+	help
+	  Monitors battery capacity and stops charging when it reaches
+	  limit_percent (default 80%), resuming when it drops to
+	  resume_percent (default 75%).  Preserves battery health by
+	  preventing prolonged stays at 100%.
+
+	  Tunables at /sys/module/zenith_charge_limiter/parameters/.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called zenith_charge_limiter.
+
 config CHARGER_WILCO
 	tristate "Wilco EC based charger for ChromeOS"
 	depends on WILCO_EC
