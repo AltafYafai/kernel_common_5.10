@@ -77,8 +77,8 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
  * (CFS  default: 6ms * (1 + ilog(ncpus)), units: nanoseconds)
  */
 #ifdef CONFIG_SCHED_BORE
-unsigned int sysctl_sched_latency			= 16000000ULL;
-static unsigned int normalized_sysctl_sched_latency	= 16000000ULL;
+unsigned int sysctl_sched_latency			= 12000000ULL;
+static unsigned int normalized_sysctl_sched_latency	= 12000000ULL;
 #else // CONFIG_SCHED_BORE
 unsigned int sysctl_sched_latency			= 6000000ULL;
 static unsigned int normalized_sysctl_sched_latency	= 6000000ULL;
@@ -110,8 +110,8 @@ enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_L
  * (CFS  default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
 #ifdef CONFIG_SCHED_BORE
-unsigned int sysctl_sched_min_granularity			= 2000000ULL;
-static unsigned int normalized_sysctl_sched_min_granularity	= 2000000ULL;
+unsigned int sysctl_sched_min_granularity			= 1500000ULL;
+static unsigned int normalized_sysctl_sched_min_granularity	= 1500000ULL;
 #else // CONFIG_SCHED_BORE
 unsigned int sysctl_sched_min_granularity			= 750000ULL;
 static unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
