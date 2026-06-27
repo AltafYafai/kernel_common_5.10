@@ -4985,6 +4985,12 @@ EXPORT_SYMBOL_GPL(zenith_get_active_profile);
  * Safe from any context that permits sleeping (mutex_lock).
  * Returns silently (no-op) if global_tunables is not yet set.
  */
+/*
+ * Forward declarations for variables defined later in the file.
+ */
+extern struct zenith_tunables *global_tunables;
+extern struct mutex global_tunables_lock;
+
 void zenith_set_profile(unsigned int profile)
 {
 	struct zenith_tunables *t;
@@ -8341,7 +8347,8 @@ extern void iyashi_apply_profile(unsigned int profile);
 static inline void iyashi_apply_profile(unsigned int profile) { }
 #endif
 
-	static inline void equilibrium_apply_profile(unsigned int profile) { }\n\tstatic inline void nocturne_apply_profile(unsigned int profile) { }
+	static inline void equilibrium_apply_profile(unsigned int profile) { }
+	static inline void nocturne_apply_profile(unsigned int profile) { }
 
 /* Patch K: live skin-temp readout for the game_perf_burst guardrail.
  * Returns millidegrees C.
@@ -12181,8 +12188,6 @@ static void zenith_irq_work(struct irq_work *irq_work)
 
 /************************** Sysfs Interface & Tunables ************************/
 
-static struct zenith_tunables *global_tunables;
-static DEFINE_MUTEX(global_tunables_lock);
 
 static inline struct zenith_tunables *to_zenith_tunables(struct gov_attr_set *attr_set)
 {
