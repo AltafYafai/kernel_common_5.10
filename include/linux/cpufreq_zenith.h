@@ -29,6 +29,7 @@ void zenith_gpu_load_event(unsigned int gpu_load_pct);
 void zenith_gpu_freq_event(unsigned int freq_pct);
 bool zenith_is_game_mode_active(void);
 unsigned int zenith_get_active_profile(void);
+void zenith_set_profile(unsigned int profile);
 #else
 static inline void zenith_set_drm_vblank_us(unsigned int us) { }
 static inline void zenith_drm_vblank_event(void) { }
@@ -36,6 +37,7 @@ static inline void zenith_gpu_load_event(unsigned int gpu_load_pct) { }
 static inline void zenith_gpu_freq_event(unsigned int freq_pct) { }
 static inline bool zenith_is_game_mode_active(void) { return false; }
 static inline unsigned int zenith_get_active_profile(void) { return ZENITH_PROFILE_BALANCED; }
+static inline void zenith_set_profile(unsigned int profile) { }
 #endif
 
 #endif /* _LINUX_CPUFREQ_ZENITH_H */

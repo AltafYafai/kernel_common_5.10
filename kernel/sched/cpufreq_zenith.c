@@ -4975,6 +4975,29 @@ unsigned int zenith_get_active_profile(void)
 EXPORT_SYMBOL_GPL(zenith_get_active_profile);
 
 /**
+ * zenith_set_profile - public wrapper to switch Zenith governor profile
+ * @profile: one of ZENITH_PROFILE_* (PERFORMANCE, BALANCED, BATTERY, etc.)
+ *
+ * Grabs global_tunables_lock and delegates to the internal
+ * zenith_apply_profile() so external modules can switch profiles
+ * without reaching into governor-internal state.
+ *
+ * Safe from any context that permits sleeping (mutex_lock).
+ * Returns silently (no-op) if global_tunables is not yet set.
+ */
+void zenith_set_profile(unsigned int profile)
+{
+	struct zenith_tunables *t;
+
+	mutex_lock(&global_tunables_lock);
+	t = global_tunables;
+	if (t)
+		zenith_apply_profile(t, profile);
+	mutex_unlock(&global_tunables_lock);
+}
+EXPORT_SYMBOL_GPL(zenith_set_profile);
+
+/**
  * zenith_set_drm_vblank_us - publish active panel vblank period to zenith
  * @us: vblank period in microseconds; 0 clears the cache.
  *
