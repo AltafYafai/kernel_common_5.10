@@ -551,6 +551,33 @@ config ZENITH_NET_PRIO
 
 	  Tunables at /sys/module/zenith_net_prio/parameters/.
 
+config ZENITH_F2FS_GC
+	tristate "Zenith F2FS GC Trigger — profile-aware F2FS GC"
+	depends on CPU_FREQ_GOV_ZENITH
+	help
+	  When the active Zenith profile switches to GAMING or
+	  PERFORMANCE, triggers urgent F2FS garbage collection to
+	  front-load GC before gameplay begins.  Prevents in-game
+	  I/O stalls from background GC.
+
+	  Fully automatic — zero configuration required.
+
+	  Tunables at /sys/module/zenith_f2fs_gc/parameters/.
+
+config ZENITH_ADAPTIVE_BOOST
+	tristate "Zenith Adaptive CPU Boost — learns touch intervals"
+	depends on CPU_FREQ_GOV_ZENITH && INPUT
+	help
+	  Extends the static input boost with per-app touch interval
+	  tracking.  Rapid touches (scrolling, gaming) get longer
+	  boost windows.  Sparse touches stay conservative.
+
+	  Works alongside zenith_input_boost for best results.
+
+	  Fully automatic — learns per-app patterns.
+
+	  Tunables at /sys/module/zenith_adaptive_boost/parameters/.
+
 config UID_SYS_STATS
 	bool "Per-UID statistics"
 	depends on PROFILING && TASK_XACCT && TASK_IO_ACCOUNTING

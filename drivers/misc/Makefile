@@ -65,5 +65,7 @@ obj-$(CONFIG_ZENITH_WAKE_BLOCK)	+= zenith_wake_block.o
 obj-$(CONFIG_ZENITH_CSTATE_TUNE)	+= zenith_cstate_tune.o
 obj-$(CONFIG_ZENITH_READAHEAD)	+= zenith_readahead.o
 obj-$(CONFIG_ZENITH_NET_PRIO)	+= zenith_net_prio.o
+obj-$(CONFIG_ZENITH_F2FS_GC)	+= zenith_f2fs_gc.o
+obj-$(CONFIG_ZENITH_ADAPTIVE_BOOST)	+= zenith_adaptive_boost.o
 obj-$(CONFIG_UID_SYS_STATS)	+= uid_sys_stats.o
 
