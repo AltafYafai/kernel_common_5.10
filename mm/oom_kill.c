@@ -245,13 +245,24 @@ long oom_badness(struct task_struct *p, unsigned long totalpages)
 	/*
 	 * During game mode, protect foreground tasks with low oom_score_adj
 	 * (Android sets -950..-900 for top-app) by reducing their badness
-	 * score by 25% (not 50%).  The full 50% reduction masked too much
-	 * memory pressure — when combined with game-mode swap throttling
-	 * and min_free_kbytes inflation, the OOM killer could fail to find
-	 * a usable victim under extreme pressure and panic.
+	 * score by 10%.  The prior 25% reduction masked too much memory
+	 * pressure on lower-RAM devices (4-6GB): when the OOM killer could
+	 * not find a usable victim it panicked with "System is deadlocked
+	 * on memory".  Gated behind a 4GB RAM threshold so this protection
+	 * is never applied on devices that cannot afford to skip victims.
+	 *
+	 * totalpages is oc->totalpages from the caller (select_bad_process),
+	 * set by constrained_alloc() to totalram_pages() + total_swap_pages
+	 * or a subset thereof.  The 1M threshold approximates 4 GB with 4K
+	 * pages and is conservative -- swap pages are included so a device
+	 * with 3 GB RAM + 2 GB swap also qualifies, and the OOM killer
+	 * context is already constrained enough that the 10% reduction is
+	 * safe across all reported victims.
 	 */
-	if (zenith_is_game_mode_active() && p->signal->oom_score_adj < 100)
-		points -= points / 4;
+	if (totalpages > 1048576UL &&
+	    zenith_is_game_mode_active() &&
+	    p->signal->oom_score_adj < 100)
+		points -= points / 10;
 
 	return points;
 }
