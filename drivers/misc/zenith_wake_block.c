@@ -29,7 +29,7 @@
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/file.h>
-#include <linux/pm_wakeup.h>
+#include <linux/device.h>
 
 static bool wb_enabled __read_mostly = true;
 static char wb_blocklist[512] __read_mostly =
