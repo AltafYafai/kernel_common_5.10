@@ -40,4 +40,5 @@ obj-$(CONFIG_CPU_ISOLATION) += isolation.o
 obj-$(CONFIG_PSI) += psi.o
 obj-$(CONFIG_SCHED_PREFER_SILVER) += prefer_silver.o
 obj-$(CONFIG_HIKARI) += hikari.o
-obj-$(CONFIG_ZENITH_PER_APP) += zenith_per_app.o
+obj-$(CONFIG_ZENITH_PER_APP)			+= zenith_per_app.o
+obj-$(CONFIG_ZENITH_PER_TASK_FREQ_FLOOR)	+= zenith_per_task_freq.o
