@@ -459,6 +459,18 @@ config MISC_RTSX
 	tristate
 	default MISC_RTSX_PCI || MISC_RTSX_USB
 
+config DYNAMIC_FSYNC
+	tristate "Dynamic fsync — disable fsync when screen is on"
+	depends on FB
+	help
+	  When enabled, fsync/fdatasync calls are made no-ops while the
+	  screen is on, eliminating write-back stalls for a smoother UI
+	  experience.  Fsync is re-enabled when the screen turns off to
+	  guarantee data integrity before suspend.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called dynamic_fsync.
+
 config UID_SYS_STATS
 	bool "Per-UID statistics"
 	depends on PROFILING && TASK_XACCT && TASK_IO_ACCOUNTING
