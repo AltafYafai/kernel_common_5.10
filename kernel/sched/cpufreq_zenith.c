@@ -4964,6 +4964,52 @@ void zenith_set_profile(unsigned int profile)
 EXPORT_SYMBOL_GPL(zenith_set_profile);
 
 /**
+ * zenith_get_active_profile() - return the currently active profile
+ *
+ * Lock-free reader.  Returns the active profile from the global tunables
+ * when available; falls back to ZENITH_PROFILE_BALANCED if the governor
+ * is not yet initialised.  When the active profile is ZENITH_PROFILE_AUTO
+ * the resolved auto_target is returned instead.
+ *
+ * Context: any context (no sleep, no lock).
+ */
+unsigned int zenith_get_active_profile(void)
+{
+	struct zenith_tunables *t;
+
+	t = READ_ONCE(global_tunables);
+	if (!t)
+		return ZENITH_PROFILE_BALANCED;
+
+	if (READ_ONCE(t->active_profile) == ZENITH_PROFILE_AUTO)
+		return READ_ONCE(t->auto_target);
+
+	return READ_ONCE(t->active_profile);
+}
+EXPORT_SYMBOL_GPL(zenith_get_active_profile);
+
+/**
+ * zenith_is_game_mode_active() - return whether game mode is currently active
+ *
+ * Lock-free reader.  Returns true when the effective game mode (tunables
+ * game_mode elevated by the auto-detection engine) is >= 1.  Falls back
+ * to false if the governor is not yet initialised.
+ *
+ * Context: any context (no sleep, no lock).
+ */
+bool zenith_is_game_mode_active(void)
+{
+	struct zenith_tunables *t;
+
+	t = READ_ONCE(global_tunables);
+	if (!t)
+		return false;
+
+	return READ_ONCE(t->game_mode) >= 1;
+}
+EXPORT_SYMBOL_GPL(zenith_is_game_mode_active);
+
+/**
  * zenith_set_drm_vblank_us - publish active panel vblank period to zenith
  * @us: vblank period in microseconds; 0 clears the cache.
  *
