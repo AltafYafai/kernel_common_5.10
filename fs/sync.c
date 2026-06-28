@@ -9,7 +9,6 @@
 #include <linux/slab.h>
 #include <linux/export.h>
 #include <linux/namei.h>
-#include <linux/dynamic_fsync.h>
 #include <linux/sched/xacct.h>
 #include <linux/writeback.h>
 #include <linux/syscalls.h>
@@ -17,15 +16,7 @@
 #include <linux/pagemap.h>
 #include <linux/quotaops.h>
 #include <linux/backing-dev.h>
-#include <linux/dynamic_fsync.h>
 #include "internal.h"
-
-#ifdef CONFIG_DYNAMIC_FSYNC
-int dynamic_fsync_state __read_mostly;
-bool dynamic_fsync_enabled __read_mostly = true;
-EXPORT_SYMBOL_GPL(dynamic_fsync_state);
-EXPORT_SYMBOL_GPL(dynamic_fsync_enabled);
-#endif
 
 #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
 			SYNC_FILE_RANGE_WAIT_AFTER)
@@ -230,9 +221,6 @@ static int do_fsync(unsigned int fd, int datasync)
 {
 	struct fd f = fdget(fd);
 	int ret = -EBADF;
-
-	if (dynamic_fsync_should_skip())
-		return 0;
 
 	if (f.file) {
 		ret = vfs_fsync(f.file, datasync);

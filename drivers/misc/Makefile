@@ -58,7 +58,6 @@ obj-$(CONFIG_HABANA_AI)		+= habanalabs/
 obj-$(CONFIG_UACCE)		+= uacce/
 obj-$(CONFIG_XILINX_SDFEC)	+= xilinx_sdfec.o
 obj-$(CONFIG_HISI_HIKEY_USB)	+= hisi_hikey_usb.o
-obj-$(CONFIG_DYNAMIC_FSYNC)	+= dynamic_fsync.o
 obj-$(CONFIG_ZENITH_INPUT_BOOST)	+= zenith_input_boost.o
 obj-$(CONFIG_ZENITH_STUNE_BOOST)	+= zenith_stune_boost.o
 obj-$(CONFIG_ZENITH_WAKE_BLOCK)	+= zenith_wake_block.o
