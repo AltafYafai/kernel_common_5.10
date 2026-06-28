@@ -7627,30 +7627,6 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	update_curr(cfs_rq_of(se));
 	trace_android_rvh_check_preempt_wakeup(rq, p, &preempt, &nopreempt,
 			wake_flags, se, pse, next_buddy_marked, sysctl_sched_wakeup_granularity);
-
-#ifdef CONFIG_SCHED_GENTLE_FAIR_SLEEPERS
-	/*
-	 * Gentle Fair Sleepers: if the waking task has been sleeping
-	 * for more than one scheduler latency period, give it a small
-	 * vruntime bonus so it preempts more easily.  This prevents
-	 * freshly-woken tasks (UI, touch) from being immediately
-	 * pushed aside by CPU-hungry background tasks.
-	 *
-	 * The bonus is clamped and sign-protected: even for arbitrarily
-	 * long sleep times (hours, days) pse->vruntime can never wrap
-	 * past zero because the subtraction is bounded by the cap.
-	 */
-	if ((s64)(se->vruntime - pse->vruntime) < 0) {
-		u64 sleep_time = rq_clock(rq) - p->se.exec_start;
-		if (sleep_time > sysctl_sched_latency) {
-			u64 bonus = min(sleep_time >> 6, (u64)sysctl_sched_min_granularity);
-			if (pse->vruntime > bonus)
-				pse->vruntime -= bonus;
-			else
-				pse->vruntime = 0;
-		}
-	}
-#endif
 	if (preempt)
 		goto preempt;
 	if (nopreempt)

@@ -1399,35 +1399,6 @@ config SCHED_BORE
 
 	  If unsure, say Y here.
 
-config SCHED_GENTLE_FAIR_SLEEPERS
-	bool "Gentle Fair Sleepers — wake-up preemption bonus"
-	depends on SMP
-	default y
-	help
-	  Gives a small vruntime bonus to tasks waking from sleep so they
-	  can execute briefly before being preempted by CPU-hungry tasks.
-	  Smooths UI interactions by preventing freshly-woken tasks from
-	  being immediately pushed aside.
-
-	  When enabled, a waking task's effective vruntime is adjusted
-	  based on sleep duration, making it more likely to preempt.
-
-	  If unsure, say Y.
-
-config ZENITH_PER_TASK_FREQ_FLOOR
-	bool "Zenith Per-Task Frequency Floor"
-	depends on CPU_FREQ_GOV_ZENITH
-	default y
-	help
-	  Allows per-task minimum frequency requests via a /proc interface.
-	  Tasks can request a minimum CPU frequency floor, which is applied
-	  by Zenith as a scheduling hint.  Useful for latency-sensitive
-	  workloads that need guaranteed headroom.
-
-	  Interface: /proc/zenith/per_task_freq write "pid=<pid> freq=<kHz>"
-
-	  If unsure, say Y.
-
 config SCHED_AUTOGROUP
 	bool "Automatic process group scheduling"
 	select CGROUPS
