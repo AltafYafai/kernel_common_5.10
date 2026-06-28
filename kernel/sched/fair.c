@@ -26,39 +26,8 @@
 #include "sched.h"
 #include <linux/hikari.h>
 #include <linux/prefer_silver.h>
-#include <linux/xarray.h>
 
 #include <trace/hooks/sched.h>
-
-/*
- * KMI-safe per-task max_allowed_capacity storage.
- * Stored in an xarray keyed by task_struct pointer to avoid
- * adding fields to the exported struct task_struct.
- */
-static DEFINE_XARRAY(task_cap_xa);
-
-static unsigned long task_max_allowed_cap(struct task_struct *p)
-{
-	void *entry;
-
-	rcu_read_lock();
-	entry = xa_load(&task_cap_xa, (unsigned long)p);
-	rcu_read_unlock();
-
-	if (entry)
-		return xa_to_value(entry);
-	return SCHED_CAPACITY_SCALE;
-}
-
-static inline void task_set_max_allowed_cap(struct task_struct *p, unsigned long cap)
-{
-	xa_store(&task_cap_xa, (unsigned long)p, xa_mk_value(cap), GFP_ATOMIC);
-}
-
-static inline void task_clear_max_allowed_cap(struct task_struct *p)
-{
-	xa_erase(&task_cap_xa, (unsigned long)p);
-}
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
 
@@ -4424,7 +4393,7 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
 	 * available CPU already? Or do we fit into this CPU ?
 	 */
 	if (!p || (p->nr_cpus_allowed == 1) ||
-	    (arch_scale_cpu_capacity(cpu) == task_max_allowed_cap(p)) ||
+	    (arch_scale_cpu_capacity(cpu) == p->max_allowed_capacity) ||
 	    task_fits_cpu(p, cpu)) {
 
 		rq->misfit_task_load = 0;
@@ -7437,7 +7406,6 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 static void task_dead_fair(struct task_struct *p)
 {
 	remove_entity_load_avg(&p->se);
-	task_clear_max_allowed_cap(p);
 }
 
 /*
@@ -7458,7 +7426,7 @@ static void set_task_max_allowed_capacity(struct task_struct *p)
 		if (!cpumask_intersects(p->cpus_ptr, cpumask))
 			continue;
 
-		task_set_max_allowed_cap(p, entry->capacity);
+		p->max_allowed_capacity = entry->capacity;
 		break;
 	}
 	rcu_read_unlock();
