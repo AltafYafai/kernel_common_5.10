@@ -2,14 +2,11 @@
 /*
  * Generic GPU devfreq governor auto-switcher for the zenith governor.
  *
- * Watches for zenith game-mode transitions and profile changes, and
- * automatically switches the GPU's devfreq governor:
- *   - game mode active or PERFORMANCE profile  -> "performance"
- *   - game mode stopped and not PERFORMANCE    -> "simple_ondemand"
- *     (with configurable idle timeout before falling to idle governor)
- *
- * Profile-aware switching is enabled by default (gpu_profile_aware=1)
- * and can be disabled at runtime via module param.
+ * Watches for zenith game-mode transitions via zenith_is_game_mode_active()
+ * and automatically switches the GPU's devfreq governor:
+ *   - game mode active  -> "performance"
+ *   - game mode stopped -> "simple_ondemand" (with configurable idle timeout
+ *     before falling to "simple_ondemand")
  *
  * Works with ANY GPU driver (Mali, Adreno, Panfrost, etc.) that registers
  * a devfreq device, not just Qualcomm's msm_gpu.
@@ -22,7 +19,6 @@
 #include <linux/workqueue.h>
 #include <linux/device.h>
 #include <linux/cpufreq_zenith.h>
-#include <linux/zenith_profiles.h>
 #include <linux/jiffies.h>
 #include <linux/string.h>
 #include <linux/slab.h>
@@ -96,17 +92,6 @@ module_param(gpu_idle_ms, uint, 0644);
 MODULE_PARM_DESC(gpu_idle_ms,
 		 "Idle timeout in ms before idle governor (default: 5000, 0=skip)");
 
-static bool gpu_profile_aware = true;
-module_param(gpu_profile_aware, bool, 0644);
-MODULE_PARM_DESC(gpu_profile_aware,
-		 "React to Zenith PERFORMANCE profile (default: true)");
-
-static char gpu_perf_governor[DEVFREQ_NAME_LEN] = "performance";
-module_param_string(gpu_perf_governor, gpu_perf_governor,
-		    sizeof(gpu_perf_governor), 0644);
-MODULE_PARM_DESC(gpu_perf_governor,
-		 "Governor while PERFORMANCE profile is active (default: performance)");
-
 /***** Game-mode memory tuning save state *****/
 
 static int saved_dirty_ratio;
@@ -169,16 +154,6 @@ static void gpu_governor_worker(struct work_struct *work)
 	}
 
 	game_active = zenith_is_game_mode_active();
-
-	/*
-	 * Profile-aware switching: when gpu_profile_aware is enabled and
-	 * the active profile is PERFORMANCE, treat it like game mode for
-	 * GPU governor selection.  Game mode takes precedence when both
-	 * are active (the user is gaming on a PERFORMANCE profile).
-	 */
-	if (!game_active && gpu_profile_aware &&
-	    zenith_get_active_profile() == ZENITH_PROFILE_PERFORMANCE)
-		game_active = true;
 
 	/*
 	 * Proactively wake kcompactd when game mode first activates.
@@ -280,10 +255,9 @@ static void gpu_governor_worker(struct work_struct *work)
 
 	/* Only switch if the governor actually changed */
 	if (strcmp(df->governor_name, target)) {
-		bool real_game = zenith_is_game_mode_active();
 		pr_info("zenith_gpu_switch: %s: %s -> %s%s\n",
 			dev_name(&df->dev), df->governor_name, target,
-			game_active ? (real_game ? " (game on)" : " (perf profile)") : "");
+			game_active ? " (game on)" : "");
 		devfreq_set_governor(df, target);
 	} else {
 		gpu_debug("%s: already %s (game=%d)\n",

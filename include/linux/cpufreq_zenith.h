@@ -20,7 +20,6 @@
 #define _LINUX_CPUFREQ_ZENITH_H
 
 #include <linux/types.h>
-#include <linux/zenith_profiles.h>
 
 #if IS_ENABLED(CONFIG_CPU_FREQ_GOV_ZENITH)
 extern void zenith_set_drm_vblank_us(unsigned int us);
