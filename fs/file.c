@@ -667,33 +667,19 @@ void fd_install(unsigned int fd, struct file *file)
 
 EXPORT_SYMBOL(fd_install);
 
-/**
- * pick_file - return file associatd with fd
- * @files: file struct to retrieve file from
- * @fd: file descriptor to retrieve file for
- *
- * If this functions returns an EINVAL error pointer the fd was beyond the
- * current maximum number of file descriptors for that fdtable.
- *
- * Returns: The file associated with @fd, on error returns an error pointer.
- */
 static struct file *pick_file(struct files_struct *files, unsigned fd)
 {
-	struct file *file;
+	struct file *file = NULL;
 	struct fdtable *fdt;
 
 	spin_lock(&files->file_lock);
 	fdt = files_fdtable(files);
-	if (fd >= fdt->max_fds) {
-		file = ERR_PTR(-EINVAL);
+	if (fd >= fdt->max_fds)
 		goto out_unlock;
-	}
 	fd = array_index_nospec(fd, fdt->max_fds);
 	file = fdt->fd[fd];
-	if (!file) {
-		file = ERR_PTR(-EBADF);
+	if (!file)
 		goto out_unlock;
-	}
 	rcu_assign_pointer(fdt->fd[fd], NULL);
 	__put_unused_fd(files, fd);
 
@@ -710,7 +696,7 @@ int __close_fd(struct files_struct *files, unsigned fd)
 	struct file *file;
 
 	file = pick_file(files, fd);
-	if (IS_ERR(file))
+	if (!file)
 		return -EBADF;
 
 	return filp_close(file, files);
@@ -751,16 +737,11 @@ static inline void __range_close(struct files_struct *cur_fds, unsigned int fd,
 		struct file *file;
 
 		file = pick_file(cur_fds, fd++);
-		if (!IS_ERR(file)) {
-			/* found a valid file to close */
-			filp_close(file, cur_fds);
-			cond_resched();
+		if (!file)
 			continue;
-		}
 
-		/* beyond the last fd in that table */
-		if (PTR_ERR(file) == -EINVAL)
-			return;
+		filp_close(file, cur_fds);
+		cond_resched();
 	}
 }
 
