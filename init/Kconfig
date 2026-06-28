@@ -944,26 +944,6 @@ config HIKARI_ZENITH_HINT
 	  subscribes to the notifier, the hint is silently dropped and
 	  Hikari continues operating its other actuators.
 
-config ZENITH_PER_APP
-	bool "Zenith Per-App Profile Auto-Switcher"
-	depends on CPU_FREQ_GOV_ZENITH && CGROUP_SCHED
-	default y
-	help
-	  Automatically switches the active Zenith governor profile
-	  when a matching application enters the top-app cgroup.
-	  Built-in default rules detect common gaming, camera, and
-	  audio apps and apply the appropriate profile (GAMING,
-	  PERFORMANCE, AUDIO).
-
-	  When the matched app exits, the profile reverts to the
-	  previously active profile.
-
-	  Fully automatic — zero configuration required.  Users can
-	  add custom rules via /proc/zenith/per_app_profiles.
-	  Format: "com.example.app=<profile_id>" per line.
-	  Profile IDs: 0=CUSTOM, 1=PERFORMANCE, 2=BALANCED,
-	  3=BATTERY, 4=LEGACY, 5=GAMING, 6=AUDIO, 7=AUTO.
-
 	  If unsure, say Y.
 
 endmenu
