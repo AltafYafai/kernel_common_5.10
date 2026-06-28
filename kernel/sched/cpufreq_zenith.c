@@ -5005,7 +5005,7 @@ bool zenith_is_game_mode_active(void)
 	if (!t)
 		return false;
 
-	return READ_ONCE(t->game_mode) >= 1;
+	return zenith_eff_game_mode(READ_ONCE(t->game_mode)) >= 1;
 }
 EXPORT_SYMBOL_GPL(zenith_is_game_mode_active);
 
