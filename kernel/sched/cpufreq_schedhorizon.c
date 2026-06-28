@@ -74,46 +74,16 @@ static inline int match_nearest_efficient_step(int freq, int maxstep, int *freq_
 {
 	int i;
 
-	if (maxstep <= 0 || !freq_table)
-		return 0;
-
-	for (i = 0; i < maxstep; i++) {
+	for (i=0; i<maxstep; i++) {
 		if (freq_table[i] >= freq)
 			break;
 	}
-
-	/*
-	 * If no table entry >= freq was found (i == maxstep), clamp the
-	 * result to the last valid index so the caller's subsequent
-	 * array accesses stay in bounds.  An out-of-range index here
-	 * would mean every configured efficient_freq is below the
-	 * requested freq, so the caller should clamp to the highest
-	 * available step anyway.
-	 */
-	if (i >= maxstep)
-		i = maxstep - 1;
 
 	return i;
 }
 
 static inline void do_freq_limit(struct sugov_policy *sg_policy, unsigned int *freq, u64 time)
 {
-	/*
-	 * Safety: guard against out-of-bounds access if tunables were
-	 * reconfigured via sysfs while the governor was running.  Reset
-	 * to step 0 when current_step exceeds either array, so the hot
-	 * path degrades to the least-restrictive behaviour rather than
-	 * reading past a kmalloc'd buffer.
-	 */
-	if (sg_policy->tunables->current_step >= sg_policy->tunables->nefficient_freq ||
-	    sg_policy->tunables->current_step >= sg_policy->tunables->nup_delay ||
-	    sg_policy->tunables->nefficient_freq <= 0 ||
-	    sg_policy->tunables->nup_delay <= 0) {
-		sg_policy->tunables->current_step = 0;
-		sg_policy->first_hp_request_time = 0;
-		return;
-	}
-
 	if (*freq > sg_policy->tunables->efficient_freq[sg_policy->tunables->current_step] && !sg_policy->first_hp_request_time) {
 		/* First request */
 		*freq = sg_policy->tunables->efficient_freq[sg_policy->tunables->current_step];

@@ -73,7 +73,7 @@
  * --------------------------------------------------------------- */
 
 static unsigned int iyashi_enabled            __read_mostly = 1;
-static unsigned int iyashi_floor_pct          __read_mostly = 70;
+static unsigned int iyashi_floor_pct          __read_mostly = 90;
 static unsigned int iyashi_near_limit_offset_c __read_mostly = 5;
 
 /*

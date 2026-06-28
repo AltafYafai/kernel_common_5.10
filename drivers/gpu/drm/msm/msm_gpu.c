@@ -902,7 +902,7 @@ static void gpu_governor_work(struct work_struct *work)
 		if (strcmp(df->governor_name, "powersave"))
 			devfreq_set_governor(df, "powersave");
 	} else {
-		/* GPU active -> switch to simple_ondemand */
+		/* GPU active, not gaming -> simple_ondemand */
 		if (strcmp(df->governor_name, "simple_ondemand"))
 			devfreq_set_governor(df, "simple_ondemand");
 	}

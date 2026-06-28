@@ -1612,7 +1612,7 @@
  * requested preset before any userspace can write to the profile sysfs
  * node. Defaults to CUSTOM, which means "no cmdline override".
  */
-static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_BALANCED;
+static unsigned int zenith_cmdline_profile = ZENITH_PROFILE_CUSTOM;
 
 /* Optional per-policy cmdline profile overrides parsed from
  * zenith.policy_profile=N:prof,M:prof,...  Indexed by the "policy
@@ -4932,80 +4932,23 @@ static inline unsigned int zenith_eff_game_mode(unsigned int base_gm)
 		return 1;
 	return base_gm;
 }
-
 /**
- * zenith_set_profile - public wrapper to switch Zenith governor profile
- * @profile: one of ZENITH_PROFILE_* (PERFORMANCE, BALANCED, BATTERY, etc.)
+ * zenith_is_game_mode_active - query whether Zenith auto-detected a game
  *
- * Grabs global_tunables_lock and delegates to the internal
- * zenith_apply_profile() so external modules can switch profiles
- * without reaching into governor-internal state.
+ * Returns true when the in-kernel game-engine thread detector has
+ * identified a game workload and the auto-detection latch is still
+ * valid.  Intended for external drivers (GPU, thermal, etc.) that
+ * want to synchronise their own policy with Zenith's game mode.
  *
- * Safe from any context that permits sleeping (mutex_lock).
- * Returns silently (no-op) if global_tunables is not yet set.
- */
-/*
- * Forward declarations for variables defined later in the file.
- */
-static struct zenith_tunables *global_tunables;
-static DEFINE_MUTEX(global_tunables_lock);
-static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof);
-
-void zenith_set_profile(unsigned int profile)
-{
-	struct zenith_tunables *t;
-
-	mutex_lock(&global_tunables_lock);
-	t = global_tunables;
-	if (t)
-		zenith_apply_profile(t, profile);
-	mutex_unlock(&global_tunables_lock);
-}
-EXPORT_SYMBOL_GPL(zenith_set_profile);
-
-/**
- * zenith_get_active_profile() - return the currently active profile
- *
- * Lock-free reader.  Returns the active profile from the global tunables
- * when available; falls back to ZENITH_PROFILE_BALANCED if the governor
- * is not yet initialised.  When the active profile is ZENITH_PROFILE_AUTO
- * the resolved auto_target is returned instead.
- *
- * Context: any context (no sleep, no lock).
- */
-unsigned int zenith_get_active_profile(void)
-{
-	struct zenith_tunables *t;
-
-	t = READ_ONCE(global_tunables);
-	if (!t)
-		return ZENITH_PROFILE_BALANCED;
-
-	if (READ_ONCE(t->active_profile) == ZENITH_PROFILE_AUTO)
-		return READ_ONCE(t->auto_target);
-
-	return READ_ONCE(t->active_profile);
-}
-EXPORT_SYMBOL_GPL(zenith_get_active_profile);
-
-/**
- * zenith_is_game_mode_active() - return whether game mode is currently active
- *
- * Lock-free reader.  Returns true when the effective game mode (tunables
- * game_mode elevated by the auto-detection engine) is >= 1.  Falls back
- * to false if the governor is not yet initialised.
- *
- * Context: any context (no sleep, no lock).
+ * Safe to call from any context.  Returns false when the governor
+ * is not built, when game_auto is disabled, or when the latch has
+ * expired -- same fail-safe shape as every other exported hook.
  */
 bool zenith_is_game_mode_active(void)
 {
-	struct zenith_tunables *t;
-
-	t = READ_ONCE(global_tunables);
-	if (!t)
+	if (!static_branch_likely(&zenith_game_auto_key))
 		return false;
-
-	return zenith_eff_game_mode(READ_ONCE(t->game_mode)) >= 1;
+	return zenith_game_auto_active();
 }
 EXPORT_SYMBOL_GPL(zenith_is_game_mode_active);
 
@@ -8353,8 +8296,16 @@ extern void iyashi_apply_profile(unsigned int profile);
 static inline void iyashi_apply_profile(unsigned int profile) { }
 #endif
 
-	static inline void equilibrium_apply_profile(unsigned int profile) { }
-	static inline void nocturne_apply_profile(unsigned int profile) { }
+#if IS_ENABLED(CONFIG_VINDICATOR_EQUILIBRIUM)
+extern void equilibrium_apply_profile(unsigned int profile);
+#else
+static inline void equilibrium_apply_profile(unsigned int profile) { }
+#endif
+#if IS_ENABLED(CONFIG_VINDICATOR_NOCTURNE)
+extern void nocturne_apply_profile(unsigned int profile);
+#else
+static inline void nocturne_apply_profile(unsigned int profile) { }
+#endif
 
 /* Patch K: live skin-temp readout for the game_perf_burst guardrail.
  * Returns millidegrees C.
@@ -12194,6 +12145,8 @@ static void zenith_irq_work(struct irq_work *irq_work)
 
 /************************** Sysfs Interface & Tunables ************************/
 
+static struct zenith_tunables *global_tunables;
+static DEFINE_MUTEX(global_tunables_lock);
 
 static inline struct zenith_tunables *to_zenith_tunables(struct gov_attr_set *attr_set)
 {
