@@ -500,5 +500,4 @@ source "drivers/misc/ocxl/Kconfig"
 source "drivers/misc/cardreader/Kconfig"
 source "drivers/misc/habanalabs/Kconfig"
 source "drivers/misc/uacce/Kconfig"
-source "drivers/misc/vindicator/Kconfig"
 endmenu
