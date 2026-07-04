@@ -7187,7 +7187,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 			current->recent_used_cpu = cpu;
 	}
 	rcu_read_unlock();
-
+}
 
 static void detach_entity_cfs_rq(struct sched_entity *se);
 
