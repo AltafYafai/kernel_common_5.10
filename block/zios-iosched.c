@@ -499,9 +499,9 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		bias_pct  = zd->normal_params.top_app_bias_pct;
 		starve_max = zd->normal_params.write_starve_max;
 	}
-	coalesce = zd->power_efficient ?
-		min(zd->read_coalesce_limit, 4u) :
-		zd->read_coalesce_limit;
+	coalesce = zd->read_coalesce_limit;
+	if (zd->power_efficient || zd->game_mode)
+		coalesce = min(coalesce, 4u);
 
 	/* Tier 0: Top-app */
 	if (zd->nr_top_app > 0) {
@@ -519,6 +519,10 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 
 			if (zd->nr_writes > 0)
 				zd->write_starve_count++;
+			if (zd->nr_writeback > 0)
+				zd->writeback_starve_count++;
+			if (zd->nr_swap > 0)
+				zd->swap_starve_count++;
 
 			/* Track for priority inheritance */
 			zd->last_top_app_jiffies = jiffies;
@@ -542,6 +546,10 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 				zd->nr_sync_reads--;
 				if (zd->nr_writes > 0)
 					zd->write_starve_count++;
+				if (zd->nr_writeback > 0)
+					zd->writeback_starve_count++;
+				if (zd->nr_swap > 0)
+					zd->swap_starve_count++;
 				goto done;
 			}
 		}
@@ -562,6 +570,10 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 				zd->nr_async_reads--;
 				if (zd->nr_writes > 0)
 					zd->write_starve_count++;
+				if (zd->nr_writeback > 0)
+					zd->writeback_starve_count++;
+				if (zd->nr_swap > 0)
+					zd->swap_starve_count++;
 				goto done;
 			}
 		}

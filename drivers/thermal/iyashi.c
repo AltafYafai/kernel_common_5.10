@@ -427,7 +427,7 @@ void iyashi_apply_profile(unsigned int profile)
 		},
 		/* BATTERY (3): lower floor, tighter margin */
 		[3] = {
-			.floor_pct          = 75,
+			.floor_pct          = 60,
 			.near_limit_offset_c = 3,
 			.min_freq_pct       = 0,
 			.hikari_aware       = 0,
