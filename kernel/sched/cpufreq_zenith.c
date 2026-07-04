@@ -1820,19 +1820,11 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS	1
 
 /* prefer_silver_aware defaults.  See struct zenith_tunables for
- * semantics.  Hot threshold of 50%% means the bump fires when at
- * least half of the recent prefer_silver decisions actually
- * redirected onto a silver core; hot bump of 5 points is small
- * enough to avoid a perceived step but large enough to noticeably
- * delay big-cluster downclock during sustained UI navigation.
- * Both knobs are tunable; the defaults are conservative.
+ * semantics.  These fields remain as dead storage -- the Kconfig was
+ * removed and nothing updates ps_hit_rate_pct, so the runtime path
+ * never fires.
  *
- * Default flipped from 0 to 1 in the wave-1 auto-defaults round so
- * the prefer_silver coordination kicks in out of the box on builds
- * that have CONFIG_SCHED_PREFER_SILVER=y.  The bump is cluster-aware
- * (only big/prime clusters react) and gated on the silver-cpu hit
- * rate exceeding prefer_silver_hot_threshold_pct, so on devices
- * without prefer_silver, the runtime path is a no-op.
+ * Both knobs are tunable; the defaults are conservative.
  */
 #define ZENITH_DEFAULT_PREFER_SILVER_AWARE			1
 #define ZENITH_DEFAULT_PREFER_SILVER_HOT_THRESHOLD_PCT		50
@@ -2513,7 +2505,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  *
  *   brutal_decay_ms, wakeup_boost_ms, boot_boost_decay_ms,
  *   screen_off_glide_ms, thermal_pressure_continuous,
- *   prefer_silver_aware, frame_budget_us_auto.
+ *   frame_budget_us_auto.
  *
  * On stock systems all seven knobs default to 0 (legacy hard
  * cliffs / off).  Without auto_tune_v2_glides the consumer has to
@@ -2617,10 +2609,11 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_FLAG_LOCAL_ACTIONS		BIT(11)
 /* Set by the V1 classifier worker when prefer_silver_aware is on AND
  * the prefer_silver hit-rate over the last classifier window crossed
- * the prefer_silver_hot_threshold_pct cutoff.  Read-only signal; the
- * actual dynamic_up_thresh bump is applied directly in
- * zenith_get_next_freq() (the signal does not feed the V2 state
- * machine because prefer_silver redistribution is workload-dependent
+ * the prefer_silver_hot_threshold_pct cutoff (dead -- Kconfig removed,
+ * never fires).  Read-only signal; the actual dynamic_up_thresh bump
+ * is applied directly in zenith_get_next_freq() (the signal does not
+ * feed the V2 state machine because prefer_silver redistribution is
+ * workload-dependent
  * and would race with the existing thermal / PSI / frame triggers).
  */
 #define ZENITH_AT_FLAG_PREFER_SILVER_HOT	BIT(12)
@@ -4182,22 +4175,10 @@ struct zenith_tunables {
 	 */
 	unsigned int		thermal_pressure_continuous;
 
-	/* prefer_silver_aware: when 1, on big / prime cluster policies,
-	 * raise dynamic_up_thresh by prefer_silver_hot_bump_pct percent
-	 * (additive points) whenever the prefer_silver hit-rate over
-	 * the last classifier window is at or above
-	 * prefer_silver_hot_threshold_pct.  The intent is to reflect
-	 * the fact that prefer_silver hides light load from the big
-	 * cluster, so the big cluster sees an artificially "lighter"
-	 * load and would otherwise downclock more aggressively than it
-	 * should.  Little cluster policies are intentionally not bumped
-	 * (they are already absorbing the redirected light tasks).
-	 *
-	 * Default 0 (off).  Has no effect when
-	 * CONFIG_SCHED_PREFER_SILVER=n: the worker does not import
-	 * prefer_silver_get_hit_miss() in that build, so the cached
-	 * hit-rate stays at 0 and the bump never fires regardless of
-	 * the tunable value.
+	/* prefer_silver fields: dead storage.  The Kconfig was removed;
+	 * nothing updates ps_hit_rate_pct, so the downstream bump never
+	 * fires regardless of these values.  Fields kept to avoid
+	 * shifting the struct layout.
 	 */
 	unsigned int		prefer_silver_aware;
 	unsigned int		prefer_silver_hot_threshold_pct;
@@ -4444,7 +4425,7 @@ struct zenith_tunables {
 	 * V2 worker populates per-policy effective values for the
 	 * round-U-z10 glide / coordination knobs (brutal_decay_ms,
 	 * wakeup_boost_ms, boot_boost_decay_ms, screen_off_glide_ms,
-	 * thermal_pressure_continuous, prefer_silver_aware,
+	 * thermal_pressure_continuous,
 	 * frame_budget_us_auto) based on V2 state.  Consumers use the
 	 * effective value only when the user-set tunable is 0.  0 here
 	 * locks all seven back to legacy behaviour exactly.  Ignored
@@ -5932,15 +5913,12 @@ struct zenith_policy {
 	u64			screen_off_arm_ns;
 	unsigned int		screen_state_last;
 
-	/* prefer_silver_aware coordination state.  Snapshot of the
-	 * global prefer_silver hit / miss counters at the previous V1
-	 * classifier window, plus the resulting hit-rate (0..100) for
-	 * the most-recent window.  The hit-rate is read on the hot
-	 * path by zenith_get_next_freq() and only updated by the worker,
-	 * so the read is unsynchronised but bounded to the previous
-	 * complete window.  When CONFIG_SCHED_PREFER_SILVER=n these
-	 * fields stay at 0 (the worker never updates them) and the
-	 * downstream bump never fires.
+	/* prefer_silver_aware coordination state (dead -- Kconfig removed).
+	 * Snapshot of the global prefer_silver hit / miss counters at
+	 * the previous V1 classifier window, plus the resulting hit-rate
+	 * (0..100) for the most-recent window.  These fields stay at 0
+	 * (the worker never updates them) and the downstream bump never
+	 * fires.
 	 */
 	unsigned int		ps_prev_hit;
 	unsigned int		ps_prev_miss;
@@ -8752,10 +8730,11 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
  * cluster is at max_cap and gets classified ZENITH_CLUSTER_PRIME -- the
  * BIG class is unused.
  *
- * The prefer_silver_aware bump path needs to distinguish these two cases
- * so it can fire on the lowest non-LITTLE cluster in either topology
- * (BIG on tri-cluster, PRIME on 2-cluster) without wrongly inflating
- * up_threshold on PRIME when a separate BIG cluster also exists.
+ * The prefer_silver_aware bump path (dead -- Kconfig removed) would
+ * need to distinguish these two cases so it can fire on the lowest
+ * non-LITTLE cluster in either topology (BIG on tri-cluster, PRIME on
+ * 2-cluster) without wrongly inflating up_threshold on PRIME when a
+ * separate BIG cluster also exists.
  *
  * Topology is invariant after boot, so the result is computed once on
  * the first call and cached.  capacity_orig is read via
@@ -9497,45 +9476,11 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 			dynamic_up_thresh -= swing;
 	}
 
-	/* prefer_silver_aware coordination: when prefer_silver is hot
-	 * and this policy belongs to the BIG / mid cluster, raise
-	 * dynamic_up_thresh by prefer_silver_hot_bump_pct points
-	 * (clamped to ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT) so the
-	 * big cluster down-clocks less aggressively during sustained
-	 * UI / app workloads where prefer_silver is steering the
-	 * light wake-ups onto the silver/LITTLE cluster.
-	 *
-	 * Fires on the lowest non-LITTLE cluster only:
-	 *
-	 *   - 3+-cluster topology (1+3+4 et al): cluster_class == BIG.
-	 *     PRIME is excluded -- prefer_silver only redirects *light*
-	 *     wake-ups onto silver (the heavy-task gate in
-	 *     find_best_silver_cpu() rejects anything above
-	 *     sysctl_heavy_task_thresh), so the work it hides from the
-	 *     rest of the system is BIG-cluster work, never PRIME work.
-	 *     Inflating up_threshold on PRIME would just delay
-	 *     down-shifts on the highest-leakage cluster: pure power
-	 *     tax with no perf return.
-	 *   - 2-cluster topology (true big.LITTLE): no BIG class exists
-	 *     and the lone non-LITTLE cluster is classified PRIME.  Fall
-	 *     through to PRIME there so the bump still fires on the
-	 *     cluster that absorbs the heavy work, exactly as before
-	 *     this restriction was introduced.  The
-	 *     zenith_topology_has_big_class() probe distinguishes the
-	 *     two cases at runtime via capacity_orig, with the result
-	 *     cached for the lifetime of the kernel.
-	 *
-	 * Also skipped whenever a harder override above has pinned
-	 * dynamic_up_thresh strictly higher than the natural
-	 * up_threshold (screen-off, thermal cliff, hispeed pin) --
-	 * those values are absolute and must not be inflated further.
-	 *
-	 * The (dynamic_up_thresh <= natural) test deliberately allows
-	 * the bump to ride on top of the variance-adaptive shaping
-	 * lower in the same chain (which only ever lowers
-	 * dynamic_up_thresh below natural), preserving its smoothing
-	 * effect while restoring the climb resistance prefer_silver
-	 * was eroding by hiding light load from this cluster.
+	/* prefer_silver_aware coordination (dead -- Kconfig removed):
+	 * the code below is permanently gated because ps_hit_rate_pct
+	 * stays at 0.  The logic is preserved for documentation;
+	 * re-enable by re-importing the prefer_silver hit/miss
+	 * counters and restoring CONFIG_SCHED_PREFER_SILVER.
 	 */
 	if (zenith_glide_value(z_policy,
 			z_policy->tunables->prefer_silver_aware,
@@ -12257,22 +12202,11 @@ static void zenith_refresh_rate_delays(struct gov_attr_set *attr_set)
 	}
 }
 
-/* Update the per-policy prefer_silver hit-rate snapshot.
- *
- * Called once per V1 classifier window from zenith_auto_tune_work().
- * Reads the global prefer_silver hit / miss atomic counters via the
- * accessor exported by kernel/sched/prefer_silver.c, computes the
- * delta against the previous window's snapshot, and stores the
- * resulting hit-rate as a percentage (0..100) on z_policy for
- * zenith_get_next_freq() to consume.  When the rate crosses the
- * tunable's hot threshold, ORs ZENITH_AT_FLAG_PREFER_SILVER_HOT
- * into *flags so the at_log dump and trace events reflect the
- * trigger.
- *
- * On builds without CONFIG_SCHED_PREFER_SILVER the accessor symbol
- * is unavailable, so the helper is a no-op stub and the cached
- * hit-rate stays at zero — the downstream bump in
- * zenith_get_next_freq() never fires regardless of the tunable.
+/* Update the per-policy prefer_silver hit-rate snapshot (dead --
+ * CONFIG_SCHED_PREFER_SILVER was removed, the #ifdef block below
+ * is never compiled).  Was called once per V1 classifier window
+ * from zenith_auto_tune_work(); the no-op #else stub keeps the
+ * call site from breaking.
  */
 static void zenith_at_update_prefer_silver_rate(struct zenith_policy *z_policy,
 						struct zenith_tunables *t,
@@ -13809,7 +13743,7 @@ ZENITH_TUNABLE_UINT_BOOL_INVAL(ignore_nice_load);
  *
  *   - User intent / opt-in flags whose semantics are device-wide
  *     and not per-profile: audio_aware, render_aware, camera_aware,
- *     psi_aware, prefer_silver_aware, game_auto, auto_tune_v2,
+ *     psi_aware, game_auto, auto_tune_v2,
  *     auto_tune_v3 (all of the seven static-key-gated aware-flags
  *     and tier switches plus auto_tune_cluster_aware,
  *     auto_tune_v2_signals, auto_tune_frame_pacing,
