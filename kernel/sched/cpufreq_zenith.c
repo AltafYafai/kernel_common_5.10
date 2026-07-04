@@ -17962,68 +17962,6 @@ static ssize_t thermal_active_show(struct gov_attr_set *attr_set, char *buf)
 }
 static struct governor_attr thermal_active = __ATTR_RO(thermal_active);
 
-/* prefer_silver_aware: strict 0/1.  See struct zenith_tunables for
- * semantics.  When CONFIG_SCHED_PREFER_SILVER=n the field is still
- * stored and round-tripped via sysfs so userspace tools that probe
- * the governor's tunable list don't choke on a missing node, but
- * the run-time bump path is dead because the worker stub never
- * updates ps_hit_rate_pct.
- */
-ZENITH_TUNABLE_UINT_BOOL_INVAL(prefer_silver_aware);
-
-/* prefer_silver_hot_threshold_pct: 0..100.  When the per-window
- * prefer_silver hit-rate is at or above this percentage,
- * prefer_silver_aware fires the bump on big / prime clusters.
- */
-static ssize_t prefer_silver_hot_threshold_pct_show(
-		struct gov_attr_set *attr_set, char *buf)
-{
-	return sysfs_emit(buf, "%u\n",
-		to_zenith_tunables(attr_set)->prefer_silver_hot_threshold_pct);
-}
-
-static ssize_t prefer_silver_hot_threshold_pct_store(
-		struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->prefer_silver_hot_threshold_pct = val;
-	return count;
-}
-static struct governor_attr prefer_silver_hot_threshold_pct =
-	__ATTR_RW(prefer_silver_hot_threshold_pct);
-
-/* prefer_silver_hot_bump_pct: 0..ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT.
- * Additive points added to dynamic_up_thresh on big / prime clusters
- * when the prefer_silver hit-rate is hot.  Clamped to the max in the
- * fast path; this store enforces the same range so userspace gets
- * an early -EINVAL on out-of-range values.
- */
-static ssize_t prefer_silver_hot_bump_pct_show(
-		struct gov_attr_set *attr_set, char *buf)
-{
-	return sysfs_emit(buf, "%u\n",
-		to_zenith_tunables(attr_set)->prefer_silver_hot_bump_pct);
-}
-
-static ssize_t prefer_silver_hot_bump_pct_store(
-		struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) ||
-	    val > ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT)
-		return -EINVAL;
-	t->prefer_silver_hot_bump_pct = val;
-	return count;
-}
-static struct governor_attr prefer_silver_hot_bump_pct =
-	__ATTR_RW(prefer_silver_hot_bump_pct);
-
 /* thermal_util_derate sysfs knob.  Strict 0/1 boolean.  See the
  * ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block for semantics.
  */
@@ -21559,9 +21497,6 @@ static struct attribute *zenith_attrs[] = {
 	&thermal_aware.attr,
 	&thermal_active.attr,
 	&thermal_pressure_continuous.attr,
-	&prefer_silver_aware.attr,
-	&prefer_silver_hot_threshold_pct.attr,
-	&prefer_silver_hot_bump_pct.attr,
 	&thermal_util_derate.attr,
 	&thermal_derate_rate_pct.attr,
 	&auto_thermal_cap.attr,
@@ -22150,10 +22085,6 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->thermal_active	= 0;
 	tunables->thermal_pressure_continuous =
 		ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS;
-	tunables->prefer_silver_aware	= ZENITH_DEFAULT_PREFER_SILVER_AWARE;
-	tunables->prefer_silver_hot_threshold_pct =
-		ZENITH_DEFAULT_PREFER_SILVER_HOT_THRESHOLD_PCT;
-	tunables->prefer_silver_hot_bump_pct =
 		ZENITH_DEFAULT_PREFER_SILVER_HOT_BUMP_PCT;
 	tunables->brutal_decay_ms	= ZENITH_DEFAULT_BRUTAL_DECAY_MS;
 	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
