@@ -107,9 +107,6 @@
 #ifdef CONFIG_DRM_PANEL_NOTIFY
 #include <drm/drm_panel_notifier.h>
 #endif
-#ifdef CONFIG_SCHED_PREFER_SILVER
-#include <linux/prefer_silver.h>
-#endif
 #include <trace/events/power.h>
 #include <trace/events/sched.h>
 
