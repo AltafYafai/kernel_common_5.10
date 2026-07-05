@@ -445,8 +445,12 @@ EXPORT_SYMBOL_GPL(kasumi_get_last_real_mc);
  * higher ramp start, enable warmup + hot-zone boost) so the
  * framework throttles later during sustained foreground load.
  * BATTERY tightens the window so thermal responses arrive sooner
- * and the cooling devices can save power.  AUDIO matches
- * BALANCED -- audio threads care about jitter, not raw freq.
+ * and the cooling devices can save power.
+ * AUDIO (6) uses the same offset as BALANCED but lifts the
+ * ramp start to 88 C so the dampening taper begins later,
+ * preserving more headroom during sustained audio output
+ * without triggering the aggressive quadratic cut that
+ * PERFORMANCE/GAMING apply.
  *
  * Every tunable written here is already individually writable via
  * /sys/kernel/kasumi/; a subsequent sysfs write overrides the
@@ -498,17 +502,27 @@ void kasumi_apply_profile(unsigned int profile)
 			.warmup_offset_mc   = 25000,
 			.hot_threshold_mc   = 0,
 			.hot_extra_offset_mc = 10000,
-		},
-		/* GAMING (5): most aggressive dampening */
+		},		/* GAMING (5): most aggressive dampening */
 		[5] = {
-			.offset_mc          = 22000,  /* 22 C */
-			.ramp_mc            = 90000,  /* 90 C */
+			.offset_mc          = 22000,	/* 22 C */
+			.ramp_mc            = 90000,	/* 90 C */
 			.ceiling_mc         = 95000,
 			.ramp_shape         = KASUMI_RAMP_QUADRATIC,
 			.warmup_secs        = 30,
 			.warmup_offset_mc   = 25000,
-			.hot_threshold_mc   = 70000,  /* 70 C */
+			.hot_threshold_mc   = 70000,	/* 70 C */
 			.hot_extra_offset_mc = 12000, /* 12 C */
+		},
+		/* AUDIO (6): moderate dampening, preserves audio jitter margins */
+		[6] = {
+			.offset_mc          = 15000,	/* 15 C — same as BALANCED */
+			.ramp_mc            = 88000,	/* 88 C — later taper than BALANCED */
+			.ceiling_mc         = 95000,
+			.ramp_shape         = KASUMI_RAMP_LINEAR,
+			.warmup_secs        = 0,
+			.warmup_offset_mc   = 25000,
+			.hot_threshold_mc   = 0,	/* off — audio doesn't push thermals */
+			.hot_extra_offset_mc = 0,
 		},
 	};
 
