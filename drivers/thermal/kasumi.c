@@ -909,118 +909,13 @@ static int __init kasumi_sysfs_init(void)
 		return ret;
 	}
 
-#ifdef CONFIG_KASUMI_DEBUG_MSG
-	/*
-	 * Kasumi boot banner.  Full mythic + mechanism narrative
-	 * emitted once at init.  Single 'Kasumi : ' prefix on every
-	 * line so the whole banner is grep-stable; ASCII relationship
-	 * diagrams show how this subsystem composes with the others.
-	 */
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : when the sun crosses the ridge, the mist comes down.\n");
-	pr_info("Kasumi : nothing is lost.  the river is still there, the path is still there.\n");
-	pr_info("Kasumi : they are merely held below the surface for one breath longer.\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :     __ __                           _\n");
-	pr_info("Kasumi :    / //_/___ ________  ______ ___  (_)\n");
-	pr_info("Kasumi :   / ,< / __ `/ ___/ / / / __ `__ \\/ /\n");
-	pr_info("Kasumi :  / /| / /_/ (__  ) /_/ / / / / / / /\n");
-	pr_info("Kasumi : /_/ |_\\__,_/____/\\__,_/_/ /_/ /_/_/\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :                        霞\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :          ----  what Kasumi is  ----\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : a small filter on thermal_zone_get_temp().  it sees every reading\n");
-	pr_info("Kasumi : that every thermal zone produces.  it subtracts a small, configurable\n");
-	pr_info("Kasumi : offset before the value escapes into the rest of the kernel.\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : userspace and the thermal framework see Kasumi's softened number.\n");
-	pr_info("Kasumi : the cooling step happens at the same trip point, but a few seconds\n");
-	pr_info("Kasumi : later -- long enough for a foreground burst to land.\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : the framework's other guards still apply.  trip points still trip.\n");
-	pr_info("Kasumi : critical still triggers shutdown.  Kasumi can only veil; it cannot lie.\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :          ----  how the mist gathers  ----\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :         thermal sensor (raw)\n");
-	pr_info("Kasumi :                   |\n");
-	pr_info("Kasumi :                   v\n");
-	pr_info("Kasumi :         thermal_zone_get_temp()\n");
-	pr_info("Kasumi :                   |\n");
-	pr_info("Kasumi :                   v\n");
-	pr_info("Kasumi :         zone_filter ? -- no -> framework\n");
-	pr_info("Kasumi :                   | yes\n");
-	pr_info("Kasumi :                   v\n");
-	pr_info("Kasumi :                   +-- snapshot real_mc (for Zenith)\n");
-	pr_info("Kasumi :                   |\n");
-	pr_info("Kasumi :               real >= ceiling ?\n");
-	pr_info("Kasumi :                   | yes -> framework (no dampening)\n");
-	pr_info("Kasumi :                   | no\n");
-	pr_info("Kasumi :                   v\n");
-	pr_info("Kasumi :             zone offset override ?\n");
-	pr_info("Kasumi :                   | yes -> use that\n");
-	pr_info("Kasumi :                   | no\n");
-	pr_info("Kasumi :                   v\n");
-	pr_info("Kasumi :               boot warmup ?\n");
-	pr_info("Kasumi :                   | yes -> use warmup offset\n");
-	pr_info("Kasumi :                   | no\n");
-	pr_info("Kasumi :                   v\n");
-	pr_info("Kasumi :               use offset_mc\n");
-	pr_info("Kasumi :                   |\n");
-	pr_info("Kasumi :                   v\n");
-	pr_info("Kasumi :           real < ramp ?\n");
-	pr_info("Kasumi :                   | yes -> real - offset\n");
-	pr_info("Kasumi :                   | no\n");
-	pr_info("Kasumi :                   v\n");
-	pr_info("Kasumi :             ramp shape switch:\n");
-	pr_info("Kasumi :               linear     -- offset taper to 0 at ceiling\n");
-	pr_info("Kasumi :               quadratic  -- gentle low, steep near ceiling\n");
-	pr_info("Kasumi :               step       -- full offset all the way up\n");
-	pr_info("Kasumi :                   |\n");
-	pr_info("Kasumi :                   v\n");
-	pr_info("Kasumi :         framework gets dampened value\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :          ----  the safety floor  ----\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : at boot, before any sysfs is exposed, Kasumi runs a self-test that\n");
-	pr_info("Kasumi : asserts three contracts:\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :   1. at-or-above-ceiling input is returned UNCHANGED\n");
-	pr_info("Kasumi :   2. below-ramp input is exactly real - offset\n");
-	pr_info("Kasumi :   3. zero or negative input is passed through\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : if any assertion fails the subsystem auto-disables and the boot\n");
-	pr_info("Kasumi : log says 'kasumi: safety self-test FAILED' loudly.\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :          ----  why a zone filter  ----\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : different zones lie differently.  the cpu zone tracks workload heat\n");
-	pr_info("Kasumi : honestly.  the pmic zone is dominated by current and is bursty.\n");
-	pr_info("Kasumi : the battery zone is dominated by charge state.  Kasumi accepts a\n");
-	pr_info("Kasumi : whitelist or a blacklist via zone_filter so the operator chooses\n");
-	pr_info("Kasumi : which zones the mist actually rolls over.\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :          ----  why a per-zone offset  ----\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : even after filtering, a single offset is a rough tool.  zone_offsets\n");
-	pr_info("Kasumi : takes a comma-separated 'zone_type=mc' list so cpu can get 20 C of\n");
-	pr_info("Kasumi : softening while pmic gets 5 C.\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :          ----  bond with Zenith  ----\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : Kasumi exports kasumi_get_last_real_mc().  Zenith's game_perf_burst\n");
-	pr_info("Kasumi : guardrail reads it directly so the FSM can never be fooled by a\n");
-	pr_info("Kasumi : configured offset -- the un-dampened value is the one the burst\n");
-	pr_info("Kasumi : decides on, while the dampened value still goes to userspace.\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :          ----  the mist holds nothing it should not  ----\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi :          the river is still there, just below the surface.\n");
-	pr_info("Kasumi : \n");
-	pr_info("Kasumi : built by XTENSEI.\n");
-#endif /* CONFIG_KASUMI_DEBUG_MSG */
+	#ifdef CONFIG_KASUMI_DEBUG_MSG
+	pr_info("kasumi: initialized (offset=%u ramp=%u ceiling=%u shape=%u)\n",
+		READ_ONCE(kasumi_offset_mc),
+		READ_ONCE(kasumi_ramp_mc),
+		READ_ONCE(kasumi_ceiling_mc),
+		READ_ONCE(kasumi_ramp_shape));
+	#endif /* CONFIG_KASUMI_DEBUG_MSG */
 
 	return 0;
 }
