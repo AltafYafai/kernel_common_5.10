@@ -432,6 +432,21 @@ int kasumi_get_last_real_mc(void)
 EXPORT_SYMBOL_GPL(kasumi_get_last_real_mc);
 
 /*
+ * Return the offset that was actually applied during the most recent
+ * kasumi_dampen() call, in millidegrees Celsius.  Hikari reads this
+ * to detect when the dampening offset is so large that the frequency
+ * floor and thermal dampening are conspiring to hide heat buildup.
+ *
+ * Safe from any context: returns a stale snapshot (last value written
+ * by WRITE_ONCE in the dampen path) and never blocks.
+ */
+int kasumi_get_applied_offset_mc(void)
+{
+	return READ_ONCE(kasumi_applied_offset_mc);
+}
+EXPORT_SYMBOL_GPL(kasumi_get_applied_offset_mc);
+
+/*
  * Profile-aware Kasumi tuning.  Called from Zenith's
  * zenith_apply_profile() when the active profile changes.
  *

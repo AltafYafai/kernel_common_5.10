@@ -52,6 +52,14 @@
 #include <linux/fs.h>
 #include <linux/hikari.h>
 #include <linux/zenith_profiles.h>
+
+/*
+ * Kasumi cross-link: read the currently applied thermal dampening
+ * offset to detect when the frequency floor and dampening are
+ * hiding heat buildup from each other.  When the offset exceeds
+ * 15 C (15000 mc) the force floor is reduced proportionally.
+ */
+extern int kasumi_get_applied_offset_mc(void);
 #include <linux/init.h>
 #include <linux/jiffies.h>
 #include <linux/jump_label.h>
@@ -977,9 +985,36 @@ void hikari_apply_profile(unsigned int profile)
 
 	v = &profiles[profile];
 
-	WRITE_ONCE(hikari_force_floor_pct_big, v->force_floor_pct_big);
-	WRITE_ONCE(hikari_force_floor_pct_little, v->force_floor_pct_little);
-	hikari_recompute_force_floors();
+	{
+		unsigned int big = v->force_floor_pct_big;
+		int kasumi_offset = kasumi_get_applied_offset_mc();
+
+		/*
+		 * Kasumi cross-link: when the thermal dampening offset exceeds
+		 * 15 C (15000 mc), the frequency floor and dampening can
+		 * conspire to hide heat buildup.  Reduce the big floor
+		 * proportionally: each 5 C over 15 C reduces the floor by
+		 * 5 percentage points, with a floor of 0 (full surrender to
+		 * the thermal framework).
+		 *
+		 * Example: offset=22 C, big=15%  -> reduction = 5%
+		 *          effective floor = 15 - 5 = 10%
+		 * Example: offset=30 C, big=15%  -> reduction = 15%
+		 *          effective floor = 0%
+		 */
+		if (kasumi_offset > 15000 && big > 0) {
+			unsigned int reduction = (kasumi_offset - 15000) / 5000 * 5;
+
+			if (reduction >= big)
+				big = 0;
+			else
+				big -= reduction;
+		}
+
+		WRITE_ONCE(hikari_force_floor_pct_big, big);
+		WRITE_ONCE(hikari_force_floor_pct_little, v->force_floor_pct_little);
+		hikari_recompute_force_floors();
+	}
 
 	if (trace_hikari_profile_enabled())
 		trace_hikari_profile(profile, v->force_floor_pct_big,
