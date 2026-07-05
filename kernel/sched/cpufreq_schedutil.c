@@ -178,8 +178,7 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 {
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int freq = arch_scale_freq_invariant() ?
-				policy->cpuinfo.max_freq :
-				policy->cur + (policy->cur >> 2);
+				policy->cpuinfo.max_freq : policy->cur;
 	unsigned int idx, l_freq, h_freq;
 	unsigned long next_freq = 0;
 
@@ -788,7 +787,8 @@ static int sugov_init(struct cpufreq_policy *policy)
 		goto stop_kthread;
 	}
 
-	tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);
+	/* 1000 us down rate limit provides good power/perf balance per Sultan Alsawaf */
+	tunables->rate_limit_us = 1000;
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;

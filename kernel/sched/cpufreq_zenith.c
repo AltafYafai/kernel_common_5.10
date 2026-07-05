@@ -107,9 +107,6 @@
 #ifdef CONFIG_DRM_PANEL_NOTIFY
 #include <drm/drm_panel_notifier.h>
 #endif
-#ifdef CONFIG_SCHED_PREFER_SILVER
-#include <linux/prefer_silver.h>
-#endif
 #include <trace/events/power.h>
 #include <trace/events/sched.h>
 
@@ -179,7 +176,7 @@
  * climbs to SCHED_CAPACITY_SCALE without an upper time bound).
  */
 #define ZENITH_DEFAULT_IOWAIT_BACKOFF_AFTER_MS	0
-#define ZENITH_DEFAULT_UP_THRESHOLD		75
+#define ZENITH_DEFAULT_UP_THRESHOLD		70
 #define ZENITH_DEFAULT_UP_THRESHOLD_HISPEED	0	/* disabled */
 #define ZENITH_DEFAULT_DOWN_THRESHOLD		60
 #define ZENITH_DEFAULT_HISPEED_FREQ		0	/* disabled */
@@ -206,7 +203,7 @@
  * ZENITH_HISPEED_ENTRY_STREAK_MAX so the per-policy u8 counter
  * never overflows.
  */
-#define ZENITH_DEFAULT_HISPEED_ENTRY_STREAK	0
+#define ZENITH_DEFAULT_HISPEED_ENTRY_STREAK	2
 #define ZENITH_HISPEED_ENTRY_STREAK_MAX		16
 
 /* brutal_entry_streak (default 0, off):
@@ -269,7 +266,7 @@
 #define ZENITH_DEFAULT_PEAK_HEADROOM_RESCUE		1
 #define ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_LOAD_PCT	90
 #define ZENITH_DEFAULT_PEAK_HEADROOM_FREQ_FLOOR_PCT	85
-#define ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_STREAK	3
+#define ZENITH_DEFAULT_PEAK_HEADROOM_STARVE_STREAK	2
 #define ZENITH_DEFAULT_PEAK_HEADROOM_JUMP_PCT		100
 #define ZENITH_DEFAULT_PEAK_HEADROOM_HOLD_MS		50
 #define ZENITH_DEFAULT_PEAK_HEADROOM_PREARM		1
@@ -297,7 +294,7 @@
  * BATTERY and LEGACY hide the tier entirely while PERFORMANCE
  * widens it.
  */
-#define ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS		40
+#define ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_MS		30
 #define ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_IDLE_MS	80
 #define ZENITH_DEFAULT_CLUSTER_WAKE_PULSE_FLOOR_PCT	55
 #define ZENITH_CLUSTER_WAKE_PULSE_MS_MAX		200
@@ -604,7 +601,7 @@
  * is the same domain as predict_up_thresh.
  */
 #define ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH		32
-#define ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT		50
+#define ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT		40
 #define ZENITH_PELT_RISING_EDGE_THRESH_MAX		255
 #define ZENITH_PELT_RISING_EDGE_MIN_PCT_MAX		100
 
@@ -1316,7 +1313,7 @@
  * 120 Hz frames -- enough recovery time after a single miss
  * without holding a high-freq pin past a brief stall.
  */
-#define ZENITH_DEFAULT_FRAME_OVERRUN_SLACK_US		0
+#define ZENITH_DEFAULT_FRAME_OVERRUN_SLACK_US		4000
 #define ZENITH_FRAME_OVERRUN_SLACK_US_MAX		16667
 #define ZENITH_DEFAULT_FRAME_OVERRUN_WINDOW_MS		50
 #define ZENITH_FRAME_OVERRUN_WINDOW_MS_MAX		200
@@ -1823,19 +1820,11 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS	1
 
 /* prefer_silver_aware defaults.  See struct zenith_tunables for
- * semantics.  Hot threshold of 50%% means the bump fires when at
- * least half of the recent prefer_silver decisions actually
- * redirected onto a silver core; hot bump of 5 points is small
- * enough to avoid a perceived step but large enough to noticeably
- * delay big-cluster downclock during sustained UI navigation.
- * Both knobs are tunable; the defaults are conservative.
+ * semantics.  These fields remain as dead storage -- the Kconfig was
+ * removed and nothing updates ps_hit_rate_pct, so the runtime path
+ * never fires.
  *
- * Default flipped from 0 to 1 in the wave-1 auto-defaults round so
- * the prefer_silver coordination kicks in out of the box on builds
- * that have CONFIG_SCHED_PREFER_SILVER=y.  The bump is cluster-aware
- * (only big/prime clusters react) and gated on the silver-cpu hit
- * rate exceeding prefer_silver_hot_threshold_pct, so on devices
- * without prefer_silver, the runtime path is a no-op.
+ * Both knobs are tunable; the defaults are conservative.
  */
 #define ZENITH_DEFAULT_PREFER_SILVER_AWARE			1
 #define ZENITH_DEFAULT_PREFER_SILVER_HOT_THRESHOLD_PCT		50
@@ -2516,7 +2505,7 @@ static inline void zenith_set_static_key(struct static_key_false *key,
  *
  *   brutal_decay_ms, wakeup_boost_ms, boot_boost_decay_ms,
  *   screen_off_glide_ms, thermal_pressure_continuous,
- *   prefer_silver_aware, frame_budget_us_auto.
+ *   frame_budget_us_auto.
  *
  * On stock systems all seven knobs default to 0 (legacy hard
  * cliffs / off).  Without auto_tune_v2_glides the consumer has to
@@ -2620,10 +2609,11 @@ static inline void zenith_set_static_key(struct static_key_false *key,
 #define ZENITH_AT_FLAG_LOCAL_ACTIONS		BIT(11)
 /* Set by the V1 classifier worker when prefer_silver_aware is on AND
  * the prefer_silver hit-rate over the last classifier window crossed
- * the prefer_silver_hot_threshold_pct cutoff.  Read-only signal; the
- * actual dynamic_up_thresh bump is applied directly in
- * zenith_get_next_freq() (the signal does not feed the V2 state
- * machine because prefer_silver redistribution is workload-dependent
+ * the prefer_silver_hot_threshold_pct cutoff (dead -- Kconfig removed,
+ * never fires).  Read-only signal; the actual dynamic_up_thresh bump
+ * is applied directly in zenith_get_next_freq() (the signal does not
+ * feed the V2 state machine because prefer_silver redistribution is
+ * workload-dependent
  * and would race with the existing thermal / PSI / frame triggers).
  */
 #define ZENITH_AT_FLAG_PREFER_SILVER_HOT	BIT(12)
@@ -4185,22 +4175,10 @@ struct zenith_tunables {
 	 */
 	unsigned int		thermal_pressure_continuous;
 
-	/* prefer_silver_aware: when 1, on big / prime cluster policies,
-	 * raise dynamic_up_thresh by prefer_silver_hot_bump_pct percent
-	 * (additive points) whenever the prefer_silver hit-rate over
-	 * the last classifier window is at or above
-	 * prefer_silver_hot_threshold_pct.  The intent is to reflect
-	 * the fact that prefer_silver hides light load from the big
-	 * cluster, so the big cluster sees an artificially "lighter"
-	 * load and would otherwise downclock more aggressively than it
-	 * should.  Little cluster policies are intentionally not bumped
-	 * (they are already absorbing the redirected light tasks).
-	 *
-	 * Default 0 (off).  Has no effect when
-	 * CONFIG_SCHED_PREFER_SILVER=n: the worker does not import
-	 * prefer_silver_get_hit_miss() in that build, so the cached
-	 * hit-rate stays at 0 and the bump never fires regardless of
-	 * the tunable value.
+	/* prefer_silver fields: dead storage.  The Kconfig was removed;
+	 * nothing updates ps_hit_rate_pct, so the downstream bump never
+	 * fires regardless of these values.  Fields kept to avoid
+	 * shifting the struct layout.
 	 */
 	unsigned int		prefer_silver_aware;
 	unsigned int		prefer_silver_hot_threshold_pct;
@@ -4447,7 +4425,7 @@ struct zenith_tunables {
 	 * V2 worker populates per-policy effective values for the
 	 * round-U-z10 glide / coordination knobs (brutal_decay_ms,
 	 * wakeup_boost_ms, boot_boost_decay_ms, screen_off_glide_ms,
-	 * thermal_pressure_continuous, prefer_silver_aware,
+	 * thermal_pressure_continuous,
 	 * frame_budget_us_auto) based on V2 state.  Consumers use the
 	 * effective value only when the user-set tunable is 0.  0 here
 	 * locks all seven back to legacy behaviour exactly.  Ignored
@@ -4901,6 +4879,20 @@ static atomic_t zenith_on_battery = ATOMIC_INIT(0);
  */
 static u64 zenith_game_auto_active_until_ns;
 
+/* Atomic notifier chain for game-mode state transitions.  Fired
+ * whenever the effective game mode transitions 0->1 or 1->0, whether
+ * triggered by a user sysfs write or by the V2 auto-detector.  The
+ * action parameter passed to notifier callbacks is 1 (game mode
+ * entered) or 0 (game mode exited).  External drivers (GPU switch,
+ * thermal, etc.) register a callback and can block for immediate
+ * policy synchronisation.
+ *
+ * The chain is ATOMIC so it is safe to fire from any context,
+ * including the scheduler hot path where the V2 auto-detector runs.
+ * Callbacks must not sleep.
+ */
+static ATOMIC_NOTIFIER_HEAD(zenith_game_mode_nh);
+
 /* True if the in-kernel game detector latch is currently in the
  * future, i.e. a recent fresh detection has happened and is still
  * within ZENITH_GAME_AUTO_ACTIVE_TTL_NS.  Lock-free; readers tolerate
@@ -4951,6 +4943,34 @@ bool zenith_is_game_mode_active(void)
 	return zenith_game_auto_active();
 }
 EXPORT_SYMBOL_GPL(zenith_is_game_mode_active);
+
+/**
+ * zenith_register_game_mode_notifier - register a notifier for game mode
+ *                                       transitions
+ * @nb: notifier_block to register (callback receives action=1 on enter,
+ *      action=0 on exit)
+ *
+ * Register a callback that fires when the effective game mode changes.
+ * The callback runs in atomic context (RCU-read-side) and must not
+ * sleep.  Typically the callback will schedule_work() to defer
+ * heavyweight operations (governor switch, VM tuning) to process
+ * context.
+ */
+int zenith_register_game_mode_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_register(&zenith_game_mode_nh, nb);
+}
+EXPORT_SYMBOL_GPL(zenith_register_game_mode_notifier);
+
+/**
+ * zenith_unregister_game_mode_notifier - unregister a game mode notifier
+ * @nb: notifier_block previously registered
+ */
+int zenith_unregister_game_mode_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_unregister(&zenith_game_mode_nh, nb);
+}
+EXPORT_SYMBOL_GPL(zenith_unregister_game_mode_notifier);
 
 /**
  * zenith_set_drm_vblank_us - publish active panel vblank period to zenith
@@ -5935,15 +5955,12 @@ struct zenith_policy {
 	u64			screen_off_arm_ns;
 	unsigned int		screen_state_last;
 
-	/* prefer_silver_aware coordination state.  Snapshot of the
-	 * global prefer_silver hit / miss counters at the previous V1
-	 * classifier window, plus the resulting hit-rate (0..100) for
-	 * the most-recent window.  The hit-rate is read on the hot
-	 * path by zenith_get_next_freq() and only updated by the worker,
-	 * so the read is unsynchronised but bounded to the previous
-	 * complete window.  When CONFIG_SCHED_PREFER_SILVER=n these
-	 * fields stay at 0 (the worker never updates them) and the
-	 * downstream bump never fires.
+	/* prefer_silver_aware coordination state (dead -- Kconfig removed).
+	 * Snapshot of the global prefer_silver hit / miss counters at
+	 * the previous V1 classifier window, plus the resulting hit-rate
+	 * (0..100) for the most-recent window.  These fields stay at 0
+	 * (the worker never updates them) and the downstream bump never
+	 * fires.
 	 */
 	unsigned int		ps_prev_hit;
 	unsigned int		ps_prev_miss;
@@ -8262,8 +8279,11 @@ static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
 		z_policy->game_auto_streak = 0;
 
 	if (z_policy->game_auto_streak >= ZENITH_GAME_AUTO_DETECT_STREAK) {
+		u64 prev = READ_ONCE(zenith_game_auto_active_until_ns);
 		until = ktime_get_ns() + ZENITH_GAME_AUTO_ACTIVE_TTL_NS;
 		WRITE_ONCE(zenith_game_auto_active_until_ns, until);
+		if (!prev)
+			atomic_notifier_call_chain(&zenith_game_mode_nh, 1, NULL);
 		z_policy->game_auto_streak = 0;
 	}
 }
@@ -8294,6 +8314,17 @@ static inline void kasumi_apply_profile(unsigned int profile) { }
 extern void iyashi_apply_profile(unsigned int profile);
 #else
 static inline void iyashi_apply_profile(unsigned int profile) { }
+#endif
+
+#if IS_ENABLED(CONFIG_VINDICATOR_EQUILIBRIUM)
+extern void equilibrium_apply_profile(unsigned int profile);
+#else
+static inline void equilibrium_apply_profile(unsigned int profile) { }
+#endif
+#if IS_ENABLED(CONFIG_VINDICATOR_NOCTURNE)
+extern void nocturne_apply_profile(unsigned int profile);
+#else
+static inline void nocturne_apply_profile(unsigned int profile) { }
 #endif
 
 /* Patch K: live skin-temp readout for the game_perf_burst guardrail.
@@ -8744,10 +8775,11 @@ static enum zenith_stat_idx zenith_path_to_bucket(const char *path)
  * cluster is at max_cap and gets classified ZENITH_CLUSTER_PRIME -- the
  * BIG class is unused.
  *
- * The prefer_silver_aware bump path needs to distinguish these two cases
- * so it can fire on the lowest non-LITTLE cluster in either topology
- * (BIG on tri-cluster, PRIME on 2-cluster) without wrongly inflating
- * up_threshold on PRIME when a separate BIG cluster also exists.
+ * The prefer_silver_aware bump path (dead -- Kconfig removed) would
+ * need to distinguish these two cases so it can fire on the lowest
+ * non-LITTLE cluster in either topology (BIG on tri-cluster, PRIME on
+ * 2-cluster) without wrongly inflating up_threshold on PRIME when a
+ * separate BIG cluster also exists.
  *
  * Topology is invariant after boot, so the result is computed once on
  * the first call and cached.  capacity_orig is read via
@@ -9489,45 +9521,11 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 			dynamic_up_thresh -= swing;
 	}
 
-	/* prefer_silver_aware coordination: when prefer_silver is hot
-	 * and this policy belongs to the BIG / mid cluster, raise
-	 * dynamic_up_thresh by prefer_silver_hot_bump_pct points
-	 * (clamped to ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT) so the
-	 * big cluster down-clocks less aggressively during sustained
-	 * UI / app workloads where prefer_silver is steering the
-	 * light wake-ups onto the silver/LITTLE cluster.
-	 *
-	 * Fires on the lowest non-LITTLE cluster only:
-	 *
-	 *   - 3+-cluster topology (1+3+4 et al): cluster_class == BIG.
-	 *     PRIME is excluded -- prefer_silver only redirects *light*
-	 *     wake-ups onto silver (the heavy-task gate in
-	 *     find_best_silver_cpu() rejects anything above
-	 *     sysctl_heavy_task_thresh), so the work it hides from the
-	 *     rest of the system is BIG-cluster work, never PRIME work.
-	 *     Inflating up_threshold on PRIME would just delay
-	 *     down-shifts on the highest-leakage cluster: pure power
-	 *     tax with no perf return.
-	 *   - 2-cluster topology (true big.LITTLE): no BIG class exists
-	 *     and the lone non-LITTLE cluster is classified PRIME.  Fall
-	 *     through to PRIME there so the bump still fires on the
-	 *     cluster that absorbs the heavy work, exactly as before
-	 *     this restriction was introduced.  The
-	 *     zenith_topology_has_big_class() probe distinguishes the
-	 *     two cases at runtime via capacity_orig, with the result
-	 *     cached for the lifetime of the kernel.
-	 *
-	 * Also skipped whenever a harder override above has pinned
-	 * dynamic_up_thresh strictly higher than the natural
-	 * up_threshold (screen-off, thermal cliff, hispeed pin) --
-	 * those values are absolute and must not be inflated further.
-	 *
-	 * The (dynamic_up_thresh <= natural) test deliberately allows
-	 * the bump to ride on top of the variance-adaptive shaping
-	 * lower in the same chain (which only ever lowers
-	 * dynamic_up_thresh below natural), preserving its smoothing
-	 * effect while restoring the climb resistance prefer_silver
-	 * was eroding by hiding light load from this cluster.
+	/* prefer_silver_aware coordination (dead -- Kconfig removed):
+	 * the code below is permanently gated because ps_hit_rate_pct
+	 * stays at 0.  The logic is preserved for documentation;
+	 * re-enable by re-importing the prefer_silver hit/miss
+	 * counters and restoring CONFIG_SCHED_PREFER_SILVER.
 	 */
 	if (zenith_glide_value(z_policy,
 			z_policy->tunables->prefer_silver_aware,
@@ -12249,22 +12247,11 @@ static void zenith_refresh_rate_delays(struct gov_attr_set *attr_set)
 	}
 }
 
-/* Update the per-policy prefer_silver hit-rate snapshot.
- *
- * Called once per V1 classifier window from zenith_auto_tune_work().
- * Reads the global prefer_silver hit / miss atomic counters via the
- * accessor exported by kernel/sched/prefer_silver.c, computes the
- * delta against the previous window's snapshot, and stores the
- * resulting hit-rate as a percentage (0..100) on z_policy for
- * zenith_get_next_freq() to consume.  When the rate crosses the
- * tunable's hot threshold, ORs ZENITH_AT_FLAG_PREFER_SILVER_HOT
- * into *flags so the at_log dump and trace events reflect the
- * trigger.
- *
- * On builds without CONFIG_SCHED_PREFER_SILVER the accessor symbol
- * is unavailable, so the helper is a no-op stub and the cached
- * hit-rate stays at zero — the downstream bump in
- * zenith_get_next_freq() never fires regardless of the tunable.
+/* Update the per-policy prefer_silver hit-rate snapshot (dead --
+ * CONFIG_SCHED_PREFER_SILVER was removed, the #ifdef block below
+ * is never compiled).  Was called once per V1 classifier window
+ * from zenith_auto_tune_work(); the no-op #else stub keeps the
+ * call site from breaking.
  */
 static void zenith_at_update_prefer_silver_rate(struct zenith_policy *z_policy,
 						struct zenith_tunables *t,
@@ -13801,7 +13788,7 @@ ZENITH_TUNABLE_UINT_BOOL_INVAL(ignore_nice_load);
  *
  *   - User intent / opt-in flags whose semantics are device-wide
  *     and not per-profile: audio_aware, render_aware, camera_aware,
- *     psi_aware, prefer_silver_aware, game_auto, auto_tune_v2,
+ *     psi_aware, game_auto, auto_tune_v2,
  *     auto_tune_v3 (all of the seven static-key-gated aware-flags
  *     and tier switches plus auto_tune_cluster_aware,
  *     auto_tune_v2_signals, auto_tune_frame_pacing,
@@ -15279,6 +15266,8 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 	kasumi_apply_profile(prof);
 	iyashi_apply_profile(prof);
 	hikari_apply_profile(prof);
+	equilibrium_apply_profile(prof);
+	nocturne_apply_profile(prof);
 }
 
 /* Patch B-AUTO-4: auto-selector classifier (priority cascade).
@@ -17951,68 +17940,6 @@ static ssize_t thermal_active_show(struct gov_attr_set *attr_set, char *buf)
 		       READ_ONCE(to_zenith_tunables(attr_set)->thermal_active));
 }
 static struct governor_attr thermal_active = __ATTR_RO(thermal_active);
-
-/* prefer_silver_aware: strict 0/1.  See struct zenith_tunables for
- * semantics.  When CONFIG_SCHED_PREFER_SILVER=n the field is still
- * stored and round-tripped via sysfs so userspace tools that probe
- * the governor's tunable list don't choke on a missing node, but
- * the run-time bump path is dead because the worker stub never
- * updates ps_hit_rate_pct.
- */
-ZENITH_TUNABLE_UINT_BOOL_INVAL(prefer_silver_aware);
-
-/* prefer_silver_hot_threshold_pct: 0..100.  When the per-window
- * prefer_silver hit-rate is at or above this percentage,
- * prefer_silver_aware fires the bump on big / prime clusters.
- */
-static ssize_t prefer_silver_hot_threshold_pct_show(
-		struct gov_attr_set *attr_set, char *buf)
-{
-	return sysfs_emit(buf, "%u\n",
-		to_zenith_tunables(attr_set)->prefer_silver_hot_threshold_pct);
-}
-
-static ssize_t prefer_silver_hot_threshold_pct_store(
-		struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->prefer_silver_hot_threshold_pct = val;
-	return count;
-}
-static struct governor_attr prefer_silver_hot_threshold_pct =
-	__ATTR_RW(prefer_silver_hot_threshold_pct);
-
-/* prefer_silver_hot_bump_pct: 0..ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT.
- * Additive points added to dynamic_up_thresh on big / prime clusters
- * when the prefer_silver hit-rate is hot.  Clamped to the max in the
- * fast path; this store enforces the same range so userspace gets
- * an early -EINVAL on out-of-range values.
- */
-static ssize_t prefer_silver_hot_bump_pct_show(
-		struct gov_attr_set *attr_set, char *buf)
-{
-	return sysfs_emit(buf, "%u\n",
-		to_zenith_tunables(attr_set)->prefer_silver_hot_bump_pct);
-}
-
-static ssize_t prefer_silver_hot_bump_pct_store(
-		struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct zenith_tunables *t = to_zenith_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) ||
-	    val > ZENITH_PREFER_SILVER_HOT_BUMP_MAX_PCT)
-		return -EINVAL;
-	t->prefer_silver_hot_bump_pct = val;
-	return count;
-}
-static struct governor_attr prefer_silver_hot_bump_pct =
-	__ATTR_RW(prefer_silver_hot_bump_pct);
 
 /* thermal_util_derate sysfs knob.  Strict 0/1 boolean.  See the
  * ZENITH_DEFAULT_THERMAL_UTIL_DERATE comment block for semantics.
@@ -20827,8 +20754,12 @@ static ssize_t game_mode_store(struct gov_attr_set *attr_set,
 	prev = t->game_mode;
 	t->game_mode = val;
 	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_GAME_MODE);
-	if (prev != t->game_mode)
-		trace_zenith_game_mode(smp_processor_id(), t->game_mode);
+	if (prev != t->game_mode) {
+		if (trace_zenith_game_mode_enabled())
+			trace_zenith_game_mode(smp_processor_id(), t->game_mode);
+		atomic_notifier_call_chain(&zenith_game_mode_nh,
+					 val ? 1 : 0, NULL);
+	}
 	return count;
 }
 static struct governor_attr game_mode = __ATTR_RW(game_mode);
@@ -20858,8 +20789,12 @@ static ssize_t game_auto_store(struct gov_attr_set *attr_set,
 	old = t->game_auto;
 	t->game_auto = val;
 	zenith_set_static_key(&zenith_game_auto_key, val);
-	if (!val)
+	if (!val) {
+		u64 prev_latch = READ_ONCE(zenith_game_auto_active_until_ns);
 		WRITE_ONCE(zenith_game_auto_active_until_ns, 0);
+		if (prev_latch)
+			atomic_notifier_call_chain(&zenith_game_mode_nh, 0, NULL);
+	}
 	if (old != val)
 		zenith_log_master_flip(t, "game_auto", old, val);
 	return count;
@@ -21549,9 +21484,6 @@ static struct attribute *zenith_attrs[] = {
 	&thermal_aware.attr,
 	&thermal_active.attr,
 	&thermal_pressure_continuous.attr,
-	&prefer_silver_aware.attr,
-	&prefer_silver_hot_threshold_pct.attr,
-	&prefer_silver_hot_bump_pct.attr,
 	&thermal_util_derate.attr,
 	&thermal_derate_rate_pct.attr,
 	&auto_thermal_cap.attr,
@@ -22140,10 +22072,6 @@ static int zenith_init(struct cpufreq_policy *policy)
 	tunables->thermal_active	= 0;
 	tunables->thermal_pressure_continuous =
 		ZENITH_DEFAULT_THERMAL_PRESSURE_CONTINUOUS;
-	tunables->prefer_silver_aware	= ZENITH_DEFAULT_PREFER_SILVER_AWARE;
-	tunables->prefer_silver_hot_threshold_pct =
-		ZENITH_DEFAULT_PREFER_SILVER_HOT_THRESHOLD_PCT;
-	tunables->prefer_silver_hot_bump_pct =
 		ZENITH_DEFAULT_PREFER_SILVER_HOT_BUMP_PCT;
 	tunables->brutal_decay_ms	= ZENITH_DEFAULT_BRUTAL_DECAY_MS;
 	tunables->thermal_util_derate	= ZENITH_DEFAULT_THERMAL_UTIL_DERATE;
@@ -23569,377 +23497,9 @@ static int __init zenith_gov_init(void)
 	 * "Hikari :" / "Kasumi :" / "Iyashi :" prefixes, so each
 	 * subsystem is individually grep-able.
 	 */
-#ifdef CONFIG_ZENITH_DEBUG_MSG
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :                 . . . . . . . . . . . . . . . . . . .\n");
-	pr_info("Zenith :               . the kernel, before it remembers itself .\n");
-	pr_info("Zenith :                 . . . . . . . . . . . . . . . . . . .\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :                               *           .\n");
-	pr_info("Zenith :                          .       *\n");
-	pr_info("Zenith :                                   .     *\n");
-	pr_info("Zenith :                            *  .              .\n");
-	pr_info("Zenith :                     .                 *\n");
-	pr_info("Zenith :                                                 .\n");
-	pr_info("Zenith :                               \\              /\n");
-	pr_info("Zenith :                                \\  .       . /\n");
-	pr_info("Zenith :                                 \\   *    /\n");
-	pr_info("Zenith :                                  \\      /\n");
-	pr_info("Zenith :                                   \\    /\n");
-	pr_info("Zenith :                                    \\  /\n");
-	pr_info("Zenith :                                     \\/\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          Listen.\n");
-	pr_info("Zenith :          This is not a kernel that boots.\n");
-	pr_info("Zenith :          This is a kernel that wakes.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          There are four names in this dark, and each\n");
-	pr_info("Zenith :          of them is a verb dressed as a noun.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          You will meet them in order:\n");
-	pr_info("Zenith :             Zenith.   Hikari.   Kasumi.   Iyashi.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          By the time the last line of this banner\n");
-	pr_info("Zenith :          scrolls past, userspace will already be\n");
-	pr_info("Zenith :          awake, and the work will already be moving.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :                     Before dawn, on the ridge.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :                                   .\n");
-	pr_info("Zenith :                              .         .\n");
-	pr_info("Zenith :                        __.--.__/ \\__.--.__\n");
-	pr_info("Zenith :                   _.--'                    `--._\n");
-	pr_info("Zenith :              _.--'              ^^^^             `--._\n");
-	pr_info("Zenith :         _.--'             ^^         ^^^               `-.\n");
-	pr_info("Zenith :        '                                                  `\n");
-	pr_info("Zenith :        ~~~~~ 霞 ~~~~~~~~~~ 霞 ~~~~~~~~~~~ 霞 ~~~~~~~~~~ 霞 ~~~~~\n");
-	pr_info("Zenith :         ~~~~~~~ 霞 ~~~~~~~~~~~~~~ 霞 ~~~~~~~~~~~~~ 霞 ~~~~~~~~~\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        The peak does not sleep.   It is Zenith.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        The mist that climbs the rock is Kasumi —  霞 —\n");
-	pr_info("Zenith :        a veil drawn over heat the way silk is drawn\n");
-	pr_info("Zenith :        over a sleeping animal:  not to hide it, but to\n");
-	pr_info("Zenith :        keep what watches it from panicking.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        The breath beneath the mist is Iyashi —  癒し —\n");
-	pr_info("Zenith :        the healing that says: leave room.   Always leave room.\n");
-	pr_info("Zenith :        Throttle, but never to the bone.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        And the first light over the ridge, the one that\n");
-	pr_info("Zenith :        wakes the kernel,  is Hikari —  光.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Four names.   One ridge.   One climb.\n");
-	pr_info("Zenith :        Built by XTENSEI.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Read on, in chapters.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Chapter I.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        ZENITH.   頂点.   The peak.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          _______ _____ _   _ _____ _______ _    _ \n");
-	pr_info("Zenith :         |___  /  ____| \\ | |_   _|__   __| |  | |\n");
-	pr_info("Zenith :            / /| |__  |  \\| | | |    | |  | |__| |\n");
-	pr_info("Zenith :           / / |  __| | . ` | | |    | |  |  __  |\n");
-	pr_info("Zenith :          / /__| |____| |\\  |_| |_   | |  | |  | |\n");
-	pr_info("Zenith :         /_____|______|_| \\_|_____|  |_|  |_|  |_|\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Eleven months ago, a fork.   One word in the\n");
-	pr_info("Zenith :        commit message:   init.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Today, a governor that schedules silicon by mood:\n");
-	pr_info("Zenith :            six profiles.\n");
-	pr_info("Zenith :            three automation tiers.\n");
-	pr_info("Zenith :            181 tunables.\n");
-	pr_info("Zenith :            six vendor-scheduler hooks.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        It thinks at fs_initcall.   By the time userspace\n");
-	pr_info("Zenith :        can ask the question, Zenith already has an answer.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Steady.   Ready.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        The peak does not sleep.   The peak does not\n");
-	pr_info("Zenith :        even close its eyes.   Sleep is something the\n");
-	pr_info("Zenith :        things below the peak get to do.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        頂点 is not arrogance.   頂点 is the place from\n");
-	pr_info("Zenith :        which the climb is finally honest.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          /\\\n");
-	pr_info("Zenith :         /  \\    Up here, the air is thin —\n");
-	pr_info("Zenith :        /    \\   and decisions are sharp.\n");
-	pr_info("Zenith :       /      \\\n");
-	pr_info("Zenith :      /        \\\n");
-	pr_info("Zenith :     /          \\\n");
-	pr_info("Zenith :    /____________\\\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Interlude.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :            .         .         .\n");
-	pr_info("Zenith :        Above the ridge, the sky is still dark.\n");
-	pr_info("Zenith :        Below the ridge, the kernel is still warm.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Between them, the climb.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        The climb is not new.   The climb has been\n");
-	pr_info("Zenith :        happening since the bootloader handed us\n");
-	pr_info("Zenith :        the first page of physical memory.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        What is new is what we do with the climb.\n");
-	pr_info("Zenith :            .         .         .\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Chapter II.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        HIKARI.   光.   Light.   The first ray over the rim.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          _    _ _____ _  __          _____  _____ \n");
-	pr_info("Zenith :         | |  | |_   _| |/ /    /\\   |  __ \\|_   _|\n");
-	pr_info("Zenith :         | |__| | | | | ' /    /  \\  | |__) | | |  \n");
-	pr_info("Zenith :         |  __  | | | |  <    / /\\ \\ |  _  /  | |  \n");
-	pr_info("Zenith :         | |  | |_| |_| . \\  / ____ \\| | \\ \\ _| |_ \n");
-	pr_info("Zenith :         |_|  |_|_____|_|\\_\\/_/    \\_\\_|  \\_\\_____|\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Wake-time work is a kind of light:  it falls on\n");
-	pr_info("Zenith :        the things that are awake to receive it, and on\n");
-	pr_info("Zenith :        nothing else.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Hikari is the kernel's choosing —  who gets\n");
-	pr_info("Zenith :        warmth,  who keeps it,  who must wait one more\n");
-	pr_info("Zenith :        tick before the next slice of CPU.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Opt-in, lazy, default-on.   A small contract\n");
-	pr_info("Zenith :        written in three places:\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :            hikari_on_enqueue().\n");
-	pr_info("Zenith :            hikari_on_dequeue().\n");
-	pr_info("Zenith :            hikari_active_key.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        A static key holds the door.   The kill switch\n");
-	pr_info("Zenith :        is never further than one sysctl write away.\n");
-	pr_info("Zenith :        Disabled, Hikari is a single patched\n");
-	pr_info("Zenith :        unlikely-branch.   Enabled, it is the EWMA\n");
-	pr_info("Zenith :        that learned what your foreground actually\n");
-	pr_info("Zenith :        does.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        光 does not insist.   光 illuminates.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        If the watcher decides to shut the window,\n");
-	pr_info("Zenith :        光 obeys instantly.   That, too, is light.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Interlude.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :                .                .         .\n");
-	pr_info("Zenith :             .       *       .              *\n");
-	pr_info("Zenith :                   .              *             .\n");
-	pr_info("Zenith :              The kernel learns whom to wake.\n");
-	pr_info("Zenith :                   .              *             .\n");
-	pr_info("Zenith :             .       *       .              *\n");
-	pr_info("Zenith :                .                .         .\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        And among those it wakes, who deserves more\n");
-	pr_info("Zenith :        light, and for how long, and at what cost.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        This is not a metaphor.   This is a histogram.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Chapter III.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        KASUMI.   霞.   Mist on the ridge.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          _  __           _____ _    _ __  __ _____ \n");
-	pr_info("Zenith :         | |/ /    /\\    / ____| |  | |  \\/  |_   _|\n");
-	pr_info("Zenith :         | ' /    /  \\  | (___ | |  | | \\  / | | |  \n");
-	pr_info("Zenith :         |  <    / /\\ \\  \\___ \\| |  | | |\\/| | | |  \n");
-	pr_info("Zenith :         | . \\  / ____ \\ ____) | |__| | |  | |_| |_ \n");
-	pr_info("Zenith :         |_|\\_\\/_/    \\_\\_____/ \\____/|_|  |_|_____|\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          ~~  ~~~~  ~~~~~~  ~~  ~~~~  ~~~~~~~~  ~~~~  ~~\n");
-	pr_info("Zenith :         ~~~~~~ 霞 ~~~~~~~~~~~ 霞 ~~~~~~~~~~~~~ 霞 ~~~~~~\n");
-	pr_info("Zenith :          ~~~~ 霞 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 霞 ~~~~~\n");
-	pr_info("Zenith :           ~~~~~~~~~~~~~~~~ reported_mc ~~~~~~~~~~~~~~~\n");
-	pr_info("Zenith :          ~~~~~~~~~~~ ~~~~~~~~ ~~~~~~~ ~~~~~~~~~ ~~~~~~~\n");
-	pr_info("Zenith :        ───────────────────────── ridge ──────────────────\n");
-	pr_info("Zenith :              last_real_mc          —  the truth\n");
-	pr_info("Zenith :              applied_offset_mc     —  the depth of the mist\n");
-	pr_info("Zenith :              ramp_mc … ceiling_mc  —  where mist thins to air\n");
-	pr_info("Zenith :        ─────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Heat does not lie to Kasumi.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Kasumi lies — gently, on purpose — to the\n");
-	pr_info("Zenith :        watchers that would panic at numbers that are\n");
-	pr_info("Zenith :        merely warm.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        The kernel keeps the truth.\n");
-	pr_info("Zenith :        The framework keeps the mist.\n");
-	pr_info("Zenith :        Both are real.   Neither is wrong.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        When the climb reaches the ceiling, the mist\n");
-	pr_info("Zenith :        parts.   Above the line, Kasumi returns the\n");
-	pr_info("Zenith :        raw heat, byte-for-byte —  a contract the\n");
-	pr_info("Zenith :        kernel self-tests at boot, and refuses to\n");
-	pr_info("Zenith :        bring up sysfs if broken.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        The contract is checked three ways before\n");
-	pr_info("Zenith :        /sys/kernel/kasumi/ exists at all:\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :            1.  at-ceiling input returns input.\n");
-	pr_info("Zenith :            2.  below-ramp input shifts by exactly the offset.\n");
-	pr_info("Zenith :            3.  zero input still returns zero.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Fail any one, and the whole subsystem stays dark.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        霞 is not deception.   霞 is composure.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Interlude.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~\n");
-	pr_info("Zenith :            The mist parts only where the kernel\n");
-	pr_info("Zenith :            asks it to.   Everywhere else, composure.\n");
-	pr_info("Zenith :        ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Even the mist has a kill switch.\n");
-	pr_info("Zenith :        /sys/kernel/kasumi/enabled = 0  ->  passthrough.\n");
-	pr_info("Zenith :        The truth was always there.   We just stop\n");
-	pr_info("Zenith :        editing it before the framework reads.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Chapter IV.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        IYASHI.   癒し.   Healing.   The breath the climb keeps.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          _______     __       _____ _    _ _____ \n");
-	pr_info("Zenith :         |_   _\\ \\   / //\\    / ____| |  | |_   _|\n");
-	pr_info("Zenith :           | |  \\ \\_/ //  \\  | (___ | |__| | | |  \n");
-	pr_info("Zenith :           | |   \\   // /\\ \\  \\___ \\|  __  | | |  \n");
-	pr_info("Zenith :          _| |_   | |/ ____ \\ ____) | |  | |_| |_ \n");
-	pr_info("Zenith :         |_____|  |_/_/    \\_\\_____/|_|  |_|_____|\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Cooling without cruelty.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        When the rock is cold, the climb runs at its\n");
-	pr_info("Zenith :        full stride.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        When the rock is warm, Iyashi still leaves the\n");
-	pr_info("Zenith :        top of the OPP stack open —  one step for\n");
-	pr_info("Zenith :        headroom,  one step for breath.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        When the climb is within five degrees of a real\n");
-	pr_info("Zenith :        trip point, Iyashi steps aside.   The framework\n");
-	pr_info("Zenith :        throttles.   That is what it is there for.\n");
-	pr_info("Zenith :        Iyashi only buys the room before that line.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Three knobs and two counters:\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :            floor_pct           —  how much of the OPP stack\n");
-	pr_info("Zenith :                                    we refuse to throttle away.\n");
-	pr_info("Zenith :            near_limit_offset_c —  how close to the trip we\n");
-	pr_info("Zenith :                                    stop holding the floor.\n");
-	pr_info("Zenith :            cdev_filter         —  which cooling devices we\n");
-	pr_info("Zenith :                                    are even willing to argue with.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :            clamped_count       —  the number of times we\n");
-	pr_info("Zenith :                                    said no.\n");
-	pr_info("Zenith :            passthrough_count   —  the number of times we\n");
-	pr_info("Zenith :                                    said go ahead.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        These are not numbers.   They are vows.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        癒し does not refuse the cool.   癒し refuses\n");
-	pr_info("Zenith :        the panic.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Interlude.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        The four breaths in order, then together:\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :            Zenith decides where to climb.\n");
-	pr_info("Zenith :            Hikari decides whom to light.\n");
-	pr_info("Zenith :            Kasumi decides what to veil.\n");
-	pr_info("Zenith :            Iyashi decides where to leave room.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Four small refusals of panic.\n");
-	pr_info("Zenith :        One ridge.   One climb.   One kernel.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Closing roll.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :                One ridge.    Four names.    Four breaths.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        ─────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          _______ _____ _   _ _____ _______ _    _ \n");
-	pr_info("Zenith :         |___  /  ____| \\ | |_   _|__   __| |  | |\n");
-	pr_info("Zenith :            / /| |__  |  \\| | | |    | |  | |__| |\n");
-	pr_info("Zenith :           / / |  __| | . ` | | |    | |  |  __  |\n");
-	pr_info("Zenith :          / /__| |____| |\\  |_| |_   | |  | |  | |\n");
-	pr_info("Zenith :         /_____|______|_| \\_|_____|  |_|  |_|  |_|\n");
-	pr_info("Zenith :                                                        頂点\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          _    _ _____ _  __          _____  _____ \n");
-	pr_info("Zenith :         | |  | |_   _| |/ /    /\\   |  __ \\|_   _|\n");
-	pr_info("Zenith :         | |__| | | | | ' /    /  \\  | |__) | | |  \n");
-	pr_info("Zenith :         |  __  | | | |  <    / /\\ \\ |  _  /  | |  \n");
-	pr_info("Zenith :         | |  | |_| |_| . \\  / ____ \\| | \\ \\ _| |_ \n");
-	pr_info("Zenith :         |_|  |_|_____|_|\\_\\/_/    \\_\\_|  \\_\\_____|\n");
-	pr_info("Zenith :                                                         光\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          _  __           _____ _    _ __  __ _____ \n");
-	pr_info("Zenith :         | |/ /    /\\    / ____| |  | |  \\/  |_   _|\n");
-	pr_info("Zenith :         | ' /    /  \\  | (___ | |  | | \\  / | | |  \n");
-	pr_info("Zenith :         |  <    / /\\ \\  \\___ \\| |  | | |\\/| | | |  \n");
-	pr_info("Zenith :         | . \\  / ____ \\ ____) | |__| | |  | |_| |_ \n");
-	pr_info("Zenith :         |_|\\_\\/_/    \\_\\_____/ \\____/|_|  |_|_____|\n");
-	pr_info("Zenith :                                                         霞\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :          _______     __       _____ _    _ _____ \n");
-	pr_info("Zenith :         |_   _\\ \\   / //\\    / ____| |  | |_   _|\n");
-	pr_info("Zenith :           | |  \\ \\_/ //  \\  | (___ | |__| | | |  \n");
-	pr_info("Zenith :           | |   \\   // /\\ \\  \\___ \\|  __  | | |  \n");
-	pr_info("Zenith :          _| |_   | |/ ____ \\ ____) | |  | |_| |_ \n");
-	pr_info("Zenith :         |_____|  |_/_/    \\_\\_____/|_|  |_|_____|\n");
-	pr_info("Zenith :                                                        癒し\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        ─────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        Built by XTENSEI.\n");
-	pr_info("Zenith :        For everyone who climbs with their thinking still on.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        This is not a banner.   This is a boot vow.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :        The ridge does not care that the climb was hard.\n");
-	pr_info("Zenith :        The ridge only notices that you arrived.\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith :                .       *           .            *\n");
-	pr_info("Zenith :                   *          .             .\n");
-	pr_info("Zenith :            .              .          *          .\n");
-	pr_info("Zenith :             *      Boot complete.   The ridge is open.      *\n");
-	pr_info("Zenith :            .              .          *          .\n");
-	pr_info("Zenith :                   *          .             .\n");
-	pr_info("Zenith :                .       *           .            *\n");
-	pr_info("Zenith :\n");
-	pr_info("Zenith : ─────────────────────────────────────────────────────────────────\n");
-#endif /* CONFIG_ZENITH_DEBUG_MSG */
+	#ifdef CONFIG_ZENITH_DEBUG_MSG
+	pr_info("Zenith: v4 hybrid cpufreq governor initialized (Zenith/Hikari/Kasumi/Iyashi)\n");
+	#endif /* CONFIG_ZENITH_DEBUG_MSG */
 
 	/* Allocate the initial RCU comm tables from the in-tree default
 	 * arrays.  Failure here is non-fatal: zenith_policy_has_X()

@@ -32,6 +32,7 @@
 #include <linux/property.h>
 #include <linux/suspend.h>
 #include <linux/wait.h>
+#include <linux/srcu.h>
 #include <asm/unaligned.h>
 
 #include <net/bluetooth/bluetooth.h>
@@ -59,6 +60,9 @@ DEFINE_MUTEX(hci_cb_list_lock);
 
 /* HCI ID Numbering */
 static DEFINE_IDA(hci_index_ida);
+
+/* Global SRCU for synchronizing hci_dev access during unregister */
+static DEFINE_SRCU(bt_srcu);
 
 /* ---- HCI debugfs entries ---- */
 
@@ -1619,8 +1623,11 @@ setup_failed:
 		skb_queue_purge(&hdev->cmd_q);
 		skb_queue_purge(&hdev->rx_q);
 
-		if (hdev->flush)
+		if (hdev->flush) {
+			int bt_idx = srcu_read_lock(&bt_srcu);
 			hdev->flush(hdev);
+			srcu_read_unlock(&bt_srcu, bt_idx);
+		}
 
 		if (hdev->sent_cmd) {
 			cancel_delayed_work_sync(&hdev->cmd_timer);
@@ -1790,8 +1797,11 @@ int hci_dev_do_close(struct hci_dev *hdev)
 
 	msft_do_close(hdev);
 
-	if (hdev->flush)
+	if (hdev->flush) {
+		int bt_idx = srcu_read_lock(&bt_srcu);
 		hdev->flush(hdev);
+		srcu_read_unlock(&bt_srcu, bt_idx);
+	}
 
 	/* Reset device */
 	skb_queue_purge(&hdev->cmd_q);
@@ -1891,8 +1901,11 @@ static int hci_dev_do_reset(struct hci_dev *hdev)
 	hci_conn_hash_flush(hdev);
 	hci_dev_unlock(hdev);
 
-	if (hdev->flush)
+	if (hdev->flush) {
+		int bt_idx = srcu_read_lock(&bt_srcu);
 		hdev->flush(hdev);
+		srcu_read_unlock(&bt_srcu, bt_idx);
+	}
 
 	atomic_set(&hdev->cmd_cnt, 1);
 	hdev->acl_cnt = 0; hdev->sco_cnt = 0; hdev->le_cnt = 0;
@@ -3833,6 +3846,9 @@ void hci_unregister_dev(struct hci_dev *hdev)
 	write_lock(&hci_dev_list_lock);
 	list_del(&hdev->list);
 	write_unlock(&hci_dev_list_lock);
+
+	/* Wait for any concurrent flush callbacks to complete */
+	synchronize_srcu(&bt_srcu);
 
 	cancel_work_sync(&hdev->rx_work);
 	cancel_work_sync(&hdev->cmd_work);

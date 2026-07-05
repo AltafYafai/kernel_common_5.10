@@ -64,10 +64,7 @@ module_param_string(gpu_devfreq_name, gpu_devfreq_name,
 MODULE_PARM_DESC(gpu_devfreq_name,
 		 "GPU devfreq device name (empty = auto-detect)");
 
-static unsigned int gpu_check_ms = 1000;
-module_param(gpu_check_ms, uint, 0644);
-MODULE_PARM_DESC(gpu_check_ms,
-		 "Poll interval in ms (default: 1000)");
+
 
 static char gpu_game_governor[DEVFREQ_NAME_LEN] = "performance";
 module_param_string(gpu_game_governor, gpu_game_governor,
@@ -123,6 +120,7 @@ static bool game_tuning_active;
 /***** Internal state *****/
 
 static struct delayed_work gpu_governor_work;
+static struct notifier_block gpu_game_mode_nb;
 static unsigned long gpu_last_game_active_jiffies;
 static bool gpu_prev_game_active;
 
@@ -265,24 +263,40 @@ static void gpu_governor_worker(struct work_struct *work)
 	}
 
 resched:
+	/* Reschedule at 5s for idle/wake watchdog.
+	 * The game_mode notifier handles immediate state transitions,
+	 * so this is just a low-frequency safety net for TTL expiry
+	 * and GPU idle/timeout tracking.
+	 */
 	queue_delayed_work(system_unbound_wq, &gpu_governor_work,
-			   msecs_to_jiffies(gpu_check_ms));
+			   msecs_to_jiffies(5000));
+}
+
+static int gpu_game_mode_notifier_cb(struct notifier_block *nb,
+				 unsigned long action, void *data)
+{
+	mod_delayed_work(system_unbound_wq, &gpu_governor_work, 0);
+	return NOTIFY_OK;
 }
 
 static int __init zenith_gpu_switch_init(void)
 {
+	gpu_game_mode_nb.notifier_call = gpu_game_mode_notifier_cb;
+	gpu_game_mode_nb.priority = 0;
+	zenith_register_game_mode_notifier(&gpu_game_mode_nb);
+
 	gpu_last_game_active_jiffies = jiffies;
 	INIT_DELAYED_WORK(&gpu_governor_work, gpu_governor_worker);
-	queue_delayed_work(system_unbound_wq, &gpu_governor_work,
-			   msecs_to_jiffies(gpu_check_ms));
+	queue_delayed_work(system_unbound_wq, &gpu_governor_work, 0);
 
-	pr_info("zenith_gpu_switch: watching '%s' every %u ms\n",
-		gpu_devfreq_name, gpu_check_ms);
+	pr_info("zenith_gpu_switch: watching '%s' (notifier + 5s watchdog)\n",
+		gpu_devfreq_name);
 	return 0;
 }
 
 static void __exit zenith_gpu_switch_exit(void)
 {
+	zenith_unregister_game_mode_notifier(&gpu_game_mode_nb);
 	cancel_delayed_work_sync(&gpu_governor_work);
 	pr_info("zenith_gpu_switch: stopped\n");
 }

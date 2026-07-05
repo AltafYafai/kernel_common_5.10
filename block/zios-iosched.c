@@ -379,7 +379,7 @@ static void zios_check_thermal(struct zios_data *zd)
 	struct thermal_zone_device *tz;
 	int temp, ret;
 
-	if (time_before(jiffies, zd->last_thermal_check + 30 * HZ))
+	if (time_before(jiffies, zd->last_thermal_check + 60 * HZ))
 		return;
 	zd->last_thermal_check = jiffies;
 
@@ -414,7 +414,7 @@ static void zios_check_battery(struct zios_data *zd)
 	union power_supply_propval val;
 	int ret;
 
-	if (time_before(jiffies, zd->last_power_check + 60 * HZ))
+	if (time_before(jiffies, zd->last_power_check + 120 * HZ))
 		return;
 	zd->last_power_check = jiffies;
 
@@ -499,9 +499,9 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 		bias_pct  = zd->normal_params.top_app_bias_pct;
 		starve_max = zd->normal_params.write_starve_max;
 	}
-	coalesce = zd->power_efficient ?
-		min(zd->read_coalesce_limit, 4u) :
-		zd->read_coalesce_limit;
+	coalesce = zd->read_coalesce_limit;
+	if (zd->power_efficient || zd->game_mode)
+		coalesce = min(coalesce, 4u);
 
 	/* Tier 0: Top-app */
 	if (zd->nr_top_app > 0) {
@@ -519,6 +519,10 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 
 			if (zd->nr_writes > 0)
 				zd->write_starve_count++;
+			if (zd->nr_writeback > 0)
+				zd->writeback_starve_count++;
+			if (zd->nr_swap > 0)
+				zd->swap_starve_count++;
 
 			/* Track for priority inheritance */
 			zd->last_top_app_jiffies = jiffies;
@@ -542,6 +546,10 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 				zd->nr_sync_reads--;
 				if (zd->nr_writes > 0)
 					zd->write_starve_count++;
+				if (zd->nr_writeback > 0)
+					zd->writeback_starve_count++;
+				if (zd->nr_swap > 0)
+					zd->swap_starve_count++;
 				goto done;
 			}
 		}
@@ -562,6 +570,10 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 				zd->nr_async_reads--;
 				if (zd->nr_writes > 0)
 					zd->write_starve_count++;
+				if (zd->nr_writeback > 0)
+					zd->writeback_starve_count++;
+				if (zd->nr_swap > 0)
+					zd->swap_starve_count++;
 				goto done;
 			}
 		}
@@ -988,7 +1000,7 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	zd->last_top_app_jiffies = 0;
 
 	zd->debug_log = false;
-	zd->sample_interval_ms = 500;
+	zd->sample_interval_ms = 2000;
 	zd->last_sample = jiffies;
 	zd->window_read_sectors = 0;
 	zd->window_write_sectors = 0;

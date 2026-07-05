@@ -25,7 +25,6 @@
  */
 #include "sched.h"
 #include <linux/hikari.h>
-#include <linux/prefer_silver.h>
 #include <linux/xarray.h>
 
 #include <trace/hooks/sched.h>
@@ -76,13 +75,8 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
  * (BORE default: 16ms constant, units: nanoseconds)
  * (CFS  default: 6ms * (1 + ilog(ncpus)), units: nanoseconds)
  */
-#ifdef CONFIG_SCHED_BORE
-unsigned int sysctl_sched_latency			= 16000000ULL;
-static unsigned int normalized_sysctl_sched_latency	= 16000000ULL;
-#else // CONFIG_SCHED_BORE
 unsigned int sysctl_sched_latency			= 6000000ULL;
 static unsigned int normalized_sysctl_sched_latency	= 6000000ULL;
-#endif // CONFIG_SCHED_BORE
 EXPORT_SYMBOL_GPL(sysctl_sched_latency);
 
 /*
@@ -97,11 +91,7 @@ EXPORT_SYMBOL_GPL(sysctl_sched_latency);
  * (BORE default SCHED_TUNABLESCALING_NONE = *1 constant)
  * (CFS  default SCHED_TUNABLESCALING_LOG  = *(1+ilog(ncpus))
  */
-#ifdef CONFIG_SCHED_BORE
 enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_NONE;
-#else // CONFIG_SCHED_BORE
-enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
-#endif // CONFIG_SCHED_BORE
 
 /*
  * Minimal preemption granularity for CPU-bound tasks:
@@ -109,13 +99,8 @@ enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_L
  * (BORE default: 2 msec constant, units: nanoseconds)
  * (CFS  default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-#ifdef CONFIG_SCHED_BORE
-unsigned int sysctl_sched_min_granularity			= 2000000ULL;
-static unsigned int normalized_sysctl_sched_min_granularity	= 2000000ULL;
-#else // CONFIG_SCHED_BORE
 unsigned int sysctl_sched_min_granularity			= 750000ULL;
 static unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
-#endif // CONFIG_SCHED_BORE
 EXPORT_SYMBOL_GPL(sysctl_sched_min_granularity);
 
 /*
@@ -143,26 +128,10 @@ unsigned int sysctl_sched_child_runs_first __read_mostly = 1;
  * (BORE default: 3 msec constant, units: nanoseconds)
  * (CFS  default: 1 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-#ifdef CONFIG_SCHED_BORE
-unsigned int sysctl_sched_wakeup_granularity			= 2000000UL;
-static unsigned int normalized_sysctl_sched_wakeup_granularity	= 2000000UL;
-#else // CONFIG_SCHED_BORE
 unsigned int sysctl_sched_wakeup_granularity			= 1000000UL;
 static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
-#endif // CONFIG_SCHED_BORE
 
 const_debug unsigned int sysctl_sched_migration_cost	= 250000UL;
-
-#ifdef CONFIG_SCHED_BORE
-u8   __read_mostly sched_bore                   = 1;
-u8   __read_mostly sched_burst_exclude_kthreads = 1;
-u8   __read_mostly sched_burst_smoothness_long  = 1;
-u8   __read_mostly sched_burst_smoothness_short = 0;
-u8   __read_mostly sched_burst_fork_atavistic   = 2;
-u8   __read_mostly sched_burst_penalty_offset   = 22;
-uint __read_mostly sched_burst_penalty_scale    = 1280;
-uint __read_mostly sched_burst_cache_lifetime   = 60000000;
-#endif // CONFIG_SCHED_BORE
 
 int sched_thermal_decay_shift;
 static int __init setup_sched_thermal_decay_shift(char *str)
@@ -589,115 +558,6 @@ find_matching_se(struct sched_entity **se, struct sched_entity **pse)
 
 #endif	/* CONFIG_FAIR_GROUP_SCHED */
 
-#ifdef CONFIG_SCHED_BORE
-#define MAX_BURST_PENALTY (39U <<2)
-
-static inline u32 log2plus1_u64_u32f8(u64 v) {
-	u32 msb = fls64(v);
-	u8 fractional = (v << (64 - msb) >> 55);
-	return msb << 8 | fractional;
-}
-
-static inline u32 calc_burst_penalty(u64 burst_time) {
-	u32 greed, tolerance, penalty, scaled_penalty;
-	
-	greed = log2plus1_u64_u32f8(burst_time);
-	tolerance = sched_burst_penalty_offset << 8;
-	penalty = max(0, (s32)(greed - tolerance));
-	scaled_penalty = penalty * sched_burst_penalty_scale >> 16;
-
-	return min(MAX_BURST_PENALTY, scaled_penalty);
-}
-
-static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
-			    unsigned long weight);
-static void reweight_task_by_prio(struct task_struct *p, int prio)
-{
-	struct sched_entity *se = &p->se;
-	struct cfs_rq *cfs_rq = cfs_rq_of(se);
-	struct load_weight *load = &se->load;
-	unsigned long weight = scale_load(sched_prio_to_weight[prio]);
-
-	reweight_entity(cfs_rq, se, weight);
-	load->inv_weight = sched_prio_to_wmult[prio];
-}
-
-static inline u8 effective_prio(struct task_struct *p) {
-	u8 prio = p->static_prio - MAX_RT_PRIO;
-	if (likely(sched_bore))
-		prio += p->se.burst_score;
-	return min(39, (int)prio);
-}
-
-static void update_burst_score(struct sched_entity *se) {
-	struct task_struct *p;
-	u8 prev_prio, new_prio;
-	u8 burst_score = 0;
-
-	if (!entity_is_task(se))
-		return;
-
-	p = task_of(se);
-	prev_prio = effective_prio(p);
-
-	if (!((p->flags & PF_KTHREAD) && likely(sched_burst_exclude_kthreads)))
-		burst_score = se->burst_penalty >> 2;
-
-	se->burst_score = burst_score;
-
-	new_prio = effective_prio(p);
-	if (new_prio != prev_prio)
-		reweight_task_by_prio(p, new_prio);
-}
-
-static void update_burst_penalty(struct sched_entity *se) {
-	se->curr_burst_penalty = calc_burst_penalty(se->burst_time);
-	se->burst_penalty = max(se->prev_burst_penalty, se->curr_burst_penalty);
-	update_burst_score(se);
-}
-
-static inline u32 binary_smooth(u32 new, u32 old) {
-	int increment = new - old;
-		return (0 <= increment)?
-	old + ( increment >> (int)sched_burst_smoothness_long):
-	old - (-increment >> (int)sched_burst_smoothness_short);
-}
-
-static void restart_burst(struct sched_entity *se) {
-	se->burst_penalty = se->prev_burst_penalty =
-		binary_smooth(se->curr_burst_penalty, se->prev_burst_penalty);
-	se->curr_burst_penalty = 0;
-	se->burst_time = 0;
-	update_burst_score(se);
-}
-
-static void reset_task_weights_bore(void) {
-	struct task_struct *task;
-	struct rq *rq;
-	struct rq_flags rf;
-
-	write_lock_irq(&tasklist_lock);
-	for_each_process(task) {
-		rq = task_rq(task);
-		rq_lock_irqsave(rq, &rf);
-		reweight_task_by_prio(task, effective_prio(task));
-		rq_unlock_irqrestore(rq, &rf);
-	}
-	write_unlock_irq(&tasklist_lock);
-}
-
-int sched_bore_update_handler(struct ctl_table *table, int write,
-		void __user *buffer, size_t *lenp, loff_t *ppos) {
-	int ret = proc_dou8vec_minmax(table, write, buffer, lenp, ppos);
-	if (ret || !write)
-		return ret;
-
-	reset_task_weights_bore();
-
-	return 0;
-}
-#endif // CONFIG_SCHED_BORE
-
 static __always_inline
 void account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec);
 
@@ -1066,10 +926,6 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	curr->sum_exec_runtime += delta_exec;
 	schedstat_add(cfs_rq->exec_clock, delta_exec);
 
-#ifdef CONFIG_SCHED_BORE
-	curr->burst_time += delta_exec;
-	update_burst_penalty(curr);
-#endif // CONFIG_SCHED_BORE
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
 	update_min_vruntime(cfs_rq);
 
@@ -6062,14 +5918,6 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	bool was_sched_idle = sched_idle_rq(rq);
 
 	util_est_dequeue(&rq->cfs, p);
-#ifdef CONFIG_SCHED_BORE
-	if (task_sleep) {
-		cfs_rq = cfs_rq_of(se);
-		if (cfs_rq->curr == se)
-			update_curr(cfs_rq);
-		restart_burst(se);
-	}
-#endif // CONFIG_SCHED_BORE
 
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
@@ -6604,7 +6452,6 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int t
 {
 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_idle_mask);
 	struct sched_domain *this_sd;
-	u64 avg_cost, avg_idle;
 	u64 time;
 	int this = smp_processor_id();
 	int cpu, nr = INT_MAX;
@@ -6613,18 +6460,17 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int t
 	if (!this_sd)
 		return -1;
 
-	/*
-	 * Due to large variance we need a large fuzz factor; hackbench in
-	 * particularly is sensitive here.
-	 */
-	avg_idle = this_rq()->avg_idle / 512;
-	avg_cost = this_sd->avg_scan_cost + 1;
-
-	if (sched_feat(SIS_AVG_CPU) && avg_idle < avg_cost)
-		return -1;
-
 	if (sched_feat(SIS_PROP)) {
-		u64 span_avg = sd->span_weight * avg_idle;
+		u64 avg_cost, avg_idle, span_avg;
+
+		/*
+		 * Due to large variance we need a large fuzz factor;
+		 * hackbench in particularly is sensitive here.
+		 */
+		avg_idle = this_rq()->avg_idle / 512;
+		avg_cost = this_sd->avg_scan_cost + 1;
+
+		span_avg = sd->span_weight * avg_idle;
 		if (span_avg > 4*avg_cost)
 			nr = div_u64(span_avg, avg_cost);
 		else
@@ -7339,38 +7185,6 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 			current->recent_used_cpu = cpu;
 	}
 	rcu_read_unlock();
-
-#ifdef CONFIG_SCHED_PREFER_SILVER
-	/*
-	 * Defer to EAS whenever the Energy Model is loaded and EAS is
-	 * engaged.  On SD_BALANCE_WAKE EAS short-circuits at the top
-	 * of this function (returns from find_energy_efficient_cpu()),
-	 * so reaching here on an EAS-enabled build means either:
-	 *   1. EAS picked, was satisfied, and we never executed this
-	 *      block (no-op gate);
-	 *   2. EAS bailed because the root domain is overutilized,
-	 *      in which case redirecting light wake-ups onto silver
-	 *      would concentrate work on the cluster that already
-	 *      has the least headroom -- the opposite of what an
-	 *      overutilized system needs.
-	 *   3. This is SD_BALANCE_FORK / SD_BALANCE_EXEC, where EAS
-	 *      does not run by design but the EM-driven topology is
-	 *      still the authoritative description of which cluster
-	 *      a task belongs on; deferring keeps placement
-	 *      consistent across wake / fork.
-	 *
-	 * On builds without an Energy Model in DT (sched_energy_enabled()
-	 * permanently false), prefer_silver remains the sole light-task
-	 * placement biaser and runs unchanged.
-	 */
-	if (!sched_energy_enabled() &&
-	    prefer_silver_check_task_util(p)) {
-		int silver_cpu = find_best_silver_cpu(p);
-		if (silver_cpu >= 0)
-			return silver_cpu;
-	}
-#endif /* CONFIG_SCHED_PREFER_SILVER */
-	return new_cpu;
 }
 
 static void detach_entity_cfs_rq(struct sched_entity *se);
@@ -7851,25 +7665,16 @@ static void yield_task_fair(struct rq *rq)
 	/*
 	 * Are we the only task in the tree?
 	 */
-#if !defined(CONFIG_SCHED_BORE)
 	if (unlikely(rq->nr_running == 1))
 		return;
 
 	clear_buddies(cfs_rq, se);
-#endif // CONFIG_SCHED_BORE
 
 	update_rq_clock(rq);
 	/*
 	 * Update run-time statistics of the 'current'.
 	 */
 	update_curr(cfs_rq);
-#ifdef CONFIG_SCHED_BORE
-	restart_burst(se);
-	if (unlikely(rq->nr_running == 1))
-		return;
-
-	clear_buddies(cfs_rq, se);
-#endif // CONFIG_SCHED_BORE
 	/*
 	 * Tell update_rq_clock() that we've just updated,
 	 * so we don't do microscopic update in schedule()
@@ -10034,8 +9839,11 @@ static struct rq *find_busiest_queue(struct lb_env *env,
 		if (rt > env->fbq_type)
 			continue;
 
-		capacity = capacity_of(i);
 		nr_running = rq->cfs.h_nr_running;
+		if (!nr_running)
+			continue;
+
+		capacity = capacity_of(i);
 
 		/*
 		 * For ASYM_CPUCAPACITY domains, don't pick a CPU that could
@@ -10141,11 +9949,30 @@ asym_active_balance(struct lb_env *env)
 }
 
 static inline bool
-voluntary_active_balance(struct lb_env *env)
+imbalanced_active_balance(struct lb_env *env)
+{
+	struct sched_domain *sd = env->sd;
+
+	/*
+	 * The imbalanced case includes the case of pinned tasks preventing a fair
+	 * distribution of the load on the system but also the even distribution of the
+	 * threads on a system with spare capacity
+	 */
+	if ((env->migration_type == migrate_task) &&
+	    (sd->nr_balance_failed > sd->cache_nice_tries+2))
+		return 1;
+
+	return 0;
+}
+
+static int need_active_balance(struct lb_env *env)
 {
 	struct sched_domain *sd = env->sd;
 
 	if (asym_active_balance(env))
+		return 1;
+
+	if (imbalanced_active_balance(env))
 		return 1;
 
 	/*
@@ -10165,16 +9992,6 @@ voluntary_active_balance(struct lb_env *env)
 		return 1;
 
 	return 0;
-}
-
-static int need_active_balance(struct lb_env *env)
-{
-	struct sched_domain *sd = env->sd;
-
-	if (voluntary_active_balance(env))
-		return 1;
-
-	return unlikely(sd->nr_balance_failed > sd->cache_nice_tries+2);
 }
 
 static int active_load_balance_cpu_stop(void *data);
@@ -10268,6 +10085,8 @@ redo:
 	env.src_rq = busiest;
 
 	ld_moved = 0;
+	/* Clear this flag as soon as we find a pullable task */
+	env.flags |= LBF_ALL_PINNED;
 	if (busiest->nr_running > 1) {
 		/*
 		 * Attempt to move tasks. If find_busiest_group has found
@@ -10275,7 +10094,6 @@ redo:
 		 * still unbalanced. ld_moved simply stays zero, so it is
 		 * correctly treated as an imbalance.
 		 */
-		env.flags |= LBF_ALL_PINNED;
 		env.loop_max  = min(sysctl_sched_nr_migrate, busiest->nr_running);
 
 more_balance:
@@ -10406,9 +10224,11 @@ more_balance:
 			if (!cpumask_test_cpu(this_cpu, busiest->curr->cpus_ptr)) {
 				raw_spin_unlock_irqrestore(&busiest->lock,
 							    flags);
-				env.flags |= LBF_ALL_PINNED;
 				goto out_one_pinned;
 			}
+
+			/* Record that we found at least one task that could run on this_cpu */
+			env.flags &= ~LBF_ALL_PINNED;
 
 			/*
 			 * ->active_balance synchronizes accesses to
@@ -10431,21 +10251,13 @@ more_balance:
 			/* We've kicked active balancing, force task migration. */
 			sd->nr_balance_failed = sd->cache_nice_tries+1;
 		}
-	} else
+	} else {
 		sd->nr_balance_failed = 0;
+	}
 
-	if (likely(!active_balance) || voluntary_active_balance(&env)) {
+	if (likely(!active_balance) || need_active_balance(&env)) {
 		/* We were unbalanced, so reset the balancing interval */
 		sd->balance_interval = sd->min_interval;
-	} else {
-		/*
-		 * If we've begun active balancing, start to back off. This
-		 * case may not be covered by the all_pinned logic if there
-		 * is only 1 task on the busy runqueue (because we don't call
-		 * detach_tasks).
-		 */
-		if (sd->balance_interval < sd->max_interval)
-			sd->balance_interval *= 2;
 	}
 
 	goto out;
@@ -11097,11 +10909,7 @@ static bool _nohz_idle_balance(struct rq *this_rq, unsigned int flags,
 	 */
 	smp_mb();
 
-	/*
-	 * Start with the next CPU after this_cpu so we will end with this_cpu and let a
-	 * chance for other idle cpu to pull load.
-	 */
-	for_each_cpu_wrap(balance_cpu,  nohz.idle_cpus_mask, this_cpu+1) {
+	for_each_cpu(balance_cpu, nohz.idle_cpus_mask) {
 		if (!idle_cpu(balance_cpu))
 			continue;
 
@@ -11474,9 +11282,6 @@ static void task_fork_fair(struct task_struct *p)
 		update_curr(cfs_rq);
 		se->vruntime = curr->vruntime;
 	}
-#ifdef CONFIG_SCHED_BORE
-	update_burst_score(se);
-#endif // CONFIG_SCHED_BORE
 	place_entity(cfs_rq, se, 1);
 
 	if (sysctl_sched_child_runs_first && curr && entity_before(curr, se)) {
