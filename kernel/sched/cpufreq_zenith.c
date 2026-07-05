@@ -601,7 +601,7 @@
  * is the same domain as predict_up_thresh.
  */
 #define ZENITH_DEFAULT_PELT_RISING_EDGE_THRESH		32
-#define ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT		50
+#define ZENITH_DEFAULT_PELT_RISING_EDGE_MIN_PCT		40
 #define ZENITH_PELT_RISING_EDGE_THRESH_MAX		255
 #define ZENITH_PELT_RISING_EDGE_MIN_PCT_MAX		100
 
@@ -1313,7 +1313,7 @@
  * 120 Hz frames -- enough recovery time after a single miss
  * without holding a high-freq pin past a brief stall.
  */
-#define ZENITH_DEFAULT_FRAME_OVERRUN_SLACK_US		0
+#define ZENITH_DEFAULT_FRAME_OVERRUN_SLACK_US		4000
 #define ZENITH_FRAME_OVERRUN_SLACK_US_MAX		16667
 #define ZENITH_DEFAULT_FRAME_OVERRUN_WINDOW_MS		50
 #define ZENITH_FRAME_OVERRUN_WINDOW_MS_MAX		200
