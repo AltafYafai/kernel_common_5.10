@@ -9297,6 +9297,7 @@ static unsigned int zenith_get_next_freq(struct zenith_policy *z_policy,
 	if (static_branch_likely(&zenith_game_auto_key) &&
 	    READ_ONCE(z_policy->tunables->game_auto))
 		zenith_policy_game_auto_tick(z_policy);
+	zenith_auto_predict_tick(z_policy);
 
 	/* Patch K: game_perf_burst FSM tick.  Must run AFTER the
 	 * game_auto tick above so a fresh streak-driven latch on
@@ -13584,7 +13585,9 @@ static ssize_t _name##_store(struct gov_attr_set *attr_set, const char *buf, siz
 	return count; \
 } \
 static struct governor_attr _name = __ATTR_RW(_name)
+static unsigned int auto_profile_predict __read_mostly;
 
+ZENITH_TUNABLE_UINT_BOOL_INVAL(auto_profile_predict);
 ZENITH_TUNABLE_UINT_BOOL_INVAL(io_is_busy);
 
 static ssize_t iowait_boost_min_show(struct gov_attr_set *attr_set, char *buf)
@@ -13850,6 +13853,85 @@ ZENITH_TUNABLE_UINT_BOOL_INVAL(ignore_nice_load);
  * BALANCED row, but the current convention is to fill every cell
  * for readability.
  */
+
+/*
+ * Lightweight workload classifier for auto-profile prediction.
+ * Called from the governor tick when auto_profile_predict is set.
+ * Reads the max-cluster util_avg, classifies into a band, and
+ * switches profiles after 4 consecutive same-band samples.
+ * Experimental: off by default, enable via sysfs.
+ */
+static void zenith_auto_predict_tick(struct zenith_policy *z_policy)
+{
+	unsigned long max_util = 0;
+	int cpu;
+	int target_profile;
+	static unsigned int settle_count;
+	static int last_band = -1;
+	int band;
+
+	if (unlikely(!READ_ONCE(auto_profile_predict)))
+		return;
+	if (unlikely(!z_policy))
+		return;
+
+	/* Find max util across all CPUs in the policy. */
+	for_each_cpu(cpu, &z_policy->cpus) {
+		struct rq *rq = cpu_rq(cpu);
+		unsigned long util = READ_ONCE(rq->cfs.avg.util_avg);
+
+		if (util > max_util)
+			max_util = util;
+	}
+
+	/* Classify into a band. */
+	if (max_util < SCHED_CAPACITY_SCALE * 35 / 100)
+		band = 0;  /* idle/light */
+	else if (max_util <= SCHED_CAPACITY_SCALE * 65 / 100)
+		band = 1;  /* medium */
+	else if (max_util <= SCHED_CAPACITY_SCALE * 85 / 100)
+		band = 2;  /* heavy */
+	else
+		band = 3;  /* sustained */
+
+	/* Update settle count. */
+	if (band == last_band) {
+		if (settle_count < 4)
+			settle_count++;
+	} else {
+		last_band = band;
+		settle_count = 1;
+		return;
+	}
+
+	if (settle_count < 4)
+		return;
+
+	/* Map band to profile. */
+	switch (band) {
+	case 0:
+		target_profile = ZENITH_PROFILE_BATTERY;
+		break;
+	case 1:
+		target_profile = ZENITH_PROFILE_BALANCED;
+		break;
+	case 2:
+		target_profile = ZENITH_PROFILE_PERFORMANCE;
+		break;
+	case 3:
+		target_profile = ZENITH_PROFILE_GAMING;
+		break;
+	default:
+		return;
+	}
+
+	if (target_profile != READ_ONCE(z_policy->active_profile)) {
+		zenith_apply_profile(z_policy->tunables, target_profile);
+		pr_info_ratelimited("zenith: auto-predict switched to profile %d\n",
+			    target_profile);
+	}
+}
+
 static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 {
 	struct zenith_profile_defaults {
