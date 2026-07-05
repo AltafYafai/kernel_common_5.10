@@ -20710,7 +20710,8 @@ static ssize_t game_mode_store(struct gov_attr_set *attr_set,
 	t->game_mode = val;
 	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_GAME_MODE);
 	if (prev != t->game_mode)
-		trace_zenith_game_mode(smp_processor_id(), t->game_mode);
+		if (trace_zenith_game_mode_enabled())
+			trace_zenith_game_mode(smp_processor_id(), t->game_mode);
 	return count;
 }
 static struct governor_attr game_mode = __ATTR_RW(game_mode);
