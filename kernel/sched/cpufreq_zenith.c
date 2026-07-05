@@ -14006,7 +14006,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * over the same warm-up period.
 			 */
 			.predict_up_thresh = 48,
-			.predict_up_window = 4,
+			.predict_up_window = 3,
 			/* Patch C3: PERFORMANCE wants the rising-edge
 			 * tier to fire on smaller per-sample slopes
 			 * (24 vs 32 default) and from a lower absolute
@@ -14236,8 +14236,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 */
 			.predict_up_thresh =
 				ZENITH_DEFAULT_PREDICT_UP_THRESH,
-			.predict_up_window =
-				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			.predict_up_window = ZENITH_DEFAULT_PREDICT_UP_WINDOW,
 			/* Patch C3: BALANCED matches cold-boot defaults
 			 * (32 thresh, 50%% level gate).
 			 */
@@ -14457,8 +14456,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			 * hispeed tier is good enough at this freq cap.
 			 */
 			.predict_up_thresh = 0,
-			.predict_up_window =
-				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			.predict_up_window = 6,
 			/* Patch C3: BATTERY also disables the rising-
 			 * edge tier; same energy-frame argument as
 			 * predict_up.  The hispeed level tier alone is
@@ -14838,7 +14836,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 			.screen_on_bias_pct = 0,
 			.input_boost_down_rate_mult_pct = 350,
 			.predict_up_thresh = 40,
-			.predict_up_window = 4,
+			.predict_up_window = 2,
 			/* Patch C3: GAMING is the most aggressive
 			 * profile for the rising-edge tier (20 / 35).
 			 * Slope as small as ~8%% per sample fires the
@@ -14994,8 +14992,7 @@ static void zenith_apply_profile(struct zenith_tunables *t, unsigned int prof)
 				ZENITH_DEFAULT_INPUT_BOOST_DOWN_RATE_MULT_PCT,
 			.predict_up_thresh =
 				ZENITH_DEFAULT_PREDICT_UP_THRESH,
-			.predict_up_window =
-				ZENITH_DEFAULT_PREDICT_UP_WINDOW,
+			.predict_up_window = 3,
 			/* Patch C3: AUDIO matches BALANCED defaults.
 			 * Audio worker bursts are predictable enough
 			 * that the rolling-window predict_up handles
