@@ -4879,6 +4879,20 @@ static atomic_t zenith_on_battery = ATOMIC_INIT(0);
  */
 static u64 zenith_game_auto_active_until_ns;
 
+/* Atomic notifier chain for game-mode state transitions.  Fired
+ * whenever the effective game mode transitions 0->1 or 1->0, whether
+ * triggered by a user sysfs write or by the V2 auto-detector.  The
+ * action parameter passed to notifier callbacks is 1 (game mode
+ * entered) or 0 (game mode exited).  External drivers (GPU switch,
+ * thermal, etc.) register a callback and can block for immediate
+ * policy synchronisation.
+ *
+ * The chain is ATOMIC so it is safe to fire from any context,
+ * including the scheduler hot path where the V2 auto-detector runs.
+ * Callbacks must not sleep.
+ */
+static ATOMIC_NOTIFIER_HEAD(zenith_game_mode_nh);
+
 /* True if the in-kernel game detector latch is currently in the
  * future, i.e. a recent fresh detection has happened and is still
  * within ZENITH_GAME_AUTO_ACTIVE_TTL_NS.  Lock-free; readers tolerate
@@ -4929,6 +4943,34 @@ bool zenith_is_game_mode_active(void)
 	return zenith_game_auto_active();
 }
 EXPORT_SYMBOL_GPL(zenith_is_game_mode_active);
+
+/**
+ * zenith_register_game_mode_notifier - register a notifier for game mode
+ *                                       transitions
+ * @nb: notifier_block to register (callback receives action=1 on enter,
+ *      action=0 on exit)
+ *
+ * Register a callback that fires when the effective game mode changes.
+ * The callback runs in atomic context (RCU-read-side) and must not
+ * sleep.  Typically the callback will schedule_work() to defer
+ * heavyweight operations (governor switch, VM tuning) to process
+ * context.
+ */
+int zenith_register_game_mode_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_register(&zenith_game_mode_nh, nb);
+}
+EXPORT_SYMBOL_GPL(zenith_register_game_mode_notifier);
+
+/**
+ * zenith_unregister_game_mode_notifier - unregister a game mode notifier
+ * @nb: notifier_block previously registered
+ */
+int zenith_unregister_game_mode_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_unregister(&zenith_game_mode_nh, nb);
+}
+EXPORT_SYMBOL_GPL(zenith_unregister_game_mode_notifier);
 
 /**
  * zenith_set_drm_vblank_us - publish active panel vblank period to zenith
@@ -8237,8 +8279,11 @@ static void zenith_policy_game_auto_tick(struct zenith_policy *z_policy)
 		z_policy->game_auto_streak = 0;
 
 	if (z_policy->game_auto_streak >= ZENITH_GAME_AUTO_DETECT_STREAK) {
+		u64 prev = READ_ONCE(zenith_game_auto_active_until_ns);
 		until = ktime_get_ns() + ZENITH_GAME_AUTO_ACTIVE_TTL_NS;
 		WRITE_ONCE(zenith_game_auto_active_until_ns, until);
+		if (!prev)
+			atomic_notifier_call_chain(&zenith_game_mode_nh, 1, NULL);
 		z_policy->game_auto_streak = 0;
 	}
 }
@@ -20709,9 +20754,12 @@ static ssize_t game_mode_store(struct gov_attr_set *attr_set,
 	prev = t->game_mode;
 	t->game_mode = val;
 	zenith_at_mark_override(t, ZENITH_AT_OVERRIDE_GAME_MODE);
-	if (prev != t->game_mode)
+	if (prev != t->game_mode) {
 		if (trace_zenith_game_mode_enabled())
 			trace_zenith_game_mode(smp_processor_id(), t->game_mode);
+		atomic_notifier_call_chain(&zenith_game_mode_nh,
+					 val ? 1 : 0, NULL);
+	}
 	return count;
 }
 static struct governor_attr game_mode = __ATTR_RW(game_mode);
@@ -20741,8 +20789,12 @@ static ssize_t game_auto_store(struct gov_attr_set *attr_set,
 	old = t->game_auto;
 	t->game_auto = val;
 	zenith_set_static_key(&zenith_game_auto_key, val);
-	if (!val)
+	if (!val) {
+		u64 prev_latch = READ_ONCE(zenith_game_auto_active_until_ns);
 		WRITE_ONCE(zenith_game_auto_active_until_ns, 0);
+		if (prev_latch)
+			atomic_notifier_call_chain(&zenith_game_mode_nh, 0, NULL);
+	}
 	if (old != val)
 		zenith_log_master_flip(t, "game_auto", old, val);
 	return count;
