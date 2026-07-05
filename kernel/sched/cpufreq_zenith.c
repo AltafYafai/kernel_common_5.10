@@ -13876,7 +13876,7 @@ static void zenith_auto_predict_tick(struct zenith_policy *z_policy)
 		return;
 
 	/* Find max util across all CPUs in the policy. */
-	for_each_cpu(cpu, &z_policy->cpus) {
+	for_each_cpu(cpu, z_policy->policy->cpus) {
 		struct rq *rq = cpu_rq(cpu);
 		unsigned long util = READ_ONCE(rq->cfs.avg.util_avg);
 
