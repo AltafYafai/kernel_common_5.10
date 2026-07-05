@@ -962,7 +962,7 @@ void hikari_apply_profile(unsigned int profile)
 		[3] = { .force_floor_pct_big = 0,
 			.force_floor_pct_little = 0 },
 		/* GAMING (5) */
-		[5] = { .force_floor_pct_big = 20,
+		[5] = { .force_floor_pct_big = 15,
 			.force_floor_pct_little = 10 },
 		/* AUDIO (6) */
 		[6] = { .force_floor_pct_big = 0,
