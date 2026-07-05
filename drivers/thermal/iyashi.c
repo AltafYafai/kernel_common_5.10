@@ -395,8 +395,11 @@ EXPORT_SYMBOL_GPL(iyashi_clamp_target);
  * BATTERY lowers the floor and narrows the margin so thermal
  * responses arrive sooner and the cooling devices save power.
  *
- * AUDIO matches BALANCED -- audio threads care about jitter
- * not raw cpufreq headroom.
+ * AUDIO (6) lifts the floor to 92% (vs BALANCED's 90%) and
+ * widens the near-limit margin to 6 C (vs 5 C) to reduce the
+ * chance of a thermal-triggered frequency dip glitching an
+ * active audio stream.  Hikari cross-link is left off because
+ * audio threads are steady-state, not bursty.
  *
  * Does NOT touch enforce_min or cdev_filter -- those are
  * topology/policy-specific and belong in userspace init.
@@ -438,6 +441,13 @@ void iyashi_apply_profile(unsigned int profile)
 			.near_limit_offset_c = 10,
 			.min_freq_pct       = 0,
 			.hikari_aware       = 1,
+		},
+		/* AUDIO (6): moderate floor, protects against buffer underruns */
+		[6] = {
+			.floor_pct          = 92,
+			.near_limit_offset_c = 6,
+			.min_freq_pct       = 0,
+			.hikari_aware       = 0,
 		},
 	};
 
