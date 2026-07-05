@@ -203,7 +203,7 @@ static unsigned long hikari_last_demand_jiffies __read_mostly;
 static unsigned int hikari_audio_intensify = 1;
 static unsigned int hikari_topapp_auto_optin = 1;
 static unsigned int hikari_topapp_auto_optout;
-static unsigned int hikari_ewma_shift = 3;
+static unsigned int hikari_ewma_shift = 4;
 
 static const unsigned int hikari_uint_zero = 0;
 static const unsigned int hikari_uint_one  = 1;
