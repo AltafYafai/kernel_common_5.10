@@ -379,7 +379,7 @@ static void zios_check_thermal(struct zios_data *zd)
 	struct thermal_zone_device *tz;
 	int temp, ret;
 
-	if (time_before(jiffies, zd->last_thermal_check + 30 * HZ))
+	if (time_before(jiffies, zd->last_thermal_check + 60 * HZ))
 		return;
 	zd->last_thermal_check = jiffies;
 
@@ -414,7 +414,7 @@ static void zios_check_battery(struct zios_data *zd)
 	union power_supply_propval val;
 	int ret;
 
-	if (time_before(jiffies, zd->last_power_check + 60 * HZ))
+	if (time_before(jiffies, zd->last_power_check + 120 * HZ))
 		return;
 	zd->last_power_check = jiffies;
 
@@ -1000,7 +1000,7 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	zd->last_top_app_jiffies = 0;
 
 	zd->debug_log = false;
-	zd->sample_interval_ms = 500;
+	zd->sample_interval_ms = 2000;
 	zd->last_sample = jiffies;
 	zd->window_read_sectors = 0;
 	zd->window_write_sectors = 0;
