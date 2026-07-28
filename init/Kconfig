@@ -834,7 +834,30 @@ config UCLAMP_BUCKETS_COUNT
 	  number of clamp buckets the finer their granularity and the higher
 	  the precision of clamping aggregation and tracking at run-time.
 
+	  For example, with the minimum configuration value we will have 5
+	  clamp buckets tracking 20% utilization each. A 25% boosted tasks will
+	  be refcounted in the [20..39]% bucket and will set the bucket clamp
+	  effective value to 25%.
+	  If a second 30% boosted task should be co-scheduled on the same CPU,
+	  that task will be refcounted in the same bucket of the first task and
+	  it will boost the bucket clamp effective value to 30%.
+	  The clamp effective value of a bucket is reset to its nominal value
+	  (20% in the example above) when there are no more tasks refcounted in
+	  that bucket.
 
+	  An additional boost/capping margin can be added to some tasks. In the
+	  example above the 25% task will be boosted to 30% until it exits the
+	  CPU. If that should be considered not acceptable on certain systems,
+	  it's always possible to reduce the margin by increasing the number of
+	  clamp buckets to trade off used memory for run-time tracking
+	  precision.
+
+	  If in doubt, use the default value.
+
+endmenu
+
+
+# GrayRavens custom drivers
 config HIKARI
 	bool "Hikari wake-time policy engine"
 	depends on SMP
@@ -898,7 +921,7 @@ config HIKARI_UCLAMP
 	depends on HIKARI && UCLAMP_TASK
 	default y
 	help
-	  Allow Hikari to bump an opted-in task's uclamp_min for a short
+	  Allow Hikari to bump an opted-in task uclamp_min for a short
 	  window after a slow wake-up, then restore the previous value.
 	  Capped at kernel.hikari_uclamp_boost_pct of cpu_capacity (max
 	  50%) and time-limited by kernel.hikari_uclamp_ttl_ms.
@@ -960,7 +983,7 @@ config KOAKUMA
 	default y
 	help
 	  Listens to selene game events.  When a game starts, walks the
-	  game process's file-backed memory mappings and calls
+	  game process file-backed memory mappings and calls
 	  page_cache_sync_readahead() to preload game binary, library,
 	  and data pages into the page cache.
 
@@ -972,99 +995,63 @@ config KOAKUMA
 
 config KAGUYA
 	bool "Kaguya kernel safeprop enforcer"
+	depends on SMP
 	default y
 	help
-	  Enforces Android system property overrides from the kernel.
-	  Uses a timer-based workqueue that periodically calls
-	  resetprop(1) through call_usermodehelper() to re-apply
-	  spoofed properties, catching any userspace overwrites.
-
-	  Ships with 14 built-in safeprop spoofs for hiding bootloader
-	  unlock and enforcing device integrity.  Configurable via
-	  /sys/kernel/kaguya/ (enabled, interval_ms, props_add/del).
-
-config ZENITH_ALLOWLIST
-	bool "Zenith Device Boot Allowlist"
-	default y
-	help
-	  Restricts kernel boot to allowlisted devices only.
-	  Reads the device serialno from /firmware/android/serialno
-	  in the device tree and panics if it does not match the
-	  configured device string.
-
-	  This prevents the kernel from booting on unsupported
-	  hardware.  Configurable via /sys/kernel/zenith-allowlist/
-	  (device, enabled).
-
-config ZENITH_ALLOWLIST_DEVICE_STRING
-	string "Allowlisted device identifier (substring match)"
-	depends on ZENITH_ALLOWLIST
-	default "X6711"
-	help
-	  Case-insensitive substring matched against the device's
-	  serialno from DT (/firmware/android/serialno).  Only
-	  devices whose serialno contains this string will boot.
-
-	  Example: "X6711" for Infinix X6711.
+	  Periodically enforces a set of Android system properties
+	  by calling resetprop via usermodehelper.  Property list
+	  is configurable via /sys/kernel/kaguya/
 
 	  If unsure, say Y.
 
-endmenu
-
-menu "FAIR Scheuler tunables"
-
-choice
-	prompt "Utilization's PELT half-Life"
-	default PELT_UTIL_HALFLIFE_DEFAULT
+config KAGUYA_PROPS_MAX
+	int "Maximum number of safeproperties"
+	depends on KAGUYA
+	range 1 256
+	default 32
 	help
-	  Allows choosing one of the possible values for the PELT half-life to
-	  be used for the update of the utilization of tasks and CPUs.
-	  The half-life is the amount of [ms] required by the PELT signal to
-	  build up to 50% utilization. The higher the half-life the longer it
-	  takes for a task to be represented as a big one.
+	  Maximum number of properties Kaguya can track.
 
-	  Note that adjusting PELT half-life via kernel parameters is only
-	  allowed when PELT_UTIL_HALFLIFE_DEFAULT is selected.
+config KAGUYA_PROP_NAME_LEN
+	int "Maximum property name length"
+	depends on KAGUYA
+	range 1 128
+	default 64
+	help
+	  Maximum length of property names tracked by Kaguya.
 
-	  If not sure, use the default.
+config KAGUYA_PROP_VAL_LEN
+	int "Maximum property value length"
+	depends on KAGUYA
+	range 1 256
+	default 128
+	help
+	  Maximum length of property values tracked by Kaguya.
 
-config PELT_UTIL_HALFLIFE_DEFAULT
-	bool "Default (32 ms)"
+config KAGUYA_INTERVAL
+	int "Default enforcement interval (ms)"
+	depends on KAGUYA
+	range 100 60000
+	default 5000
+	help
+	  Default interval between enforcement cycles.
 
-config PELT_UTIL_HALFLIFE_32
-	bool "32 ms"
+config ZENITH_ALLOWLIST
+	bool "Zenith device boot allowlist"
+	depends on SMP
+	default y
+	help
+	  Restrict boot to specific device(s) via ro.product.board match.
+	  Useful for releasing device-specific kernel builds.
 
-config PELT_UTIL_HALFLIFE_16
-	bool "16 ms"
+	  If unsure, say N.
 
-config PELT_UTIL_HALFLIFE_12
-	bool "12 ms"
+config ZENITH_ALLOWLIST_DEVICE_STRING
+	string "Device identifier for boot allowlist"
+	depends on ZENITH_ALLOWLIST
+	help
+	  ro.product.board value that the allowlist checks against.
 
-config PELT_UTIL_HALFLIFE_8
-	bool "8 ms"
-
-
-	  For example, with the minimum configuration value we will have 5
-	  clamp buckets tracking 20% utilization each. A 25% boosted tasks will
-	  be refcounted in the [20..39]% bucket and will set the bucket clamp
-	  effective value to 25%.
-	  If a second 30% boosted task should be co-scheduled on the same CPU,
-	  that task will be refcounted in the same bucket of the first task and
-	  it will boost the bucket clamp effective value to 30%.
-	  The clamp effective value of a bucket is reset to its nominal value
-	  (20% in the example above) when there are no more tasks refcounted in
-	  that bucket.
-
-	  An additional boost/capping margin can be added to some tasks. In the
-	  example above the 25% task will be boosted to 30% until it exits the
-	  CPU. If that should be considered not acceptable on certain systems,
-	  it's always possible to reduce the margin by increasing the number of
-	  clamp buckets to trade off used memory for run-time tracking
-	  precision.
-
-	  If in doubt, use the default value.
-
-endmenu
 
 #
 # For architectures that want to enable the support for NUMA-affine scheduler
