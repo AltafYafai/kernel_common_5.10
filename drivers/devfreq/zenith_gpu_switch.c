@@ -135,6 +135,7 @@ static bool gpu_exiting;
  */
 static unsigned long gpu_high_load_start_jiffies;
 static unsigned int gpu_high_load_promoted;
+static unsigned int gpu_probe_retries;
 
 #define GPU_HIGH_LOAD_PCT 80
 #define GPU_HIGH_LOAD_DURATION_MS 500
@@ -162,7 +163,12 @@ static void gpu_governor_worker(struct work_struct *work)
 
 	df = gpu_resolve_devfreq();
 	if (IS_ERR_OR_NULL(df)) {
-		/* GPU not probed yet -- retry later */
+		/* GPU not probed yet -- retry later (up to 12 times) */
+		if (++gpu_probe_retries > 12) {
+			pr_info("zenith_gpu_switch: no GPU devfreq found after 12 retries, "
+				"disabling\n");
+			return;
+		}
 		goto resched;
 	}
 
