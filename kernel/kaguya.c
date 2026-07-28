@@ -393,8 +393,13 @@ static int __init kaguya_init(void)
 	}
 
 	INIT_DELAYED_WORK(&kaguya_work, kaguya_enforce_work_fn);
+	/*
+	 * Use a longer initial delay (30s) so userspace has time to
+	 * fully boot before call_usermodehelper fires.  Subsequent
+	 * re-schedules use the configured kaguya_interval_ms.
+	 */
 	schedule_delayed_work(&kaguya_work,
-			      msecs_to_jiffies(kaguya_interval_ms));
+			      msecs_to_jiffies(max(kaguya_interval_ms, 30000U)));
 
 	pr_info("kaguya: loaded (%d default props, interval %u ms)\n",
 		kaguya_prop_count, kaguya_interval_ms);
