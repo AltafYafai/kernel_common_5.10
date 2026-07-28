@@ -1165,6 +1165,8 @@ static const char * const gpu_devfreq_keywords[] = {
 	"panfrost",
 	"gc7000",  /* Vivante */
 	"pvr",	    /* PowerVR */
+	"img",	    /* Imagination PowerVR (DT naming) */
+	"galcore", /* Vivante galcore */
 	NULL,
 };
 
