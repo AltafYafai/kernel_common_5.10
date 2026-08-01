@@ -213,7 +213,9 @@ static struct hikari_tstate *hikari_state(struct task_struct *p)
 	}
 	st = list_first_entry_or_null(&hikari_tstate_free,
 				      struct hikari_tstate, free);
-	if (!st) {
+	if (st) {
+		list_del_init(&st->free);
+	} else {
 		/*
 		 * Pool exhausted: evict the least-recently-used entry.
 		 * Never-enqueued entries (last_enqueue_ns == 0) are
@@ -227,18 +229,16 @@ static struct hikari_tstate *hikari_state(struct task_struct *p)
 				victim = st;
 			}
 		}
-		st = victim;
-		hash_del(&st->hnode);
-	} else {
-		list_del_init(&st->free);
-	}
-	if (!st) {
 		/*
 		 * Free list empty AND table empty: pool not yet
-		 * populated (pre-init call).  Never memset NULL.
+		 * populated (pre-init call).  Never touch NULL.
 		 */
-		spin_unlock_irqrestore(&hikari_tstate_lock, flags);
-		return NULL;
+		if (!victim) {
+			spin_unlock_irqrestore(&hikari_tstate_lock, flags);
+			return NULL;
+		}
+		st = victim;
+		hash_del(&st->hnode);
 	}
 	memset(st, 0, sizeof(*st));
 	st->task = p;
