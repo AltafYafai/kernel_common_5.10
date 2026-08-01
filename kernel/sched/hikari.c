@@ -50,6 +50,7 @@
 #include <linux/cpufreq.h>
 #include <linux/cpumask.h>
 #include <linux/fs.h>
+#include <linux/hashtable.h>
 #include <linux/hikari.h>
 #include <linux/selene.h>
 #include <linux/zenith_profiles.h>
@@ -144,6 +145,108 @@ static const u32 hikari_wake_hist_edges_us[HIKARI_WAKE_HIST_BUCKETS - 1] = {
 };
 
 static DEFINE_PER_CPU(struct hikari_pcpu, hikari_pcpu);
+
+/*
+ * Per-task state side table.
+ *
+ * Android GKI freezes struct task_struct: any layout change shifts
+ * the KMI CRC of every exported symbol whose type graph reaches
+ * task_struct.  Hikari therefore keeps its four per-task values in
+ * this statically allocated, spinlock-protected hash table keyed by
+ * task pointer instead of in task_struct itself.
+ *
+ * Entries are handed out from a fixed pool on first touch (hot
+ * paths never sleep and never allocate).  When the pool is
+ * exhausted the least-recently-used entry is evicted and reused, so
+ * the table size stays bounded and the feature can never silently
+ * die.  Lookups validate the task pointer AND its pid so a recycled
+ * task_struct address cannot inherit stale state from a dead task.
+ */
+#define HIKARI_TSTATE_MAX	1024
+
+struct hikari_tstate {
+	struct task_struct	*task;
+	pid_t			pid;
+	u32			flags;
+	u32			wait_ewma_ns;
+	u32			last_enqueue_ns;
+	u32			boost_until_ns;
+	struct hlist_node	hnode;
+	struct list_head	free;
+};
+
+static DEFINE_SPINLOCK(hikari_tstate_lock);
+static DEFINE_HASHTABLE(hikari_tstate_table, 8);
+static LIST_HEAD(hikari_tstate_free);
+static struct hikari_tstate hikari_tstate_pool[HIKARI_TSTATE_MAX];
+
+static void __init hikari_tstate_init(void)
+{
+	int i;
+
+	for (i = 0; i < HIKARI_TSTATE_MAX; i++)
+		list_add(&hikari_tstate_pool[i].free, &hikari_tstate_free);
+}
+
+/*
+ * Look up (or lazily create) the per-task state entry for @p.
+ * Returns NULL only when the fixed pool is exhausted.  Safe to call
+ * from scheduler hot paths: spinlock + hash probe, no sleeping.
+ */
+static struct hikari_tstate *hikari_state(struct task_struct *p)
+{
+	struct hikari_tstate *st, *victim = NULL;
+	unsigned long flags;
+	u32 oldest;
+	int bkt;
+
+	if (!p)
+		return NULL;
+
+	spin_lock_irqsave(&hikari_tstate_lock, flags);
+	hash_for_each_possible(hikari_tstate_table, st, hnode,
+			       (unsigned long)p) {
+		if (st->task == p && st->pid == p->pid) {
+			spin_unlock_irqrestore(&hikari_tstate_lock, flags);
+			return st;
+		}
+	}
+	st = list_first_entry_or_null(&hikari_tstate_free,
+				      struct hikari_tstate, free);
+	if (!st) {
+		/*
+		 * Pool exhausted: evict the least-recently-used entry.
+		 * Never-enqueued entries (last_enqueue_ns == 0) are
+		 * preferred victims.  The evicted task loses its boost
+		 * hints at worst -- graceful degradation.
+		 */
+		oldest = ~0U;
+		hash_for_each(hikari_tstate_table, bkt, st, hnode) {
+			if (st->last_enqueue_ns <= oldest) {
+				oldest = st->last_enqueue_ns;
+				victim = st;
+			}
+		}
+		st = victim;
+		hash_del(&st->hnode);
+	} else {
+		list_del_init(&st->free);
+	}
+	if (!st) {
+		/*
+		 * Free list empty AND table empty: pool not yet
+		 * populated (pre-init call).  Never memset NULL.
+		 */
+		spin_unlock_irqrestore(&hikari_tstate_lock, flags);
+		return NULL;
+	}
+	memset(st, 0, sizeof(*st));
+	st->task = p;
+	st->pid = p->pid;
+	hash_add(hikari_tstate_table, &st->hnode, (unsigned long)p);
+	spin_unlock_irqrestore(&hikari_tstate_lock, flags);
+	return st;
+}
 
 /*
  * Sysctl-backed tunables.  All u32, all proc_douintvec_minmax.
@@ -388,13 +491,15 @@ static inline void hikari_set_skip_reason(struct task_struct *p, u32 reason);
 
 static inline bool hikari_task_active(struct task_struct *p)
 {
+	struct hikari_tstate *st;
 	u32 flags;
 
 	if (!hikari_enabled())
 		return false;
-	if (!p)
+	st = hikari_state(p);
+	if (!st)
 		return false;
-	flags = READ_ONCE(p->hikari_flags);
+	flags = READ_ONCE(st->flags);
 	return (flags & HIKARI_FLAG_OPT_IN) != 0;
 }
 
@@ -402,7 +507,9 @@ static void hikari_set_flag(struct task_struct *p, u32 bit, bool on);
 
 static inline bool hikari_in_top_app(struct task_struct *p)
 {
-	return (READ_ONCE(p->hikari_flags) & HIKARI_FLAG_FOREGROUND) != 0;
+	struct hikari_tstate *st = hikari_state(p);
+
+	return st && (READ_ONCE(st->flags) & HIKARI_FLAG_FOREGROUND);
 }
 
 /*
@@ -423,6 +530,7 @@ static inline void hikari_lazy_topapp_update(struct task_struct *p)
 #ifdef CONFIG_CGROUP_SCHED
 	struct task_group *tg;
 	struct cgroup *cgrp;
+	struct hikari_tstate *st;
 	bool in_topapp;
 	u32 flags;
 
@@ -436,8 +544,12 @@ static inline void hikari_lazy_topapp_update(struct task_struct *p)
 	if (!cgrp || !cgrp->kn || !cgrp->kn->name)
 		return;
 
+	st = hikari_state(p);
+	if (!st)
+		return;
+
 	in_topapp = (strcmp(cgrp->kn->name, "top-app") == 0);
-	flags = READ_ONCE(p->hikari_flags);
+	flags = READ_ONCE(st->flags);
 
 	if (in_topapp && (!(flags & HIKARI_FLAG_FOREGROUND) ||
 			  (flags & HIKARI_FLAG_BACKGROUND)))
@@ -489,6 +601,7 @@ static inline unsigned int hikari_learn_boost_value(void)
  */
 unsigned int hikari_uclamp_max_ceiling(struct task_struct *p)
 {
+	struct hikari_tstate *st;
 	unsigned int pct;
 	unsigned int ceiling;
 
@@ -503,7 +616,8 @@ unsigned int hikari_uclamp_max_ceiling(struct task_struct *p)
 	if (pct > 100)
 		pct = 100;
 
-	if (!(READ_ONCE(p->hikari_flags) & HIKARI_FLAG_BACKGROUND))
+	st = hikari_state(p);
+	if (!st || !(READ_ONCE(st->flags) & HIKARI_FLAG_BACKGROUND))
 		return 0;
 
 	ceiling = (SCHED_CAPACITY_SCALE * pct) / 100U;
@@ -515,6 +629,7 @@ EXPORT_SYMBOL_GPL(hikari_uclamp_max_ceiling);
 
 unsigned int hikari_uclamp_boost_amount(struct task_struct *p)
 {
+	struct hikari_tstate *st;
 	u32 until;
 
 	if (!IS_ENABLED(CONFIG_HIKARI_UCLAMP))
@@ -524,6 +639,10 @@ unsigned int hikari_uclamp_boost_amount(struct task_struct *p)
 	if (!p)
 		return 0;
 
+	st = hikari_state(p);
+	if (!st)
+		return 0;
+
 	/*
 	 * Per-task uclamp learning: tasks that consistently show high
 	 * wake-to-run latency get a persistent uclamp_min boost via
@@ -531,10 +650,10 @@ unsigned int hikari_uclamp_boost_amount(struct task_struct *p)
 	 * path (one READ_ONCE + bit test) and returns immediately for
 	 * flagged tasks regardless of TTL state.
 	 */
-	if (READ_ONCE(p->hikari_flags) & HIKARI_FLAG_LEARNED)
+	if (READ_ONCE(st->flags) & HIKARI_FLAG_LEARNED)
 		return hikari_learn_boost_value();
 
-	until = READ_ONCE(p->hikari_boost_until_ns);
+	until = READ_ONCE(st->boost_until_ns);
 	if (!hikari_token_active(until)) {
 		/* Lazy clear: avoid storing through a hot read but on
 		 * the next non-hot visit we'll zero it.
@@ -547,9 +666,14 @@ EXPORT_SYMBOL_GPL(hikari_uclamp_boost_amount);
 
 static inline void hikari_apply_uclamp_boost(struct task_struct *p)
 {
+	struct hikari_tstate *st;
+
 	if (!IS_ENABLED(CONFIG_HIKARI_UCLAMP))
 		return;
-	WRITE_ONCE(p->hikari_boost_until_ns,
+	st = hikari_state(p);
+	if (!st)
+		return;
+	WRITE_ONCE(st->boost_until_ns,
 		   hikari_token_add_ms(READ_ONCE(hikari_uclamp_ttl_ms)));
 	atomic_inc(&this_cpu_ptr(&hikari_pcpu)->boost_count);
 }
@@ -752,6 +876,7 @@ static inline bool hikari_cpu_is_audio_active(unsigned int cpu)
 
 void hikari_on_enqueue(struct task_struct *p, struct rq *rq)
 {
+	struct hikari_tstate *st;
 	u32 now32;
 
 	if (!hikari_enabled())
@@ -761,11 +886,12 @@ void hikari_on_enqueue(struct task_struct *p, struct rq *rq)
 
 	hikari_lazy_topapp_update(p);
 
-	if (!(READ_ONCE(p->hikari_flags) & HIKARI_FLAG_OPT_IN))
+	st = hikari_state(p);
+	if (!st || !(READ_ONCE(st->flags) & HIKARI_FLAG_OPT_IN))
 		return;
 
 	now32 = (u32)rq_clock_task(rq);
-	WRITE_ONCE(p->hikari_last_enqueue_ns, now32 ? now32 : 1);
+	WRITE_ONCE(st->last_enqueue_ns, now32 ? now32 : 1);
 
 	/*
 	 * Lazy boost-expiry clear: if a stale "active" boost from
@@ -773,17 +899,18 @@ void hikari_on_enqueue(struct task_struct *p, struct rq *rq)
 	 * the only safety against u32-jiffies wraparound for
 	 * boost_until.
 	 */
-	if (p->hikari_boost_until_ns &&
-	    !hikari_token_active(p->hikari_boost_until_ns))
-		WRITE_ONCE(p->hikari_boost_until_ns, 0);
+	if (st->boost_until_ns &&
+	    !hikari_token_active(st->boost_until_ns))
+		WRITE_ONCE(st->boost_until_ns, 0);
 
-	if (READ_ONCE(p->hikari_flags) & HIKARI_FLAG_AUDIO_TAGGED)
+	if (READ_ONCE(st->flags) & HIKARI_FLAG_AUDIO_TAGGED)
 		hikari_pcpu_mark_audio(task_cpu(p));
 }
 EXPORT_SYMBOL_GPL(hikari_on_enqueue);
 
 void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 {
+	struct hikari_tstate *st;
 	u32 last, now32, delta, ewma, threshold_ns;
 
 	if (!hikari_task_active(p)) {
@@ -813,7 +940,11 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 	if (rt_task(p) || dl_task(p))
 		return;
 
-	last = READ_ONCE(p->hikari_last_enqueue_ns);
+	st = hikari_state(p);
+	if (!st)
+		return;
+
+	last = READ_ONCE(st->last_enqueue_ns);
 	if (!last)
 		return;
 
@@ -846,7 +977,7 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 			shift = hikari_ewma_shift_max;
 		weight = (1u << shift) - 1;
 
-		ewma = READ_ONCE(p->hikari_wait_ewma_ns);
+		ewma = READ_ONCE(st->wait_ewma_ns);
 		if (unlikely(!ewma)) {
 			/* Fast-start: first sample lands immediately instead of
 			 * decaying from zero over ~8 wake events.
@@ -858,8 +989,8 @@ void hikari_on_dequeue(struct task_struct *p, struct rq *rq)
 			ewma = next > U32_MAX ? U32_MAX : (u32)next;
 		}
 	}
-	WRITE_ONCE(p->hikari_wait_ewma_ns, ewma);
-	WRITE_ONCE(p->hikari_last_enqueue_ns, 0);
+	WRITE_ONCE(st->wait_ewma_ns, ewma);
+	WRITE_ONCE(st->last_enqueue_ns, 0);
 
 	/*
 	 * Histogram the *current sample* (not the EWMA) so the
@@ -888,7 +1019,7 @@ if (ewma > threshold_ns) {
 			 * will get the TTL-limited boost instead.
 			 */
 			if (READ_ONCE(hikari_learn_boost_pct) > 0 &&
-			    !(READ_ONCE(p->hikari_flags) & HIKARI_FLAG_LEARNED))
+			    !(READ_ONCE(st->flags) & HIKARI_FLAG_LEARNED))
 				hikari_set_flag(p, HIKARI_FLAG_LEARNED, true);
 		}
 
@@ -900,7 +1031,7 @@ if (ewma > threshold_ns) {
 		 * (below threshold/forget_ratio), clear the learned
 		 * flag so the task stops getting a permanent boost.
 		 */
-		if ((READ_ONCE(p->hikari_flags) & HIKARI_FLAG_LEARNED) &&
+		if ((READ_ONCE(st->flags) & HIKARI_FLAG_LEARNED) &&
 		    ewma < threshold_ns / max(READ_ONCE(hikari_learn_forget_ratio), 2u))
 			hikari_set_flag(p, HIKARI_FLAG_LEARNED, false);
 
@@ -911,12 +1042,15 @@ EXPORT_SYMBOL_GPL(hikari_on_dequeue);
 
 void hikari_on_wake_up(struct task_struct *p, int target_cpu)
 {
+	struct hikari_tstate *st;
+
 	if (!hikari_task_active(p))
 		return;
 	if (target_cpu < 0 || target_cpu >= nr_cpu_ids)
 		return;
 
-	if (READ_ONCE(p->hikari_flags) & HIKARI_FLAG_AUDIO_TAGGED)
+	st = hikari_state(p);
+	if (st && (READ_ONCE(st->flags) & HIKARI_FLAG_AUDIO_TAGGED))
 		hikari_pcpu_mark_audio(target_cpu);
 }
 EXPORT_SYMBOL_GPL(hikari_on_wake_up);
@@ -935,6 +1069,7 @@ EXPORT_SYMBOL_GPL(hikari_on_wake_up);
  */
 int hikari_select_cpu(struct task_struct *p, int prev_cpu, int wake_flags)
 {
+	struct hikari_tstate *st;
 	u32 ewma, threshold_ns;
 	int cpu;
 
@@ -945,16 +1080,20 @@ int hikari_select_cpu(struct task_struct *p, int prev_cpu, int wake_flags)
 	if (!hikari_task_active(p))
 		return -1;
 
-	ewma = READ_ONCE(p->hikari_wait_ewma_ns);
+	st = hikari_state(p);
+	if (!st)
+		return -1;
+
+	ewma = READ_ONCE(st->wait_ewma_ns);
 	threshold_ns = READ_ONCE(hikari_wake_threshold_us) * 1000;
 	if (ewma <= threshold_ns) {
 		hikari_set_skip_reason(p, HIKARI_SKIP_EWMA_LOW);
 		return -1;
 	}
 
-	if (!hikari_in_top_app(p) &&
+	if (!(READ_ONCE(st->flags) & HIKARI_FLAG_FOREGROUND) &&
 	    !hikari_cpu_is_audio_active(prev_cpu) &&
-	    !(READ_ONCE(p->hikari_flags) & HIKARI_FLAG_AUDIO_TAGGED)) {
+	    !(READ_ONCE(st->flags) & HIKARI_FLAG_AUDIO_TAGGED)) {
 		hikari_set_skip_reason(p, HIKARI_SKIP_PLACEMENT_NOT_TOPAPP);
 		return -1;
 	}
@@ -1125,16 +1264,18 @@ unsigned long hikari_get_last_demand_jiffies(void)
 
 static void hikari_set_flag(struct task_struct *p, u32 bit, bool on)
 {
+	struct hikari_tstate *st;
 	u32 cur, new;
 
-	if (!p)
+	st = hikari_state(p);
+	if (!st)
 		return;
 	do {
-		cur = READ_ONCE(p->hikari_flags);
+		cur = READ_ONCE(st->flags);
 		new = on ? (cur | bit) : (cur & ~bit);
 		if (new == cur)
 			return;
-	} while (cmpxchg(&p->hikari_flags, cur, new) != cur);
+	} while (cmpxchg(&st->flags, cur, new) != cur);
 }
 
 /*
@@ -1146,18 +1287,20 @@ static void hikari_set_flag(struct task_struct *p, u32 bit, bool on)
  */
 static inline void hikari_set_skip_reason(struct task_struct *p, u32 reason)
 {
+	struct hikari_tstate *st;
 	u32 cur, new;
 	u32 want = (reason << HIKARI_SKIP_REASON_SHIFT) &
 		   HIKARI_SKIP_REASON_MASK;
 
-	if (!p)
+	st = hikari_state(p);
+	if (!st)
 		return;
 	do {
-		cur = READ_ONCE(p->hikari_flags);
+		cur = READ_ONCE(st->flags);
 		new = (cur & ~HIKARI_SKIP_REASON_MASK) | want;
 		if (new == cur)
 			return;
-	} while (cmpxchg(&p->hikari_flags, cur, new) != cur);
+	} while (cmpxchg(&st->flags, cur, new) != cur);
 }
 
 void hikari_set_opt_in(struct task_struct *p, bool opt_in)
@@ -1468,6 +1611,7 @@ static const char * const hikari_skip_reason_names[] = {
 
 void hikari_seq_print_stats(struct seq_file *m, struct task_struct *p)
 {
+	struct hikari_tstate *st;
 	u32 flags, ewma, last_enq, boost_until, reason;
 	const char *reason_name;
 
@@ -1476,10 +1620,16 @@ void hikari_seq_print_stats(struct seq_file *m, struct task_struct *p)
 		return;
 	}
 
-	flags       = READ_ONCE(p->hikari_flags);
-	ewma        = READ_ONCE(p->hikari_wait_ewma_ns);
-	last_enq    = READ_ONCE(p->hikari_last_enqueue_ns);
-	boost_until = READ_ONCE(p->hikari_boost_until_ns);
+	st = hikari_state(p);
+	if (!st) {
+		seq_puts(m, "hikari: no per-task state\n");
+		return;
+	}
+
+	flags       = READ_ONCE(st->flags);
+	ewma        = READ_ONCE(st->wait_ewma_ns);
+	last_enq    = READ_ONCE(st->last_enqueue_ns);
+	boost_until = READ_ONCE(st->boost_until_ns);
 	reason      = (flags & HIKARI_SKIP_REASON_MASK) >>
 		      HIKARI_SKIP_REASON_SHIFT;
 	reason_name = (reason <= HIKARI_SKIP_REASON_MAX)
@@ -1520,9 +1670,12 @@ EXPORT_SYMBOL_GPL(hikari_seq_print_stats);
 /* Helper for /proc/<pid>/hikari_enable + /proc/<pid>/hikari_audio. */
 u32 hikari_task_get_flag(struct task_struct *p, u32 bit)
 {
+	struct hikari_tstate *st;
+
 	if (!p)
 		return 0;
-	return (READ_ONCE(p->hikari_flags) & bit) ? 1U : 0U;
+	st = hikari_state(p);
+	return st && (READ_ONCE(st->flags) & bit) ? 1U : 0U;
 }
 EXPORT_SYMBOL_GPL(hikari_task_get_flag);
 
@@ -1593,15 +1746,17 @@ static ssize_t total_hint_count_show(struct kobject *kobj,
 static ssize_t opted_in_count_show(struct kobject *kobj,
 				   struct kobj_attribute *attr, char *buf)
 {
-	struct task_struct *p;
+	struct hikari_tstate *st;
 	unsigned int count = 0;
+	unsigned long flags;
+	int bkt;
 
-	rcu_read_lock();
-	for_each_process(p) {
-		if (READ_ONCE(p->hikari_flags) & HIKARI_FLAG_OPT_IN)
+	spin_lock_irqsave(&hikari_tstate_lock, flags);
+	hash_for_each(hikari_tstate_table, bkt, st, hnode) {
+		if (READ_ONCE(st->flags) & HIKARI_FLAG_OPT_IN)
 			count++;
 	}
-	rcu_read_unlock();
+	spin_unlock_irqrestore(&hikari_tstate_lock, flags);
 
 	return sysfs_emit(buf, "%u\n", count);
 }
@@ -1971,6 +2126,7 @@ static int __init hikari_init(void)
 		atomic_set(&pc->hint_count, 0);
 	}
 
+	hikari_tstate_init();
 	hikari_discover_clusters();
 	hikari_recompute_force_floors();
 

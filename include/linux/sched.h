@@ -421,24 +421,8 @@ struct sched_avg {
 	struct util_est			util_est;
 } ____cacheline_aligned;
 
-/*
- * Keep sched_statistics layout stable regardless of CONFIG_SCHEDSTATS.
- *
- * The struct is embedded inline in struct sched_entity (and transitively
- * in struct task_struct), and its layout is part of the Android GKI KMI
- * (abi_gki_aarch64.xml records it as size-in-bits='1728').  Gating the
- * fields on CONFIG_SCHEDSTATS collapsed the struct to zero size when
- * the feature was disabled, shifting every subsequent field of
- * sched_entity / task_struct and breaking every vendor module compiled
- * against the published ABI.
- *
- * Keeping the fields unconditional costs 216 B per task_struct but has
- * no runtime cost: the __schedstat_{inc,add,set} macros expand to
- * do {} while (0) when CONFIG_SCHEDSTATS=n, so the compiler never
- * emits a load/store for any of these counters.  The memory is
- * reserved but dead.
- */
 struct sched_statistics {
+#ifdef CONFIG_SCHEDSTATS
 	u64				wait_start;
 	u64				wait_max;
 	u64				wait_count;
@@ -470,6 +454,7 @@ struct sched_statistics {
 	u64				nr_wakeups_affine_attempts;
 	u64				nr_wakeups_passive;
 	u64				nr_wakeups_idle;
+#endif
 };
 
 struct sched_entity {
@@ -983,8 +968,8 @@ struct task_struct {
 	struct nameidata		*nameidata;
 
 #ifdef CONFIG_SYSVIPC
-	// struct sysv_sem			sysvsem;
-	// struct sysv_shm			sysvshm;
+	struct sysv_sem			sysvsem;
+	struct sysv_shm			sysvshm;
 #endif
 #ifdef CONFIG_DETECT_HUNG_TASK
 	unsigned long			last_switch_count;
@@ -1393,50 +1378,17 @@ struct task_struct {
 	/* PF_IO_WORKER */
 	ANDROID_KABI_USE(1, void *pf_io_worker);
 
-	/*
-	 * Hikari wake-time policy engine state.  Packed into KABI
-	 * reserves 2 and 3 via ANDROID_KABI_USE2 so task_struct size
-	 * and alignment are unchanged.  See <linux/hikari.h>.
-	 *
-	 * hikari_wait_ewma_ns   - EWMA of wake-to-run wait time, in
-	 *                         nanoseconds (saturating u32; ~4.29s
-	 *                         max which is far above any sane
-	 *                         wake-wait we'd care about).
-	 * hikari_flags          - HIKARI_FLAG_* bits (opt-in, audio,
-	 *                         foreground).
-	 * hikari_last_enqueue_ns- Truncated rq_clock_task() at the
-	 *                         last wake-side enqueue.  Used to
-	 *                         compute the wait sample on dequeue.
-	 * hikari_boost_until_ns - jiffies-equivalent (truncated
-	 *                         ktime_get_ns()) until which the
-	 *                         current uclamp_min boost is active.
-	 *                         Zero means no boost pending.
-	 *
-	 * All four are touched only from the task's own CPU, with the
-	 * task either current or rq->lock held, so READ_ONCE/WRITE_ONCE
-	 * are sufficient and no atomics are needed.
-	 */
-	ANDROID_KABI_USE2(2, u32 hikari_wait_ewma_ns,    u32 hikari_flags);
-	ANDROID_KABI_USE2(3, u32 hikari_last_enqueue_ns, u32 hikari_boost_until_ns);
-
-	/*
-	 * Preserve user-dumpable flag when mm goes away (ptrace
-	 * fix from stable 5.10.256).  Moved to KABI reserve 4 to
-	 * avoid colliding with Hikari's use of reserves 2 & 3.
-	 */
-	ANDROID_KABI_USE(4, struct {
+	ANDROID_KABI_USE(2, struct {
+		/* Save user-dumpable when mm goes away */
 		unsigned	user_dumpable:1;
 		});
-	ANDROID_KABI_RESERVE(5);
 
-#ifdef CONFIG_SYSVIPC
-	ANDROID_KABI_USE(6, struct sysv_sem sysvsem);
-	_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8), struct sysv_shm sysvshm);
-#else
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
+	ANDROID_KABI_RESERVE(5);
 	ANDROID_KABI_RESERVE(6);
 	ANDROID_KABI_RESERVE(7);
 	ANDROID_KABI_RESERVE(8);
-	#endif
 
 	/*
 	 * New fields for task_struct should be added above here, so that
@@ -1786,11 +1738,6 @@ extern int can_nice(const struct task_struct *p, const int nice);
 extern int task_curr(const struct task_struct *p);
 extern int idle_cpu(int cpu);
 extern int available_idle_cpu(int cpu);
-#ifdef CONFIG_SMP
-extern unsigned long sched_cpu_util(int cpu);
-#else
-static inline unsigned long sched_cpu_util(int cpu) { return 0; }
-#endif
 extern int sched_setscheduler(struct task_struct *, int, const struct sched_param *);
 extern int sched_setscheduler_nocheck(struct task_struct *, int, const struct sched_param *);
 extern void sched_set_fifo(struct task_struct *p);
