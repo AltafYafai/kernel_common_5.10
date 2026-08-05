@@ -157,7 +157,6 @@ void pci_restore_rebar_state(struct pci_dev *pdev)
  * @dev: the PCI device
  * @resno: index of the BAR to be resized
  * @size: new size as defined in the spec (0=1MB, 31=128TB)
- * @exclude_bars: a mask of BARs that should not be released
  *
  * Reconfigure @resno to @size and re-run resource assignment algorithm
  * with the new size.
@@ -165,15 +164,10 @@ void pci_restore_rebar_state(struct pci_dev *pdev)
  * Prior to resize, release @dev resources that share a bridge window with
  * @resno.  This unpins the bridge window resource to allow changing it.
  *
- * The caller may prevent releasing a particular BAR by providing
- * @exclude_bars mask, but this may result in the resize operation failing
- * due to insufficient space.
- *
  * Return: 0 on success, or negative on error. In case of an error, the
  *         resources are restored to their original places.
  */
-int pci_resize_resource(struct pci_dev *dev, int resno, int size,
-			int exclude_bars)
+int pci_resize_resource(struct pci_dev *dev, int resno, int size)
 {
 	struct pci_host_bridge *host;
 	int old, ret;
@@ -204,7 +198,7 @@ int pci_resize_resource(struct pci_dev *dev, int resno, int size,
 	if (ret)
 		return ret;
 
-	ret = pci_do_resource_release_and_resize(dev, resno, size, exclude_bars);
+	ret = pci_do_resource_release_and_resize(dev, resno, size, 0);
 	if (ret)
 		goto error_resize;
 
