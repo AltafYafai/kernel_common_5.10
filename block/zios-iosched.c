@@ -743,10 +743,27 @@ static bool zios_has_work(struct blk_mq_hw_ctx *hctx)
 
 static void zios_limit_depth(unsigned int op, struct blk_mq_alloc_data *data)
 {
-	struct zios_data *zd = data->q->elevator->elevator_data;
+	struct zios_data *zd;
 	unsigned int depth;
 
 	if (op_is_sync(op) && !op_is_write(op))
+		return;
+
+	/*
+	 * 5.10 block core calls limit_depth() from __blk_mq_alloc_request()
+	 * *before* data->hctx (and data->ctx) are populated, so the hctx
+	 * and its sched tags can legitimately be NULL here.  Never follow
+	 * them blindly: fall back to the full queue depth (leave
+	 * data->shallow_depth untouched) instead of crashing on a NULL
+	 * hctx->sched_tags dereference.
+	 */
+	if (!data || !data->q || !data->q->elevator)
+		return;
+	zd = data->q->elevator->elevator_data;
+	if (!zd)
+		return;
+	if (!data->hctx || !data->hctx->sched_tags ||
+	    !data->hctx->sched_tags->bitmap_tags)
 		return;
 
 	depth = zd->async_depth;
