@@ -231,6 +231,9 @@ static void lucid_on_game_start(const char *game_name)
 	lucid_pid_cache_count = cache_idx;
 	mutex_unlock(&lucid_lock);
 
+	pr_info("GrayRavens: lucid: GAME_START '%s': game oom=%d, %d bg procs -> oom=%d\n",
+		game_name, lucid_oom_game, cache_idx, lucid_oom_bg);
+
 	pr_debug("lucid: game start — deprioritised %d processes\n",
 		 cache_idx);
 }
@@ -278,6 +281,8 @@ static void lucid_on_game_stop(void)
 	}
 	lucid_pid_cache_count = 0;
 	mutex_unlock(&lucid_lock);
+
+	pr_info("GrayRavens: lucid: GAME_STOP: restored %d processes\n", count);
 
 	pr_debug("lucid: game stop — restored %d processes\n", count);
 }

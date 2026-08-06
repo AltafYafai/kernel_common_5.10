@@ -353,6 +353,8 @@ static void selene_set_game(const char *name, unsigned int len)
 
 		/* Different app — stop previous game first */
 		if (selene_active_is_game && selene_active_game) {
+			printk(KERN_INFO "GrayRavens: selene: GAME_STOP '%s'\n",
+			       selene_active_game);
 			blocking_notifier_call_chain(&selene_chain,
 						     SELENE_EVENT_GAME_STOP,
 						     selene_active_game);
@@ -363,6 +365,8 @@ static void selene_set_game(const char *name, unsigned int len)
 		selene_active_is_game = is_game;
 
 		if (is_game) {
+			printk(KERN_INFO "GrayRavens: selene: GAME_START '%s'\n",
+			       selene_active_game);
 			blocking_notifier_call_chain(&selene_chain,
 						     SELENE_EVENT_GAME_START,
 						     selene_active_game);
@@ -370,6 +374,8 @@ static void selene_set_game(const char *name, unsigned int len)
 	} else {
 		/* Clear */
 		if (selene_active_is_game && selene_active_game) {
+			printk(KERN_INFO "GrayRavens: selene: GAME_STOP '%s'\n",
+			       selene_active_game);
 			blocking_notifier_call_chain(&selene_chain,
 						     SELENE_EVENT_GAME_STOP,
 						     selene_active_game);

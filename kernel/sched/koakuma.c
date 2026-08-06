@@ -125,6 +125,9 @@ static void koakuma_preload_work_fn(struct work_struct *work)
 
 	koakuma_last_preloaded_bytes = total_preloaded;
 
+	pr_info("GrayRavens: koakuma: preloaded %lu KB for '%s'\n",
+		total_preloaded / 1024, koakuma_game_name);
+
 	pr_debug("koakuma: preloaded %lu KB for %s\n",
 		 total_preloaded / 1024, koakuma_game_name);
 
@@ -169,6 +172,8 @@ static int koakuma_selene_notifier(struct notifier_block *nb,
 		mutex_unlock(&koakuma_lock);
 
 		schedule_work(&koakuma_preload_work);
+		pr_info("GrayRavens: koakuma: GAME_START '%s': preload queued (max %u MB)\n",
+			name, koakuma_max_preload_mb);
 		break;
 	}
 	case SELENE_EVENT_GAME_STOP:
@@ -179,6 +184,7 @@ static int koakuma_selene_notifier(struct notifier_block *nb,
 		}
 		koakuma_game_name[0] = '\0';
 		mutex_unlock(&koakuma_lock);
+		pr_info("GrayRavens: koakuma: GAME_STOP: preload cancelled\n");
 		break;
 	}
 	return NOTIFY_OK;

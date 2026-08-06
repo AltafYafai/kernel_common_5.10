@@ -2102,9 +2102,11 @@ static int hikari_selene_nb_fn(struct notifier_block *nb,
 	switch (event) {
 	case SELENE_EVENT_GAME_START:
 		WRITE_ONCE(hikari_game_selene_boost, true);
+		printk(KERN_INFO "GrayRavens: hikari: GAME_START: game floor armed\n");
 		break;
 	case SELENE_EVENT_GAME_STOP:
 		WRITE_ONCE(hikari_game_selene_boost, false);
+		printk(KERN_INFO "GrayRavens: hikari: GAME_STOP: game floor cleared\n");
 		break;
 	}
 	return NOTIFY_OK;

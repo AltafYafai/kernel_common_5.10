@@ -931,9 +931,11 @@ static int kasumi_selene_nb_fn(struct notifier_block *nb,
 	switch (event) {
 	case SELENE_EVENT_GAME_START:
 		kasumi_apply_profile(ZENITH_PROFILE_GAMING);
+		printk(KERN_INFO "GrayRavens: kasumi: GAME_START: profile GAMING applied\n");
 		break;
 	case SELENE_EVENT_GAME_STOP:
 		kasumi_apply_profile(ZENITH_PROFILE_BALANCED);
+		printk(KERN_INFO "GrayRavens: kasumi: GAME_STOP: profile BALANCED applied\n");
 		break;
 	}
 	return NOTIFY_OK;

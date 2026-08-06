@@ -338,6 +338,8 @@ static int gpu_game_mode_notifier_cb(struct notifier_block *nb,
 				 unsigned long action, void *data)
 {
 	mod_delayed_work(system_unbound_wq, &gpu_governor_work, 0);
+	printk(KERN_INFO "GrayRavens: zenith_gpu_switch: game mode %s\n",
+	       action ? "ON" : "OFF");
 	return NOTIFY_OK;
 }
 
