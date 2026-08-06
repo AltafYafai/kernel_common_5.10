@@ -26,6 +26,7 @@
 #include <linux/string.h>
 #include <linux/workqueue.h>
 #include <linux/umh.h>
+#include <linux/fs.h>
 
 /* ------------------------------------------------------------------ */
 /* Property store                                                      */
@@ -79,6 +80,24 @@ static char *kaguya_envp[] = {
 	NULL,
 };
 
+/* Candidate resetprop locations, in priority order.  Magisk installs
+ * /system/bin/resetprop on most setups; KernelSU-Next keeps its tools
+ * under /data/adb/ksu/bin.  Additional locations can be appended here.
+ */static const char *const kaguya_resetprop_candidates[] = {
+	"/system/bin/resetprop",
+	"/data/adb/magisk/resetprop",
+	"/data/adb/ksu/bin/resetprop",
+	NULL,
+};
+
+/* Resolved resetprop path once found ("" = unresolved).  Cached so the
+ * enforcement tick only probes once after the first success; a missing
+ * binary keeps re-probing so a late-installed resetprop (e.g. Magisk
+ * flashed after boot) is picked up automatically.
+ */
+static char kaguya_resetprop_path[64];
+static bool kaguya_resetprop_warned;
+
 /* ------------------------------------------------------------------ */
 /* Enforcement tick — re-applies all properties via resetprop           */
 /* ------------------------------------------------------------------ */
@@ -97,53 +116,105 @@ struct kaguya_batch_cmd {
 	char cmd_buf[KAGUYA_CMD_BUF_SIZE];
 };
 
+/*
+ * Resolve a usable resetprop binary.  Only -ENOENT/-ENOTDIR count as
+ * "missing": if the probe is denied by SELinux or fails for another
+ * reason the binary may still exist, so we optimistically return the
+ * path and let the exec attempt be the definitive test (the builder
+ * ships matching ksu_allow rules for these locations).
+ */
+static const char *kaguya_resolve_resetprop(void)
+{
+	const char *const *p;
+
+	if (kaguya_resetprop_path[0])
+		return kaguya_resetprop_path;
+
+	for (p = kaguya_resetprop_candidates; *p; p++) {
+		struct file *f = filp_open(*p, O_RDONLY, 0);
+
+		if (IS_ERR(f)) {
+			if (PTR_ERR(f) == -ENOENT || PTR_ERR(f) == -ENOTDIR)
+				continue;
+			/* Not missing (e.g. SELinux denied the open) — cache it so
+			 * the tick stops re-probing, and let the exec attempt be
+			 * the definitive test.
+			 */
+			strscpy(kaguya_resetprop_path, *p,
+				sizeof(kaguya_resetprop_path));
+			return kaguya_resetprop_path;
+		}
+		filp_close(f, NULL);
+		strscpy(kaguya_resetprop_path, *p,
+			sizeof(kaguya_resetprop_path));
+		pr_info("kaguya: using resetprop at %s\n",
+			kaguya_resetprop_path);
+		return kaguya_resetprop_path;
+	}
+
+	if (!kaguya_resetprop_warned) {
+		pr_warn("kaguya: no resetprop found (%s, %s, %s) - safeprop "
+			"enforcement disabled; install Magisk or KernelSU-Next "
+			"tools\n",
+			kaguya_resetprop_candidates[0],
+			kaguya_resetprop_candidates[1],
+			kaguya_resetprop_candidates[2]);
+		kaguya_resetprop_warned = true;
+	}
+	return NULL;
+}
+
 static void kaguya_enforce_work_fn(struct work_struct *work)
 {
-	int i;
-
 	if (!kaguya_enabled)
 		goto reschedule;
 
 	mutex_lock(&kaguya_lock);
 
 	if (kaguya_prop_count > 0) {
-		struct kaguya_batch_cmd cmd;
-		int pos = 0;
+		const char *rp = kaguya_resolve_resetprop();
 
-		/* Build a single shell command: resetprop 'n1' 'v1' && ... */
-		pos += snprintf(cmd.cmd_buf + pos,
-				sizeof(cmd.cmd_buf) - pos,
-				"/system/bin/resetprop");
+		if (rp) {
+			struct kaguya_batch_cmd cmd;
+			int pos = 0, i;
 
-		for (i = 0; i < kaguya_prop_count &&
-		     pos < (int)sizeof(cmd.cmd_buf) - 1; i++) {
-			int rem = (int)sizeof(cmd.cmd_buf) - pos;
-			int n = snprintf(cmd.cmd_buf + pos, rem,
-					 " '%s' '%s' && /system/bin/resetprop",
-					 kaguya_props[i].name,
-					 kaguya_props[i].value);
+			/* Build: resetprop 'n1' 'v1' && resetprop 'n2' 'v2'.
+			 * Note: if the chain ever truncates against the 4K buffer,
+			 * sh parses the whole line first and no prop gets set.
+			 */
+			for (i = 0; i < kaguya_prop_count; i++) {
+				int n;
 
-			if (n < 0 || n >= rem) {
-				pr_debug("kaguya: cmd buf full at prop %d\n", i);
-				break;
+				if (i == 0)
+					n = snprintf(cmd.cmd_buf + pos,
+						     sizeof(cmd.cmd_buf) - pos,
+						     "%s '%s' '%s'", rp,
+						     kaguya_props[i].name,
+						     kaguya_props[i].value);
+				else
+					n = snprintf(cmd.cmd_buf + pos,
+						     sizeof(cmd.cmd_buf) - pos,
+						     " && %s '%s' '%s'", rp,
+						     kaguya_props[i].name,
+						     kaguya_props[i].value);
+
+				if (n < 0 ||
+				    n >= (int)sizeof(cmd.cmd_buf) - pos) {
+					pr_debug("kaguya: cmd buf full at prop %d\n",
+						 i);
+					break;
+				}
+				pos += n;
 			}
-			pos += n;
+
+			cmd.argv[0] = "/system/bin/sh";
+			cmd.argv[1] = "-c";
+			cmd.argv[2] = cmd.cmd_buf;
+			cmd.argv[3] = NULL;
+
+			call_usermodehelper(cmd.argv[0], cmd.argv,
+					    kaguya_envp, UMH_NO_WAIT);
 		}
-
-		/* Strip the trailing " && /system/bin/resetprop" (25 chars) */
-#define KAGUYA_TRAILING_LEN (int)(sizeof(" && /system/bin/resetprop") - 1)
-		if (pos >= KAGUYA_TRAILING_LEN) {
-			pos -= KAGUYA_TRAILING_LEN;
-			cmd.cmd_buf[pos] = '\0';
-		}
-
-		cmd.argv[0] = "/system/bin/sh";
-		cmd.argv[1] = "-c";
-		cmd.argv[2] = cmd.cmd_buf;
-		cmd.argv[3] = NULL;
-
-		call_usermodehelper(cmd.argv[0], cmd.argv,
-				    kaguya_envp, UMH_NO_WAIT);
 	}
 
 	mutex_unlock(&kaguya_lock);
