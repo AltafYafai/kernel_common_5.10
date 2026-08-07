@@ -137,6 +137,20 @@ static unsigned long gpu_high_load_start_jiffies;
 static unsigned int gpu_high_load_promoted;
 static unsigned int gpu_probe_retries;
 
+/*
+ * Governor availability fallback.  Some GKI builds do not register the
+ * governor the device (or this driver) asks for (e.g. 'simple_ondemand'
+ * when CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND is off).  devfreq_set_governor()
+ * then fails with -EINVAL and the device stays on the built-in 'dummy'
+ * governor.  We record the governor the device came up with and fall back
+ * to it instead of churning devfreq every tick.
+ */
+static char gpu_native_governor[DEVFREQ_NAME_LEN];
+static bool gpu_native_saved;
+static bool gpu_game_gov_missing;
+static bool gpu_active_gov_missing;
+static bool gpu_gov_warned;
+
 #define GPU_HIGH_LOAD_PCT 80
 #define GPU_HIGH_LOAD_DURATION_MS 500
 
@@ -160,6 +174,7 @@ static void gpu_governor_worker(struct work_struct *work)
 	bool game_active;
 	unsigned long idle_jiffies;
 	unsigned long total_ram_kb;
+	int ret;
 
 	df = gpu_resolve_devfreq();
 	if (IS_ERR_OR_NULL(df)) {
@@ -170,6 +185,12 @@ static void gpu_governor_worker(struct work_struct *work)
 			return;
 		}
 		goto resched;
+	}
+
+	if (!gpu_native_saved) {
+		strscpy(gpu_native_governor, df->governor_name,
+			DEVFREQ_NAME_LEN);
+		gpu_native_saved = true;
 	}
 
 	game_active = zenith_is_game_mode_active();
@@ -304,12 +325,60 @@ static void gpu_governor_worker(struct work_struct *work)
 		}
 	}
 
+	/*
+	 * Fall back to the governor the device came up with when a
+	 * requested governor is known to be unregistered or immutable
+	 * in this kernel.  Without this, devfreq_set_governor() fails
+	 * with -EINVAL and we re-attempt every tick (visible as a 5s
+	 * 'dummy -> simple_ondemand' flap in dmesg on MTK GKI builds
+	 * lacking the governor).
+	 *
+	 * Note: once a governor is marked unavailable, the governor-name
+	 * params are effectively locked until reboot -- we stop probing
+	 * the failing name to keep the flap dead.
+	 */
+	if (!game_active && gpu_active_gov_missing &&
+	    (!strcmp(target, gpu_active_governor) ||
+	     !strcmp(target, gpu_idle_governor)))
+		target = gpu_native_governor;
+	else if (game_active && gpu_game_gov_missing &&
+		 !strcmp(target, gpu_game_governor))
+		target = gpu_native_governor;
+
 	/* Only switch if the governor actually changed */
 	if (strcmp(df->governor_name, target)) {
-		pr_info("zenith_gpu_switch: %s: %s -> %s%s\n",
-			dev_name(&df->dev), df->governor_name, target,
-			game_active ? " (game on)" : "");
-		devfreq_set_governor(df, target);
+		ret = devfreq_set_governor(df, target);
+		if (ret == -EINVAL) {
+			/*
+			 * Governor not built into this kernel, or the
+			 * device's governor is immutable.  Remember it so
+			 * we stop retrying, and settle back on the native
+			 * governor instead of leaving devfreq half-switched.
+			 */
+			if (game_active)
+				gpu_game_gov_missing = true;
+			else if (!strcmp(target, gpu_active_governor) ||
+				 !strcmp(target, gpu_idle_governor))
+				gpu_active_gov_missing = true;
+			if (!gpu_gov_warned) {
+				pr_warn("zenith_gpu_switch: %s: governor '%s' "
+					"not available or immutable, keeping "
+					"'%s'\n",
+					dev_name(&df->dev), target,
+					gpu_native_governor);
+				gpu_gov_warned = true;
+			}
+			if (strcmp(df->governor_name, gpu_native_governor))
+				devfreq_set_governor(df, gpu_native_governor);
+		} else if (ret) {
+			pr_warn("zenith_gpu_switch: %s: set governor '%s' "
+				"failed (%d)\n", dev_name(&df->dev), target,
+				ret);
+		} else {
+			pr_info("zenith_gpu_switch: %s: %s -> %s%s\n",
+				dev_name(&df->dev), df->governor_name, target,
+				game_active ? " (game on)" : "");
+		}
 	} else {
 		gpu_debug("%s: already %s (game=%d)\n",
 			  dev_name(&df->dev), target, game_active);
