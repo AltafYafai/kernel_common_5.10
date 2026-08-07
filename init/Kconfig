@@ -1036,6 +1036,26 @@ config KAGUYA_INTERVAL
 	help
 	  Default interval between enforcement cycles.
 
+config KAGUYA_CMDLINE_SPOOF
+	bool "Kaguya boot argument spoofing (/proc/cmdline, /proc/bootconfig)"
+	depends on KAGUYA
+	default n
+	help
+	  Rewrites detection-sensitive boot arguments (verifiedbootstate,
+	  device_state, flash.locked, veritymode, selinux, warranty_bit)
+	  when /proc/cmdline and /proc/bootconfig are read, matching the
+	  values kaguya enforces via resetprop.  Keeps the property and
+	  raw-boot-text layers consistent so root-detection checks cannot
+	  spot a prop-vs-cmdline mismatch.
+
+	  Recovery and init-family processes keep the real values: recovery
+	  tools need the true state, and init must see the real veritymode.
+
+	  Off by default: upstream (SuiKernel) recommends validating the
+	  feature with it disabled first, before enabling it widely.
+
+	  If unsure, say N.
+
 config ZENITH_ALLOWLIST
 	bool "Zenith device boot allowlist"
 	depends on SMP

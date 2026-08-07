@@ -9,13 +9,26 @@
 #include <linux/seq_file.h>
 #include <linux/bootconfig.h>
 #include <linux/slab.h>
+#include <linux/kaguya.h>
 
 static char *saved_boot_config;
 
 static int boot_config_proc_show(struct seq_file *m, void *v)
 {
-	if (saved_boot_config)
+	if (saved_boot_config) {
+#ifdef CONFIG_KAGUYA_CMDLINE_SPOOF
+		char *spoofed = kaguya_spoof_boot_args(saved_boot_config, true);
+
+		if (spoofed) {
+			seq_puts(m, spoofed);
+			kfree(spoofed);
+		} else {
+			seq_puts(m, saved_boot_config);
+		}
+#else
 		seq_puts(m, saved_boot_config);
+#endif
+	}
 	return 0;
 }
 

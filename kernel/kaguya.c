@@ -27,6 +27,8 @@
 #include <linux/workqueue.h>
 #include <linux/umh.h>
 #include <linux/fs.h>
+#include <linux/sched.h>
+#include <linux/kaguya.h>
 
 /* ------------------------------------------------------------------ */
 /* Property store                                                      */
@@ -488,6 +490,112 @@ static void __exit kaguya_exit(void)
 	kobject_put(kaguya_kobj);
 	pr_info("kaguya: unloaded\n");
 }
+
+/* ------------------------------------------------------------------ */
+/* Boot argument spoofing (/proc/cmdline, /proc/bootconfig)             */
+/* ------------------------------------------------------------------ */
+/*
+ * kaguya enforces the ro.boot.* property values above via resetprop,
+ * but /proc/cmdline and /proc/bootconfig are generated from the raw
+ * boot text, NOT from the property store.  A detection that reads
+ * either file would see the real values and, worse, spot a mismatch
+ * between the (green) property and the (orange) raw text.  These
+ * tables rewrite the raw text to the values kaguya enforces so both
+ * layers always agree.
+ *
+ * Every replacement keeps the string the same length or shrinks it
+ * except a few small ones (e.g. "verifiedbootstate=red"->green grows
+ * by 3), so the +KAGUYA_SPOOF_SLACK headroom in
+ * kaguya_spoof_boot_args() is always sufficient.
+ */
+#ifdef CONFIG_KAGUYA_CMDLINE_SPOOF
+#define KAGUYA_SPOOF_SLACK		256
+
+struct kaguya_spoof_pair {
+	const char *from;
+	const char *to;
+};
+
+/* /proc/cmdline format: key=value (androidboot.* prefix matched via strstr) */
+static const struct kaguya_spoof_pair kaguya_spoof_cmdline[] = {
+	{ "verifiedbootstate=orange",	"verifiedbootstate=green" },
+	{ "verifiedbootstate=red",	"verifiedbootstate=green" },
+	{ "veritymode=logging",		"veritymode=enforcing" },
+	{ "veritymode=disabled",	"veritymode=enforcing" },
+	{ "flash.locked=0",		"flash.locked=1" },
+	{ "vbmeta.device_state=unlocked", "vbmeta.device_state=locked" },
+	{ "selinux=permissive",		"selinux=enforcing" },
+	{ "warranty_bit=1",		"warranty_bit=0" },
+};
+
+/* /proc/bootconfig format: key = "value" */
+static const struct kaguya_spoof_pair kaguya_spoof_bootconfig[] = {
+	{ "verifiedbootstate = \"orange\"", "verifiedbootstate = \"green\"" },
+	{ "device_state = \"unlocked\"",	"device_state = \"locked\"" },
+	{ "flash.locked = \"0\"",		"flash.locked = \"1\"" },
+	{ "veritymode = \"logging\"",		"veritymode = \"enforcing\"" },
+	{ "veritymode = \"disabled\"",	"veritymode = \"enforcing\"" },
+	{ "selinux = \"permissive\"",		"selinux = \"enforcing\"" },
+};
+
+/* In-place memmove-based replace; handles growth and shrink. */
+static void kaguya_safe_replace(char *str, const char *old_str,
+				const char *new_str)
+{
+	char *pos;
+	size_t old_len = strlen(old_str);
+	size_t new_len = strlen(new_str);
+
+	while ((pos = strstr(str, old_str))) {
+		size_t tail_len = strlen(pos + old_len);
+
+		memmove(pos + new_len, pos + old_len, tail_len + 1);
+		memcpy(pos, new_str, new_len);
+	}
+}
+
+char *kaguya_spoof_boot_args(const char *str, bool bootconfig)
+{
+	const struct kaguya_spoof_pair *pairs;
+	size_t npairs, i;
+	const char *comm = current->comm;
+	bool is_init, is_recovery;
+	char *buf;
+
+	/* init-family processes keep the real veritymode so the boot chain
+	 * sees the actual verity configuration; recovery tools need the
+	 * real state to function, so they get no spoof at all.
+	 */
+	is_init = (current->pid == 1 || strstr(comm, "init") ||
+		   strstr(comm, "ueventd") || strstr(comm, "vold"));
+	is_recovery = (strstr(comm, "recovery") || strstr(comm, "twrp") ||
+			strstr(comm, "orangefox") || strstr(comm, "pitchblack") ||
+			strstr(comm, "shrp"));
+
+	if (bootconfig) {
+		pairs = kaguya_spoof_bootconfig;
+		npairs = ARRAY_SIZE(kaguya_spoof_bootconfig);
+	} else {
+		pairs = kaguya_spoof_cmdline;
+		npairs = ARRAY_SIZE(kaguya_spoof_cmdline);
+	}
+
+	buf = kmalloc(strlen(str) + KAGUYA_SPOOF_SLACK, GFP_KERNEL);
+	if (!buf)
+		return NULL;
+	strscpy(buf, str, strlen(str) + 1);
+
+	if (is_recovery)
+		return buf;
+
+	for (i = 0; i < npairs; i++) {
+		if (is_init && strstr(pairs[i].from, "veritymode"))
+			continue;
+		kaguya_safe_replace(buf, pairs[i].from, pairs[i].to);
+	}
+	return buf;
+}
+#endif /* CONFIG_KAGUYA_CMDLINE_SPOOF */
 
 module_init(kaguya_init);
 module_exit(kaguya_exit);
