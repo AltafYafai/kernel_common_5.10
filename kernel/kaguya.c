@@ -67,7 +67,7 @@ static const struct kaguya_prop kaguya_default_props[] = {
 /* State                                                               */
 /* ------------------------------------------------------------------ */
 static DEFINE_MUTEX(kaguya_lock);
-static bool kaguya_enabled = true;
+static bool kaguya_enabled = false;
 static unsigned int kaguya_interval_ms = 5000;
 static struct delayed_work kaguya_work;
 
@@ -169,7 +169,8 @@ static const char *kaguya_resolve_resetprop(void)
 static void kaguya_enforce_work_fn(struct work_struct *work)
 {
 	if (!kaguya_enabled)
-		goto reschedule;
+		return; /* off by default (2026 audit): don't keep an empty
+			 * periodic wakeup alive; sysfs enabled=1 restarts it. */
 
 	mutex_lock(&kaguya_lock);
 
@@ -247,6 +248,9 @@ static ssize_t enabled_store(struct kobject *kobj,
 	if (kstrtouint(buf, 0, &val))
 		return -EINVAL;
 	kaguya_enabled = !!val;
+	if (kaguya_enabled && kaguya_interval_ms > 0)
+		schedule_delayed_work(&kaguya_work,
+				      msecs_to_jiffies(kaguya_interval_ms));
 	return count;
 }
 static struct kobj_attribute enabled_attr =
