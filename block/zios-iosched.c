@@ -44,6 +44,9 @@
 
 #define ZIOS_VERSION "2.0.0"
 
+/* How often the process-context maintenance work re-runs (see zios_periodic_work). */
+#define ZIOS_PERIODIC_INTERVAL	(30 * HZ)
+
 /*
  * Debug logging gated behind CONFIG_ZENITH_DEBUG_MSG.
  * Production (community) builds compile these out entirely.
@@ -120,6 +123,14 @@ struct zios_data {
 	struct kmem_cache	*rq_data_cache;
 	struct request_queue	*queue;
 	spinlock_t		lock;
+
+	/*
+	 * Periodic battery/thermal maintenance.  Runs in process context
+	 * because thermal_zone_get_temp() / power_supply_* take mutexes and
+	 * may perform I2C reads (i.e. they sleep).  Never call them from the
+	 * dispatch path -- see zios_periodic_work().
+	 */
+	struct delayed_work	periodic_work;
 
 	/* Boot-time profile */
 	bool			boot_mode;
@@ -461,6 +472,33 @@ static void zios_check_battery(struct zios_data *zd)
 	power_supply_put(psy);
 }
 
+/*
+ * Process-context maintenance work.
+ *
+ * zios_check_battery() / zios_check_thermal() must NOT run from
+ * .dispatch_request(): blk-mq invokes the scheduler dispatch op while
+ * holding hctx->lock (a spinlock) on classic 5.10 blk-mq, and even on
+ * the lockless variant it runs in the I/O hot path.  thermal_zone_get_temp()
+ * and the power_supply property reads take mutexes and can do I2C
+ * transfers, i.e. they sleep.  Sleeping there triggers
+ * "BUG: scheduling while atomic" in the submitting kworker (wb_workfn
+ * for writeback), corrupts its preempt_count, and later trips
+ * "workqueue leaked lock or atomic" -- which hangs the flusher and can
+ * end in a watchdog reboot.  So all of that is deferred here.
+ */
+static void zios_periodic_work(struct work_struct *work)
+{
+	struct zios_data *zd = container_of(work, struct zios_data,
+					    periodic_work.work);
+
+	if (zd->auto_power_efficient)
+		zios_check_battery(zd);
+	if (zd->auto_thermal_throttle)
+		zios_check_thermal(zd);
+
+	schedule_delayed_work(&zd->periodic_work, ZIOS_PERIODIC_INTERVAL);
+}
+
 /* ---------- dispatch ---------- */
 
 static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
@@ -479,14 +517,10 @@ static struct request *zios_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	game_mode = zd->game_mode;
 	boot_mode = zd->boot_mode;
 
-	if (zd->auto_power_efficient &&
-	    time_after(jiffies, zd->last_power_check + 60 * HZ))
-		zios_check_battery(zd);
-
-	if (zd->auto_thermal_throttle &&
-	    time_after(jiffies, zd->last_thermal_check + 30 * HZ))
-		zios_check_thermal(zd);
-
+	/*
+	 * Battery/thermal state is maintained by zios_periodic_work() in
+	 * process context -- see the note there for why it cannot run here.
+	 */
 	spin_lock(&zd->lock);
 
 	if (game_mode) {
@@ -924,6 +958,9 @@ static void zios_exit_sched(struct elevator_queue *e)
 {
 	struct zios_data *zd = e->elevator_data;
 
+	/* Stop maintenance before tearing anything down. */
+	cancel_delayed_work_sync(&zd->periodic_work);
+
 	WARN_ON_ONCE(!list_empty(&zd->sync_read_list));
 	WARN_ON_ONCE(!list_empty(&zd->async_read_list));
 	WARN_ON_ONCE(!list_empty(&zd->write_list));
@@ -1047,6 +1084,10 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	zd->workload = ZIOS_WORKLOAD_BALANCED;
 
 	spin_lock_init(&zd->lock);
+
+	INIT_DELAYED_WORK(&zd->periodic_work, zios_periodic_work);
+	schedule_delayed_work(&zd->periodic_work, ZIOS_PERIODIC_INTERVAL);
+
 	zd->queue = q;
 	eq->elevator_data = zd;
 	q->elevator = eq;
