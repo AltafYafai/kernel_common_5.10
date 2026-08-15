@@ -72,30 +72,38 @@ static struct {
 
 static inline int lucid_read_oom_adj(struct task_struct *task)
 {
+	struct sighand_struct *sighand;
+	unsigned long flags;
+	int val = 0;
+
 	/*
-	 * task->signal is valid as long as we hold a task ref,
-	 * but task->sighand can be NULL if the task is exiting.
-	 * Return 0 (default oom_score_adj) in that case.
+	 * lock_task_sighand() takes the sighand ref and returns NULL
+	 * (without locking) when the task is exiting and sighand is
+	 * gone -- closing the race between a NULL check and the
+	 * siglock deref on a dying task.
 	 */
-	if (unlikely(!task->sighand || !task->signal))
-		return 0;
-	return task->signal->oom_score_adj;
+	sighand = lock_task_sighand(task, &flags);
+	if (sighand) {
+		if (task->signal)
+			val = task->signal->oom_score_adj;
+		unlock_task_sighand(task, &flags);
+	}
+	return val;
 }
 
 static void lucid_write_oom_adj(struct task_struct *task, int val)
 {
+	struct sighand_struct *sighand;
 	unsigned long flags;
 
-	/*
-	 * Exiting tasks may have sighand set to NULL before the
-	 * task ref count drops to zero.  Skip those silently.
-	 */
-	if (unlikely(!task->sighand || !task->signal))
+	/* Exiting tasks: sighand gone, nothing to do (race-safe). */
+	sighand = lock_task_sighand(task, &flags);
+	if (!sighand)
 		return;
 
-	spin_lock_irqsave(&task->sighand->siglock, flags);
-	task->signal->oom_score_adj = val;
-	spin_unlock_irqrestore(&task->sighand->siglock, flags);
+	if (task->signal)
+		task->signal->oom_score_adj = val;
+	unlock_task_sighand(task, &flags);
 }
 
 /* ------------------------------------------------------------------ */
