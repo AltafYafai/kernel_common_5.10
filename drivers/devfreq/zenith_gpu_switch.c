@@ -128,6 +128,34 @@ static bool gpu_exiting;
 static unsigned int gpu_probe_retries;
 
 /*
+ * Master enable.  Off by default: this kernel is meant to boot stock-sane
+ * on every GKI device, and GPU governor auto-switching is an opt-in game
+ * feature.  Writing 1 at runtime starts the worker immediately; writing 0
+ * stops it at the next scheduled run.
+ */
+static bool gpu_enabled;
+
+static int gpu_enabled_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (ret)
+		return ret;
+	if (gpu_enabled && !gpu_exiting) {
+		gpu_probe_retries = 0;
+		mod_delayed_work(system_unbound_wq, &gpu_governor_work, 0);
+	}
+	return 0;
+}
+static const struct kernel_param_ops gpu_enabled_ops = {
+	.set = gpu_enabled_set,
+	.get = param_get_bool,
+};
+module_param_cb(enabled, &gpu_enabled_ops, &gpu_enabled, 0644);
+MODULE_PARM_DESC(enabled,
+		 "Master switch (default: 0 = disabled, opt-in)");
+
+/*
  * Governor availability fallback.  Some GKI builds do not register the
  * governor the device (or this driver) asks for (e.g. 'simple_ondemand'
  * when CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND is off).  devfreq_set_governor()
@@ -162,6 +190,10 @@ static void gpu_governor_worker(struct work_struct *work)
 	unsigned long idle_jiffies;
 	unsigned long total_ram_kb;
 	int ret;
+
+	/* Master switch: stay fully inert when disabled (the default). */
+	if (!gpu_enabled)
+		return;
 
 	df = gpu_resolve_devfreq();
 	if (IS_ERR_OR_NULL(df)) {
@@ -353,6 +385,8 @@ resched:
 static int gpu_game_mode_notifier_cb(struct notifier_block *nb,
 				 unsigned long action, void *data)
 {
+	if (!gpu_enabled)
+		return NOTIFY_OK;
 	mod_delayed_work(system_unbound_wq, &gpu_governor_work, 0);
 	printk(KERN_INFO "GrayRavens: zenith_gpu_switch: game mode %s\n",
 	       action ? "ON" : "OFF");
@@ -367,10 +401,12 @@ static int __init zenith_gpu_switch_init(void)
 
 	gpu_last_game_active_jiffies = jiffies;
 	INIT_DELAYED_WORK(&gpu_governor_work, gpu_governor_worker);
-	queue_delayed_work(system_unbound_wq, &gpu_governor_work, 0);
+	if (gpu_enabled)
+		queue_delayed_work(system_unbound_wq, &gpu_governor_work, 0);
 
-	pr_info("zenith_gpu_switch: watching '%s' (notifier + 5s watchdog)\n",
-		gpu_devfreq_name);
+	pr_info("zenith_gpu_switch: %s (notifier registered)\n",
+		gpu_enabled ? "enabled" :
+		"disabled by default -- opt-in via /sys/module/zenith_gpu_switch/parameters/enabled");
 	return 0;
 }
 
