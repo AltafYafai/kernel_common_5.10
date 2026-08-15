@@ -31,6 +31,7 @@
 #include <linux/cgroup.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/cputime.h>
+#include <linux/sched/stat.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
@@ -58,9 +59,17 @@ int selene_unregister_notifier(struct notifier_block *nb)
 static DEFINE_MUTEX(selene_lock);
 
 /* Auto-scan interval in ms (0 = disabled) */
-static unsigned int selene_scan_interval_ms = 500;
+static unsigned int selene_scan_interval_ms = 1000;
 static struct delayed_work selene_scan_work;
 static bool selene_scan_running;
+
+/* Idle-skip bookkeeping: only walk the task list when a process
+ * forked or exited since the last scan (total_forks / nr_threads
+ * moved), or a game is currently active.  Avoids two full task
+ * walks per second on an idle device.
+ */
+static unsigned long selene_last_forks;
+static unsigned int selene_last_nr_threads;
 
 /* Current detected game (NULL if none) */
 static char *selene_active_game;
@@ -225,6 +234,23 @@ static void selene_scan_work_fn(struct work_struct *work)
 	if (!selene_scan_running)
 		return;
 
+	/*
+	 * Idle-skip: when no game is active and no process has forked or
+	 * exited since the last scan, nothing could have become (or stopped
+	 * being) a game, so skip the full task walk and just re-arm the
+	 * timer.  total_forks / nr_threads are cheap atomic reads.  Android
+	 * launches games via Zygote fork (moves nr_threads) and games exit
+	 * as a thread group (also moves nr_threads), so both transitions
+	 * are caught; exec-in-place into a game binary without a fork is
+	 * not how Android starts games and is the only missed case.
+	 */
+	if (!selene_active_is_game &&
+	    total_forks == selene_last_forks &&
+	    nr_threads == selene_last_nr_threads)
+		goto resched;
+	selene_last_forks = total_forks;
+	selene_last_nr_threads = nr_threads;
+
 	/* Phase 1: collect candidate PID under RCU (fast, no sleeping) */
 	rcu_read_lock();
 	for_each_process(p) {
@@ -286,6 +312,7 @@ static void selene_scan_work_fn(struct work_struct *work)
 		selene_set_game(NULL, 0);
 	}
 
+resched:
 	if (selene_scan_running && selene_scan_interval_ms > 0)
 		schedule_delayed_work(&selene_scan_work,
 				      msecs_to_jiffies(selene_scan_interval_ms));
