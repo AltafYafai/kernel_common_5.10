@@ -21,6 +21,7 @@
 
 #include <trace/events/thermal.h>
 
+#include "kasumi.h"
 #include "thermal_core.h"
 
 int get_tz_trend(struct thermal_zone_device *tz, int trip)
@@ -107,6 +108,10 @@ int thermal_zone_get_temp(struct thermal_zone_device *tz, int *temp)
 		if (!ret && *temp < crit_temp)
 			*temp = tz->emul_temperature;
 	}
+
+	/* Kasumi thermal dampening (skip zones excluded by zone_filter) */
+	if (!ret && kasumi_zone_allowed(tz->type))
+		*temp = kasumi_dampen(*temp, tz->type);
 
 	mutex_unlock(&tz->lock);
 exit:
