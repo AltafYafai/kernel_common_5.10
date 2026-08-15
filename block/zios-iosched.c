@@ -57,6 +57,14 @@
 #define zios_debug(fmt, ...)	no_printk(KERN_DEBUG "zios: " fmt, ##__VA_ARGS__)
 #endif
 
+/*
+ * Dedicated workqueue for the per-queue maintenance work.  The battery
+ * and thermal probes (power_supply_* / thermal_zone_get_temp) can sleep
+ * on I2C / mutexes; running them on the shared system_wq would stall
+ * unrelated system_wq users for the duration of every probe.
+ */
+static struct workqueue_struct *zios_wq;
+
 /* Per-request scheduler data */
 struct zios_rq_data {
 	struct request *rq;
@@ -496,7 +504,8 @@ static void zios_periodic_work(struct work_struct *work)
 	if (zd->auto_thermal_throttle)
 		zios_check_thermal(zd);
 
-	schedule_delayed_work(&zd->periodic_work, ZIOS_PERIODIC_INTERVAL);
+	queue_delayed_work(zios_wq, &zd->periodic_work,
+			   ZIOS_PERIODIC_INTERVAL);
 }
 
 /* ---------- dispatch ---------- */
@@ -1086,7 +1095,8 @@ static int zios_init_sched(struct request_queue *q, struct elevator_type *e)
 	spin_lock_init(&zd->lock);
 
 	INIT_DELAYED_WORK(&zd->periodic_work, zios_periodic_work);
-	schedule_delayed_work(&zd->periodic_work, ZIOS_PERIODIC_INTERVAL);
+	queue_delayed_work(zios_wq, &zd->periodic_work,
+			   ZIOS_PERIODIC_INTERVAL);
 
 	zd->queue = q;
 	eq->elevator_data = zd;
@@ -1547,6 +1557,10 @@ MODULE_ALIAS("mq-zios-iosched");
 
 static int __init zios_init(void)
 {
+	zios_wq = alloc_workqueue("zios", WQ_UNBOUND, 0);
+	if (!zios_wq)
+		return -ENOMEM;
+
 	pr_info("ZIOS I/O Scheduler v%s loaded\n", ZIOS_VERSION);
 	return elv_register(&mq_zios);
 }
@@ -1554,6 +1568,8 @@ static int __init zios_init(void)
 static void __exit zios_exit(void)
 {
 	elv_unregister(&mq_zios);
+	if (zios_wq)
+		destroy_workqueue(zios_wq);
 }
 
 module_init(zios_init);
