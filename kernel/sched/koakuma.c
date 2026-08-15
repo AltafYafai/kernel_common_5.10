@@ -68,8 +68,11 @@ static void koakuma_preload_work_fn(struct work_struct *work)
 		return;
 
 	mm = get_task_mm(task);
-	if (!mm)
+	if (!mm) {
+		/* Game task already exited -- release the ref we took. */
+		put_task_struct(task);
 		return;
+	}
 
 	mmap_read_lock(mm);
 
