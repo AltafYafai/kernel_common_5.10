@@ -125,16 +125,6 @@ static unsigned long gpu_last_game_active_jiffies;
 static bool gpu_prev_game_active;
 static bool gpu_exiting;
 
-/*
- * High GPU load tracking.  When the GPU runs above 80%% of its max
- * frequency for more than 500 ms cumulative (across consecutive
- * worker runs), the governor is promoted to 'performance' even
- * without game mode.  This catches non-game GPU-heavy workloads
- * (camera, GPU compute, UI rendering) that benefit from the
- * performance governor.
- */
-static unsigned long gpu_high_load_start_jiffies;
-static unsigned int gpu_high_load_promoted;
 static unsigned int gpu_probe_retries;
 
 /*
@@ -150,9 +140,6 @@ static bool gpu_native_saved;
 static bool gpu_game_gov_missing;
 static bool gpu_active_gov_missing;
 static bool gpu_gov_warned;
-
-#define GPU_HIGH_LOAD_PCT 80
-#define GPU_HIGH_LOAD_DURATION_MS 500
 
 /*
  * Resolve the GPU devfreq device.  If gpu_devfreq_name is set (non-empty),
@@ -266,63 +253,23 @@ static void gpu_governor_worker(struct work_struct *work)
 	if (game_active) {
 		target = gpu_game_governor;
 		gpu_last_game_active_jiffies = jiffies;
-		gpu_high_load_promoted = 0;
 	} else {
-		unsigned long max_freq = df->scaling_max_freq;
 		unsigned long cur_freq = df->previous_freq;
-		bool is_high_load = max_freq > 0 &&
-				    cur_freq > (max_freq * GPU_HIGH_LOAD_PCT / 100);
-		/*
-		 * Direct GPU load monitoring: when the GPU runs above 80%
-		 * of max frequency for more than 500ms, promote to the
-		 * game governor even without game mode.  Catches non-game
-		 * GPU-heavy workloads (camera, compute, UI rendering).
-		 */
-		if (is_high_load) {
-			if (!gpu_high_load_start_jiffies)
-				gpu_high_load_start_jiffies = jiffies;
-			if (!gpu_high_load_promoted &&
-			    time_after(jiffies,
-				       gpu_high_load_start_jiffies +
-				       msecs_to_jiffies(GPU_HIGH_LOAD_DURATION_MS))) {
-				target = gpu_game_governor;
-				gpu_high_load_promoted = 1;
-				pr_info("zenith_gpu_switch: %s: GPU high load "
-					"(>%u%% for >%ums), %s\n",
-					dev_name(&df->dev),
-					GPU_HIGH_LOAD_PCT,
-					GPU_HIGH_LOAD_DURATION_MS,
-					gpu_game_governor);
-			}
-		} else {
-			gpu_high_load_start_jiffies = 0;
-			if (gpu_high_load_promoted) {
-				gpu_high_load_promoted = 0;
-				pr_info("zenith_gpu_switch: %s: GPU load normal, "
-					"reverting to %s\n",
-					dev_name(&df->dev),
-					gpu_active_governor);
-			}
-		}
 
 		/*
 		 * GPU activity detection: if the GPU's current frequency is
 		 * above the minimum OPP, reset the idle timer so the
-		 * governor stays on simple_ondemand.
+		 * governor stays on the active governor.
 		 */
 		if (cur_freq > df->scaling_min_freq)
 			gpu_last_game_active_jiffies = jiffies;
 
-		if (gpu_high_load_promoted)
-			target = gpu_game_governor;
-		else {
-			idle_jiffies = jiffies - gpu_last_game_active_jiffies;
-			if (gpu_idle_ms > 0 &&
-			    jiffies_to_msecs(idle_jiffies) >= gpu_idle_ms)
-				target = gpu_idle_governor;
-			else
-				target = gpu_active_governor;
-		}
+		idle_jiffies = jiffies - gpu_last_game_active_jiffies;
+		if (gpu_idle_ms > 0 &&
+		    jiffies_to_msecs(idle_jiffies) >= gpu_idle_ms)
+			target = gpu_idle_governor;
+		else
+			target = gpu_active_governor;
 	}
 
 	/*
