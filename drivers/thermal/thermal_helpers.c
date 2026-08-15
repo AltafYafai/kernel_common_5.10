@@ -21,6 +21,7 @@
 
 #include <trace/events/thermal.h>
 
+#include "iyashi.h"
 #include "kasumi.h"
 #include "thermal_core.h"
 
@@ -211,6 +212,13 @@ void thermal_cdev_update(struct thermal_cooling_device *cdev)
 		if (instance->target > target)
 			target = instance->target;
 	}
+
+	/*
+	 * Iyashi may relax the chosen target when the bound zones are
+	 * still far from their trip points.  Called under cdev->lock so
+	 * iyashi_clamp_target() can safely walk &cdev->thermal_instances.
+	 */
+	target = iyashi_clamp_target(cdev, target);
 
 	thermal_cdev_set_cur_state(cdev, target);
 
