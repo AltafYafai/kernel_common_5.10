@@ -993,69 +993,6 @@ config KOAKUMA
 
 	  If unsure, say Y.
 
-config KAGUYA
-	bool "Kaguya kernel safeprop enforcer"
-	depends on SMP
-	default y
-	help
-	  Periodically enforces a set of Android system properties
-	  by calling resetprop via usermodehelper.  Property list
-	  is configurable via /sys/kernel/kaguya/
-
-	  If unsure, say Y.
-
-config KAGUYA_PROPS_MAX
-	int "Maximum number of safeproperties"
-	depends on KAGUYA
-	range 1 256
-	default 32
-	help
-	  Maximum number of properties Kaguya can track.
-
-config KAGUYA_PROP_NAME_LEN
-	int "Maximum property name length"
-	depends on KAGUYA
-	range 1 128
-	default 64
-	help
-	  Maximum length of property names tracked by Kaguya.
-
-config KAGUYA_PROP_VAL_LEN
-	int "Maximum property value length"
-	depends on KAGUYA
-	range 1 256
-	default 128
-	help
-	  Maximum length of property values tracked by Kaguya.
-
-config KAGUYA_INTERVAL
-	int "Default enforcement interval (ms)"
-	depends on KAGUYA
-	range 100 60000
-	default 5000
-	help
-	  Default interval between enforcement cycles.
-
-config KAGUYA_CMDLINE_SPOOF
-	bool "Kaguya boot argument spoofing (/proc/cmdline, /proc/bootconfig)"
-	depends on KAGUYA
-	default n
-	help
-	  Rewrites detection-sensitive boot arguments (verifiedbootstate,
-	  device_state, flash.locked, veritymode, selinux, warranty_bit)
-	  when /proc/cmdline and /proc/bootconfig are read, matching the
-	  values kaguya enforces via resetprop.  Keeps the property and
-	  raw-boot-text layers consistent so root-detection checks cannot
-	  spot a prop-vs-cmdline mismatch.
-
-	  Recovery and init-family processes keep the real values: recovery
-	  tools need the true state, and init must see the real veritymode.
-
-	  Off by default: upstream (SuiKernel) recommends validating the
-	  feature with it disabled first, before enabling it widely.
-
-	  If unsure, say N.
-
 config ZENITH_ALLOWLIST
 	bool "Zenith device boot allowlist"
 	depends on SMP
