@@ -320,6 +320,15 @@ static ssize_t props_add_store(struct kobject *kobj,
 	if (vlen == 0 || vlen >= KAGUYA_PROP_VAL_LEN)
 		return -EINVAL;
 
+	/*
+	 * The enforcement tick builds `sh -c "resetprop 'name' 'value' && ..."`
+	 * -- a single quote in either field would break out of the quoting and
+	 * inject arbitrary shell commands.  Reject it outright (the default
+	 * prop table never contains quotes).
+	 */
+	if (memchr(buf, '\'', nlen) || memchr(eq + 1, '\'', vlen))
+		return -EINVAL;
+
 	memcpy(name, buf, nlen);
 	name[nlen] = '\0';
 	memcpy(value, eq + 1, vlen);
