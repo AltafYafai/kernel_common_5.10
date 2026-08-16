@@ -1009,6 +1009,19 @@ config ZENITH_ALLOWLIST_DEVICE_STRING
 	help
 	  ro.product.board value that the allowlist checks against.
 
+config KAIHO
+	bool "Kaiho (kernel-side forced permissive)"
+	default n
+	help
+	  Make ROM permissive via kernel side: boots SELinux permissive
+	  regardless of the bootloader/ramdisk enforcing state, and
+	  clamps writes to /sys/fs/selinux/enforce to 0 so enforcing
+	  can never be re-enabled at runtime.  Builds of this branch
+	  also carry a -KAIHO suffix in the kernel release (uname -r).
+
+	  Ported from SuiKernel (Kanagawa Yamada) and rebranded for
+	  GrayRavens.  If unsure, say N.
+
 
 #
 # For architectures that want to enable the support for NUMA-affine scheduler
