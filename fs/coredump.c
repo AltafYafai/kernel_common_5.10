@@ -42,7 +42,6 @@
 #include <linux/path.h>
 #include <linux/timekeeping.h>
 #include <linux/elf.h>
-#include <uapi/linux/pidfd.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
@@ -54,15 +53,6 @@
 
 #include <trace/events/sched.h>
 
-static bool dump_vma_snapshot(struct coredump_params *cprm);
-static void free_vma_snapshot(struct coredump_params *cprm);
-
-/*
- * File descriptor number for the pidfd for the thread-group leader of
- * the coredumping task installed into the usermode helper's file
- * descriptor table.
- */
-#define COREDUMP_PIDFD_NUMBER 3
 
 int core_uses_pid;
 unsigned int core_pipe_limit;
@@ -335,27 +325,6 @@ static int format_corename(struct core_name *cn, struct coredump_params *cprm,
 				err = cn_printf(cn, "%lu",
 					      rlimit(RLIMIT_CORE));
 				break;
-			/* pidfd number */
-			case 'F': {
-				/*
-				 * Installing a pidfd only makes sense if
-				 * we actually spawn a usermode helper.
-				 */
-				if (!ispipe)
-					break;
-
-				/*
-				 * Note that we'll install a pidfd for the
-				 * thread-group leader. We know that task
-				 * linkage hasn't been removed yet and even if
-				 * this @current isn't the actual thread-group
-				 * leader we know that the thread-group leader
-				 * cannot be reaped until @current has exited.
-				 */
-				cprm->pid = task_tgid(current);
-				err = cn_printf(cn, "%d", COREDUMP_PIDFD_NUMBER);
-				break;
-			}
 			default:
 				break;
 			}
@@ -579,7 +548,7 @@ static void wait_for_dump_helpers(struct file *file)
 }
 
 /*
- * umh_coredump_setup
+ * umh_pipe_setup
  * helper function to customize the process used
  * to collect the core in userspace.  Specifically
  * it sets up a pipe and installs it as fd 0 (stdin)
@@ -589,62 +558,27 @@ static void wait_for_dump_helpers(struct file *file)
  * is a special value that we use to trap recursive
  * core dumps
  */
-static int umh_coredump_setup(struct subprocess_info *info, struct cred *new)
+static int umh_pipe_setup(struct subprocess_info *info, struct cred *new)
 {
 	struct file *files[2];
-	struct file *pidfs_file = NULL;
 	struct coredump_params *cp = (struct coredump_params *)info->data;
 	int err;
 
-	if (cp->pid) {
-		int fd;
-
-		fd = pidfd_prepare(cp->pid, 0, &pidfs_file);
-		if (fd < 0)
-			return fd;
-
-		/*
-		 * We don't care about the fd. We also cannot simply
-		 * replace it below because dup2() will refuse to close
-		 * this file descriptor if its in a larval state. So
-		 * close it!
-		 */
-		put_unused_fd(fd);
-
-		/*
-		 * Usermode helpers are childen of either
-		 * system_unbound_wq or of kthreadd. So we know that
-		 * we're starting off with a clean file descriptor
-		 * table. So we should always be able to use
-		 * COREDUMP_PIDFD_NUMBER as our file descriptor value.
-		 */
-		err = replace_fd(COREDUMP_PIDFD_NUMBER, pidfs_file, 0);
-		if (err < 0)
-			goto out_fail;
-
-		pidfs_file = NULL;
-	}
-
 	err = create_pipe_files(files, 0);
 	if (err)
-		goto out_fail;
+		return err;
 
 	cp->file = files[1];
 
 	err = replace_fd(0, files[0], 0);
 	fput(files[0]);
 	if (err < 0)
-		goto out_fail;
+		return err;
 
 	/* and disallow core files too */
 	current->signal->rlim[RLIMIT_CORE] = (struct rlimit){1, 1};
 
-	err = 0;
-
-out_fail:
-	if (pidfs_file)
-		fput(pidfs_file);
-	return err;
+	return 0;
 }
 
 void do_coredump(const kernel_siginfo_t *siginfo)
@@ -659,6 +593,7 @@ void do_coredump(const kernel_siginfo_t *siginfo)
 	int ispipe;
 	size_t *argv = NULL;
 	int argc = 0;
+	struct files_struct *displaced;
 	/* require nonrelative corefile path and be extra careful */
 	bool need_suid_safe = false;
 	bool core_dumped = false;
@@ -673,7 +608,6 @@ void do_coredump(const kernel_siginfo_t *siginfo)
 		 * by any locks.
 		 */
 		.mm_flags = mm->flags,
-		.vma_meta = NULL,
 	};
 
 	audit_core_dumps(siginfo->si_signo);
@@ -720,7 +654,7 @@ void do_coredump(const kernel_siginfo_t *siginfo)
 		}
 
 		if (cprm.limit == 1) {
-			/* See umh_coredump_setup() which sets RLIMIT_CORE = 1.
+			/* See umh_pipe_setup() which sets RLIMIT_CORE = 1.
 			 *
 			 * Normally core limits are irrelevant to pipes, since
 			 * we're not writing to the file system, but we use
@@ -765,7 +699,7 @@ void do_coredump(const kernel_siginfo_t *siginfo)
 		retval = -ENOMEM;
 		sub_info = call_usermodehelper_setup(helper_argv[0],
 						helper_argv, NULL, GFP_KERNEL,
-						umh_coredump_setup, NULL, &cprm);
+						umh_pipe_setup, NULL, &cprm);
 		if (sub_info)
 			retval = call_usermodehelper_exec(sub_info,
 							  UMH_WAIT_EXEC);
@@ -865,9 +799,11 @@ void do_coredump(const kernel_siginfo_t *siginfo)
 	}
 
 	/* get us an unshared descriptor table; almost always a no-op */
-	retval = unshare_files();
+	retval = unshare_files(&displaced);
 	if (retval)
 		goto close_fail;
+	if (displaced)
+		put_files_struct(displaced);
 	if (!dump_interrupted()) {
 		/*
 		 * umh disabled with CONFIG_STATIC_USERMODEHELPER_PATH="" would
@@ -877,13 +813,9 @@ void do_coredump(const kernel_siginfo_t *siginfo)
 			pr_info("Core dump to |%s disabled\n", cn.corename);
 			goto close_fail;
 		}
-		if (!dump_vma_snapshot(&cprm))
-			goto close_fail;
-
 		file_start_write(cprm.file);
 		core_dumped = binfmt->core_dump(&cprm);
 		file_end_write(cprm.file);
-		free_vma_snapshot(&cprm);
 	}
 	if (ispipe && core_pipe_limit)
 		wait_for_dump_helpers(cprm.file);
@@ -975,7 +907,7 @@ int dump_user_range(struct coredump_params *cprm, unsigned long start,
 
 			stop = !dump_emit(cprm, kaddr, PAGE_SIZE);
 			kunmap(page);
-			put_page(page);
+			put_user_page(page);
 		} else {
 			stop = !dump_skip(cprm, PAGE_SIZE);
 		}
@@ -1155,29 +1087,18 @@ static struct vm_area_struct *next_vma(struct vm_area_struct *this_vma,
 	return gate_vma;
 }
 
-static void free_vma_snapshot(struct coredump_params *cprm)
-{
-	if (cprm->vma_meta) {
-		int i;
-		for (i = 0; i < cprm->vma_count; i++) {
-			struct file *file = cprm->vma_meta[i].file;
-			if (file)
-				fput(file);
-		}
-		kvfree(cprm->vma_meta);
-		cprm->vma_meta = NULL;
-	}
-}
-
 /*
  * Under the mmap_lock, take a snapshot of relevant information about the task's
  * VMAs.
  */
-static bool dump_vma_snapshot(struct coredump_params *cprm)
+int dump_vma_snapshot(struct coredump_params *cprm, int *vma_count,
+		      struct core_vma_metadata **vma_meta,
+		      size_t *vma_data_size_ptr)
 {
 	struct vm_area_struct *vma, *gate_vma;
 	struct mm_struct *mm = current->mm;
 	int i;
+	size_t vma_data_size = 0;
 
 	/*
 	 * Once the stack expansion code is fixed to not change VMA bounds
@@ -1185,37 +1106,36 @@ static bool dump_vma_snapshot(struct coredump_params *cprm)
 	 * mmap_lock in read mode.
 	 */
 	if (mmap_write_lock_killable(mm))
-		return false;
+		return -EINTR;
 
-	cprm->vma_data_size = 0;
 	gate_vma = get_gate_vma(mm);
-	cprm->vma_count = mm->map_count + (gate_vma ? 1 : 0);
+	*vma_count = mm->map_count + (gate_vma ? 1 : 0);
 
-	cprm->vma_meta = kvmalloc_array(cprm->vma_count, sizeof(*cprm->vma_meta), GFP_KERNEL);
-	if (!cprm->vma_meta) {
+	*vma_meta = kvmalloc_array(*vma_count, sizeof(**vma_meta), GFP_KERNEL);
+	if (!*vma_meta) {
 		mmap_write_unlock(mm);
-		return false;
+		return -ENOMEM;
 	}
 
 	for (i = 0, vma = first_vma(current, gate_vma); vma != NULL;
 			vma = next_vma(vma, gate_vma), i++) {
-		struct core_vma_metadata *m = cprm->vma_meta + i;
+		struct core_vma_metadata *m = (*vma_meta) + i;
 
 		m->start = vma->vm_start;
 		m->end = vma->vm_end;
 		m->flags = vma->vm_flags;
 		m->dump_size = vma_dump_size(vma, cprm->mm_flags);
-		m->pgoff = vma->vm_pgoff;
-
-		m->file = vma->vm_file;
-		if (m->file)
-			get_file(m->file);
 	}
 
 	mmap_write_unlock(mm);
 
-	for (i = 0; i < cprm->vma_count; i++) {
-		struct core_vma_metadata *m = cprm->vma_meta + i;
+	if (WARN_ON(i != *vma_count)) {
+		kvfree(*vma_meta);
+		return -EFAULT;
+	}
+
+	for (i = 0; i < *vma_count; i++) {
+		struct core_vma_metadata *m = (*vma_meta) + i;
 
 		if (m->dump_size == DUMP_SIZE_MAYBE_ELFHDR_PLACEHOLDER) {
 			char elfmag[SELFMAG];
@@ -1228,8 +1148,9 @@ static bool dump_vma_snapshot(struct coredump_params *cprm)
 			}
 		}
 
-		cprm->vma_data_size += m->dump_size;
+		vma_data_size += m->dump_size;
 	}
 
-	return true;
+	*vma_data_size_ptr = vma_data_size;
+	return 0;
 }

@@ -240,18 +240,11 @@ static inline __be32 tunnel_id_to_key32(__be64 tun_id)
 static inline void ip_tunnel_init_flow(struct flowi4 *fl4,
 				       int proto,
 				       __be32 daddr, __be32 saddr,
-				       __be32 key, __u8 tos,
-				       struct net *net, int oif,
+				       __be32 key, __u8 tos, int oif,
 				       __u32 mark, __u32 tun_inner_hash)
 {
 	memset(fl4, 0, sizeof(*fl4));
-
-	if (oif) {
-		fl4->flowi4_l3mdev = l3mdev_master_upper_ifindex_by_index(net, oif);
-		/* Legacy VRF/l3mdev use case */
-		fl4->flowi4_oif = fl4->flowi4_l3mdev ? 0 : oif;
-	}
-
+	fl4->flowi4_oif = oif;
 	fl4->daddr = daddr;
 	fl4->saddr = saddr;
 	fl4->flowi4_tos = tos;
@@ -514,14 +507,15 @@ static inline void iptunnel_xmit_stats(struct net_device *dev, int pkt_len)
 		tstats->tx_packets++;
 		u64_stats_update_end(&tstats->syncp);
 		put_cpu_ptr(tstats);
-		return;
-	}
-
-	if (pkt_len < 0) {
-		DEV_STATS_INC(dev, tx_errors);
-		DEV_STATS_INC(dev, tx_aborted_errors);
 	} else {
-		DEV_STATS_INC(dev, tx_dropped);
+		struct net_device_stats *err_stats = &dev->stats;
+
+		if (pkt_len < 0) {
+			err_stats->tx_errors++;
+			err_stats->tx_aborted_errors++;
+		} else {
+			err_stats->tx_dropped++;
+		}
 	}
 }
 

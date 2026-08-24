@@ -283,6 +283,42 @@ int rpmsg_trysend_offchannel(struct rpmsg_endpoint *ept, u32 src, u32 dst,
 }
 EXPORT_SYMBOL(rpmsg_trysend_offchannel);
 
+/**
+ * rpmsg_get_signals() - get the signals for this endpoint
+ * @ept:	the rpmsg endpoint
+ *
+ * Returns signal bits on success and an appropriate error value on failure.
+ */
+int rpmsg_get_signals(struct rpmsg_endpoint *ept)
+{
+	if (WARN_ON(!ept))
+		return -EINVAL;
+	if (!ept->ops->get_signals)
+		return -ENXIO;
+
+	return ept->ops->get_signals(ept);
+}
+EXPORT_SYMBOL(rpmsg_get_signals);
+
+/**
+ * rpmsg_set_signals() - set the remote signals for this endpoint
+ * @ept:	the rpmsg endpoint
+ * @set:	set mask for signals
+ * @clear:	clear mask for signals
+ *
+ * Returns 0 on success and an appropriate error value on failure.
+ */
+int rpmsg_set_signals(struct rpmsg_endpoint *ept, u32 set, u32 clear)
+{
+	if (WARN_ON(!ept))
+		return -EINVAL;
+	if (!ept->ops->set_signals)
+		return -ENXIO;
+
+	return ept->ops->set_signals(ept, set, clear);
+}
+EXPORT_SYMBOL(rpmsg_set_signals);
+
 /*
  * match a rpmsg channel with a channel info struct.
  * this is used to make sure we're not creating rpmsg devices for channels
@@ -326,38 +362,50 @@ field##_show(struct device *dev,					\
 }									\
 static DEVICE_ATTR_RO(field);
 
+#define rpmsg_string_attr(field, member)				\
+static ssize_t								\
+field##_store(struct device *dev, struct device_attribute *attr,	\
+	      const char *buf, size_t sz)				\
+{									\
+	struct rpmsg_device *rpdev = to_rpmsg_device(dev);		\
+	const char *old;						\
+	char *new;							\
+									\
+	new = kstrndup(buf, sz, GFP_KERNEL);				\
+	if (!new)							\
+		return -ENOMEM;						\
+	new[strcspn(new, "\n")] = '\0';					\
+									\
+	device_lock(dev);						\
+	old = rpdev->member;						\
+	if (strlen(new)) {						\
+		rpdev->member = new;					\
+	} else {							\
+		kfree(new);						\
+		rpdev->member = NULL;					\
+	}								\
+	device_unlock(dev);						\
+									\
+	kfree(old);							\
+									\
+	return sz;							\
+}									\
+static ssize_t								\
+field##_show(struct device *dev,					\
+	     struct device_attribute *attr, char *buf)			\
+{									\
+	struct rpmsg_device *rpdev = to_rpmsg_device(dev);		\
+									\
+	return sprintf(buf, "%s\n", rpdev->member);			\
+}									\
+static DEVICE_ATTR_RW(field)
+
 /* for more info, see Documentation/ABI/testing/sysfs-bus-rpmsg */
 rpmsg_show_attr(name, id.name, "%s\n");
 rpmsg_show_attr(src, src, "0x%x\n");
 rpmsg_show_attr(dst, dst, "0x%x\n");
 rpmsg_show_attr(announce, announce ? "true" : "false", "%s\n");
-
-static ssize_t driver_override_store(struct device *dev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t count)
-{
-	struct rpmsg_device *rpdev = to_rpmsg_device(dev);
-	int ret;
-
-	ret = driver_set_override(dev, &rpdev->driver_override, buf, count);
-	if (ret)
-		return ret;
-
-	return count;
-}
-
-static ssize_t driver_override_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct rpmsg_device *rpdev = to_rpmsg_device(dev);
-	ssize_t len;
-
-	device_lock(dev);
-	len = sysfs_emit(buf, "%s\n", rpdev->driver_override);
-	device_unlock(dev);
-	return len;
-}
-static DEVICE_ATTR_RW(driver_override);
+rpmsg_string_attr(driver_override, driver_override);
 
 static ssize_t modalias_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
@@ -457,6 +505,10 @@ static int rpmsg_dev_probe(struct device *dev)
 
 		rpdev->ept = ept;
 		rpdev->src = ept->addr;
+
+		if (rpdrv->signals)
+			ept->sig_cb = rpdrv->signals;
+
 	}
 
 	err = rpdrv->probe(rpdev);
@@ -534,7 +586,7 @@ int rpmsg_register_device_override(struct rpmsg_device *rpdev,
 
 	device_initialize(dev);
 	if (driver_override) {
-		ret = driver_set_override(dev, &rpdev->driver_override,
+		ret = driver_set_override(dev, (const char **)&rpdev->driver_override,
 					  driver_override,
 					  strlen(driver_override));
 		if (ret) {

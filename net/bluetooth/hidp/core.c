@@ -1323,7 +1323,7 @@ static int hidp_session_thread(void *arg)
 
 	hidp_session_put(session);
 
-	module_put_and_kthread_exit(0);
+	module_put_and_exit(0);
 	return 0;
 }
 

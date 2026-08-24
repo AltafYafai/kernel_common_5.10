@@ -323,7 +323,7 @@ static void scsi_dec_host_busy(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 
 		spin_lock_irqsave(shost->host_lock, flags);
 		if (shost->host_failed || shost->host_eh_scheduled)
-			scsi_eh_wakeup(shost, busy);
+			scsi_eh_wakeup(shost);
 		spin_unlock_irqrestore(shost->host_lock, flags);
 	}
 	rcu_read_unlock();
@@ -1437,7 +1437,7 @@ static bool scsi_mq_lld_busy(struct request_queue *q)
 static void scsi_softirq_done(struct request *rq)
 {
 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
-	enum scsi_disposition disposition;
+	int disposition;
 
 	INIT_LIST_HEAD(&cmd->eh_entry);
 
@@ -1932,13 +1932,9 @@ int scsi_mq_setup_tags(struct Scsi_Host *shost)
 	return blk_mq_alloc_tag_set(tag_set);
 }
 
-void scsi_mq_free_tags(struct kref *kref)
+void scsi_mq_destroy_tags(struct Scsi_Host *shost)
 {
-	struct Scsi_Host *shost = container_of(kref, typeof(*shost),
-					       tagset_refcnt);
-
 	blk_mq_free_tag_set(&shost->tag_set);
-	complete(&shost->tagset_freed);
 }
 
 /**

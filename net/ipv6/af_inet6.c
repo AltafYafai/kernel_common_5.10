@@ -232,7 +232,7 @@ lookup_protocol:
 	inet->mc_loop	= 1;
 	inet->mc_ttl	= 1;
 	inet->mc_index	= 0;
-	RCU_INIT_POINTER(inet->mc_list, NULL);
+	inet->mc_list	= NULL;
 	inet->rcv_tos	= 0;
 
 	if (READ_ONCE(net->ipv4.sysctl_ip_no_pmtu_disc))
@@ -303,6 +303,8 @@ static int __inet6_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len,
 		return -EINVAL;
 
 	snum = ntohs(addr->sin6_port);
+	if (snum && inet_is_local_unbindable_port(net, snum))
+		return -EPERM;
 	if (snum && inet_port_requires_bind_service(net, snum) &&
 	    !ns_capable(net->user_ns, CAP_NET_BIND_SERVICE))
 		return -EACCES;
@@ -1041,7 +1043,6 @@ static const struct ipv6_stub ipv6_stub_impl = {
 	.ip6_mtu_from_fib6 = ip6_mtu_from_fib6,
 	.fib6_nh_init	   = fib6_nh_init,
 	.fib6_nh_release   = fib6_nh_release,
-	.fib6_nh_release_dsts = fib6_nh_release_dsts,
 	.fib6_update_sernum = fib6_update_sernum_stub,
 	.fib6_rt_update	   = fib6_rt_update,
 	.ip6_del_rt	   = ip6_del_rt,

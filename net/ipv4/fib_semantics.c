@@ -1908,7 +1908,6 @@ int fib_sync_down_addr(struct net_device *dev, __be32 local)
 			continue;
 		if (fi->fib_prefsrc == local) {
 			fi->fib_flags |= RTNH_F_DEAD;
-			fi->pfsrc_removed = true;
 			ret++;
 		}
 	}
@@ -2256,7 +2255,7 @@ void fib_select_multipath(struct fib_result *res, int hash)
 void fib_select_path(struct net *net, struct fib_result *res,
 		     struct flowi4 *fl4, const struct sk_buff *skb)
 {
-	if (fl4->flowi4_oif)
+	if (fl4->flowi4_oif && !(fl4->flowi4_flags & FLOWI_FLAG_SKIP_NH_OIF))
 		goto check_saddr;
 
 #ifdef CONFIG_IP_ROUTE_MULTIPATH

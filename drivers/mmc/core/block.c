@@ -47,10 +47,13 @@
 
 #include <linux/uaccess.h>
 
+#include <trace/hooks/mmc_core.h>
+
 #include "queue.h"
 #include "block.h"
 #include "core.h"
 #include "card.h"
+#include "crypto.h"
 #include "host.h"
 #include "bus.h"
 #include "mmc_ops.h"
@@ -991,6 +994,11 @@ static int mmc_blk_reset(struct mmc_blk_data *md, struct mmc_host *host,
 		struct mmc_blk_data *main_md =
 			dev_get_drvdata(&host->card->dev);
 		int part_err;
+		bool allow = true;
+
+		trace_android_vh_mmc_blk_reset(host, err, &allow);
+		if (!allow)
+			return -ENODEV;
 
 		main_md->part_curr = main_md->part_type;
 		part_err = mmc_blk_part_switch(host->card, md->part_type);
@@ -1316,10 +1324,9 @@ static void mmc_blk_data_prep(struct mmc_queue *mq, struct mmc_queue_req *mqrq,
 		    rq_data_dir(req) == WRITE &&
 		    (md->flags & MMC_BLK_REL_WR);
 
-	if (mqrq->flags & MQRQ_XFER_SINGLE_BLOCK)
-		recovery_mode = 1;
-
 	memset(brq, 0, sizeof(struct mmc_blk_request));
+
+	mmc_crypto_prepare_req(mqrq);
 
 	brq->mrq.data = &brq->data;
 	brq->mrq.tag = req->tag;
@@ -1456,13 +1463,10 @@ static void mmc_blk_cqe_complete_rq(struct mmc_queue *mq, struct request *req)
 		err = 0;
 
 	if (err) {
-		if (mqrq->retries++ < MMC_CQE_RETRIES) {
-			if (rq_data_dir(req) == WRITE)
-				mqrq->flags |= MQRQ_XFER_SINGLE_BLOCK;
+		if (mqrq->retries++ < MMC_CQE_RETRIES)
 			blk_mq_requeue_request(req, true);
-		} else {
+		else
 			blk_mq_end_request(req, BLK_STS_IOERR);
-		}
 	} else if (mrq->data) {
 		if (blk_update_request(req, BLK_STS_OK, mrq->data->bytes_xfered))
 			blk_mq_requeue_request(req, true);
@@ -1859,6 +1863,7 @@ static void mmc_blk_mq_rw_recovery(struct mmc_queue *mq, struct request *req)
 	    err && mmc_blk_reset(md, card->host, type)) {
 		pr_err("%s: recovery failed!\n", req->rq_disk->disk_name);
 		mqrq->retries = MMC_NO_RETRIES;
+		trace_android_vh_mmc_blk_mq_rw_recovery(card);
 		return;
 	}
 
@@ -1947,8 +1952,6 @@ static void mmc_blk_mq_complete_rq(struct mmc_queue *mq, struct request *req)
 	} else if (!blk_rq_bytes(req)) {
 		__blk_mq_end_request(req, BLK_STS_IOERR);
 	} else if (mqrq->retries++ < MMC_MAX_RETRIES) {
-		if (rq_data_dir(req) == WRITE)
-			mqrq->flags |= MQRQ_XFER_SINGLE_BLOCK;
 		blk_mq_requeue_request(req, true);
 	} else {
 		if (mmc_card_removed(mq->card))

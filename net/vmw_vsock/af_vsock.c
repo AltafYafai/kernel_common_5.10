@@ -338,8 +338,7 @@ void vsock_remove_sock(struct vsock_sock *vsk)
 }
 EXPORT_SYMBOL_GPL(vsock_remove_sock);
 
-void vsock_for_each_connected_socket(struct vsock_transport *transport,
-				     void (*fn)(struct sock *sk))
+void vsock_for_each_connected_socket(void (*fn)(struct sock *sk))
 {
 	int i;
 
@@ -348,12 +347,8 @@ void vsock_for_each_connected_socket(struct vsock_transport *transport,
 	for (i = 0; i < ARRAY_SIZE(vsock_connected_table); i++) {
 		struct vsock_sock *vsk;
 		list_for_each_entry(vsk, &vsock_connected_table[i],
-				    connected_table) {
-			if (vsk->transport != transport)
-				continue;
-
+				    connected_table)
 			fn(sk_vsock(vsk));
-		}
 	}
 
 	spin_unlock_bh(&vsock_table_lock);
@@ -400,8 +395,6 @@ EXPORT_SYMBOL_GPL(vsock_enqueue_accept);
 
 static bool vsock_use_local_transport(unsigned int remote_cid)
 {
-	lockdep_assert_held(&vsock_register_mutex);
-
 	if (!transport_local)
 		return false;
 
@@ -433,8 +426,7 @@ static void vsock_deassign_transport(struct vsock_sock *vsk)
  * The vsk->remote_addr is used to decide which transport to use:
  *  - remote CID == VMADDR_CID_LOCAL or g2h->local_cid or VMADDR_CID_HOST if
  *    g2h is not loaded, will use local transport;
- *  - remote CID <= VMADDR_CID_HOST or h2g is not loaded or remote flags field
- *    includes VMADDR_FLAG_TO_HOST flag value, will use guest->host transport;
+ *  - remote CID <= VMADDR_CID_HOST will use guest->host transport;
  *  - remote CID > VMADDR_CID_HOST will use host->guest transport;
  */
 int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
@@ -442,24 +434,7 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 	const struct vsock_transport *new_transport;
 	struct sock *sk = sk_vsock(vsk);
 	unsigned int remote_cid = vsk->remote_addr.svm_cid;
-	__u8 remote_flags;
 	int ret;
-
-	/* If the packet is coming with the source and destination CIDs higher
-	 * than VMADDR_CID_HOST, then a vsock channel where all the packets are
-	 * forwarded to the host should be established. Then the host will
-	 * need to forward the packets to the guest.
-	 *
-	 * The flag is set on the (listen) receive path (psk is not NULL). On
-	 * the connect path the flag can be set by the user space application.
-	 */
-	if (psk && vsk->local_addr.svm_cid > VMADDR_CID_HOST &&
-	    vsk->remote_addr.svm_cid > VMADDR_CID_HOST)
-		vsk->remote_addr.svm_flags |= VMADDR_FLAG_TO_HOST;
-
-	remote_flags = vsk->remote_addr.svm_flags;
-
-	mutex_lock(&vsock_register_mutex);
 
 	switch (sk->sk_type) {
 	case SOCK_DGRAM:
@@ -468,37 +443,19 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 	case SOCK_STREAM:
 		if (vsock_use_local_transport(remote_cid))
 			new_transport = transport_local;
-		else if (remote_cid <= VMADDR_CID_HOST || !transport_h2g ||
-			 (remote_flags & VMADDR_FLAG_TO_HOST))
+		else if (remote_cid <= VMADDR_CID_HOST || !transport_h2g)
 			new_transport = transport_g2h;
 		else
 			new_transport = transport_h2g;
 		break;
 	default:
-		ret = -ESOCKTNOSUPPORT;
-		goto err;
+		return -ESOCKTNOSUPPORT;
 	}
-
-	if (vsk->transport && vsk->transport == new_transport) {
-		ret = 0;
-		goto err;
-	}
-
-	/* We increase the module refcnt to prevent the transport unloading
-	 * while there are open sockets assigned to it.
-	 */
-	if (!new_transport || !try_module_get(new_transport->module)) {
-		ret = -ENODEV;
-		goto err;
-	}
-
-	/* It's safe to release the mutex after a successful try_module_get().
-	 * Whichever transport `new_transport` points at, it won't go away until
-	 * the last module_put() below or in vsock_deassign_transport().
-	 */
-	mutex_unlock(&vsock_register_mutex);
 
 	if (vsk->transport) {
+		if (vsk->transport == new_transport)
+			return 0;
+
 		/* transport->release() must be called with sock lock acquired.
 		 * This path can only be taken during vsock_stream_connect(),
 		 * where we have already held the sock lock.
@@ -518,6 +475,12 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 		vsk->peer_shutdown = 0;
 	}
 
+	/* We increase the module refcnt to prevent the transport unloading
+	 * while there are open sockets assigned to it.
+	 */
+	if (!new_transport || !try_module_get(new_transport->module))
+		return -ENODEV;
+
 	ret = new_transport->init(vsk, psk);
 	if (ret) {
 		module_put(new_transport->module);
@@ -527,9 +490,6 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 	vsk->transport = new_transport;
 
 	return 0;
-err:
-	mutex_unlock(&vsock_register_mutex);
-	return ret;
 }
 EXPORT_SYMBOL_GPL(vsock_assign_transport);
 

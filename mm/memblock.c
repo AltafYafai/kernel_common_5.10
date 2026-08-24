@@ -152,6 +152,7 @@ static __refdata struct memblock_type *memblock_memory = &memblock.memory;
 	} while (0)
 
 static int memblock_debug __initdata_memblock;
+static bool memblock_nomap_remove __initdata_memblock;
 static bool system_has_some_mirror __initdata_memblock = false;
 static int memblock_can_resize __initdata_memblock;
 static int memblock_memory_in_slab __initdata_memblock = 0;
@@ -814,6 +815,9 @@ int __init_memblock memblock_free(phys_addr_t base, phys_addr_t size)
 	kmemleak_free_part_phys(base, size);
 	return memblock_remove_range(&memblock.reserved, base, size);
 }
+#ifdef CONFIG_ARCH_KEEP_MEMBLOCK
+EXPORT_SYMBOL_GPL(memblock_free);
+#endif
 
 int __init_memblock memblock_reserve(phys_addr_t base, phys_addr_t size)
 {
@@ -1391,6 +1395,9 @@ phys_addr_t __init memblock_phys_alloc_range(phys_addr_t size,
 					     phys_addr_t start,
 					     phys_addr_t end)
 {
+	memblock_dbg("%s: %llu bytes align=0x%llx from=%pa max_addr=%pa %pS\n",
+		     __func__, (u64)size, (u64)align, &start, &end,
+		     (void *)_RET_IP_);
 	return memblock_alloc_range_nid(size, align, start, end, NUMA_NO_NODE,
 					false);
 }
@@ -1628,6 +1635,7 @@ phys_addr_t __init_memblock memblock_end_of_DRAM(void)
 
 	return (memblock.memory.regions[idx].base + memblock.memory.regions[idx].size);
 }
+EXPORT_SYMBOL_GPL(memblock_end_of_DRAM);
 
 static phys_addr_t __init_memblock __find_max_addr(phys_addr_t limit)
 {
@@ -1896,6 +1904,17 @@ static int __init early_memblock(char *p)
 	return 0;
 }
 early_param("memblock", early_memblock);
+
+static int __init early_memblock_nomap(char *str)
+{
+	return kstrtobool(str, &memblock_nomap_remove);
+}
+early_param("android12_only.will_be_removed_soon.memblock_nomap_remove", early_memblock_nomap);
+
+bool __init memblock_is_nomap_remove(void)
+{
+	return memblock_nomap_remove;
+}
 
 static void __init __free_pages_memory(unsigned long start, unsigned long end)
 {
