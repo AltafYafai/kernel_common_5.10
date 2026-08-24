@@ -183,11 +183,8 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int freq = arch_scale_freq_invariant() ?
 				policy->cpuinfo.max_freq : policy->cur;
-<<<<<<< HEAD
-=======
 	unsigned int idx, l_freq, h_freq;
 	unsigned long next_freq = 0;
->>>>>>> 44c37f9016d6 (cpufreq: schedutil: Use the frequency below the target if they're close)
 
 	freq = map_util_freq(util, freq, max);
 
