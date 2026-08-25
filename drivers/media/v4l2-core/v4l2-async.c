@@ -819,6 +819,12 @@ err_unbind:
 }
 EXPORT_SYMBOL(__v4l2_async_register_subdev);
 
+int v4l2_async_register_subdev(struct v4l2_subdev *sd)
+{
+	return __v4l2_async_register_subdev(sd, sd->owner);
+}
+EXPORT_SYMBOL(v4l2_async_register_subdev);
+
 void v4l2_async_unregister_subdev(struct v4l2_subdev *sd)
 {
 	mutex_lock(&list_lock);
