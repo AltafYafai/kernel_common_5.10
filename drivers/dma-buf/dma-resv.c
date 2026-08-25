@@ -252,13 +252,6 @@ int dma_resv_reserve_fences(struct dma_resv *obj, unsigned int num_fences)
 }
 EXPORT_SYMBOL(dma_resv_reserve_fences);
 
-/* Compatibility alias for stable ABI */
-int dma_resv_reserve_shared(struct dma_resv *obj, unsigned int num_fences)
-{
-	return dma_resv_reserve_fences(obj, num_fences);
-}
-EXPORT_SYMBOL(dma_resv_reserve_shared);
-
 /**
  * dma_resv_add_shared_fence - Add a fence to a shared slot
  * @obj: the reservation object
