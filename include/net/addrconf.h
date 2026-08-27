@@ -31,22 +31,42 @@ struct prefix_info {
 	__u8			length;
 	__u8			prefix_len;
 
+/*
+ * ANDROID: crc fix for commit 9354e0acdb74 ("net: ipv6: support
+ * reporting otherwise unknown prefix * flags in RTM_NEWPREFIX")
+ */
+#ifndef __GENKSYMS__
 	union __packed {
 		__u8		flags;
 		struct __packed {
+#endif
 #if defined(__BIG_ENDIAN_BITFIELD)
 			__u8	onlink : 1,
-			 	autoconf : 1,
+				autoconf : 1,
+# ifdef __GENKSYMS__
 				reserved : 6;
+# else
+				routeraddr : 1,
+				preferpd : 1,
+				reserved : 4;
+# endif
 #elif defined(__LITTLE_ENDIAN_BITFIELD)
+# ifdef __GENKSYMS__
 			__u8	reserved : 6,
+# else
+			__u8	reserved : 4,
+				preferpd : 1,
+				routeraddr : 1,
+# endif
 				autoconf : 1,
 				onlink : 1;
 #else
 #error "Please fix <asm/byteorder.h>"
 #endif
+#ifndef __GENKSYMS__
 		};
 	};
+#endif
 	__be32			valid;
 	__be32			prefered;
 	__be32			reserved2;
@@ -277,6 +297,18 @@ static inline bool ipv6_is_mld(struct sk_buff *skb, int nexthdr, int offset)
 void addrconf_prefix_rcv(struct net_device *dev,
 			 u8 *opt, int len, bool sllao);
 
+/* Determines into what table to put autoconf PIO/RIO/default routes
+ * learned on this device.
+ *
+ * - If 0, use the same table for every device. This puts routes into
+ *   one of RT_TABLE_{PREFIX,INFO,DFLT} depending on the type of route
+ *   (but note that these three are currently all equal to
+ *   RT6_TABLE_MAIN).
+ * - If > 0, use the specified table.
+ * - If < 0, put routes into table dev->ifindex + (-rt_table).
+ */
+u32 addrconf_rt_table(const struct net_device *dev, u32 default_table);
+
 /*
  *	anycast prototypes (anycast.c)
  */
@@ -407,11 +439,6 @@ static inline void __in6_dev_put(struct inet6_dev *idev)
 static inline void in6_dev_hold(struct inet6_dev *idev)
 {
 	refcount_inc(&idev->refcnt);
-}
-
-static inline bool in6_dev_hold_safe(struct inet6_dev *idev)
-{
-	return refcount_inc_not_zero(&idev->refcnt);
 }
 
 /* called with rcu_read_lock held */

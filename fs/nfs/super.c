@@ -87,11 +87,9 @@ const struct super_operations nfs_sops = {
 };
 EXPORT_SYMBOL_GPL(nfs_sops);
 
-#ifdef CONFIG_NFS_V4_2
 static const struct nfs_ssc_client_ops nfs_ssc_clnt_ops_tbl = {
 	.sco_sb_deactive = nfs_sb_deactive,
 };
-#endif
 
 #if IS_ENABLED(CONFIG_NFS_V4)
 static int __init register_nfs4_fs(void)
@@ -114,7 +112,6 @@ static void unregister_nfs4_fs(void)
 }
 #endif
 
-#ifdef CONFIG_NFS_V4_2
 static void nfs_ssc_register_ops(void)
 {
 	nfs_ssc_register(&nfs_ssc_clnt_ops_tbl);
@@ -124,7 +121,6 @@ static void nfs_ssc_unregister_ops(void)
 {
 	nfs_ssc_unregister(&nfs_ssc_clnt_ops_tbl);
 }
-#endif /* CONFIG_NFS_V4_2 */
 
 static struct shrinker acl_shrinker = {
 	.count_objects	= nfs_access_cache_count,
@@ -153,9 +149,7 @@ int __init register_nfs_fs(void)
 	ret = register_shrinker(&acl_shrinker);
 	if (ret < 0)
 		goto error_3;
-#ifdef CONFIG_NFS_V4_2
 	nfs_ssc_register_ops();
-#endif
 	return 0;
 error_3:
 	nfs_unregister_sysctl();
@@ -175,9 +169,7 @@ void __exit unregister_nfs_fs(void)
 	unregister_shrinker(&acl_shrinker);
 	nfs_unregister_sysctl();
 	unregister_nfs4_fs();
-#ifdef CONFIG_NFS_V4_2
 	nfs_ssc_unregister_ops();
-#endif
 	unregister_filesystem(&nfs_fs_type);
 }
 
@@ -1254,6 +1246,13 @@ int nfs_get_tree_common(struct fs_context *fc)
 	/* -o noac implies -o sync */
 	if (server->flags & NFS_MOUNT_NOAC)
 		fc->sb_flags |= SB_SYNCHRONOUS;
+
+	if (ctx->clone_data.sb)
+		if (ctx->clone_data.sb->s_flags & SB_SYNCHRONOUS)
+			fc->sb_flags |= SB_SYNCHRONOUS;
+
+	if (server->caps & NFS_CAP_SECURITY_LABEL)
+		fc->lsm_flags |= SECURITY_LSM_NATIVE_LABELS;
 
 	/* Get a superblock - note that we may end up sharing one that already exists */
 	fc->s_fs_info = server;

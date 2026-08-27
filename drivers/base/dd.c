@@ -185,7 +185,7 @@ static void driver_deferred_probe_trigger(void)
 	 * Kick the re-probe thread.  It may already be scheduled, but it is
 	 * safe to kick it again.
 	 */
-	schedule_work(&deferred_probe_work);
+	queue_work(system_unbound_wq, &deferred_probe_work);
 }
 
 /**
@@ -737,18 +737,6 @@ int driver_probe_device(struct device_driver *drv, struct device *dev)
 
 	if (!device_is_registered(dev))
 		return -ENODEV;
-
-	/*
-	 * In device_add(), the "struct device" gets linked into the subsystem's
-	 * list of devices and broadcast to userspace (via uevent) before we're
-	 * quite ready to probe. Those open pathways to driver probe before
-	 * we've finished enough of device_add() to reliably support probe.
-	 * Detect this and tell other pathways to try again later. device_add()
-	 * itself will also try to probe immediately after setting
-	 * "ready_to_probe".
-	 */
-	if (!dev_ready_to_probe(dev))
-		return dev_err_probe(dev, -EPROBE_DEFER, "Device not ready to probe\n");
 
 	pr_debug("bus: '%s': %s: matched device %s with driver %s\n",
 		 drv->bus->name, __func__, dev_name(dev), drv->name);

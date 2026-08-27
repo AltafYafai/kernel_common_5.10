@@ -33,6 +33,8 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/alarmtimer.h>
 
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/wakeupbypass.h>
 /**
  * struct alarm_base - Alarm timer bases
  * @lock:		Lock for syncrhonized access to the base
@@ -92,7 +94,7 @@ static int alarmtimer_rtc_add_device(struct device *dev,
 	if (rtcdev)
 		return -EBUSY;
 
-	if (!test_bit(RTC_FEATURE_ALARM, rtc->features))
+	if (!rtc->ops->set_alarm)
 		return -1;
 	if (!device_may_wakeup(rtc->dev.parent))
 		return -1;
@@ -246,6 +248,7 @@ static int alarmtimer_suspend(struct device *dev)
 	struct rtc_device *rtc;
 	unsigned long flags;
 	struct rtc_time tm;
+	int wakeup_bypass_enabled = 0;
 
 	spin_lock_irqsave(&freezer_delta_lock, flags);
 	min = freezer_delta;
@@ -253,6 +256,10 @@ static int alarmtimer_suspend(struct device *dev)
 	type = freezer_alarmtype;
 	freezer_delta = 0;
 	spin_unlock_irqrestore(&freezer_delta_lock, flags);
+
+	trace_android_vh_wakeup_bypass(&wakeup_bypass_enabled);
+	if (wakeup_bypass_enabled)
+		return 0;
 
 	rtc = alarmtimer_get_rtcdev();
 	/* If we have no rtcdev, just return */
@@ -281,7 +288,7 @@ static int alarmtimer_suspend(struct device *dev)
 		return 0;
 
 	if (ktime_to_ns(min) < 2 * NSEC_PER_SEC) {
-		pm_wakeup_event(dev, 2 * MSEC_PER_SEC);
+		pm_wakeup_event(dev, ktime_to_ms(min) + 1);
 		return -EBUSY;
 	}
 

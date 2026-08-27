@@ -318,52 +318,44 @@ struct irq_affinity_desc {
 
 extern cpumask_var_t irq_default_affinity;
 
-extern int irq_set_affinity(unsigned int irq, const struct cpumask *cpumask);
-extern int irq_force_affinity(unsigned int irq, const struct cpumask *cpumask);
+/* Internal implementation. Use the helpers below */
+extern int __irq_set_affinity(unsigned int irq, const struct cpumask *cpumask,
+			      bool force);
+
+/**
+ * irq_set_affinity - Set the irq affinity of a given irq
+ * @irq:	Interrupt to set affinity
+ * @cpumask:	cpumask
+ *
+ * Fails if cpumask does not contain an online CPU
+ */
+static inline int
+irq_set_affinity(unsigned int irq, const struct cpumask *cpumask)
+{
+	return __irq_set_affinity(irq, cpumask, false);
+}
+
+/**
+ * irq_force_affinity - Force the irq affinity of a given irq
+ * @irq:	Interrupt to set affinity
+ * @cpumask:	cpumask
+ *
+ * Same as irq_set_affinity, but without checking the mask against
+ * online cpus.
+ *
+ * Solely for low level cpu hotplug code, where we need to make per
+ * cpu interrupts affine before the cpu becomes online.
+ */
+static inline int
+irq_force_affinity(unsigned int irq, const struct cpumask *cpumask)
+{
+	return __irq_set_affinity(irq, cpumask, true);
+}
 
 extern int irq_can_set_affinity(unsigned int irq);
 extern int irq_select_affinity(unsigned int irq);
 
-extern int __irq_apply_affinity_hint(unsigned int irq, const struct cpumask *m,
-				     bool setaffinity);
-
-/**
- * irq_update_affinity_hint - Update the affinity hint
- * @irq:	Interrupt to update
- * @m:		cpumask pointer (NULL to clear the hint)
- *
- * Updates the affinity hint, but does not change the affinity of the interrupt.
- */
-static inline int
-irq_update_affinity_hint(unsigned int irq, const struct cpumask *m)
-{
-	return __irq_apply_affinity_hint(irq, m, false);
-}
-
-/**
- * irq_set_affinity_and_hint - Update the affinity hint and apply the provided
- *			     cpumask to the interrupt
- * @irq:	Interrupt to update
- * @m:		cpumask pointer (NULL to clear the hint)
- *
- * Updates the affinity hint and if @m is not NULL it applies it as the
- * affinity of that interrupt.
- */
-static inline int
-irq_set_affinity_and_hint(unsigned int irq, const struct cpumask *m)
-{
-	return __irq_apply_affinity_hint(irq, m, true);
-}
-
-/*
- * Deprecated. Use irq_update_affinity_hint() or irq_set_affinity_and_hint()
- * instead.
- */
-static inline int irq_set_affinity_hint(unsigned int irq, const struct cpumask *m)
-{
-	return irq_set_affinity_and_hint(irq, m);
-}
-
+extern int irq_set_affinity_hint(unsigned int irq, const struct cpumask *m);
 extern int irq_update_affinity_desc(unsigned int irq,
 				    struct irq_affinity_desc *affinity);
 
@@ -394,18 +386,6 @@ static inline int irq_can_set_affinity(unsigned int irq)
 }
 
 static inline int irq_select_affinity(unsigned int irq)  { return 0; }
-
-static inline int irq_update_affinity_hint(unsigned int irq,
-					   const struct cpumask *m)
-{
-	return -EINVAL;
-}
-
-static inline int irq_set_affinity_and_hint(unsigned int irq,
-					    const struct cpumask *m)
-{
-	return -EINVAL;
-}
 
 static inline int irq_set_affinity_hint(unsigned int irq,
 					const struct cpumask *m)
@@ -574,6 +554,12 @@ enum
 };
 
 #define SOFTIRQ_STOP_IDLE_MASK (~(1 << RCU_SOFTIRQ))
+/* Softirq's where the handling might be long: */
+#define LONG_SOFTIRQ_MASK ((1 << NET_TX_SOFTIRQ)       | \
+			   (1 << NET_RX_SOFTIRQ)       | \
+			   (1 << BLOCK_SOFTIRQ)        | \
+			   (1 << IRQ_POLL_SOFTIRQ) | \
+			   (1 << TASKLET_SOFTIRQ))
 
 /* map softirq index to softirq name. update 'softirq_to_name' in
  * kernel/softirq.c when adding a new softirq.
@@ -609,6 +595,7 @@ extern void raise_softirq_irqoff(unsigned int nr);
 extern void raise_softirq(unsigned int nr);
 
 DECLARE_PER_CPU(struct task_struct *, ksoftirqd);
+DECLARE_PER_CPU(__u32, active_softirqs);
 
 static inline struct task_struct *this_cpu_ksoftirqd(void)
 {

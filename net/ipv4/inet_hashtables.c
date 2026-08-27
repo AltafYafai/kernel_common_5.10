@@ -604,7 +604,7 @@ bool inet_ehash_nolisten(struct sock *sk, struct sock *osk, bool *found_dup_sk)
 	if (ok) {
 		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
 	} else {
-		this_cpu_inc(*sk->sk_prot->orphan_count);
+		percpu_counter_inc(sk->sk_prot->orphan_count);
 		inet_sk_set_state(sk, TCP_CLOSE);
 		sock_set_flag(sk, SOCK_DEAD);
 		inet_csk_destroy_sock(sk);
@@ -938,37 +938,22 @@ int inet_ehash_locks_alloc(struct inet_hashinfo *hashinfo)
 {
 	unsigned int locksz = sizeof(spinlock_t);
 	unsigned int i, nblocks = 1;
-	spinlock_t *ptr = NULL;
 
-	if (locksz == 0)
-		goto set_mask;
+	if (locksz != 0) {
+		/* allocate 2 cache lines or at least one spinlock per cpu */
+		nblocks = max(2U * L1_CACHE_BYTES / locksz, 1U);
+		nblocks = roundup_pow_of_two(nblocks * num_possible_cpus());
 
-	/* Allocate 2 cache lines or at least one spinlock per cpu. */
-	nblocks = max(2U * L1_CACHE_BYTES / locksz, 1U) * num_possible_cpus();
+		/* no more locks than number of hash buckets */
+		nblocks = min(nblocks, hashinfo->ehash_mask + 1);
 
-	/* At least one page per NUMA node. */
-	nblocks = max_t(unsigned int, nblocks, num_online_nodes() * PAGE_SIZE / locksz);
-
-	nblocks = roundup_pow_of_two(nblocks);
-
-	/* No more locks than number of hash buckets. */
-	nblocks = min(nblocks, hashinfo->ehash_mask + 1);
-
-	if (num_online_nodes() > 1) {
-		/* Use vmalloc() to allow NUMA policy to spread pages
-		 * on all available nodes if desired.
-		 */
-		ptr = vmalloc_array(nblocks, locksz);
-	}
-	if (!ptr) {
-		ptr = kvmalloc_array(nblocks, locksz, GFP_KERNEL);
-		if (!ptr)
+		hashinfo->ehash_locks = kvmalloc_array(nblocks, locksz, GFP_KERNEL);
+		if (!hashinfo->ehash_locks)
 			return -ENOMEM;
+
+		for (i = 0; i < nblocks; i++)
+			spin_lock_init(&hashinfo->ehash_locks[i]);
 	}
-	for (i = 0; i < nblocks; i++)
-		spin_lock_init(&ptr[i]);
-	hashinfo->ehash_locks = ptr;
-set_mask:
 	hashinfo->ehash_locks_mask = nblocks - 1;
 	return 0;
 }

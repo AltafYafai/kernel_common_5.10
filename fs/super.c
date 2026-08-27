@@ -1048,13 +1048,24 @@ void emergency_remount(void)
 
 static void do_thaw_all_callback(struct super_block *sb)
 {
+	bool active = false;
+
 	down_write(&sb->s_umount);
-	if (sb->s_root && sb->s_flags & SB_BORN) {
-		emergency_thaw_bdev(sb);
+	if (sb->s_root && sb->s_flags & SB_BORN)
+		active = atomic_inc_not_zero(&sb->s_active);
+	up_write(&sb->s_umount);
+	if (!active)
+		return;
+
+	/* thaw_bdev() acquires s_umount so it must not be held here */
+	emergency_thaw_bdev(sb);
+
+	down_write(&sb->s_umount);
+	if (sb->s_root && sb->s_flags & SB_BORN)
 		thaw_super_locked(sb);
-	} else {
+	else
 		up_write(&sb->s_umount);
-	}
+	deactivate_super(sb);
 }
 
 static void do_thaw_all(struct work_struct *work)
@@ -1458,7 +1469,7 @@ error_bdev:
 error:
 	return ERR_PTR(error);
 }
-EXPORT_SYMBOL(mount_bdev);
+EXPORT_SYMBOL_NS(mount_bdev, ANDROID_GKI_VFS_EXPORT_ONLY);
 
 void kill_block_super(struct super_block *sb)
 {
@@ -1472,7 +1483,7 @@ void kill_block_super(struct super_block *sb)
 	blkdev_put(bdev, mode | FMODE_EXCL);
 }
 
-EXPORT_SYMBOL(kill_block_super);
+EXPORT_SYMBOL_NS(kill_block_super, ANDROID_GKI_VFS_EXPORT_ONLY);
 #endif
 
 struct dentry *mount_nodev(struct file_system_type *fs_type,

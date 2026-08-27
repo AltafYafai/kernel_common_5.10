@@ -16,6 +16,7 @@
 #include <linux/types.h>
 #include <linux/interrupt.h>
 #include <linux/nvmem-provider.h>
+#include <linux/android_kabi.h>
 #include <uapi/linux/rtc.h>
 
 extern int rtc_month_days(unsigned int month, unsigned int year);
@@ -66,6 +67,8 @@ struct rtc_class_ops {
 	int (*alarm_irq_enable)(struct device *, unsigned int enabled);
 	int (*read_offset)(struct device *, long *offset);
 	int (*set_offset)(struct device *, long offset);
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct rtc_device;
@@ -124,8 +127,6 @@ struct rtc_device {
 	bool nvram_old_abi;
 	struct bin_attribute *nvram;
 
-	unsigned long features[BITS_TO_LONGS(RTC_FEATURE_CNT)];
-
 	time64_t range_min;
 	timeu64_t range_max;
 	time64_t start_secs;
@@ -142,6 +143,8 @@ struct rtc_device {
 	unsigned int uie_task_active:1;
 	unsigned int uie_timer_active:1;
 #endif
+
+	ANDROID_KABI_RESERVE(1);
 };
 #define to_rtc_device(d) container_of(d, struct rtc_device, dev)
 

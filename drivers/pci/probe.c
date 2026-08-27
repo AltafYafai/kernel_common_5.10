@@ -19,7 +19,6 @@
 #include <linux/hypervisor.h>
 #include <linux/irqdomain.h>
 #include <linux/pm_runtime.h>
-#include <linux/bitfield.h>
 #include "pci.h"
 
 #define CARDBUS_LATENCY_TIMER	176	/* secondary latency timer */
@@ -595,7 +594,6 @@ static void pci_init_host_bridge(struct pci_host_bridge *bridge)
 	bridge->native_pme = 1;
 	bridge->native_ltr = 1;
 	bridge->native_dpc = 1;
-	bridge->domain_nr = PCI_DOMAIN_NR_NOT_SET;
 
 	device_initialize(&bridge->dev);
 }
@@ -878,12 +876,11 @@ static void pci_set_bus_msi_domain(struct pci_bus *bus)
 static int pci_register_host_bridge(struct pci_host_bridge *bridge)
 {
 	struct device *parent = bridge->dev.parent;
-	struct resource_entry *window, *next, *n;
+	struct resource_entry *window, *n;
 	struct pci_bus *bus, *b;
-	resource_size_t offset, next_offset;
+	resource_size_t offset;
 	LIST_HEAD(resources);
-	struct resource *res, *next_res;
-	bool bus_registered = false;
+	struct resource *res;
 	char addr[64], *fmt;
 	const char *name;
 	int err;
@@ -901,14 +898,7 @@ static int pci_register_host_bridge(struct pci_host_bridge *bridge)
 	bus->ops = bridge->ops;
 	bus->number = bus->busn_res.start = bridge->busnr;
 #ifdef CONFIG_PCI_DOMAINS_GENERIC
-	if (bridge->domain_nr == PCI_DOMAIN_NR_NOT_SET)
-		bus->domain_nr = pci_bus_find_domain_nr(bus, parent);
-	else
-		bus->domain_nr = bridge->domain_nr;
-	if (bus->domain_nr < 0) {
-		err = bus->domain_nr;
-		goto free;
-	}
+	bus->domain_nr = pci_bus_find_domain_nr(bus, parent);
 #endif
 
 	b = pci_find_bus(pci_domain_nr(bus), bridge->busnr);
@@ -945,7 +935,6 @@ static int pci_register_host_bridge(struct pci_host_bridge *bridge)
 	name = dev_name(&bus->dev);
 
 	err = device_register(&bus->dev);
-	bus_registered = true;
 	if (err)
 		goto unregister;
 
@@ -968,34 +957,11 @@ static int pci_register_host_bridge(struct pci_host_bridge *bridge)
 	if (nr_node_ids > 1 && pcibus_to_node(bus) == NUMA_NO_NODE)
 		dev_warn(&bus->dev, "Unknown NUMA node; performance will be reduced\n");
 
-	/* Coalesce contiguous windows */
-	resource_list_for_each_entry_safe(window, n, &resources) {
-		if (list_is_last(&window->node, &resources))
-			break;
-
-		next = list_next_entry(window, node);
-		offset = window->offset;
-		res = window->res;
-		next_offset = next->offset;
-		next_res = next->res;
-
-		if (res->flags != next_res->flags || offset != next_offset)
-			continue;
-
-		if (res->end + 1 == next_res->start) {
-			next_res->start = res->start;
-			res->flags = res->start = res->end = 0;
-		}
-	}
-
 	/* Add initial resources to the bus */
 	resource_list_for_each_entry_safe(window, n, &resources) {
+		list_move_tail(&window->node, &bridge->windows);
 		offset = window->offset;
 		res = window->res;
-		if (!res->end)
-			continue;
-
-		list_move_tail(&window->node, &bridge->windows);
 
 		if (res->flags & IORESOURCE_BUS)
 			pci_bus_insert_busn_res(bus, bus->number, res->end);
@@ -1026,15 +992,9 @@ static int pci_register_host_bridge(struct pci_host_bridge *bridge)
 unregister:
 	put_device(&bridge->dev);
 	device_del(&bridge->dev);
-free:
-#ifdef CONFIG_PCI_DOMAINS_GENERIC
-	pci_bus_release_domain_nr(bus, parent);
-#endif
-	if (bus_registered)
-		put_device(&bus->dev);
-	else
-		kfree(bus);
 
+free:
+	kfree(bus);
 	return err;
 }
 
@@ -1538,8 +1498,8 @@ void set_pcie_port_type(struct pci_dev *pdev)
 	pdev->pcie_cap = pos;
 	pci_read_config_word(pdev, pos + PCI_EXP_FLAGS, &reg16);
 	pdev->pcie_flags_reg = reg16;
-	pci_read_config_dword(pdev, pos + PCI_EXP_DEVCAP, &pdev->devcap);
-	pdev->pcie_mpss = FIELD_GET(PCI_EXP_DEVCAP_PAYLOAD, pdev->devcap);
+	pci_read_config_word(pdev, pos + PCI_EXP_DEVCAP, &reg16);
+	pdev->pcie_mpss = reg16 & PCI_EXP_DEVCAP_PAYLOAD;
 
 	parent = pci_upstream_bridge(pdev);
 	if (!parent)
@@ -1582,7 +1542,7 @@ void set_pcie_hotplug_bridge(struct pci_dev *pdev)
 
 	pcie_capability_read_dword(pdev, PCI_EXP_SLTCAP, &reg32);
 	if (reg32 & PCI_EXP_SLTCAP_HPC)
-		pdev->is_hotplug_bridge = pdev->is_pciehp = 1;
+		pdev->is_hotplug_bridge = 1;
 }
 
 static void set_pcie_thunderbolt(struct pci_dev *dev)
@@ -2291,7 +2251,6 @@ static void pci_configure_device(struct pci_dev *dev)
 static void pci_release_capabilities(struct pci_dev *dev)
 {
 	pci_aer_exit(dev);
-	pci_rcec_exit(dev);
 	pci_vpd_release(dev);
 	pci_iov_release(dev);
 	pci_free_cap_save_buffers(dev);
@@ -2492,7 +2451,6 @@ static void pci_init_capabilities(struct pci_dev *dev)
 	pci_ptm_init(dev);		/* Precision Time Measurement */
 	pci_aer_init(dev);		/* Advanced Error Reporting */
 	pci_dpc_init(dev);		/* Downstream Port Containment */
-	pci_rcec_init(dev);		/* Root Complex Event Collector */
 
 	pcie_report_downtraining(dev);
 

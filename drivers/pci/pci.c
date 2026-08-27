@@ -31,7 +31,9 @@
 #include <linux/vmalloc.h>
 #include <asm/dma.h>
 #include <linux/aer.h>
-#include <linux/bitfield.h>
+#ifndef  __GENKSYMS__
+#include <trace/hooks/pci.h>
+#endif
 #include "pci.h"
 
 DEFINE_MUTEX(pci_slot_mutex);
@@ -60,17 +62,21 @@ struct pci_pme_device {
 	struct pci_dev *dev;
 };
 
-#define PME_TIMEOUT 1000 /* How long between PME checks */
+#define PME_TIMEOUT 4000 /* How long between PME checks */
 
 static void pci_dev_d3_sleep(struct pci_dev *dev)
 {
 	unsigned int delay = dev->d3hot_delay;
+	int err = -EOPNOTSUPP;
 
 	if (delay < pci_pm_d3hot_delay)
 		delay = pci_pm_d3hot_delay;
 
-	if (delay)
-		msleep(delay);
+	if (delay) {
+		trace_android_rvh_pci_d3_sleep(dev, delay, &err);
+		if (err == -EOPNOTSUPP)
+			msleep(delay);
+	}
 }
 
 #ifdef CONFIG_PCI_DOMAINS
@@ -689,6 +695,36 @@ int pci_find_ht_capability(struct pci_dev *dev, int ht_cap)
 	return pos;
 }
 EXPORT_SYMBOL_GPL(pci_find_ht_capability);
+
+/**
+ * pci_find_vsec_capability - Find a vendor-specific extended capability
+ * @dev: PCI device to query
+ * @vendor: Vendor ID for which capability is defined
+ * @cap: Vendor-specific capability ID
+ *
+ * If @dev has Vendor ID @vendor, search for a VSEC capability with
+ * VSEC ID @cap. If found, return the capability offset in
+ * config space; otherwise return 0.
+ */
+u16 pci_find_vsec_capability(struct pci_dev *dev, u16 vendor, int cap)
+{
+	u16 vsec = 0;
+	u32 header;
+
+	if (vendor != dev->vendor)
+		return 0;
+
+	while ((vsec = pci_find_next_ext_capability(dev, vsec,
+						     PCI_EXT_CAP_ID_VNDR))) {
+		if (pci_read_config_dword(dev, vsec + PCI_VNDR_HEADER,
+					  &header) == PCIBIOS_SUCCESSFUL &&
+		    PCI_VNDR_HEADER_ID(header) == cap)
+			return vsec;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pci_find_vsec_capability);
 
 /**
  * pci_find_parent_resource - return resource region of parent bus of given
@@ -1623,6 +1659,33 @@ static void pci_restore_config_space(struct pci_dev *pdev)
 		pci_restore_config_space_range(pdev, 0, 8, 0, false);
 	} else {
 		pci_restore_config_space_range(pdev, 0, 15, 0, false);
+	}
+}
+
+static void pci_restore_rebar_state(struct pci_dev *pdev)
+{
+	unsigned int pos, nbars, i;
+	u32 ctrl;
+
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_REBAR);
+	if (!pos)
+		return;
+
+	pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
+	nbars = (ctrl & PCI_REBAR_CTRL_NBAR_MASK) >>
+		    PCI_REBAR_CTRL_NBAR_SHIFT;
+
+	for (i = 0; i < nbars; i++, pos += 8) {
+		struct resource *res;
+		int bar_idx, size;
+
+		pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
+		bar_idx = ctrl & PCI_REBAR_CTRL_BAR_IDX;
+		res = pdev->resource + bar_idx;
+		size = ilog2(resource_size(res)) - 20;
+		ctrl &= ~PCI_REBAR_CTRL_BAR_SIZE;
+		ctrl |= size << PCI_REBAR_CTRL_BAR_SHIFT;
+		pci_write_config_dword(pdev, pos + PCI_REBAR_CTRL, ctrl);
 	}
 }
 
@@ -2832,12 +2895,8 @@ static const struct dmi_system_id bridge_d3_blacklist[] = {
  * pci_bridge_d3_possible - Is it possible to put the bridge into D3
  * @bridge: Bridge to check
  *
- * Currently we only allow D3 for some PCIe ports and for Thunderbolt.
- *
- * Return: Whether it is possible to move the bridge to D3.
- *
- * The return value is guaranteed to be constant across the entire lifetime
- * of the bridge, including its hot-removal.
+ * This function checks if it is possible to move the bridge to D3.
+ * Currently we only allow D3 for recent enough PCIe ports and Thunderbolt.
  */
 bool pci_bridge_d3_possible(struct pci_dev *bridge)
 {
@@ -3528,6 +3587,114 @@ void pci_acs_init(struct pci_dev *dev)
 	 * quirks.
 	 */
 	pci_enable_acs(dev);
+}
+
+/**
+ * pci_rebar_find_pos - find position of resize ctrl reg for BAR
+ * @pdev: PCI device
+ * @bar: BAR to find
+ *
+ * Helper to find the position of the ctrl register for a BAR.
+ * Returns -ENOTSUPP if resizable BARs are not supported at all.
+ * Returns -ENOENT if no ctrl register for the BAR could be found.
+ */
+static int pci_rebar_find_pos(struct pci_dev *pdev, int bar)
+{
+	unsigned int pos, nbars, i;
+	u32 ctrl;
+
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_REBAR);
+	if (!pos)
+		return -ENOTSUPP;
+
+	pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
+	nbars = (ctrl & PCI_REBAR_CTRL_NBAR_MASK) >>
+		    PCI_REBAR_CTRL_NBAR_SHIFT;
+
+	for (i = 0; i < nbars; i++, pos += 8) {
+		int bar_idx;
+
+		pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
+		bar_idx = ctrl & PCI_REBAR_CTRL_BAR_IDX;
+		if (bar_idx == bar)
+			return pos;
+	}
+
+	return -ENOENT;
+}
+
+/**
+ * pci_rebar_get_possible_sizes - get possible sizes for BAR
+ * @pdev: PCI device
+ * @bar: BAR to query
+ *
+ * Get the possible sizes of a resizable BAR as bitmask defined in the spec
+ * (bit 0=1MB, bit 19=512GB). Returns 0 if BAR isn't resizable.
+ */
+u32 pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar)
+{
+	int pos;
+	u32 cap;
+
+	pos = pci_rebar_find_pos(pdev, bar);
+	if (pos < 0)
+		return 0;
+
+	pci_read_config_dword(pdev, pos + PCI_REBAR_CAP, &cap);
+	cap &= PCI_REBAR_CAP_SIZES;
+
+	/* Sapphire RX 5600 XT Pulse has an invalid cap dword for BAR 0 */
+	if (pdev->vendor == PCI_VENDOR_ID_ATI && pdev->device == 0x731f &&
+	    bar == 0 && cap == 0x7000)
+		cap = 0x3f000;
+
+	return cap >> 4;
+}
+
+/**
+ * pci_rebar_get_current_size - get the current size of a BAR
+ * @pdev: PCI device
+ * @bar: BAR to set size to
+ *
+ * Read the size of a BAR from the resizable BAR config.
+ * Returns size if found or negative error code.
+ */
+int pci_rebar_get_current_size(struct pci_dev *pdev, int bar)
+{
+	int pos;
+	u32 ctrl;
+
+	pos = pci_rebar_find_pos(pdev, bar);
+	if (pos < 0)
+		return pos;
+
+	pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
+	return (ctrl & PCI_REBAR_CTRL_BAR_SIZE) >> PCI_REBAR_CTRL_BAR_SHIFT;
+}
+
+/**
+ * pci_rebar_set_size - set a new size for a BAR
+ * @pdev: PCI device
+ * @bar: BAR to set size to
+ * @size: new size as defined in the spec (0=1MB, 19=512GB)
+ *
+ * Set the new size of a BAR as defined in the spec.
+ * Returns zero if resizing was successful, error code otherwise.
+ */
+int pci_rebar_set_size(struct pci_dev *pdev, int bar, int size)
+{
+	int pos;
+	u32 ctrl;
+
+	pos = pci_rebar_find_pos(pdev, bar);
+	if (pos < 0)
+		return pos;
+
+	pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
+	ctrl &= ~PCI_REBAR_CTRL_BAR_SIZE;
+	ctrl |= size << PCI_REBAR_CTRL_BAR_SHIFT;
+	pci_write_config_dword(pdev, pos + PCI_REBAR_CTRL, ctrl);
+	return 0;
 }
 
 /**
@@ -4452,10 +4619,13 @@ EXPORT_SYMBOL(pci_wait_for_pending_transaction);
  */
 bool pcie_has_flr(struct pci_dev *dev)
 {
+	u32 cap;
+
 	if (dev->dev_flags & PCI_DEV_FLAGS_NO_FLR_RESET)
 		return false;
 
-	return FIELD_GET(PCI_EXP_DEVCAP_FLR, dev->devcap) == 1;
+	pcie_capability_read_dword(dev, PCI_EXP_DEVCAP, &cap);
+	return cap & PCI_EXP_DEVCAP_FLR;
 }
 EXPORT_SYMBOL_GPL(pcie_has_flr);
 
@@ -5629,7 +5799,6 @@ int pcie_set_readrq(struct pci_dev *dev, int rq)
 {
 	u16 v;
 	int ret;
-	struct pci_host_bridge *bridge = pci_find_host_bridge(dev->bus);
 
 	if (rq < 128 || rq > 4096 || !is_power_of_2(rq))
 		return -EINVAL;
@@ -5647,15 +5816,6 @@ int pcie_set_readrq(struct pci_dev *dev, int rq)
 	}
 
 	v = (ffs(rq) - 8) << 12;
-
-	if (bridge->no_inc_mrrs) {
-		int max_mrrs = pcie_get_readrq(dev);
-
-		if (rq > max_mrrs) {
-			pci_info(dev, "can't set Max_Read_Request_Size to %d; max is %d\n", rq, max_mrrs);
-			return -EINVAL;
-		}
-	}
 
 	ret = pcie_capability_clear_and_set_word(dev, PCI_EXP_DEVCTL,
 						  PCI_EXP_DEVCTL_READRQ, v);
@@ -6344,83 +6504,66 @@ static void pci_no_domains(void)
 }
 
 #ifdef CONFIG_PCI_DOMAINS_GENERIC
-static DEFINE_IDA(pci_domain_nr_static_ida);
-static DEFINE_IDA(pci_domain_nr_dynamic_ida);
+static atomic_t __domain_nr = ATOMIC_INIT(-1);
 
-static void of_pci_reserve_static_domain_nr(void)
+static int pci_get_new_domain_nr(void)
 {
-	struct device_node *np;
-	int domain_nr;
-
-	for_each_node_by_type(np, "pci") {
-		domain_nr = of_get_pci_domain_nr(np);
-		if (domain_nr < 0)
-			continue;
-		/*
-		 * Permanently allocate domain_nr in dynamic_ida
-		 * to prevent it from dynamic allocation.
-		 */
-		ida_alloc_range(&pci_domain_nr_dynamic_ida,
-				domain_nr, domain_nr, GFP_KERNEL);
-	}
+	return atomic_inc_return(&__domain_nr);
 }
 
 static int of_pci_bus_find_domain_nr(struct device *parent)
 {
-	static bool static_domains_reserved = false;
-	int domain_nr;
+	static int use_dt_domains = -1;
+	int domain = -1;
 
-	/* On the first call scan device tree for static allocations. */
-	if (!static_domains_reserved) {
-		of_pci_reserve_static_domain_nr();
-		static_domains_reserved = true;
-	}
-
-	if (parent) {
-		/*
-		 * If domain is in DT, allocate it in static IDA.  This
-		 * prevents duplicate static allocations in case of errors
-		 * in DT.
-		 */
-		domain_nr = of_get_pci_domain_nr(parent->of_node);
-		if (domain_nr >= 0)
-			return ida_alloc_range(&pci_domain_nr_static_ida,
-					       domain_nr, domain_nr,
-					       GFP_KERNEL);
-	}
+	if (parent)
+		domain = of_get_pci_domain_nr(parent->of_node);
 
 	/*
-	 * If domain was not specified in DT, choose a free ID from dynamic
-	 * allocations. All domain numbers from DT are permanently in
-	 * dynamic allocations to prevent assigning them to other DT nodes
-	 * without static domain.
+	 * Check DT domain and use_dt_domains values.
+	 *
+	 * If DT domain property is valid (domain >= 0) and
+	 * use_dt_domains != 0, the DT assignment is valid since this means
+	 * we have not previously allocated a domain number by using
+	 * pci_get_new_domain_nr(); we should also update use_dt_domains to
+	 * 1, to indicate that we have just assigned a domain number from
+	 * DT.
+	 *
+	 * If DT domain property value is not valid (ie domain < 0), and we
+	 * have not previously assigned a domain number from DT
+	 * (use_dt_domains != 1) we should assign a domain number by
+	 * using the:
+	 *
+	 * pci_get_new_domain_nr()
+	 *
+	 * API and update the use_dt_domains value to keep track of method we
+	 * are using to assign domain numbers (use_dt_domains = 0).
+	 *
+	 * All other combinations imply we have a platform that is trying
+	 * to mix domain numbers obtained from DT and pci_get_new_domain_nr(),
+	 * which is a recipe for domain mishandling and it is prevented by
+	 * invalidating the domain value (domain = -1) and printing a
+	 * corresponding error.
 	 */
-	return ida_alloc(&pci_domain_nr_dynamic_ida, GFP_KERNEL);
-}
+	if (domain >= 0 && use_dt_domains) {
+		use_dt_domains = 1;
+	} else if (domain < 0 && use_dt_domains != 1) {
+		use_dt_domains = 0;
+		domain = pci_get_new_domain_nr();
+	} else {
+		if (parent)
+			pr_err("Node %pOF has ", parent->of_node);
+		pr_err("Inconsistent \"linux,pci-domain\" property in DT\n");
+		domain = -1;
+	}
 
-static void of_pci_bus_release_domain_nr(struct pci_bus *bus, struct device *parent)
-{
-	if (bus->domain_nr < 0)
-		return;
-
-	/* Release domain from IDA where it was allocated. */
-	if (of_get_pci_domain_nr(parent->of_node) == bus->domain_nr)
-		ida_free(&pci_domain_nr_static_ida, bus->domain_nr);
-	else
-		ida_free(&pci_domain_nr_dynamic_ida, bus->domain_nr);
+	return domain;
 }
 
 int pci_bus_find_domain_nr(struct pci_bus *bus, struct device *parent)
 {
 	return acpi_disabled ? of_pci_bus_find_domain_nr(parent) :
 			       acpi_pci_bus_find_domain_nr(bus);
-}
-
-void pci_bus_release_domain_nr(struct pci_bus *bus, struct device *parent)
-{
-	if (!acpi_disabled)
-		return;
-	of_pci_bus_release_domain_nr(bus, parent);
 }
 #endif
 

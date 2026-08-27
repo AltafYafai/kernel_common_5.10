@@ -16,6 +16,8 @@
 #include <linux/atomic.h>
 #include <linux/uidgid.h>
 #include <linux/wait.h>
+#include <linux/rwsem.h>
+#include <linux/android_kabi.h>
 
 struct file;
 struct dentry;
@@ -156,6 +158,17 @@ struct kernfs_node {
 	unsigned short		flags;
 	umode_t			mode;
 	struct kernfs_iattrs	*iattr;
+
+	ANDROID_KABI_RESERVE(1);
+};
+
+struct kernfs_node_ext {
+	struct kernfs_node	node;
+	/*
+	 * Monotonic revision counter, used to identify if a directory
+	 * node has changed during negative dentry revalidation.
+	 */
+	unsigned long		rev;
 };
 
 /*
@@ -175,6 +188,11 @@ struct kernfs_syscall_ops {
 		      const char *new_name);
 	int (*show_path)(struct seq_file *sf, struct kernfs_node *kn,
 			 struct kernfs_root *root);
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
+	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_RESERVE(4);
 };
 
 struct kernfs_root {
@@ -188,10 +206,17 @@ struct kernfs_root {
 	u32			id_highbits;
 	struct kernfs_syscall_ops *syscall_ops;
 
-	/* list of kernfs_super_info of this root, protected by kernfs_mutex */
+	/* list of kernfs_super_info of this root, protected by kernfs_rwsem */
 	struct list_head	supers;
 
 	wait_queue_head_t	deactivate_waitq;
+
+	ANDROID_KABI_RESERVE(1);
+};
+
+struct kernfs_root_ext {
+	struct kernfs_root	root;
+	struct rw_semaphore	kernfs_rwsem;
 };
 
 struct kernfs_open_file {
@@ -212,6 +237,8 @@ struct kernfs_open_file {
 	bool			mmapped:1;
 	bool			released:1;
 	const struct vm_operations_struct *vm_ops;
+
+	ANDROID_KABI_RESERVE(1);
 };
 
 struct kernfs_ops {
@@ -268,6 +295,9 @@ struct kernfs_ops {
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 	struct lock_class_key	lockdep_key;
 #endif
+
+	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_RESERVE(2);
 };
 
 /*

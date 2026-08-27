@@ -31,7 +31,6 @@
 #include <linux/pm_qos.h>
 #include <linux/kobject.h>
 
-#include <linux/bitfield.h>
 #include <linux/uaccess.h>
 #include <asm/byteorder.h>
 
@@ -2506,8 +2505,6 @@ static void set_usb_port_removable(struct usb_device *udev)
 	u16 wHubCharacteristics;
 	bool removable = true;
 
-	dev_set_removable(&udev->dev, DEVICE_REMOVABLE_UNKNOWN);
-
 	if (!hdev)
 		return;
 
@@ -2519,11 +2516,11 @@ static void set_usb_port_removable(struct usb_device *udev)
 	 */
 	switch (hub->ports[udev->portnum - 1]->connect_type) {
 	case USB_PORT_CONNECT_TYPE_HOT_PLUG:
-		dev_set_removable(&udev->dev, DEVICE_REMOVABLE);
+		udev->removable = USB_DEVICE_REMOVABLE;
 		return;
 	case USB_PORT_CONNECT_TYPE_HARD_WIRED:
 	case USB_PORT_NOT_USED:
-		dev_set_removable(&udev->dev, DEVICE_FIXED);
+		udev->removable = USB_DEVICE_FIXED;
 		return;
 	default:
 		break;
@@ -2548,9 +2545,9 @@ static void set_usb_port_removable(struct usb_device *udev)
 	}
 
 	if (removable)
-		dev_set_removable(&udev->dev, DEVICE_REMOVABLE);
+		udev->removable = USB_DEVICE_REMOVABLE;
 	else
-		dev_set_removable(&udev->dev, DEVICE_FIXED);
+		udev->removable = USB_DEVICE_FIXED;
 
 }
 
@@ -2622,7 +2619,8 @@ int usb_new_device(struct usb_device *udev)
 	device_enable_async_suspend(&udev->dev);
 
 	/* check whether the hub or firmware marks this port as non-removable */
-	set_usb_port_removable(udev);
+	if (udev->parent)
+		set_usb_port_removable(udev);
 
 	/* Register the device.  The device driver is responsible
 	 * for configuring the device and invoking the add-device
@@ -2749,81 +2747,6 @@ error_autoresume:
 out_authorized:
 	usb_unlock_device(usb_dev);	/* complements locktree */
 	return result;
-}
-
-/**
- * get_port_ssp_rate - Match the extended port status to SSP rate
- * @hdev: The hub device
- * @ext_portstatus: extended port status
- *
- * Match the extended port status speed id to the SuperSpeed Plus sublink speed
- * capability attributes. Base on the number of connected lanes and speed,
- * return the corresponding enum usb_ssp_rate.
- */
-static enum usb_ssp_rate get_port_ssp_rate(struct usb_device *hdev,
-					   u32 ext_portstatus)
-{
-	struct usb_ssp_cap_descriptor *ssp_cap = hdev->bos->ssp_cap;
-	u32 attr;
-	u8 speed_id;
-	u8 ssac;
-	u8 lanes;
-	int i;
-
-	if (!ssp_cap)
-		goto out;
-
-	speed_id = ext_portstatus & USB_EXT_PORT_STAT_RX_SPEED_ID;
-	lanes = USB_EXT_PORT_RX_LANES(ext_portstatus) + 1;
-
-	ssac = le32_to_cpu(ssp_cap->bmAttributes) &
-		USB_SSP_SUBLINK_SPEED_ATTRIBS;
-
-	for (i = 0; i <= ssac; i++) {
-		u8 ssid;
-
-		attr = le32_to_cpu(ssp_cap->bmSublinkSpeedAttr[i]);
-		ssid = FIELD_GET(USB_SSP_SUBLINK_SPEED_SSID, attr);
-		if (speed_id == ssid) {
-			u16 mantissa;
-			u8 lse;
-			u8 type;
-
-			/*
-			 * Note: currently asymmetric lane types are only
-			 * applicable for SSIC operate in SuperSpeed protocol
-			 */
-			type = FIELD_GET(USB_SSP_SUBLINK_SPEED_ST, attr);
-			if (type == USB_SSP_SUBLINK_SPEED_ST_ASYM_RX ||
-			    type == USB_SSP_SUBLINK_SPEED_ST_ASYM_TX)
-				goto out;
-
-			if (FIELD_GET(USB_SSP_SUBLINK_SPEED_LP, attr) !=
-			    USB_SSP_SUBLINK_SPEED_LP_SSP)
-				goto out;
-
-			lse = FIELD_GET(USB_SSP_SUBLINK_SPEED_LSE, attr);
-			mantissa = FIELD_GET(USB_SSP_SUBLINK_SPEED_LSM, attr);
-
-			/* Convert to Gbps */
-			for (; lse < USB_SSP_SUBLINK_SPEED_LSE_GBPS; lse++)
-				mantissa /= 1000;
-
-			if (mantissa >= 10 && lanes == 1)
-				return USB_SSP_GEN_2x1;
-
-			if (mantissa >= 10 && lanes == 2)
-				return USB_SSP_GEN_2x2;
-
-			if (mantissa >= 5 && lanes == 2)
-				return USB_SSP_GEN_1x2;
-
-			goto out;
-		}
-	}
-
-out:
-	return USB_SSP_GEN_UNKNOWN;
 }
 
 /*
@@ -3015,11 +2938,9 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
 		/* extended portstatus Rx and Tx lane count are zero based */
 		udev->rx_lanes = USB_EXT_PORT_RX_LANES(ext_portstatus) + 1;
 		udev->tx_lanes = USB_EXT_PORT_TX_LANES(ext_portstatus) + 1;
-		udev->ssp_rate = get_port_ssp_rate(hub->hdev, ext_portstatus);
 	} else {
 		udev->rx_lanes = 1;
 		udev->tx_lanes = 1;
-		udev->ssp_rate = USB_SSP_GEN_UNKNOWN;
 	}
 	if (hub_is_wusb(hub))
 		udev->speed = USB_SPEED_WIRELESS;
@@ -4702,7 +4623,7 @@ static int hub_set_address(struct usb_device *udev, int devnum)
 	if (udev->state != USB_STATE_DEFAULT)
 		return -EINVAL;
 	if (hcd->driver->address_device)
-		retval = hcd->driver->address_device(hcd, udev, USB_CTRL_SET_TIMEOUT);
+		retval = hcd->driver->address_device(hcd, udev);
 	else
 		retval = usb_control_msg(udev, usb_sndaddr0pipe(),
 				USB_REQ_SET_ADDRESS, 0, devnum, 0,
@@ -6221,11 +6142,6 @@ re_enumerate_no_bos:
  * the reset is over (using their post_reset method).
  *
  * Return: The same as for usb_reset_and_verify_device().
- * However, if a reset is already in progress (for instance, if a
- * driver doesn't have pre_reset() or post_reset() callbacks, and while
- * being unbound or re-bound during the ongoing reset its disconnect()
- * or probe() routine tries to perform a second, nested reset), the
- * routine returns -EINPROGRESS.
  *
  * Note:
  * The caller must own the device lock.  For example, it's safe to use
@@ -6258,10 +6174,6 @@ int usb_reset_device(struct usb_device *udev)
 		dev_dbg(&udev->dev, "%s for root hub!\n", __func__);
 		return -EISDIR;
 	}
-
-	if (udev->reset_in_progress)
-		return -EINPROGRESS;
-	udev->reset_in_progress = 1;
 
 	port_dev = hub->ports[udev->portnum - 1];
 
@@ -6327,7 +6239,6 @@ int usb_reset_device(struct usb_device *udev)
 
 	usb_autosuspend_device(udev);
 	memalloc_noio_restore(noio_flag);
-	udev->reset_in_progress = 0;
 	return ret;
 }
 EXPORT_SYMBOL_GPL(usb_reset_device);

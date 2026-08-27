@@ -315,7 +315,7 @@ static void esp_output_done(struct crypto_async_request *base, int err)
 			if (err != -EINPROGRESS)
 				kfree_skb(skb);
 		} else {
-			xfrm_output_resume(skb_to_full_sk(skb), skb, err);
+			xfrm_output_resume(skb, err);
 		}
 	}
 }

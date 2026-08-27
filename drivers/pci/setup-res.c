@@ -75,16 +75,12 @@ static void pci_std_update_resource(struct pci_dev *dev, int resno)
 		 * as zero when disabled, so don't update ROM BARs unless
 		 * they're enabled.  See
 		 * https://lore.kernel.org/r/43147B3D.1030309@vc.cvut.cz/
-		 * But we must update ROM BAR for buggy devices where even a
-		 * disabled ROM can conflict with other BARs.
 		 */
-		if (!(res->flags & IORESOURCE_ROM_ENABLE) &&
-		    !dev->rom_bar_overlap)
+		if (!(res->flags & IORESOURCE_ROM_ENABLE))
 			return;
 
 		reg = dev->rom_base_reg;
-		if (res->flags & IORESOURCE_ROM_ENABLE)
-			new |= PCI_ROM_ADDRESS_ENABLE;
+		new |= PCI_ROM_ADDRESS_ENABLE;
 	} else
 		return;
 
@@ -421,6 +417,59 @@ void pci_release_resource(struct pci_dev *dev, int resno)
 	res->flags |= IORESOURCE_UNSET;
 }
 EXPORT_SYMBOL(pci_release_resource);
+
+int pci_resize_resource(struct pci_dev *dev, int resno, int size)
+{
+	struct resource *res = dev->resource + resno;
+	struct pci_host_bridge *host;
+	int old, ret;
+	u32 sizes;
+	u16 cmd;
+
+	/* Check if we must preserve the firmware's resource assignment */
+	host = pci_find_host_bridge(dev->bus);
+	if (host->preserve_config)
+		return -ENOTSUPP;
+
+	/* Make sure the resource isn't assigned before resizing it. */
+	if (!(res->flags & IORESOURCE_UNSET))
+		return -EBUSY;
+
+	pci_read_config_word(dev, PCI_COMMAND, &cmd);
+	if (cmd & PCI_COMMAND_MEMORY)
+		return -EBUSY;
+
+	sizes = pci_rebar_get_possible_sizes(dev, resno);
+	if (!sizes)
+		return -ENOTSUPP;
+
+	if (!(sizes & BIT(size)))
+		return -EINVAL;
+
+	old = pci_rebar_get_current_size(dev, resno);
+	if (old < 0)
+		return old;
+
+	ret = pci_rebar_set_size(dev, resno, size);
+	if (ret)
+		return ret;
+
+	res->end = res->start + pci_rebar_size_to_bytes(size) - 1;
+
+	/* Check if the new config works by trying to assign everything. */
+	if (dev->bus->self) {
+		ret = pci_reassign_bridge_resources(dev->bus->self, res->flags);
+		if (ret)
+			goto error_resize;
+	}
+	return 0;
+
+error_resize:
+	pci_rebar_set_size(dev, resno, old);
+	res->end = res->start + pci_rebar_size_to_bytes(old) - 1;
+	return ret;
+}
+EXPORT_SYMBOL(pci_resize_resource);
 
 int pci_enable_resources(struct pci_dev *dev, int mask)
 {
