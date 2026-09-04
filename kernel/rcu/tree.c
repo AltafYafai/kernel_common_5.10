@@ -4332,7 +4332,8 @@ static void __init rcu_start_exp_gp_kworkers(void)
 
 static inline void rcu_alloc_par_gp_wq(void)
 {
-	rcu_par_gp_wq = alloc_workqueue("rcu_par_gp", WQ_MEM_RECLAIM, 0);
+	rcu_par_gp_wq = alloc_workqueue("rcu_par_gp",
+					WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
 	WARN_ON(!rcu_par_gp_wq);
 }
 #endif /* CONFIG_RCU_EXP_KTHREAD */
@@ -4369,7 +4370,7 @@ static int __init rcu_spawn_gp_kthread(void)
 		return 0;
 	if (kthread_prio) {
 		sp.sched_priority = kthread_prio;
-		sched_setscheduler_nocheck(t, SCHED_FIFO, &sp);
+		sched_setscheduler_nocheck(t, SCHED_RR, &sp);
 	}
 	rnp = rcu_get_root();
 	raw_spin_lock_irqsave_rcu_node(rnp, flags);
@@ -4656,7 +4657,7 @@ void __init rcu_init(void)
 	}
 
 	/* Create workqueue for expedited GPs and for Tree SRCU. */
-	rcu_gp_wq = alloc_workqueue("rcu_gp", WQ_MEM_RECLAIM, 0);
+	rcu_gp_wq = alloc_workqueue("rcu_gp", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
 	WARN_ON(!rcu_gp_wq);
 	rcu_alloc_par_gp_wq();
 	srcu_init();

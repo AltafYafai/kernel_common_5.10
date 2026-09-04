@@ -766,7 +766,6 @@ include/config/auto.conf:
 endif # may-sync-config
 endif # need-config
 
-KBUILD_CFLAGS	+= $(call cc-option,-fno-delete-null-pointer-checks,)
 KBUILD_CFLAGS	+= $(call cc-disable-warning,frame-address,)
 KBUILD_CFLAGS	+= $(call cc-disable-warning, format-truncation)
 KBUILD_CFLAGS	+= $(call cc-disable-warning, format-overflow)
@@ -779,6 +778,15 @@ KBUILD_CFLAGS += -O3
 else ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS += -Os
 endif
+
+KBUILD_CFLAGS  += $(call cc-option,-mllvm -hot-cold-split=true)
+KBUILD_CFLAGS  += $(call cc-option,-mllvm -enable-ml-inliner=release)
+KBUILD_CFLAGS  += $(call cc-option,-mllvm -regalloc-enable-advisor=release)
+KBUILD_LDFLAGS += $(call cc-option,-mllvm -enable-ml-inliner=release)
+KBUILD_LDFLAGS += $(call cc-option,-mllvm -regalloc-enable-advisor=release)
+
+KBUILD_CFLAGS   += -march=armv8.2-a+lse+crypto+dotprod
+KBUILD_AFLAGS   += -march=armv8.2-a+lse+crypto+dotprod
 
 # Tell gcc to never replace conditional load with a non-conditional one
 KBUILD_CFLAGS	+= $(call cc-option,--param=allow-store-data-races=0)
