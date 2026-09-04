@@ -550,7 +550,7 @@ void tick_unfreeze(void)
 		tick_resume_local();
 	}
 	if (tick_do_timer_cpu == TICK_DO_TIMER_NONE)
-		tick_do_timer_cpu = cpu;
+		tick_do_timer_cpu = smp_processor_id();
 
 	tick_freeze_depth--;
 

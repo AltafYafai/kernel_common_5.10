@@ -853,53 +853,6 @@ void __init __weak arch_call_rest_init(void)
 	rest_init();
 }
 
-
-	len = strlen(cmdline);
-	while (len > IDEAL_CMDLINE_LEN) {
-		const char *first_space;
-		const char *prev_cutoff;
-		const char *cutoff;
-		int to_print;
-		size_t used;
-
-		/* Find the last ' ' that wouldn't make the line too long */
-		prev_cutoff = NULL;
-		cutoff = cmdline;
-		while (true) {
-			cutoff = strchr(cutoff + 1, ' ');
-			if (!cutoff || cutoff - cmdline > IDEAL_CMDLINE_SPLIT_LEN)
-				break;
-			prev_cutoff = cutoff;
-		}
-		if (prev_cutoff)
-			cutoff = prev_cutoff;
-		else if (!cutoff)
-			break;
-
-		/* Find the beginning and end of the string of spaces */
-		first_space = cutoff;
-		while (first_space > cmdline && first_space[-1] == ' ')
-			first_space--;
-		to_print = first_space - cmdline;
-		while (*cutoff == ' ')
-			cutoff++;
-		used = cutoff - cmdline;
-
-		/* If the whole string is used, break and do the final printout */
-		if (len == used)
-			break;
-
-		if (to_print)
-			pr_notice("%s%.*s%s\n", KERNEL_CMDLINE_PREFIX,
-				  to_print, cmdline, KERNEL_CMDLINE_CONTINUATION);
-
-		len -= used;
-		cmdline += used;
-	}
-	if (len)
-		pr_notice("%s%s\n", KERNEL_CMDLINE_PREFIX, cmdline);
-}
-
 void __init init_dma_buf_kmem_pool(void);
 asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 {
