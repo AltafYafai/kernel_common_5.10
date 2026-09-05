@@ -560,7 +560,7 @@ out_fail:
 		list_del(&iod->ls_rcv_list);
 	}
 
-	kfree(tgtport->iod);
+	kfree(iod);
 
 	return -EFAULT;
 }

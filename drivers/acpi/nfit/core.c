@@ -3455,8 +3455,6 @@ static void acpi_nfit_unregister(void *data)
 	struct acpi_nfit_desc *acpi_desc = data;
 
 	nvdimm_bus_unregister(acpi_desc->nvdimm_bus);
-	/* The nvdimm_bus object may have been freed, so clear the pointer. */
-	acpi_desc->nvdimm_bus = NULL;
 }
 
 int acpi_nfit_init(struct acpi_nfit_desc *acpi_desc, void *data, acpi_size sz)
@@ -3681,10 +3679,7 @@ static void acpi_nfit_put_table(void *table)
 void acpi_nfit_shutdown(void *data)
 {
 	struct acpi_nfit_desc *acpi_desc = data;
-	struct device *bus_dev;
-
-	if (!acpi_desc || !acpi_desc->nvdimm_bus)
-		return;
+	struct device *bus_dev = to_nvdimm_bus_dev(acpi_desc->nvdimm_bus);
 
 	/*
 	 * Destruct under acpi_desc_lock so that nfit_handle_mce does not
@@ -3699,7 +3694,6 @@ void acpi_nfit_shutdown(void *data)
 	mutex_unlock(&acpi_desc->init_mutex);
 	cancel_delayed_work_sync(&acpi_desc->dwork);
 
-	bus_dev = to_nvdimm_bus_dev(acpi_desc->nvdimm_bus);
 	/*
 	 * Bounce the nvdimm bus lock to make sure any in-flight
 	 * acpi_nfit_ars_rescan() submissions have had a chance to
@@ -3767,14 +3761,13 @@ static int acpi_nfit_add(struct acpi_device *adev)
 				sz - sizeof(struct acpi_table_nfit));
 
 	if (rc)
-		acpi_nfit_shutdown(acpi_desc);
-
-	return rc;
+		return rc;
+	return devm_add_action_or_reset(dev, acpi_nfit_shutdown, acpi_desc);
 }
 
 static int acpi_nfit_remove(struct acpi_device *adev)
 {
-	acpi_nfit_shutdown(dev_get_drvdata(&adev->dev));
+	/* see acpi_nfit_unregister */
 	return 0;
 }
 

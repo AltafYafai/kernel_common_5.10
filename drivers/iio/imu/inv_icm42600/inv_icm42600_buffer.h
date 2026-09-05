@@ -32,9 +32,6 @@ struct inv_icm42600_fifo {
 	struct {
 		unsigned int gyro;
 		unsigned int accel;
-		unsigned int eff_gyro;
-		unsigned int eff_accel;
-		unsigned int value;
 	} watermark;
 	size_t count;
 	struct {

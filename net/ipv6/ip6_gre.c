@@ -2090,9 +2090,6 @@ static int ip6gre_changelink(struct net_device *dev, struct nlattr *tb[],
 	struct ip6gre_net *ign = net_generic(t->net, ip6gre_net_id);
 	struct __ip6_tnl_parm p;
 
-	if (!rtnl_dev_link_net_capable(dev, t->net))
-		return -EPERM;
-
 	t = ip6gre_changelink_common(dev, tb, data, &p, extack);
 	if (IS_ERR(t))
 		return PTR_ERR(t);
@@ -2303,14 +2300,10 @@ static int ip6erspan_changelink(struct net_device *dev, struct nlattr *tb[],
 				struct nlattr *data[],
 				struct netlink_ext_ack *extack)
 {
-	struct ip6_tnl *t = netdev_priv(dev);
+	struct ip6gre_net *ign = net_generic(dev_net(dev), ip6gre_net_id);
 	struct __ip6_tnl_parm p;
-	struct ip6gre_net *ign;
+	struct ip6_tnl *t;
 
-	if (!rtnl_dev_link_net_capable(dev, t->net))
-		return -EPERM;
-
-	ign = net_generic(t->net, ip6gre_net_id);
 	t = ip6gre_changelink_common(dev, tb, data, &p, extack);
 	if (IS_ERR(t))
 		return PTR_ERR(t);

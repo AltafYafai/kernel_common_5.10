@@ -1426,6 +1426,9 @@ static int pch_spi_pd_remove(struct platform_device *plat_dev)
 	dev_dbg(&plat_dev->dev, "%s:[ch%d] irq=%d\n",
 		__func__, plat_dev->id, board_dat->pdev->irq);
 
+	if (use_dma)
+		pch_free_dma_buf(board_dat, data);
+
 	/* check for any pending messages; no action is taken if the queue
 	 * is still full; but at least we tried.  Unload anyway */
 	count = 500;
@@ -1449,16 +1452,8 @@ static int pch_spi_pd_remove(struct platform_device *plat_dev)
 		free_irq(board_dat->pdev->irq, data);
 	}
 
-	spi_controller_get(data->master);
-
-	spi_unregister_controller(data->master);
-
-	if (use_dma)
-		pch_free_dma_buf(board_dat, data);
-
 	pci_iounmap(board_dat->pdev, data->io_remap_addr);
-
-	spi_controller_put(data->master);
+	spi_unregister_master(data->master);
 
 	return 0;
 }

@@ -913,7 +913,8 @@ struct net_device *dev_get_by_name(struct net *net, const char *name)
 
 	rcu_read_lock();
 	dev = dev_get_by_name_rcu(net, name);
-	dev_hold(dev);
+	if (dev)
+		dev_hold(dev);
 	rcu_read_unlock();
 	return dev;
 }
@@ -986,7 +987,8 @@ struct net_device *dev_get_by_index(struct net *net, int ifindex)
 
 	rcu_read_lock();
 	dev = dev_get_by_index_rcu(net, ifindex);
-	dev_hold(dev);
+	if (dev)
+		dev_hold(dev);
 	rcu_read_unlock();
 	return dev;
 }
@@ -4302,13 +4304,30 @@ EXPORT_SYMBOL(__dev_direct_xmit);
  *			Receiver routines
  *************************************************************************/
 
-int netdev_max_backlog __read_mostly = 1000;
+int netdev_max_backlog __read_mostly = 16384;
 EXPORT_SYMBOL(netdev_max_backlog);
 
 int netdev_tstamp_prequeue __read_mostly = 1;
-int netdev_budget __read_mostly = 300;
-/* Must be at least 2 jiffes to guarantee 1 jiffy timeout */
-unsigned int __read_mostly netdev_budget_usecs = 2 * USEC_PER_SEC / HZ;
+/* Default raised from 300 -> 600.  netdev_budget caps how many packets
+ * net_rx_action() will pull from any one NAPI poll before yielding.
+ * The 300-packet ceiling is older than 1 GbE-class radios; on modern
+ * Wi-Fi 5/6 hardware (and on tethered LTE/5G modem-class throughput)
+ * 300 packets is well under one A-MPDU burst, so the softirq yields
+ * mid-burst and the next poll has to re-spin RX context for no win.
+ * Doubling it lets a single poll drain a typical aggregate cleanly
+ * without making the softirq monopolise the CPU; the time-limit
+ * (netdev_budget_usecs) and the per-NAPI quota (weight, default 64)
+ * are both preserved as a back-stop.
+ */
+int netdev_budget __read_mostly = 600;
+/* Must be at least 2 jiffes to guarantee 1 jiffy timeout.
+ *
+ * Stretched from 2 jiffies to 4 jiffies to match the bumped packet
+ * budget above; otherwise the time-limit fires before the packet
+ * limit on slow-CPU / low-HZ Android platforms and the extra budget
+ * is wasted.  Still well under a single scheduler timeslice.
+ */
+unsigned int __read_mostly netdev_budget_usecs = 4 * USEC_PER_SEC / HZ;
 int weight_p __read_mostly = 64;           /* old backlog weight */
 int dev_weight_rx_bias __read_mostly = 1;  /* bias for backlog weight */
 int dev_weight_tx_bias __read_mostly = 1;  /* bias for output_queue quota */

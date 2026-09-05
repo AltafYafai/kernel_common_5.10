@@ -103,18 +103,6 @@ __ip_vs_dst_check(struct ip_vs_dest *dest)
 	return dest_dst;
 }
 
-/* Based on ip_exceeds_mtu(). */
-static bool ip_vs_exceeds_mtu(const struct sk_buff *skb, unsigned int mtu)
-{
-	if (skb->len <= mtu)
-		return false;
-
-	if (skb_is_gso(skb) && skb_gso_validate_network_len(skb, mtu))
-		return false;
-
-	return true;
-}
-
 static inline bool
 __mtu_check_toobig_v6(const struct sk_buff *skb, u32 mtu)
 {
@@ -124,9 +112,10 @@ __mtu_check_toobig_v6(const struct sk_buff *skb, u32 mtu)
 		 */
 		if (IP6CB(skb)->frag_max_size > mtu)
 			return true; /* largest fragment violate MTU */
-	} else if (ip_vs_exceeds_mtu(skb, mtu))
+	}
+	else if (skb->len > mtu && !skb_is_gso(skb)) {
 		return true; /* Packet size violate MTU size */
-
+	}
 	return false;
 }
 
@@ -251,7 +240,7 @@ static inline bool ensure_mtu_is_adequate(struct netns_ipvs *ipvs, int skb_af,
 			return true;
 
 		if (unlikely(ip_hdr(skb)->frag_off & htons(IP_DF) &&
-			     ip_vs_exceeds_mtu(skb, mtu) &&
+			     skb->len > mtu && !skb_is_gso(skb) &&
 			     !ip_vs_iph_icmp(ipvsh))) {
 			icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
 				  htonl(mtu));
@@ -718,13 +707,15 @@ int
 ip_vs_bypass_xmit(struct sk_buff *skb, struct ip_vs_conn *cp,
 		  struct ip_vs_protocol *pp, struct ip_vs_iphdr *ipvsh)
 {
+	struct iphdr  *iph = ip_hdr(skb);
+
 	EnterFunction(10);
 
-	if (__ip_vs_get_out_rt(cp->ipvs, cp->af, skb, NULL, ip_hdr(skb)->daddr,
+	if (__ip_vs_get_out_rt(cp->ipvs, cp->af, skb, NULL, iph->daddr,
 			       IP_VS_RT_MODE_NON_LOCAL, NULL, ipvsh) < 0)
 		goto tx_error;
 
-	ip_send_check(ip_hdr(skb));
+	ip_send_check(iph);
 
 	/* Another hack: avoid icmp_send in ip_fragment */
 	skb->ignore_df = 1;

@@ -6,7 +6,7 @@
 #ifndef __RGA_HW_H__
 #define __RGA_HW_H__
 
-#define RGA_CMDBUF_SIZE 0x80
+#define RGA_CMDBUF_SIZE 0x20
 
 /* Hardware limits */
 #define MAX_WIDTH 8192

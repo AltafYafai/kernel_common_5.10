@@ -11,7 +11,6 @@
 #include <linux/netdevice.h>
 #include <linux/phy.h>
 #include <linux/platform_device.h>
-#include <linux/soc/ti/k3-ringacc.h>
 #include "am65-cpsw-qos.h"
 
 struct am65_cpts;
@@ -78,8 +77,6 @@ struct am65_cpsw_rx_chn {
 
 struct am65_cpsw_pdata {
 	u32	quirks;
-	enum k3_ring_mode fdqring_mode;
-	const char	*ale_dev_id;
 };
 
 struct am65_cpsw_common {
@@ -94,7 +91,6 @@ struct am65_cpsw_common {
 	struct am65_cpsw_host   host;
 	struct am65_cpsw_port	*ports;
 	u32			disabled_ports_mask;
-	struct net_device	*dma_ndev;
 
 	int			usage_count; /* number of opened ports */
 	struct cpsw_ale		*ale;

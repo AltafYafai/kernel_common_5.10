@@ -29,8 +29,7 @@
 #include <net/ip_vs.h>
 
 static int
-tcp_csum_check(int af, struct sk_buff *skb, struct ip_vs_protocol *pp,
-	       unsigned int tcphoff);
+tcp_csum_check(int af, struct sk_buff *skb, struct ip_vs_protocol *pp);
 
 static int
 tcp_conn_schedule(struct netns_ipvs *ipvs, int af, struct sk_buff *skb,
@@ -167,7 +166,7 @@ tcp_snat_handler(struct sk_buff *skb, struct ip_vs_protocol *pp,
 		int ret;
 
 		/* Some checks before mangling */
-		if (!tcp_csum_check(cp->af, skb, pp, tcphoff))
+		if (!tcp_csum_check(cp->af, skb, pp))
 			return 0;
 
 		/* Call application helper if needed */
@@ -245,7 +244,7 @@ tcp_dnat_handler(struct sk_buff *skb, struct ip_vs_protocol *pp,
 		int ret;
 
 		/* Some checks before mangling */
-		if (!tcp_csum_check(cp->af, skb, pp, tcphoff))
+		if (!tcp_csum_check(cp->af, skb, pp))
 			return 0;
 
 		/*
@@ -302,9 +301,17 @@ tcp_dnat_handler(struct sk_buff *skb, struct ip_vs_protocol *pp,
 
 
 static int
-tcp_csum_check(int af, struct sk_buff *skb, struct ip_vs_protocol *pp,
-	       unsigned int tcphoff)
+tcp_csum_check(int af, struct sk_buff *skb, struct ip_vs_protocol *pp)
 {
+	unsigned int tcphoff;
+
+#ifdef CONFIG_IP_VS_IPV6
+	if (af == AF_INET6)
+		tcphoff = sizeof(struct ipv6hdr);
+	else
+#endif
+		tcphoff = ip_hdrlen(skb);
+
 	switch (skb->ip_summed) {
 	case CHECKSUM_NONE:
 		skb->csum = skb_checksum(skb, tcphoff, skb->len - tcphoff, 0);
@@ -315,7 +322,7 @@ tcp_csum_check(int af, struct sk_buff *skb, struct ip_vs_protocol *pp,
 			if (csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
 					    &ipv6_hdr(skb)->daddr,
 					    skb->len - tcphoff,
-					    IPPROTO_TCP,
+					    ipv6_hdr(skb)->nexthdr,
 					    skb->csum)) {
 				IP_VS_DBG_RL_PKT(0, af, pp, skb, 0,
 						 "Failed checksum for");
@@ -555,10 +562,12 @@ set_tcp_state(struct ip_vs_proto_data *pd, struct ip_vs_conn *cp,
 			if (!(cp->flags & IP_VS_CONN_F_INACTIVE) &&
 			    !tcp_state_active(new_state)) {
 				atomic_dec(&dest->activeconns);
+				atomic_inc(&dest->inactconns);
 				cp->flags |= IP_VS_CONN_F_INACTIVE;
 			} else if ((cp->flags & IP_VS_CONN_F_INACTIVE) &&
 				   tcp_state_active(new_state)) {
 				atomic_inc(&dest->activeconns);
+				atomic_dec(&dest->inactconns);
 				cp->flags &= ~IP_VS_CONN_F_INACTIVE;
 			}
 		}
@@ -578,12 +587,17 @@ set_tcp_state(struct ip_vs_proto_data *pd, struct ip_vs_conn *cp,
 static void
 tcp_state_transition(struct ip_vs_conn *cp, int direction,
 		     const struct sk_buff *skb,
-		     struct ip_vs_proto_data *pd,
-		     unsigned int iph_len)
+		     struct ip_vs_proto_data *pd)
 {
 	struct tcphdr _tcph, *th;
 
-	th = skb_header_pointer(skb, iph_len, sizeof(_tcph), &_tcph);
+#ifdef CONFIG_IP_VS_IPV6
+	int ihl = cp->af == AF_INET ? ip_hdrlen(skb) : sizeof(struct ipv6hdr);
+#else
+	int ihl = ip_hdrlen(skb);
+#endif
+
+	th = skb_header_pointer(skb, ihl, sizeof(_tcph), &_tcph);
 	if (th == NULL)
 		return;
 

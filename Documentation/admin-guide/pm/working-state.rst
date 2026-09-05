@@ -12,5 +12,6 @@ Working-State Power Management
    cpufreq
    intel_pstate
    cpufreq_drivers
+   zenith
    intel_epb
    intel-speed-select

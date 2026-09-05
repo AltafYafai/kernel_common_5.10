@@ -421,7 +421,7 @@ do_transfer()
 	wait_local_port_listen "${listener_ns}" "${port}"
 
 	local start
-	start=$(date +%s%N)
+	start=$(date +%s%3N)
 	ip netns exec ${connector_ns} ./mptcp_connect -t $timeout -p $port -s ${cl_proto} $extra_args $connect_addr < "$cin" > "$cout" &
 	local cpid=$!
 
@@ -431,7 +431,7 @@ do_transfer()
 	local rets=$?
 
 	local stop
-	stop=$(date +%s%N)
+	stop=$(date +%s%3N)
 
 	if $capture; then
 		sleep 1
@@ -440,7 +440,7 @@ do_transfer()
 	fi
 
 	local duration
-	duration=$(((stop-start) / 1000000))
+	duration=$((stop-start))
 	duration=$(printf "(duration %05sms)" $duration)
 	if [ ${rets} -ne 0 ] || [ ${retc} -ne 0 ]; then
 		echo "$duration [ FAIL ] client exit code $retc, server $rets" 1>&2

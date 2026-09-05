@@ -464,7 +464,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 		vcpu->mmio_needed = 0;
 	}
 
-	if (!vcpu->wants_to_run)
+	if (vcpu->run->immediate_exit)
 		goto out;
 
 	lose_fpu(1);

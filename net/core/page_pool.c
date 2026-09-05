@@ -318,39 +318,16 @@ static void page_pool_return_page(struct page_pool *pool, struct page *page)
 	 */
 }
 
-static bool page_pool_producer_lock(struct page_pool *pool)
-	__acquires(&pool->ring.producer_lock)
-{
-	bool in_softirq = in_serving_softirq();
-
-	if (in_softirq)
-		spin_lock(&pool->ring.producer_lock);
-	else
-		spin_lock_bh(&pool->ring.producer_lock);
-
-	return in_softirq;
-}
-
-static void page_pool_producer_unlock(struct page_pool *pool,
-				      bool in_softirq)
-	__releases(&pool->ring.producer_lock)
-{
-	if (in_softirq)
-		spin_unlock(&pool->ring.producer_lock);
-	else
-		spin_unlock_bh(&pool->ring.producer_lock);
-}
-
 static bool page_pool_recycle_in_ring(struct page_pool *pool, struct page *page)
 {
-	bool in_softirq, ret;
-
+	int ret;
 	/* BH protection not needed if current is serving softirq */
-	in_softirq = page_pool_producer_lock(pool);
-	ret = !__ptr_ring_produce(&pool->ring, page);
-	page_pool_producer_unlock(pool, in_softirq);
+	if (in_serving_softirq())
+		ret = ptr_ring_produce(&pool->ring, page);
+	else
+		ret = ptr_ring_produce_bh(&pool->ring, page);
 
-	return ret;
+	return (ret == 0) ? true : false;
 }
 
 /* Only allow direct recycling in special circumstances, into the
@@ -487,14 +464,10 @@ static void page_pool_scrub(struct page_pool *pool)
 
 static int page_pool_release(struct page_pool *pool)
 {
-	bool in_softirq;
 	int inflight;
 
 	page_pool_scrub(pool);
 	inflight = page_pool_inflight(pool);
-	/* Acquire producer lock to make sure producers have exited. */
-	in_softirq = page_pool_producer_lock(pool);
-	page_pool_producer_unlock(pool, in_softirq);
 	if (!inflight)
 		page_pool_free(pool);
 

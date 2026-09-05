@@ -977,7 +977,7 @@ int acpi_add_power_resource(acpi_handle handle)
 	return 0;
 
  err:
-	acpi_dev_put(device);
+	acpi_release_power_resource(&device->dev);
 	return result;
 }
 

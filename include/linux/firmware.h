@@ -4,7 +4,6 @@
 
 #include <linux/types.h>
 #include <linux/compiler.h>
-#include <linux/cleanup.h>
 #include <linux/gfp.h>
 
 #define FW_ACTION_NOHOTPLUG 0
@@ -118,7 +117,5 @@ static inline int request_partial_firmware_into_buf
 #endif
 
 int firmware_request_cache(struct device *device, const char *name);
-
-DEFINE_FREE(firmware, struct firmware *, release_firmware(_T))
 
 #endif

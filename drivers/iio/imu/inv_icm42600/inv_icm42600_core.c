@@ -15,12 +15,11 @@
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
-
-#include <linux/iio/common/inv_sensors_timestamp.h>
 #include <linux/iio/iio.h>
 
 #include "inv_icm42600.h"
 #include "inv_icm42600_buffer.h"
+#include "inv_icm42600_timestamp.h"
 
 static const struct regmap_range_cfg inv_icm42600_regmap_ranges[] = {
 	{
@@ -518,21 +517,9 @@ static int inv_icm42600_irq_init(struct inv_icm42600_state *st, int irq,
 	if (ret)
 		return ret;
 
-	irq_type |= IRQF_ONESHOT;
 	return devm_request_threaded_irq(dev, irq, inv_icm42600_irq_timestamp,
 					 inv_icm42600_irq_handler, irq_type,
 					 "inv_icm42600", st);
-}
-
-static int inv_icm42600_timestamp_setup(struct inv_icm42600_state *st)
-{
-	unsigned int val;
-
-	/* enable timestamp register */
-	val = INV_ICM42600_TMST_CONFIG_TMST_TO_REGS_EN |
-	      INV_ICM42600_TMST_CONFIG_TMST_EN;
-	return regmap_update_bits(st->map, INV_ICM42600_REG_TMST_CONFIG,
-				  INV_ICM42600_TMST_CONFIG_MASK, val);
 }
 
 static int inv_icm42600_enable_regulator_vddio(struct inv_icm42600_state *st)
@@ -721,8 +708,8 @@ out_unlock:
 static int __maybe_unused inv_icm42600_resume(struct device *dev)
 {
 	struct inv_icm42600_state *st = dev_get_drvdata(dev);
-	struct inv_sensors_timestamp *gyro_ts = iio_priv(st->indio_gyro);
-	struct inv_sensors_timestamp *accel_ts = iio_priv(st->indio_accel);
+	struct inv_icm42600_timestamp *gyro_ts = iio_priv(st->indio_gyro);
+	struct inv_icm42600_timestamp *accel_ts = iio_priv(st->indio_accel);
 	int ret = 0;
 
 	mutex_lock(&st->lock);
@@ -743,8 +730,8 @@ static int __maybe_unused inv_icm42600_resume(struct device *dev)
 
 	/* restore FIFO data streaming */
 	if (st->fifo.on) {
-		inv_sensors_timestamp_reset(gyro_ts);
-		inv_sensors_timestamp_reset(accel_ts);
+		inv_icm42600_timestamp_reset(gyro_ts);
+		inv_icm42600_timestamp_reset(accel_ts);
 		ret = regmap_write(st->map, INV_ICM42600_REG_FIFO_CONFIG,
 				   INV_ICM42600_FIFO_CONFIG_STREAM);
 	}
@@ -800,4 +787,3 @@ EXPORT_SYMBOL_GPL(inv_icm42600_pm_ops);
 MODULE_AUTHOR("InvenSense, Inc.");
 MODULE_DESCRIPTION("InvenSense ICM-426xx device driver");
 MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS(IIO_INV_SENSORS_TIMESTAMP);

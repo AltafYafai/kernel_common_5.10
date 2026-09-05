@@ -12,6 +12,7 @@
 
 #include "sched.h"
 
+#include <linux/hikari.h>
 #include <linux/nospec.h>
 
 #include <linux/kcov.h>
@@ -78,7 +79,7 @@ EXPORT_SYMBOL_GPL(sysctl_sched_features);
  * Number of tasks to iterate in a single balance run.
  * Limited because this is done with IRQs disabled.
  */
-const_debug unsigned int sysctl_sched_nr_migrate = 32;
+const_debug unsigned int sysctl_sched_nr_migrate = 8;
 
 /*
  * period over which we measure -rt task CPU usage in us.
@@ -1153,17 +1154,53 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 	return uc_req;
 }
 
+static inline unsigned long
+uclamp_apply_hikari_boost(struct task_struct *p, enum uclamp_id clamp_id,
+			  unsigned long base)
+{
+	unsigned int boost;
+	unsigned int ceiling;
+
+	if (clamp_id == UCLAMP_MIN) {
+		boost = hikari_uclamp_boost_amount(p);
+		if (!boost)
+			return base;
+		if (boost > SCHED_CAPACITY_SCALE)
+			boost = SCHED_CAPACITY_SCALE;
+		return max(base, (unsigned long)boost);
+	}
+
+	/*
+	 * UCLAMP_MAX path: hikari applies a per-task uclamp_max
+	 * ceiling for background-tagged tasks when the global
+	 * hikari_uclamp_max_pct knob is non-zero.  Returns the
+	 * minimum of the platform-effective base and the hikari
+	 * ceiling so a strict downstream limit (e.g. cgroup ceiling)
+	 * is never *raised*.
+	 */
+	if (clamp_id == UCLAMP_MAX) {
+		ceiling = hikari_uclamp_max_ceiling(p);
+		if (!ceiling)
+			return base;
+		return min(base, (unsigned long)ceiling);
+	}
+
+	return base;
+}
+
 unsigned long uclamp_eff_value(struct task_struct *p, enum uclamp_id clamp_id)
 {
 	struct uclamp_se uc_eff;
 
 	/* Task currently refcounted: use back-annotated (effective) value */
 	if (p->uclamp[clamp_id].active)
-		return (unsigned long)p->uclamp[clamp_id].value;
+		return uclamp_apply_hikari_boost(p, clamp_id,
+						 (unsigned long)p->uclamp[clamp_id].value);
 
 	uc_eff = uclamp_eff_get(p, clamp_id);
 
-	return (unsigned long)uc_eff.value;
+	return uclamp_apply_hikari_boost(p, clamp_id,
+					 (unsigned long)uc_eff.value);
 }
 EXPORT_SYMBOL_GPL(uclamp_eff_value);
 
@@ -2538,7 +2575,7 @@ out:
 		 * leave kernel.
 		 */
 		if (p->mm && printk_ratelimit()) {
-			printk_deferred("process %d (%s) no longer affine to cpu%d\n",
+			pr_debug("process %d (%s) no longer affine to cpu%d\n",
 					task_pid_nr(p), p->comm, cpu);
 		}
 	}
@@ -3212,6 +3249,13 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	cpu = task_cpu(p);
 #endif /* CONFIG_SMP */
 
+	/*
+	 * Hikari: notify the wake-time policy engine that p is about
+	 * to be enqueued on cpu.  Marks audio-active CPUs and may
+	 * trigger downstream actuators for opted-in tasks.
+	 */
+	hikari_on_wake_up(p, cpu);
+
 	ttwu_queue(p, cpu, wake_flags);
 unlock:
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
@@ -3291,6 +3335,132 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 {
 	return try_to_wake_up(p, state, 0);
 }
+
+#ifdef CONFIG_SCHED_BORE
+extern u8   sched_burst_fork_atavistic;
+extern uint sched_burst_cache_lifetime;
+
+static void __init sched_init_bore(void) {
+	init_task.se.burst_time = 0;
+	init_task.se.prev_burst_penalty = 0;
+	init_task.se.curr_burst_penalty = 0;
+	init_task.se.burst_penalty = 0;
+	init_task.se.burst_score = 0;
+	init_task.se.child_burst_last_cached = 0;
+}
+
+static u32 count_child_tasks(struct task_struct *p) {
+	struct task_struct *child;
+	u32 cnt = 0;
+	list_for_each_entry(child, &p->children, sibling) {cnt++;}
+	return cnt;
+}
+
+static inline bool task_burst_inheritable(struct task_struct *p) {
+	return (p->sched_class == &fair_sched_class);
+}
+
+static inline bool child_burst_cache_expired(struct task_struct *p, u64 now) {
+	u64 expiration_time =
+		p->se.child_burst_last_cached + sched_burst_cache_lifetime;
+	return ((s64)(expiration_time - now) < 0);
+}
+
+static void __update_child_burst_cache(
+		struct task_struct *p, u32 cnt, u32 sum, u64 now) {
+	u8 avg = 0;
+	if (cnt) avg = sum / cnt;
+	p->se.child_burst = max(avg, p->se.burst_penalty);
+	p->se.child_burst_cnt = cnt;
+	p->se.child_burst_last_cached = now;
+}
+
+static inline void update_child_burst_direct(struct task_struct *p, u64 now) {
+	struct task_struct *child;
+	u32 cnt = 0, sum = 0;
+
+	list_for_each_entry(child, &p->children, sibling) {
+		if (!task_burst_inheritable(child)) continue;
+		cnt++;
+		sum += child->se.burst_penalty;
+	}
+
+	__update_child_burst_cache(p, cnt, sum, now);
+}
+
+static inline u8 __inherit_burst_direct(struct task_struct *p, u64 now) {
+	if (child_burst_cache_expired(p, now))
+		update_child_burst_direct(p, now);
+
+	return p->se.child_burst;
+}
+
+static void update_child_burst_topological(
+	struct task_struct *p, u64 now, u32 depth, u32 *acnt, u32 *asum) {
+	struct task_struct *child, *dec;
+	u32 cnt = 0, dcnt = 0, sum = 0;
+
+	list_for_each_entry(child, &p->children, sibling) {
+		dec = child;
+		while ((dcnt = count_child_tasks(dec)) == 1)
+			dec = list_first_entry(&dec->children, struct task_struct, sibling);
+		
+		if (!dcnt || !depth) {
+			if (!task_burst_inheritable(dec)) continue;
+			cnt++;
+			sum += dec->se.burst_penalty;
+			continue;
+		}
+		if (!child_burst_cache_expired(dec, now)) {
+			cnt += dec->se.child_burst_cnt;
+			sum += (u32)dec->se.child_burst * dec->se.child_burst_cnt;
+			continue;
+		}
+		update_child_burst_topological(dec, now, depth - 1, &cnt, &sum);
+	}
+
+	__update_child_burst_cache(p, cnt, sum, now);
+	*acnt += cnt;
+	*asum += sum;
+}
+
+static inline u8 __inherit_burst_topological(struct task_struct *p, u64 now) {
+	struct task_struct *anc = p;
+	u32 cnt = 0, sum = 0;
+
+	while (anc->real_parent != anc && count_child_tasks(anc) == 1)
+		anc = anc->real_parent;
+
+	if (child_burst_cache_expired(anc, now))
+		update_child_burst_topological(
+			anc, now, sched_burst_fork_atavistic - 1, &cnt, &sum);
+
+	return anc->se.child_burst;
+}
+
+static inline void inherit_burst(struct task_struct *p, struct task_struct *parent) {
+	u8 burst_cache;
+	u64 now = ktime_get_ns();
+
+	read_lock(&tasklist_lock);
+	burst_cache = likely(sched_burst_fork_atavistic)?
+		__inherit_burst_topological(parent, now):
+		__inherit_burst_direct(parent, now);
+	read_unlock(&tasklist_lock);
+
+	p->se.prev_burst_penalty = max(p->se.prev_burst_penalty, burst_cache);
+}
+
+void sched_fork_bore(struct task_struct *p, struct task_struct *parent) {
+	p->se.burst_time = 0;
+	p->se.curr_burst_penalty = 0;
+	p->se.child_burst_last_cached = 0;
+
+	if (task_burst_inheritable(p))
+		inherit_burst(p, parent);
+	p->se.burst_penalty = p->se.prev_burst_penalty;
+}
+#endif // CONFIG_SCHED_BORE
 
 /*
  * Perform scheduler related setup for a newly forked process p.
@@ -3562,7 +3732,7 @@ void sched_post_fork(struct task_struct *p)
 	uclamp_post_fork(p);
 }
 
-u64 to_ratio(u64 period, u64 runtime)
+unsigned long to_ratio(u64 period, u64 runtime)
 {
 	if (runtime == RUNTIME_INF)
 		return BW_UNIT;
@@ -5392,6 +5562,34 @@ int available_idle_cpu(int cpu)
 	return 1;
 }
 EXPORT_SYMBOL_GPL(available_idle_cpu);
+
+#ifdef CONFIG_SMP
+/**
+ * sched_cpu_util - effective scheduler-tracked utilization of a CPU.
+ * @cpu: the CPU in question.
+ *
+ * Returns a single number combining the effective CFS, RT and DL
+ * utilization of @cpu, in the same SCHED_CAPACITY_SCALE-relative
+ * units as arch_scale_cpu_capacity(). Intended for callers outside
+ * kernel/sched/ (e.g. cpuidle governors) that cannot reach
+ * cpu_util_cfs() / schedutil_cpu_util() directly.
+ *
+ * Backport of the 6.x sched_cpu_util() helper, adapted to the 5.10
+ * schedutil_cpu_util() signature (which still takes @max). On
+ * configs without CPU_FREQ_GOV_SCHEDUTIL/_SCHEDHORIZON the inline
+ * fallback in sched.h returns 0, which is fine for util-awareness
+ * consumers (any threshold > 0 silently disables the feature).
+ */
+unsigned long sched_cpu_util(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	unsigned long util = cpu_util_cfs(rq);
+	unsigned long max = arch_scale_cpu_capacity(cpu);
+
+	return schedutil_cpu_util(cpu, util, max, ENERGY_UTIL, NULL);
+}
+EXPORT_SYMBOL_GPL(sched_cpu_util);
+#endif /* CONFIG_SMP */
 
 /**
  * idle_task - return the idle task for a given CPU.
@@ -7474,6 +7672,11 @@ void __init sched_init(void)
 	BUG_ON(&dl_sched_class + 1 != &stop_sched_class);
 #endif
 
+#ifdef CONFIG_SCHED_BORE
+	sched_init_bore();
+	printk(KERN_INFO "BORE (Burst-Oriented Response Enhancer) CPU Scheduler modification 5.3.0 by Masahito Suzuki");
+#endif // CONFIG_SCHED_BORE
+
 	wait_bit_init();
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -7493,7 +7696,7 @@ void __init sched_init(void)
 		ptr += nr_cpu_ids * sizeof(void **);
 
 		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
-		init_cfs_bandwidth(&root_task_group.cfs_bandwidth);
+		init_cfs_bandwidth(&root_task_group.cfs_bandwidth, NULL);
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 #ifdef CONFIG_RT_GROUP_SCHED
 		root_task_group.rt_se = (struct sched_rt_entity **)ptr;
@@ -8540,11 +8743,16 @@ static int tg_cfs_schedulable_down(struct task_group *tg, void *data)
 
 		/*
 		 * Ensure max(child_quota) <= parent_quota.  On cgroup2,
-		 * always take the min.  On cgroup1, only inherit when no
-		 * limit is set:
+		 * always take the non-RUNTIME_INF min.  On cgroup1, only
+		 * inherit when no limit is set. In both cases this is used
+		 * by the scheduler to determine if a given CFS task has a
+		 * bandwidth constraint at some higher level.
 		 */
 		if (cgroup_subsys_on_dfl(cpu_cgrp_subsys)) {
-			quota = min(quota, parent_quota);
+			if (quota == RUNTIME_INF)
+				quota = parent_quota;
+			else if (parent_quota != RUNTIME_INF)
+				quota = min(quota, parent_quota);
 		} else {
 			if (quota == RUNTIME_INF)
 				quota = parent_quota;

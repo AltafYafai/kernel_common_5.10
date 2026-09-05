@@ -2063,7 +2063,7 @@ static enum compact_result __compact_finished(struct compact_control *cc)
 		 * other migratetype buddy lists.
 		 */
 		if (find_suitable_fallback(area, order, migratetype,
-						true, &can_steal) != -1) {
+						true, &can_steal, cc->order) != -1) {
 
 			/* movable pages are OK in any pageblock */
 			if (migratetype == MIGRATE_MOVABLE)
@@ -2651,8 +2651,18 @@ int sysctl_compact_memory;
  * Tunable for proactive compaction. It determines how
  * aggressively the kernel should compact memory in the
  * background. It takes values in the range [0, 100].
+ *
+ * Upstream default is 20; on long-uptime Android devices that value is
+ * too conservative — external fragmentation grows over days of use and
+ * THP / CMA allocations degrade, which on a phone manifests as slowly
+ * worsening app cold-launch times the longer you go without a reboot.
+ * Raising the default to 40 keeps kcompactd slightly more active in the
+ * background but still well below the point at which it would compete
+ * with userspace for CPU under load (kcompactd is rate-limited and
+ * fragmentation-gated). Userspace can still tune at runtime via
+ * /proc/sys/vm/compaction_proactiveness.
  */
-unsigned int __read_mostly sysctl_compaction_proactiveness;
+unsigned int __read_mostly sysctl_compaction_proactiveness = 40;
 
 int compaction_proactiveness_sysctl_handler(struct ctl_table *table, int write,
 		void *buffer, size_t *length, loff_t *ppos)
@@ -2846,9 +2856,27 @@ void wakeup_kcompactd(pg_data_t *pgdat, int order, int highest_zoneidx)
 		return;
 
 	trace_mm_compaction_wakeup_kcompactd(pgdat->node_id, order,
-							highest_zoneidx);
+						highest_zoneidx);
 	wake_up_interruptible(&pgdat->kcompactd_wait);
 }
+
+/*
+ * wakeup_all_kcompactd - proactively wake kcompactd on all online nodes
+ *
+ * Intended to be called when game mode activates, so memory is compacted
+ * preemptively before game assets need high-order (DMA/GPU) allocations.
+ */
+void wakeup_all_kcompactd(void)
+{
+	int nid;
+
+	for_each_online_node(nid) {
+		pg_data_t *pgdat = NODE_DATA(nid);
+
+		wakeup_kcompactd(pgdat, COMPACTION_HPAGE_ORDER, MAX_NR_ZONES - 1);
+	}
+}
+EXPORT_SYMBOL_GPL(wakeup_all_kcompactd);
 
 /*
  * The background compaction daemon, started as a kernel thread

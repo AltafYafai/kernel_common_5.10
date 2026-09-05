@@ -20,6 +20,9 @@
 #include <linux/atomic.h>
 #include <linux/mm_types.h>
 #include <linux/page-flags.h>
+#ifndef __GENKSYMS__
+#include <linux/kfifo.h>
+#endif
 #include <linux/android_kabi.h>
 #include <asm/page.h>
 
@@ -277,6 +280,109 @@ enum lruvec_flags {
 					 */
 };
 
+/* MGLRU constants -- must be outside CONFIG_LRU_GEN for page flag layout */
+#define MIN_NR_GENS		2U
+#define MAX_NR_GENS		4U
+#define MAX_NR_TIERS		4U
+
+#ifndef __GENERATING_BOUNDS_H
+struct page_vma_mapped_walk;
+
+#define LRU_GEN_MASK		((BIT(LRU_GEN_WIDTH) - 1) << LRU_GEN_PGOFF)
+#define LRU_REFS_MASK		((BIT(LRU_REFS_WIDTH) - 1) << LRU_REFS_PGOFF)
+
+#ifdef CONFIG_LRU_GEN
+
+enum {
+	LRU_GEN_ANON,
+	LRU_GEN_FILE,
+};
+
+enum {
+	LRU_GEN_CORE,
+	LRU_GEN_MM_WALK,
+	LRU_GEN_NONLEAF_YOUNG,
+	NR_LRU_GEN_CAPS
+};
+
+#define MIN_LRU_BATCH		BITS_PER_LONG
+#define MAX_LRU_BATCH		(MIN_LRU_BATCH * 64)
+
+#ifdef CONFIG_LRU_GEN_STATS
+#define NR_HIST_GENS		MAX_NR_GENS
+#else
+#define NR_HIST_GENS		1U
+#endif
+
+struct lru_gen_struct {
+	unsigned long max_seq;
+	unsigned long min_seq[ANON_AND_FILE];
+	unsigned long timestamps[MAX_NR_GENS];
+	struct list_head lists[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	unsigned long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	unsigned long avg_refaulted[ANON_AND_FILE][MAX_NR_TIERS];
+	unsigned long avg_total[ANON_AND_FILE][MAX_NR_TIERS];
+	unsigned long protected[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS - 1];
+	atomic_long_t evicted[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
+	atomic_long_t refaulted[NR_HIST_GENS][ANON_AND_FILE][MAX_NR_TIERS];
+	bool enabled;
+};
+
+enum {
+	MM_LEAF_TOTAL,
+	MM_LEAF_OLD,
+	MM_LEAF_YOUNG,
+	MM_NONLEAF_TOTAL,
+	MM_NONLEAF_FOUND,
+	MM_NONLEAF_ADDED,
+	NR_MM_STATS
+};
+
+#define NR_BLOOM_FILTERS	2
+
+struct lru_gen_mm_state {
+	unsigned long seq;
+	struct list_head *head;
+	struct list_head *tail;
+	struct wait_queue_head wait;
+	unsigned long *filters[NR_BLOOM_FILTERS];
+	unsigned long stats[NR_HIST_GENS][NR_MM_STATS];
+	int nr_walkers;
+};
+
+struct lru_gen_mm_walk {
+	struct lruvec *lruvec;
+	unsigned long max_seq;
+	unsigned long next_addr;
+	unsigned long bitmap[BITS_TO_LONGS(MIN_LRU_BATCH)];
+	int nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	int mm_stats[NR_MM_STATS];
+	int batched;
+	bool can_swap;
+	bool full_scan;
+};
+
+void lru_gen_init_lruvec(struct lruvec *lruvec);
+void lru_gen_look_around(struct page_vma_mapped_walk *pvmw);
+
+#ifdef CONFIG_MEMCG
+void lru_gen_init_memcg(struct mem_cgroup *memcg);
+void lru_gen_exit_memcg(struct mem_cgroup *memcg);
+#endif
+
+#else /* !CONFIG_LRU_GEN */
+
+static inline void lru_gen_init_lruvec(struct lruvec *lruvec) { }
+static inline void lru_gen_look_around(struct page_vma_mapped_walk *pvmw) { }
+
+#ifdef CONFIG_MEMCG
+static inline void lru_gen_init_memcg(struct mem_cgroup *memcg) { }
+static inline void lru_gen_exit_memcg(struct mem_cgroup *memcg) { }
+#endif
+
+#endif /* CONFIG_LRU_GEN */
+#endif /* __GENERATING_BOUNDS_H */
+
 struct lruvec {
 	struct list_head		lists[NR_LRU_LISTS];
 	/*
@@ -292,6 +398,10 @@ struct lruvec {
 	unsigned long			refaults[ANON_AND_FILE];
 	/* Various lruvec state flags (enum lruvec_flags) */
 	unsigned long			flags;
+#ifdef CONFIG_LRU_GEN
+	struct lru_gen_struct		lrugen;
+	struct lru_gen_mm_state		mm_state;
+#endif
 #ifdef CONFIG_MEMCG
 	struct pglist_data *pgdat;
 #endif
@@ -786,6 +896,9 @@ typedef struct pglist_data {
 	struct task_struct *kcompactd;
 	bool proactive_compact_trigger;
 #endif
+#ifdef CONFIG_LRU_GEN
+	struct lru_gen_mm_walk	mm_walk;
+#endif
 	/*
 	 * This is a per-node reserve of pages that are not available
 	 * to userspace allocations.
@@ -833,6 +946,13 @@ typedef struct pglist_data {
 	struct per_cpu_nodestat __percpu *per_cpu_nodestats;
 	atomic_long_t		vm_stat[NR_VM_NODE_STAT_ITEMS];
 } pg_data_t;
+
+#define KCOMPRESS_FIFO_SIZE 256
+struct kcompress_t {
+	wait_queue_head_t kcompressd_wait;
+	struct task_struct *kcompressd;
+	struct kfifo kcompress_fifo;
+};
 
 #define node_present_pages(nid)	(NODE_DATA(nid)->node_present_pages)
 #define node_spanned_pages(nid)	(NODE_DATA(nid)->node_spanned_pages)
@@ -1013,7 +1133,10 @@ extern char numa_zonelist_order[];
 #ifndef CONFIG_NEED_MULTIPLE_NODES
 
 extern struct pglist_data contig_page_data;
-#define NODE_DATA(nid)		(&contig_page_data)
+static inline struct pglist_data *NODE_DATA(int nid)
+{
+	return &contig_page_data;
+}
 #define NODE_MEM_MAP(nid)	mem_map
 
 #else /* CONFIG_NEED_MULTIPLE_NODES */

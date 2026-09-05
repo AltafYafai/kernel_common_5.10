@@ -450,7 +450,7 @@ struct aa_label *aa_label_alloc(int size, struct aa_proxy *proxy, gfp_t gfp)
 	return new;
 
 fail:
-	aa_label_free(new);
+	kfree(new);
 
 	return NULL;
 }

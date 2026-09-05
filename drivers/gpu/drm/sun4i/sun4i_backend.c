@@ -897,8 +897,7 @@ static int sun4i_backend_bind(struct device *dev, struct device *master,
 						     &sun4i_backend_regmap_config);
 	if (IS_ERR(backend->engine.regs)) {
 		dev_err(dev, "Couldn't create the backend regmap\n");
-		ret = PTR_ERR(backend->engine.regs);
-		goto err_disable_ram_clk;
+		return PTR_ERR(backend->engine.regs);
 	}
 
 	list_add_tail(&backend->engine.list, &drv->engine_list);

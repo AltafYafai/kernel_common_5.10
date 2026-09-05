@@ -362,7 +362,7 @@ static bool need_activate_page_drain(int cpu)
 	return pagevec_count(&per_cpu(lru_pvecs.activate_page, cpu)) != 0;
 }
 
-static void activate_page(struct page *page)
+void activate_page(struct page *page)
 {
 	page = compound_head(page);
 	if (PageLRU(page) && !PageActive(page) && !PageUnevictable(page)) {
@@ -382,7 +382,7 @@ static inline void activate_page_drain(int cpu)
 {
 }
 
-static void activate_page(struct page *page)
+void activate_page(struct page *page)
 {
 	pg_data_t *pgdat = page_pgdat(page);
 
@@ -1308,17 +1308,16 @@ EXPORT_SYMBOL(pagevec_lookup_range_nr_tag);
  */
 void __init swap_setup(void)
 {
-	unsigned long megs = totalram_pages() >> (20 - PAGE_SHIFT);
-
-	/* Use a smaller cluster for small-memory machines */
-	if (megs < 16)
-		page_cluster = 2;
-	else
-		page_cluster = 3;
-	/*
-	 * Right now other parts of the system means that we
-	 * _really_ don't want to cluster much more
+	/* ZRAM (the dominant Android swap backend) is random-access with
+	 * no seek penalty, so readahead wastes decompression bandwidth.
+	 * page_cluster=0 means read exactly one page per swap-in.
+	 *
+	 * The pre-Android upstream heuristic of scaling page_cluster off
+	 * totalram_pages() was dropped in the "tune VM defaults" retune;
+	 * the local megs variable became dead and now trips -Werror=
+	 * unused-variable.
 	 */
+	page_cluster = 0;
 }
 
 #ifdef CONFIG_DEV_PAGEMAP_OPS

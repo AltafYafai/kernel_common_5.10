@@ -116,8 +116,8 @@ static int mt7622_ecc_regs[] = {
 	[ECC_DECIRQ_STA] =      0x144,
 };
 
-static inline int mtk_ecc_wait_idle(struct mtk_ecc *ecc,
-				    enum mtk_ecc_operation op)
+static inline void mtk_ecc_wait_idle(struct mtk_ecc *ecc,
+				     enum mtk_ecc_operation op)
 {
 	struct device *dev = ecc->dev;
 	u32 val;
@@ -129,8 +129,6 @@ static inline int mtk_ecc_wait_idle(struct mtk_ecc *ecc,
 	if (ret)
 		dev_warn(dev, "%s NOT idle\n",
 			 op == ECC_ENCODE ? "encoder" : "decoder");
-
-	return ret;
 }
 
 static irqreturn_t mtk_ecc_irq(int irq, void *id)
@@ -304,11 +302,7 @@ int mtk_ecc_enable(struct mtk_ecc *ecc, struct mtk_ecc_config *config)
 		return ret;
 	}
 
-	ret = mtk_ecc_wait_idle(ecc, op);
-	if (ret) {
-		mutex_unlock(&ecc->lock);
-		return ret;
-	}
+	mtk_ecc_wait_idle(ecc, op);
 
 	ret = mtk_ecc_config(ecc, config);
 	if (ret) {
@@ -408,9 +402,7 @@ int mtk_ecc_encode(struct mtk_ecc *ecc, struct mtk_ecc_config *config,
 	if (ret)
 		goto timeout;
 
-	ret = mtk_ecc_wait_idle(ecc, ECC_ENCODE);
-	if (ret)
-		goto timeout;
+	mtk_ecc_wait_idle(ecc, ECC_ENCODE);
 
 	/* Program ECC bytes to OOB: per sector oob = FDM + ECC + SPARE */
 	len = (config->strength * ecc->caps->parity_bits + 7) >> 3;

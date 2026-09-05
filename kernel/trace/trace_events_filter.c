@@ -836,9 +836,6 @@ static int regex_match_full(char *str, struct regex *r, int len)
 	if (!len)
 		return strcmp(str, r->pattern) == 0;
 
-	if (len < r->len)
-		return 0;
-
 	return strncmp(str, r->pattern, len) == 0;
 }
 
@@ -868,9 +865,11 @@ static int regex_match_end(char *str, struct regex *r, int len)
 	return 0;
 }
 
-static int regex_match_glob(char *str, struct regex *r, int len)
+static int regex_match_glob(char *str, struct regex *r, int len __maybe_unused)
 {
-	return glob_match_len(r->pattern, str, len) ? 1 : 0;
+	if (glob_match(r->pattern, str))
+		return 1;
+	return 0;
 }
 
 /**

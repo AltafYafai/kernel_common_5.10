@@ -118,7 +118,6 @@ struct xt_hashlimit_htable {
 	refcount_t use;
 	u_int8_t family;
 	bool rnd_initialized;
-	bool ratematch;
 
 	struct hashlimit_cfg3 cfg;	/* config */
 
@@ -326,7 +325,6 @@ static int htable_create(struct net *net, struct hashlimit_cfg3 *cfg,
 		vfree(hinfo);
 		return -ENOMEM;
 	}
-	hinfo->ratematch = !!(cfg->mode & XT_HASHLIMIT_RATE_MATCH);
 	spin_lock_init(&hinfo->lock);
 
 	switch (revision) {
@@ -870,10 +868,7 @@ static int hashlimit_mt_check_common(const struct xt_mtchk_param *par,
 	}
 
 	/* Check for overflow. */
-	if (cfg->mode & XT_HASHLIMIT_RATE_MATCH) {
-		if (revision < 3)
-			return -EINVAL;
-
+	if (revision >= 3 && cfg->mode & XT_HASHLIMIT_RATE_MATCH) {
 		if (cfg->avg == 0 || cfg->avg > U32_MAX) {
 			pr_info_ratelimited("invalid rate\n");
 			return -ERANGE;
@@ -905,15 +900,6 @@ static int hashlimit_mt_check_common(const struct xt_mtchk_param *par,
 		if (ret < 0) {
 			mutex_unlock(&hashlimit_mutex);
 			return ret;
-		}
-	} else {
-		if ((cfg->mode & XT_HASHLIMIT_RATE_MATCH &&
-		     !(*hinfo)->ratematch) ||
-		    (!(cfg->mode & XT_HASHLIMIT_RATE_MATCH) &&
-		      (*hinfo)->ratematch)) {
-			mutex_unlock(&hashlimit_mutex);
-			htable_put(*hinfo);
-			return -EINVAL;
 		}
 	}
 	mutex_unlock(&hashlimit_mutex);

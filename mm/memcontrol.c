@@ -2643,7 +2643,6 @@ void mem_cgroup_handle_over_high(void)
 	int nr_retries = MAX_RECLAIM_RETRIES;
 	struct mem_cgroup *memcg;
 	bool in_retry = false;
-	bool record_psi = false;
 
 	if (likely(!nr_pages))
 		return;
@@ -2706,12 +2705,9 @@ retry_reclaim:
 	 * schedule_timeout_killable sets TASK_KILLABLE). This means we don't
 	 * need to account for any ill-begotten jiffies to pay them off later.
 	 */
-	trace_android_vh_mem_cgroup_handle_over_high(&record_psi);
-	if (record_psi)
-		psi_memstall_enter(&pflags);
+	psi_memstall_enter(&pflags);
 	schedule_timeout_killable(penalty_jiffies);
-	if (record_psi)
-		psi_memstall_leave(&pflags);
+	psi_memstall_leave(&pflags);
 
 out:
 	css_put(&memcg->css);
@@ -2937,6 +2933,24 @@ static void commit_charge(struct page *page, struct mem_cgroup *memcg)
  */
 #define OBJCGS_CLEAR_MASK	(__GFP_DMA | __GFP_RECLAIMABLE | \
 				 __GFP_ACCOUNT | __GFP_NOFAIL)
+
+
+#ifdef CONFIG_LRU_GEN
+/*
+ * Lock the page's memcg for stable page_memcg() during MGLRU
+ * page table walks. Uses RCU to keep the memcg alive.
+ */
+bool mem_cgroup_trylock_pages(struct mem_cgroup *memcg)
+{
+	rcu_read_lock();
+	return true;
+}
+
+void mem_cgroup_unlock_pages(void)
+{
+	rcu_read_unlock();
+}
+#endif
 
 int memcg_alloc_page_obj_cgroups(struct page *page, struct kmem_cache *s,
 				 gfp_t gfp)
@@ -5332,6 +5346,7 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
 
 static void mem_cgroup_free(struct mem_cgroup *memcg)
 {
+	lru_gen_exit_memcg(memcg);
 	memcg_wb_domain_exit(memcg);
 	/*
 	 * Flush percpu vmstats and vmevents to guarantee the value correctness
@@ -5407,6 +5422,7 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 	idr_replace(&mem_cgroup_idr, memcg, memcg->id.id);
 	spin_unlock(&memcg_idr_lock);
 	trace_android_vh_mem_cgroup_alloc(memcg);
+	lru_gen_init_memcg(memcg);
 	return memcg;
 fail:
 	mem_cgroup_id_remove(memcg);
@@ -6645,6 +6661,30 @@ static struct cftype memory_files[] = {
 	{ }	/* terminate */
 };
 
+#ifdef CONFIG_LRU_GEN
+static void mem_cgroup_attach(struct cgroup_taskset *tset)
+{
+	struct task_struct *task;
+	struct cgroup_subsys_state *css;
+
+	/* find the first leader if there is any */
+	cgroup_taskset_for_each_leader(task, css, tset)
+		break;
+
+	if (!task)
+		return;
+
+	task_lock(task);
+	if (task->mm && READ_ONCE(task->mm->owner) == task)
+		lru_gen_migrate_mm(task->mm);
+	task_unlock(task);
+}
+#else
+static void mem_cgroup_attach(struct cgroup_taskset *tset)
+{
+}
+#endif /* CONFIG_LRU_GEN */
+
 struct cgroup_subsys memory_cgrp_subsys = {
 	.css_alloc = mem_cgroup_css_alloc,
 	.css_online = mem_cgroup_css_online,
@@ -6652,6 +6692,7 @@ struct cgroup_subsys memory_cgrp_subsys = {
 	.css_released = mem_cgroup_css_released,
 	.css_free = mem_cgroup_css_free,
 	.css_reset = mem_cgroup_css_reset,
+	.attach = mem_cgroup_attach,
 	.can_attach = mem_cgroup_can_attach,
 	.cancel_attach = mem_cgroup_cancel_attach,
 	.post_attach = mem_cgroup_move_task,

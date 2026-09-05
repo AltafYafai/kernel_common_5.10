@@ -1794,7 +1794,6 @@ struct sk_buff *sock_omalloc(struct sock *sk, unsigned long size,
 			     gfp_t priority);
 void skb_orphan_partial(struct sk_buff *skb);
 void sock_rfree(struct sk_buff *skb);
-void sock_rmem_free(struct sk_buff *skb);
 void sock_efree(struct sk_buff *skb);
 #ifdef CONFIG_INET
 void sock_edemux(struct sk_buff *skb);
@@ -1996,7 +1995,7 @@ static inline int sk_rx_queue_get(const struct sock *sk)
 
 static inline void sk_set_socket(struct sock *sk, struct socket *sock)
 {
-	WRITE_ONCE(sk->sk_socket, sock);
+	sk->sk_socket = sock;
 }
 
 static inline wait_queue_head_t *sk_sleep(struct sock *sk)
@@ -2818,7 +2817,7 @@ void sk_get_meminfo(const struct sock *sk, u32 *meminfo);
  * platforms.  This makes socket queueing behavior and performance
  * not depend upon such differences.
  */
-#define _SK_MEM_PACKETS		1024
+#define _SK_MEM_PACKETS		256
 #define _SK_MEM_OVERHEAD	SKB_TRUESIZE(256)
 #define SK_WMEM_MAX		(_SK_MEM_OVERHEAD * _SK_MEM_PACKETS)
 #define SK_RMEM_MAX		(_SK_MEM_OVERHEAD * _SK_MEM_PACKETS)

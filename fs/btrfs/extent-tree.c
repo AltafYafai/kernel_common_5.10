@@ -1995,8 +1995,7 @@ static noinline int __btrfs_run_delayed_refs(struct btrfs_trans_handle *trans,
 			locked_ref = btrfs_obtain_ref_head(trans);
 			if (IS_ERR_OR_NULL(locked_ref)) {
 				if (PTR_ERR(locked_ref) == -EAGAIN) {
-					count++;
-					goto again;
+					continue;
 				} else {
 					break;
 				}
@@ -2045,7 +2044,7 @@ static noinline int __btrfs_run_delayed_refs(struct btrfs_trans_handle *trans,
 		 * Either success case or btrfs_run_delayed_refs_for_head
 		 * returned -EAGAIN, meaning we need to select another head
 		 */
-again:
+
 		locked_ref = NULL;
 		cond_resched();
 	} while ((nr != -1 && count < nr) || locked_ref);
@@ -5762,16 +5761,12 @@ static int btrfs_trim_free_extents(struct btrfs_device *device, u64 *trimmed)
 
 	*trimmed = 0;
 
-	/*
-	 * The caller only filters out MISSING devices, but a device that was
-	 * missing at mount and later rescanned has MISSING cleared while bdev
-	 * is still NULL and WRITEABLE is still unset. Skip those here.
-	 */
-	if (!test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) || !device->bdev)
-		return 0;
-
 	/* Discard not supported = nothing to do. */
 	if (!blk_queue_discard(bdev_get_queue(device->bdev)))
+		return 0;
+
+	/* Not writable = nothing to do. */
+	if (!test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state))
 		return 0;
 
 	/* No free space = nothing to do. */

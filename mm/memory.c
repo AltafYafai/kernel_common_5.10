@@ -4897,6 +4897,10 @@ unlock:
  * The mmap_lock may have been released depending on flags and our
  * return value.  See filemap_fault() and __lock_page_or_retry().
  */
+#ifdef CONFIG_LRU_GEN
+static void lru_gen_enter_fault(struct vm_area_struct *vma);
+static void lru_gen_exit_fault(void);
+#endif
 static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 		unsigned long address, unsigned int flags)
 {
@@ -5258,7 +5262,13 @@ static vm_fault_t ___handle_speculative_fault(struct mm_struct *mm,
 	}
 
 	mem_cgroup_enter_user_fault();
+#ifdef CONFIG_LRU_GEN
+	lru_gen_enter_fault(vmf.vma);
+#endif
 	ret = handle_pte_fault(&vmf);
+#ifdef CONFIG_LRU_GEN
+	lru_gen_exit_fault();
+#endif
 	mem_cgroup_exit_user_fault();
 
 	if (ret != VM_FAULT_RETRY) {
@@ -5338,6 +5348,27 @@ bool can_reuse_spf_vma(struct vm_area_struct *vma, unsigned long address)
 	return ret;
 }
 #endif /* CONFIG_SPECULATIVE_PAGE_FAULT */
+
+#ifdef CONFIG_LRU_GEN
+static void lru_gen_enter_fault(struct vm_area_struct *vma)
+{
+	/* the LRU algorithm doesn't apply to sequential or random reads */
+	current->in_lru_fault = !(vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ));
+}
+
+static void lru_gen_exit_fault(void)
+{
+	current->in_lru_fault = false;
+}
+#else
+static void lru_gen_enter_fault(struct vm_area_struct *vma)
+{
+}
+
+static void lru_gen_exit_fault(void)
+{
+}
+#endif
 
 /*
  * By the time we get here, we already hold the mm semaphore

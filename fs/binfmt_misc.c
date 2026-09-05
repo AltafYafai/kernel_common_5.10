@@ -163,10 +163,8 @@ static Node *get_binfmt_handler(struct linux_binprm *bprm)
 static void put_binfmt_handler(Node *e)
 {
 	if (refcount_dec_and_test(&e->users)) {
-		if (e->flags & MISC_FMT_OPEN_FILE) {
-			exe_file_allow_write_access(e->interp_file);
+		if (e->flags & MISC_FMT_OPEN_FILE)
 			filp_close(e->interp_file, NULL);
-		}
 		kfree(e);
 	}
 }
@@ -201,6 +199,9 @@ static int load_misc_binary(struct linux_binprm *bprm)
 			goto ret;
 	}
 
+	if (fmt->flags & MISC_FMT_OPEN_BINARY)
+		bprm->have_execfd = 1;
+
 	/* make argv[1] be the path to the binary */
 	retval = copy_string_kernel(bprm->interp, bprm);
 	if (retval < 0)
@@ -220,14 +221,8 @@ static int load_misc_binary(struct linux_binprm *bprm)
 
 	if (fmt->flags & MISC_FMT_OPEN_FILE) {
 		interp_file = file_clone_open(fmt->interp_file);
-		if (!IS_ERR(interp_file)) {
-			int err = exe_file_deny_write_access(interp_file);
-
-			if (err) {
-				fput(interp_file);
-				interp_file = ERR_PTR(err);
-			}
-		}
+		if (!IS_ERR(interp_file))
+			deny_write_access(interp_file);
 	} else {
 		interp_file = open_exec(fmt->interpreter);
 	}
@@ -236,8 +231,6 @@ static int load_misc_binary(struct linux_binprm *bprm)
 		goto ret;
 
 	bprm->interpreter = interp_file;
-	if (fmt->flags & MISC_FMT_OPEN_BINARY)
-		bprm->have_execfd = 1;
 	if (fmt->flags & MISC_FMT_CREDENTIALS)
 		bprm->execfd_creds = 1;
 
@@ -354,10 +347,6 @@ static Node *create_entry(const char __user *buffer, size_t count)
 	del = *p++;	/* delimeter */
 
 	pr_debug("register: delim: %#x {%c}\n", del, del);
-
-	/* A flag-char delimiter runs the flag scan off the buffer. */
-	if (del == 'P' || del == 'O' || del == 'C' || del == 'F')
-		goto einval;
 
 	/* Pad the buffer with the delim to simplify parsing below. */
 	memset(buf + count, del, 8);

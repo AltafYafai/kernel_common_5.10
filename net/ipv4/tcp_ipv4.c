@@ -2919,7 +2919,8 @@ static int __net_init tcp_sk_init(struct net *net)
 	net->ipv4.sysctl_tcp_timestamps = 1;
 	net->ipv4.sysctl_tcp_early_retrans = 3;
 	net->ipv4.sysctl_tcp_recovery = TCP_RACK_LOSS_DETECTION;
-	net->ipv4.sysctl_tcp_slow_start_after_idle = 1; /* By default, RFC2861 behavior.  */
+	net->ipv4.sysctl_tcp_slow_start_after_idle = 0; /* HTTP/2 reuse-friendly.  */
+	net->ipv4.sysctl_tcp_nometrics_save = 1; /* fresh path each connection */
 	net->ipv4.sysctl_tcp_retrans_collapse = 1;
 	net->ipv4.sysctl_tcp_max_reordering = 300;
 	net->ipv4.sysctl_tcp_dsack = 1;
@@ -2932,8 +2933,12 @@ static int __net_init tcp_sk_init(struct net *net)
 	 * which are too large can cause TCP streams to be bursty.
 	 */
 	net->ipv4.sysctl_tcp_tso_win_divisor = 3;
-	/* Default TSQ limit of 16 TSO segments */
-	net->ipv4.sysctl_tcp_limit_output_bytes = 16 * 65536;
+	/* Default TSQ limit of four TSO segments worth of pacing budget.
+	 * Originally 16 * 65536 (1 MB); bumped to 4 MB to give BBR enough
+	 * headroom on high-BDP mobile/cellular paths where 1 MB throttles
+	 * pacing well below the link's actual capacity.
+	 */
+	net->ipv4.sysctl_tcp_limit_output_bytes = 4 * 1024 * 1024;
 	/* rfc5961 challenge ack rate limiting */
 	net->ipv4.sysctl_tcp_challenge_ack_limit = 1000;
 	net->ipv4.sysctl_tcp_min_tso_segs = 2;
@@ -2953,7 +2958,7 @@ static int __net_init tcp_sk_init(struct net *net)
 	net->ipv4.sysctl_tcp_comp_sack_delay_ns = NSEC_PER_MSEC;
 	net->ipv4.sysctl_tcp_comp_sack_slack_ns = 100 * NSEC_PER_USEC;
 	net->ipv4.sysctl_tcp_comp_sack_nr = 44;
-	net->ipv4.sysctl_tcp_fastopen = TFO_CLIENT_ENABLE;
+	net->ipv4.sysctl_tcp_fastopen = TFO_CLIENT_ENABLE | TFO_SERVER_ENABLE;
 	spin_lock_init(&net->ipv4.tcp_fastopen_ctx_lock);
 	net->ipv4.sysctl_tcp_fastopen_blackhole_timeout = 0;
 	atomic_set(&net->ipv4.tfo_active_disable_times, 0);

@@ -421,8 +421,24 @@ struct sched_avg {
 	struct util_est			util_est;
 } ____cacheline_aligned;
 
+/*
+ * Keep sched_statistics layout stable regardless of CONFIG_SCHEDSTATS.
+ *
+ * The struct is embedded inline in struct sched_entity (and transitively
+ * in struct task_struct), and its layout is part of the Android GKI KMI
+ * (abi_gki_aarch64.xml records it as size-in-bits='1728').  Gating the
+ * fields on CONFIG_SCHEDSTATS collapsed the struct to zero size when
+ * the feature was disabled, shifting every subsequent field of
+ * sched_entity / task_struct and breaking every vendor module compiled
+ * against the published ABI.
+ *
+ * Keeping the fields unconditional costs 216 B per task_struct but has
+ * no runtime cost: the __schedstat_{inc,add,set} macros expand to
+ * do {} while (0) when CONFIG_SCHEDSTATS=n, so the compiler never
+ * emits a load/store for any of these counters.  The memory is
+ * reserved but dead.
+ */
 struct sched_statistics {
-#ifdef CONFIG_SCHEDSTATS
 	u64				wait_start;
 	u64				wait_max;
 	u64				wait_count;
@@ -454,7 +470,6 @@ struct sched_statistics {
 	u64				nr_wakeups_affine_attempts;
 	u64				nr_wakeups_passive;
 	u64				nr_wakeups_idle;
-#endif
 };
 
 struct sched_entity {
@@ -494,10 +509,24 @@ struct sched_entity {
 	struct sched_avg		avg;
 #endif
 
+#ifdef CONFIG_SCHED_BORE
+	ANDROID_KABI_USE(1, u64 burst_time);
+	_ANDROID_KABI_REPLACE(_ANDROID_KABI_RESERVE(2),
+		struct {
+			u8 prev_burst_penalty;
+			u8 curr_burst_penalty;
+			u8 burst_penalty;
+			u8 burst_score;
+		}
+	);
+	ANDROID_KABI_USE2(3, u8 child_burst, u32 child_burst_cnt);
+	ANDROID_KABI_USE(4, u64 child_burst_last_cached);
+#else // CONFIG_SCHED_BORE
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
+#endif // CONFIG_SCHED_BORE
 };
 
 struct sched_rt_entity {
@@ -829,6 +858,9 @@ struct task_struct {
 #endif
 #ifdef CONFIG_MEMCG
 	unsigned			in_user_fault:1;
+#endif
+#ifdef CONFIG_LRU_GEN
+	unsigned			in_lru_fault:1;
 #endif
 #ifdef CONFIG_COMPAT_BRK
 	unsigned			brk_randomized:1;
@@ -1310,14 +1342,6 @@ struct task_struct {
 
 	/* Collect coverage from softirq context: */
 	unsigned int			kcov_softirq;
-
-	/* Temporary storage for preempting remote coverage collection: */
-	unsigned int			kcov_saved_mode;
-	unsigned int			kcov_saved_size;
-	void				*kcov_saved_area;
-	struct kcov			*kcov_saved_kcov;
-	int				kcov_saved_sequence;
-
 #endif
 
 #ifdef CONFIG_MEMCG
@@ -1386,13 +1410,40 @@ struct task_struct {
 	/* PF_IO_WORKER */
 	ANDROID_KABI_USE(1, void *pf_io_worker);
 
-	ANDROID_KABI_USE(2, struct {
-		/* Save user-dumpable when mm goes away */
+	/*
+	 * Hikari wake-time policy engine state.  Packed into KABI
+	 * reserves 2 and 3 via ANDROID_KABI_USE2 so task_struct size
+	 * and alignment are unchanged.  See <linux/hikari.h>.
+	 *
+	 * hikari_wait_ewma_ns   - EWMA of wake-to-run wait time, in
+	 *                         nanoseconds (saturating u32; ~4.29s
+	 *                         max which is far above any sane
+	 *                         wake-wait we'd care about).
+	 * hikari_flags          - HIKARI_FLAG_* bits (opt-in, audio,
+	 *                         foreground).
+	 * hikari_last_enqueue_ns- Truncated rq_clock_task() at the
+	 *                         last wake-side enqueue.  Used to
+	 *                         compute the wait sample on dequeue.
+	 * hikari_boost_until_ns - jiffies-equivalent (truncated
+	 *                         ktime_get_ns()) until which the
+	 *                         current uclamp_min boost is active.
+	 *                         Zero means no boost pending.
+	 *
+	 * All four are touched only from the task's own CPU, with the
+	 * task either current or rq->lock held, so READ_ONCE/WRITE_ONCE
+	 * are sufficient and no atomics are needed.
+	 */
+	ANDROID_KABI_USE2(2, u32 hikari_wait_ewma_ns,    u32 hikari_flags);
+	ANDROID_KABI_USE2(3, u32 hikari_last_enqueue_ns, u32 hikari_boost_until_ns);
+
+	/*
+	 * Preserve user-dumpable flag when mm goes away (ptrace
+	 * fix from stable 5.10.256).  Moved to KABI reserve 4 to
+	 * avoid colliding with Hikari's use of reserves 2 & 3.
+	 */
+	ANDROID_KABI_USE(4, struct {
 		unsigned	user_dumpable:1;
 		});
-
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 	ANDROID_KABI_RESERVE(5);
 
 #ifdef CONFIG_SYSVIPC
@@ -1752,6 +1803,11 @@ extern int can_nice(const struct task_struct *p, const int nice);
 extern int task_curr(const struct task_struct *p);
 extern int idle_cpu(int cpu);
 extern int available_idle_cpu(int cpu);
+#ifdef CONFIG_SMP
+extern unsigned long sched_cpu_util(int cpu);
+#else
+static inline unsigned long sched_cpu_util(int cpu) { return 0; }
+#endif
 extern int sched_setscheduler(struct task_struct *, int, const struct sched_param *);
 extern int sched_setscheduler_nocheck(struct task_struct *, int, const struct sched_param *);
 extern void sched_set_fifo(struct task_struct *p);
@@ -2015,11 +2071,6 @@ extern long sched_getaffinity(pid_t pid, struct cpumask *mask);
 #ifndef TASK_SIZE_OF
 #define TASK_SIZE_OF(tsk)	TASK_SIZE
 #endif
-
-#ifdef CONFIG_SMP
-/* Returns effective CPU energy utilization, as seen by the scheduler */
-unsigned long sched_cpu_util(int cpu, unsigned long max);
-#endif /* CONFIG_SMP */
 
 #ifdef CONFIG_RSEQ
 

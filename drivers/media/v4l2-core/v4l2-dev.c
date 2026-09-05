@@ -401,6 +401,28 @@ static int v4l2_mmap(struct file *filp, struct vm_area_struct *vm)
 	return ret;
 }
 
+/*
+ * Audit fix K4: zenith cpufreq governor camera-scenario detection.
+ *
+ * The runqueue-snapshot comm-walk in zenith's auto_tune block is a
+ * probabilistic signal -- it only fires when the camera HAL daemon
+ * happens to be the curr task on a CPU at the moment the walk runs,
+ * which is statistically rare for HALs that sleep most of the time
+ * (e.g. cameraserver / camerahalserver).  K4 wires zenith directly
+ * into the v4l2 fd-open / release hooks via two weak symbols.
+ *
+ * Weak symbols are used so that the v4l2 driver builds cleanly with
+ * any of:
+ *   - CONFIG_CPU_FREQ_GOV_ZENITH=y    (strong symbol, refcount lives)
+ *   - CONFIG_CPU_FREQ_GOV_ZENITH=m    (module load registers symbols)
+ *   - CONFIG_CPU_FREQ_GOV_ZENITH=n    (weak NULL stubs, no-op)
+ *
+ * The hook is called only on a successful open / unconditional
+ * release, so the refcount is invariant under failed-open paths.
+ */
+void zenith_v4l2_open_notify(struct video_device *vdev) __weak;
+void zenith_v4l2_release_notify(struct video_device *vdev) __weak;
+
 /* Override for the open function */
 static int v4l2_open(struct inode *inode, struct file *filp)
 {
@@ -429,8 +451,16 @@ static int v4l2_open(struct inode *inode, struct file *filp)
 		dprintk("%s: open (%d)\n",
 			video_device_node_name(vdev), ret);
 	/* decrease the refcount in case of an error */
-	if (ret)
+	if (ret) {
 		video_put(vdev);
+	} else if (zenith_v4l2_open_notify) {
+		/* K4: notify zenith of a successful open so the camera
+		 * scenario flag fires deterministically.  Done outside
+		 * of the videodev_lock critical section to keep zenith
+		 * code paths from contending on a v4l2-internal mutex.
+		 */
+		zenith_v4l2_open_notify(vdev);
+	}
 	return ret;
 }
 
@@ -459,6 +489,14 @@ static int v4l2_release(struct inode *inode, struct file *filp)
 	if (vdev->dev_debug & V4L2_DEV_DEBUG_FOP)
 		dprintk("%s: release\n",
 			video_device_node_name(vdev));
+
+	/* K4: pair the open notify so zenith can drop its refcount.
+	 * Called after fops->release returns so any final state
+	 * teardown has completed; called before video_put so vdev
+	 * is still valid even on the last open.
+	 */
+	if (zenith_v4l2_release_notify)
+		zenith_v4l2_release_notify(vdev);
 
 	/* decrease the refcount unconditionally since the release()
 	   return value is ignored. */

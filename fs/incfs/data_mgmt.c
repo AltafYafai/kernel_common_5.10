@@ -432,7 +432,7 @@ static ssize_t zstd_decompress_safe(struct mount_info *mi,
 		return result;
 
 	if (!mi->mi_zstd_stream) {
-		unsigned int workspace_size = ZSTD_DStreamWorkspaceBound(
+		unsigned int workspace_size = zstd_dstream_workspace_bound(
 						INCFS_DATA_FILE_BLOCK_SIZE);
 		void *workspace = kvmalloc(workspace_size, GFP_NOFS);
 		ZSTD_DStream *stream;
@@ -442,7 +442,7 @@ static ssize_t zstd_decompress_safe(struct mount_info *mi,
 			goto out;
 		}
 
-		stream = ZSTD_initDStream(INCFS_DATA_FILE_BLOCK_SIZE, workspace,
+		stream = zstd_init_dstream(INCFS_DATA_FILE_BLOCK_SIZE, workspace,
 				  workspace_size);
 		if (!stream) {
 			kvfree(workspace);
@@ -661,7 +661,7 @@ static void log_block_read(struct mount_info *mi, incfs_uuid_t *id,
 	++head->current_record_no;
 
 	spin_unlock(&log->rl_lock);
-	queue_delayed_work(system_power_efficient_wq, &log->ml_wakeup_work, msecs_to_jiffies(16));
+	schedule_delayed_work(&log->ml_wakeup_work, msecs_to_jiffies(16));
 }
 
 static int validate_hash_tree(struct backing_file_context *bfc, struct file *f,

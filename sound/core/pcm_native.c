@@ -2161,8 +2161,9 @@ static int snd_pcm_drain(struct snd_pcm_substream *substream,
 		drain_no_period_wakeup = to_check->no_period_wakeup;
 		drain_rate = to_check->rate;
 		drain_bufsz = to_check->buffer_size;
-		init_wait_entry(&wait, 0);
-		prepare_to_wait(&to_check->sleep, &wait, TASK_INTERRUPTIBLE);
+		init_waitqueue_entry(&wait, current);
+		set_current_state(TASK_INTERRUPTIBLE);
+		add_wait_queue(&to_check->sleep, &wait);
 		snd_pcm_stream_unlock_irq(substream);
 		if (drain_no_period_wakeup)
 			tout = MAX_SCHEDULE_TIMEOUT;
@@ -2180,7 +2181,7 @@ static int snd_pcm_drain(struct snd_pcm_substream *substream,
 		group = snd_pcm_stream_group_ref(substream);
 		snd_pcm_group_for_each_entry(s, substream) {
 			if (s->runtime == to_check) {
-				finish_wait(&to_check->sleep, &wait);
+				remove_wait_queue(&to_check->sleep, &wait);
 				break;
 			}
 		}
@@ -2335,7 +2336,6 @@ static void relink_to_local(struct snd_pcm_substream *substream)
 
 static int snd_pcm_unlink(struct snd_pcm_substream *substream)
 {
-	struct snd_pcm_substream *s;
 	struct snd_pcm_group *group;
 	bool nonatomic = substream->pcm->nonatomic;
 	bool do_free = false;
@@ -2350,12 +2350,6 @@ static int snd_pcm_unlink(struct snd_pcm_substream *substream)
 
 	group = substream->group;
 	snd_pcm_group_lock_irq(group, nonatomic);
-
-	/* release drain waiters before changing membership, else snd_pcm_drain()
-	 * leaves its on-stack wait entry queued on a member's sleep list
-	 */
-	snd_pcm_group_for_each_entry(s, substream)
-		wake_up(&s->runtime->sleep);
 
 	relink_to_local(substream);
 	refcount_dec(&group->refs);
@@ -2805,6 +2799,12 @@ static int snd_pcm_open_file(struct file *file,
 	return 0;
 }
 
+/* Forward decl for K5 hook -- the open paths set the refcount on
+ * success; the bodies are below the snd_pcm_open() definition.
+ */
+extern void zenith_alsa_pcm_open_notify(int stream) __weak;
+extern void zenith_alsa_pcm_release_notify(int stream) __weak;
+
 static int snd_pcm_playback_open(struct inode *inode, struct file *file)
 {
 	struct snd_pcm *pcm;
@@ -2816,6 +2816,8 @@ static int snd_pcm_playback_open(struct inode *inode, struct file *file)
 	err = snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_PLAYBACK);
 	if (pcm)
 		snd_card_unref(pcm->card);
+	if (!err && zenith_alsa_pcm_open_notify)
+		zenith_alsa_pcm_open_notify(SNDRV_PCM_STREAM_PLAYBACK);
 	return err;
 }
 
@@ -2830,6 +2832,8 @@ static int snd_pcm_capture_open(struct inode *inode, struct file *file)
 	err = snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_CAPTURE);
 	if (pcm)
 		snd_card_unref(pcm->card);
+	if (!err && zenith_alsa_pcm_open_notify)
+		zenith_alsa_pcm_open_notify(SNDRV_PCM_STREAM_CAPTURE);
 	return err;
 }
 
@@ -2895,12 +2899,14 @@ static int snd_pcm_release(struct inode *inode, struct file *file)
 	struct snd_pcm *pcm;
 	struct snd_pcm_substream *substream;
 	struct snd_pcm_file *pcm_file;
+	int stream;
 
 	pcm_file = file->private_data;
 	substream = pcm_file->substream;
 	if (snd_BUG_ON(!substream))
 		return -ENXIO;
 	pcm = substream->pcm;
+	stream = substream->stream;
 	mutex_lock(&pcm->open_mutex);
 	snd_pcm_release_substream(substream);
 	kfree(pcm_file);
@@ -2908,6 +2914,8 @@ static int snd_pcm_release(struct inode *inode, struct file *file)
 	wake_up(&pcm->open_wait);
 	module_put(pcm->card->module);
 	snd_card_file_remove(pcm->card, file);
+	if (zenith_alsa_pcm_release_notify)
+		zenith_alsa_pcm_release_notify(stream);
 	return 0;
 }
 

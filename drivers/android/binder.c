@@ -693,7 +693,7 @@ static void binder_do_set_priority(struct task_struct *task,
 	bool has_cap_nice;
 	unsigned int policy = desired.sched_policy;
 
-	if (task->policy == policy && task->normal_prio == desired.prio)
+	if (task->policy == policy && task->prio == desired.prio)
 		return;
 
 	has_cap_nice = has_capability_noaudit(task, CAP_SYS_NICE);
@@ -730,7 +730,7 @@ static void binder_do_set_priority(struct task_struct *task,
 			      task->pid, desired.prio,
 			      to_kernel_prio(policy, priority));
 
-	trace_binder_set_priority(task->tgid, task->pid, task->normal_prio,
+	trace_binder_set_priority(task->tgid, task->pid, task->prio,
 				  to_kernel_prio(policy, priority),
 				  desired.prio);
 
@@ -1675,20 +1675,7 @@ static void binder_free_txn_fixups(struct binder_transaction *t)
 
 static void binder_free_transaction(struct binder_transaction *t)
 {
-	struct binder_thread *target_thread;
-	struct binder_proc *target_proc;
-
-	spin_lock(&t->lock);
-	target_proc = t->to_proc;
-	target_thread = t->to_thread;
-	/*
-	 * Pin target_thread to keep target_proc alive. Undelivered
-	 * transactions with !target_thread are safe, as target_proc
-	 * can only be the current context there.
-	 */
-	if (target_thread)
-		atomic_inc(&target_thread->tmp_ref);
-	spin_unlock(&t->lock);
+	struct binder_proc *target_proc = t->to_proc;
 
 	trace_android_vh_free_oem_binder_struct(t);
 	if (target_proc) {
@@ -1703,10 +1690,6 @@ static void binder_free_transaction(struct binder_transaction *t)
 			t->buffer->transaction = NULL;
 		binder_inner_proc_unlock(target_proc);
 	}
-
-	if (target_thread)
-		binder_thread_dec_tmpref(target_thread);
-
 	/*
 	 * If the transaction has no target_proc, then
 	 * t->buffer->transaction has already been cleared.
@@ -3295,7 +3278,7 @@ static void binder_transaction(struct binder_proc *proc,
 	    binder_supported_policy(current->policy)) {
 		/* Inherit supported policies for synchronous transactions */
 		t->priority.sched_policy = current->policy;
-		t->priority.prio = current->normal_prio;
+		t->priority.prio = current->prio;
 	} else {
 		/* Otherwise, fall back to the default priority */
 		t->priority = target_proc->default_priority;
@@ -3337,7 +3320,7 @@ static void binder_transaction(struct binder_proc *proc,
 		if (extra_buffers_size < added_size) {
 			/* integer overflow of extra_buffers_size */
 			return_error = BR_FAILED_REPLY;
-			return_error_param = EINVAL;
+			return_error_param = -EINVAL;
 			return_error_line = __LINE__;
 			goto err_bad_extra_size;
 		}
@@ -3347,7 +3330,7 @@ static void binder_transaction(struct binder_proc *proc,
 
 	t->buffer = binder_alloc_new_buf(&target_proc->alloc, tr->data_size,
 		tr->offsets_size, extra_buffers_size,
-		!reply && (t->flags & TF_ONE_WAY), current->tgid);
+		!reply && (t->flags & TF_ONE_WAY));
 	if (IS_ERR(t->buffer)) {
 		/*
 		 * -ESRCH indicates VMA cleared. The target is dying.
@@ -6380,9 +6363,9 @@ static void print_binder_transaction_ilocked(struct seq_file *m,
 	}
 	if (buffer->target_node)
 		seq_printf(m, " node %d", buffer->target_node->debug_id);
-	seq_printf(m, " size %zd:%zd data %pK\n",
+	seq_printf(m, " size %zd:%zd offset %lx\n",
 		   buffer->data_size, buffer->offsets_size,
-		   buffer->user_data);
+		   proc->alloc.buffer - buffer->user_data);
 }
 
 static void print_binder_work_ilocked(struct seq_file *m,

@@ -304,11 +304,16 @@ static int io_ctl_init(struct btrfs_io_ctl *io_ctl, struct inode *inode,
 		       int write)
 {
 	int num_pages;
+	int check_crcs = 0;
 
 	num_pages = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
 
+	if (btrfs_ino(BTRFS_I(inode)) != BTRFS_FREE_INO_OBJECTID)
+		check_crcs = 1;
+
 	/* Make sure we can fit our crcs and generation into the first page */
-	if (write && (num_pages * sizeof(u32) + sizeof(u64)) > PAGE_SIZE)
+	if (write && check_crcs &&
+	    (num_pages * sizeof(u32) + sizeof(u64)) > PAGE_SIZE)
 		return -ENOSPC;
 
 	memset(io_ctl, 0, sizeof(struct btrfs_io_ctl));
@@ -319,6 +324,7 @@ static int io_ctl_init(struct btrfs_io_ctl *io_ctl, struct inode *inode,
 
 	io_ctl->num_pages = num_pages;
 	io_ctl->fs_info = btrfs_sb(inode->i_sb);
+	io_ctl->check_crcs = check_crcs;
 	io_ctl->inode = inode;
 
 	return 0;
@@ -413,8 +419,13 @@ static void io_ctl_set_generation(struct btrfs_io_ctl *io_ctl, u64 generation)
 	 * Skip the csum areas.  If we don't check crcs then we just have a
 	 * 64bit chunk at the front of the first page.
 	 */
-	io_ctl->cur += (sizeof(u32) * io_ctl->num_pages);
-	io_ctl->size -= sizeof(u64) + (sizeof(u32) * io_ctl->num_pages);
+	if (io_ctl->check_crcs) {
+		io_ctl->cur += (sizeof(u32) * io_ctl->num_pages);
+		io_ctl->size -= sizeof(u64) + (sizeof(u32) * io_ctl->num_pages);
+	} else {
+		io_ctl->cur += sizeof(u64);
+		io_ctl->size -= sizeof(u64) * 2;
+	}
 
 	put_unaligned_le64(generation, io_ctl->cur);
 	io_ctl->cur += sizeof(u64);
@@ -428,8 +439,14 @@ static int io_ctl_check_generation(struct btrfs_io_ctl *io_ctl, u64 generation)
 	 * Skip the crc area.  If we don't check crcs then we just have a 64bit
 	 * chunk at the front of the first page.
 	 */
-	io_ctl->cur += sizeof(u32) * io_ctl->num_pages;
-	io_ctl->size -= sizeof(u64) + (sizeof(u32) * io_ctl->num_pages);
+	if (io_ctl->check_crcs) {
+		io_ctl->cur += sizeof(u32) * io_ctl->num_pages;
+		io_ctl->size -= sizeof(u64) +
+			(sizeof(u32) * io_ctl->num_pages);
+	} else {
+		io_ctl->cur += sizeof(u64);
+		io_ctl->size -= sizeof(u64) * 2;
+	}
 
 	cache_gen = get_unaligned_le64(io_ctl->cur);
 	if (cache_gen != generation) {
@@ -449,6 +466,11 @@ static void io_ctl_set_crc(struct btrfs_io_ctl *io_ctl, int index)
 	u32 crc = ~(u32)0;
 	unsigned offset = 0;
 
+	if (!io_ctl->check_crcs) {
+		io_ctl_unmap_page(io_ctl);
+		return;
+	}
+
 	if (index == 0)
 		offset = sizeof(u32) * io_ctl->num_pages;
 
@@ -466,8 +488,10 @@ static int io_ctl_check_crc(struct btrfs_io_ctl *io_ctl, int index)
 	u32 crc = ~(u32)0;
 	unsigned offset = 0;
 
-	if (index >= io_ctl->num_pages)
-		return -EIO;
+	if (!io_ctl->check_crcs) {
+		io_ctl_map_page(io_ctl, 0);
+		return 0;
+	}
 
 	if (index == 0)
 		offset = sizeof(u32) * io_ctl->num_pages;

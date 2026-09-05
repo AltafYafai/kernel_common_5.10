@@ -162,7 +162,7 @@ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
 	struct cpuhp_step *step = cpuhp_get_step(state);
 	int (*cbm)(unsigned int cpu, struct hlist_node *node);
 	int (*cb)(unsigned int cpu);
-	int ret, cnt, rollback_ret;
+	int ret, cnt;
 
 	if (st->fail == state) {
 		st->fail = CPUHP_INVALID;
@@ -228,12 +228,12 @@ err:
 			break;
 
 		trace_cpuhp_multi_enter(cpu, st->target, state, cbm, node);
-		rollback_ret = cbm(cpu, node);
-		trace_cpuhp_exit(cpu, st->state, state, rollback_ret);
+		ret = cbm(cpu, node);
+		trace_cpuhp_exit(cpu, st->state, state, ret);
 		/*
 		 * Rollback must not fail,
 		 */
-		WARN_ON_ONCE(rollback_ret);
+		WARN_ON_ONCE(ret);
 	}
 	return ret;
 }
@@ -1717,13 +1717,13 @@ int freeze_secondary_cpus(int primary)
 	 */
 	cpumask_clear(frozen_cpus);
 
-	pr_info("Disabling non-boot CPUs ...\n");
+	pr_debug("Disabling non-boot CPUs ...\n");
 	for_each_online_cpu(cpu) {
 		if (cpu == primary)
 			continue;
 
 		if (pm_wakeup_pending()) {
-			pr_info("Wakeup pending. Abort CPU freeze\n");
+			pr_debug("Wakeup pending. Abort CPU freeze\n");
 			error = -EBUSY;
 			break;
 		}
@@ -1734,7 +1734,7 @@ int freeze_secondary_cpus(int primary)
 		if (!error)
 			cpumask_set_cpu(cpu, frozen_cpus);
 		else {
-			pr_err("Error taking CPU%d down: %d\n", cpu, error);
+			pr_debug("Error taking CPU%d down: %d\n", cpu, error);
 			break;
 		}
 	}
@@ -1742,7 +1742,7 @@ int freeze_secondary_cpus(int primary)
 	if (!error)
 		BUG_ON(num_online_cpus() > 1);
 	else
-		pr_err("Non-boot CPUs are not disabled\n");
+		pr_debug("Non-boot CPUs are not disabled\n");
 
 	/*
 	 * Make sure the CPUs won't be enabled by someone else. We need to do
@@ -1774,7 +1774,7 @@ void thaw_secondary_cpus(void)
 	if (cpumask_empty(frozen_cpus))
 		goto out;
 
-	pr_info("Enabling non-boot CPUs ...\n");
+	pr_debug("Enabling non-boot CPUs ...\n");
 
 	arch_thaw_secondary_cpus_begin();
 
@@ -1783,10 +1783,10 @@ void thaw_secondary_cpus(void)
 		error = _cpu_up(cpu, 1, CPUHP_ONLINE);
 		trace_suspend_resume(TPS("CPU_ON"), cpu, false);
 		if (!error) {
-			pr_info("CPU%d is up\n", cpu);
+			pr_debug("CPU%d is up\n", cpu);
 			cpu_device = get_cpu_device(cpu);
 			if (!cpu_device)
-				pr_err("%s: failed to get cpu%d device\n",
+				pr_debug("%s: failed to get cpu%d device\n",
 				       __func__, cpu);
 			else
 				kobject_uevent(&cpu_device->kobj, KOBJ_ONLINE);
@@ -2619,15 +2619,18 @@ static const struct attribute_group cpuhp_cpu_attr_group = {
 static ssize_t show_cpuhp_states(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
-	ssize_t res = 0;
+	ssize_t cur, res = 0;
 	int i;
 
 	mutex_lock(&cpuhp_state_mutex);
 	for (i = CPUHP_OFFLINE; i <= CPUHP_ONLINE; i++) {
 		struct cpuhp_step *sp = cpuhp_get_step(i);
 
-		if (sp->name)
-			res += sysfs_emit_at(buf, res, "%3d: %s\n", i, sp->name);
+		if (sp->name) {
+			cur = sprintf(buf, "%3d: %s\n", i, sp->name);
+			buf += cur;
+			res += cur;
+		}
 	}
 	mutex_unlock(&cpuhp_state_mutex);
 	return res;

@@ -272,8 +272,8 @@ static const char *mount_overload(struct fs *fs)
 	/* "PERF_" + name + "_ENVIRONMENT" + '\0' */
 	char upper_name[5 + name_len + 12 + 1];
 
-	snprintf(upper_name, sizeof(upper_name), "PERF_%s_ENVIRONMENT", fs->name);
-	mem_toupper(upper_name, strlen(upper_name));
+	snprintf(upper_name, name_len, "PERF_%s_ENVIRONMENT", fs->name);
+	mem_toupper(upper_name, name_len);
 
 	return getenv(upper_name) ?: *fs->mounts;
 }
@@ -321,14 +321,11 @@ int filename__read_int(const char *filename, int *value)
 {
 	char line[64];
 	int fd = open(filename, O_RDONLY), err = -1;
-	ssize_t n;
 
 	if (fd < 0)
 		return -1;
 
-	n = read(fd, line, sizeof(line) - 1);
-	if (n > 0) {
-		line[n] = '\0';
+	if (read(fd, line, sizeof(line)) > 0) {
 		*value = atoi(line);
 		err = 0;
 	}
@@ -342,14 +339,11 @@ static int filename__read_ull_base(const char *filename,
 {
 	char line[64];
 	int fd = open(filename, O_RDONLY), err = -1;
-	ssize_t n;
 
 	if (fd < 0)
 		return -1;
 
-	n = read(fd, line, sizeof(line) - 1);
-	if (n > 0) {
-		line[n] = '\0';
+	if (read(fd, line, sizeof(line)) > 0) {
 		*value = strtoull(line, NULL, base);
 		if (*value != ULLONG_MAX)
 			err = 0;
@@ -432,13 +426,12 @@ int filename__write_int(const char *filename, int value)
 {
 	int fd = open(filename, O_WRONLY), err = -1;
 	char buf[64];
-	int len;
 
 	if (fd < 0)
 		return err;
 
-	len = sprintf(buf, "%d", value);
-	if (write(fd, buf, len) == len)
+	sprintf(buf, "%d", value);
+	if (write(fd, buf, sizeof(buf)) == sizeof(buf))
 		err = 0;
 
 	close(fd);

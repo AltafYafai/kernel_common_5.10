@@ -1073,15 +1073,20 @@ static int pca953x_remove(struct i2c_client *client)
 {
 	struct pca953x_platform_data *pdata = dev_get_platdata(&client->dev);
 	struct pca953x_chip *chip = i2c_get_clientdata(client);
+	int ret;
 
 	if (pdata && pdata->teardown) {
-		pdata->teardown(client, chip->gpio_chip.base,
-				chip->gpio_chip.ngpio, pdata->context);
+		ret = pdata->teardown(client, chip->gpio_chip.base,
+				      chip->gpio_chip.ngpio, pdata->context);
+		if (ret < 0)
+			dev_err(&client->dev, "teardown failed, %d\n", ret);
+	} else {
+		ret = 0;
 	}
 
 	regulator_disable(chip->regulator);
 
-	return 0;
+	return ret;
 }
 
 #ifdef CONFIG_PM_SLEEP

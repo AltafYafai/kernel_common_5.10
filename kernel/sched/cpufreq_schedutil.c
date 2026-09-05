@@ -12,6 +12,7 @@
 
 #include <linux/sched/cpufreq.h>
 #include <trace/events/power.h>
+#include <trace/hooks/sched.h>
 
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
 
@@ -55,11 +56,6 @@ struct sugov_cpu {
 
 	unsigned long		bw_dl;
 	unsigned long		max;
-
-	/* The field below is for single-CPU policies only: */
-#ifdef CONFIG_NO_HZ_COMMON
-	unsigned long		saved_idle_calls;
-#endif
 };
 
 static DEFINE_PER_CPU(struct sugov_cpu, sugov_cpu);
@@ -182,11 +178,17 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 {
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int freq = arch_scale_freq_invariant() ?
-				policy->cpuinfo.max_freq : policy->cur;
+				policy->cpuinfo.max_freq :
+				policy->cur + (policy->cur >> 2);
 	unsigned int idx, l_freq, h_freq;
 	unsigned long next_freq = 0;
 
-	freq = map_util_freq(util, freq, max);
+	trace_android_vh_map_util_freq(util, freq, max, &next_freq, policy,
+			&sg_policy->need_freq_update);
+	if (next_freq)
+		freq = next_freq;
+	else
+		freq = map_util_freq(util, freq, max);
 
 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
 		return sg_policy->next_freq;
@@ -314,12 +316,7 @@ unsigned long schedutil_cpu_util(int cpu, unsigned long util_cfs,
 
 	return min(max, util);
 }
-
-unsigned long sched_cpu_util(int cpu, unsigned long max)
-{
-	return schedutil_cpu_util(cpu, cpu_util_cfs(cpu_rq(cpu)), max,
-				  ENERGY_UTIL, NULL);
-}
+EXPORT_SYMBOL_GPL(schedutil_cpu_util);
 
 static unsigned long sugov_get_util(struct sugov_cpu *sg_cpu)
 {
@@ -459,18 +456,6 @@ static unsigned long sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
 	return boost;
 }
 
-#ifdef CONFIG_NO_HZ_COMMON
-static bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu)
-{
-	unsigned long idle_calls = tick_nohz_get_idle_calls_cpu(sg_cpu->cpu);
-	bool ret = idle_calls == sg_cpu->saved_idle_calls;
-
-	sg_cpu->saved_idle_calls = idle_calls;
-	return ret;
-}
-#else
-static inline bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu) { return false; }
-#endif /* CONFIG_NO_HZ_COMMON */
 
 /*
  * Make sugov_should_update_freq() ignore the rate limit when DL
@@ -489,7 +474,6 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	unsigned long util, max;
 	unsigned int next_f;
-	unsigned int cached_freq = sg_policy->cached_raw_freq;
 
 	sugov_iowait_boost(sg_cpu, time, flags);
 	sg_cpu->last_update = time;
@@ -503,16 +487,6 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	max = sg_cpu->max;
 	util = sugov_iowait_apply(sg_cpu, time, util, max);
 	next_f = get_next_freq(sg_policy, util, max);
-	/*
-	 * Do not reduce the frequency if the CPU has not been idle
-	 * recently, as the reduction is likely to be premature then.
-	 */
-	if (sugov_cpu_is_busy(sg_cpu) && next_f < sg_policy->next_freq) {
-		next_f = sg_policy->next_freq;
-
-		/* Restore cached freq as next_freq has changed */
-		sg_policy->cached_raw_freq = cached_freq;
-	}
 
 	/*
 	 * This code runs under rq->lock for the target CPU, so it won't run
@@ -958,36 +932,3 @@ struct cpufreq_governor *cpufreq_default_governor(void)
 #endif
 
 cpufreq_governor_init(schedutil_gov);
-
-#ifdef CONFIG_ENERGY_MODEL
-extern bool sched_energy_update;
-extern struct mutex sched_energy_mutex;
-
-static void rebuild_sd_workfn(struct work_struct *work)
-{
-	mutex_lock(&sched_energy_mutex);
-	sched_energy_update = true;
-	rebuild_sched_domains();
-	sched_energy_update = false;
-	mutex_unlock(&sched_energy_mutex);
-}
-static DECLARE_WORK(rebuild_sd_work, rebuild_sd_workfn);
-
-/*
- * EAS shouldn't be attempted without sugov, so rebuild the sched_domains
- * on governor changes to make sure the scheduler knows about it.
- */
-void sched_cpufreq_governor_change(struct cpufreq_policy *policy,
-				  struct cpufreq_governor *old_gov)
-{
-	if (old_gov == &schedutil_gov || policy->governor == &schedutil_gov) {
-		/*
-		 * When called from the cpufreq_register_driver() path, the
-		 * cpu_hotplug_lock is already held, so use a work item to
-		 * avoid nested locking in rebuild_sched_domains().
-		 */
-		schedule_work(&rebuild_sd_work);
-	}
-
-}
-#endif

@@ -258,9 +258,8 @@ static int rdma_write_sg(struct rtrs_srv_op *id)
 	/* WR will fail with length error
 	 * if this is 0
 	 */
-	if (unlikely(plist->length == 0 || plist->length > max_chunk_size)) {
-		rtrs_err(s, "Invalid RDMA-Write sg list length %u\n",
-			 plist->length);
+	if (unlikely(plist->length == 0)) {
+		rtrs_err(s, "Invalid RDMA-Write sg list length 0\n");
 		return -EINVAL;
 	}
 

@@ -943,8 +943,7 @@ static int _ip_cprb_helper(u16 cardnr, u16 domain,
 			   const u8 *clr_key_value,
 			   int clr_key_bit_size,
 			   u8 *key_token,
-			   int *key_token_size,
-			   bool scrub)
+			   int *key_token_size)
 {
 	int rc, n;
 	u8 *mem, *ptr;
@@ -1085,7 +1084,7 @@ static int _ip_cprb_helper(u16 cardnr, u16 domain,
 	*key_token_size = t->len;
 
 out:
-	free_cprbmem(mem, PARMBSIZE, scrub);
+	free_cprbmem(mem, PARMBSIZE, 0);
 	return rc;
 }
 
@@ -1128,8 +1127,7 @@ int cca_clr2cipherkey(u16 card, u16 dom, u32 keybitsize, u32 keygenflags,
 	 * 4/4 COMPLETE the secure cipher key import
 	 */
 	rc = _ip_cprb_helper(card, dom, "AES     ", "FIRST   ", "MIN3PART",
-			     exorbuf, keybitsize, token, &tokensize,
-			     true);
+			     exorbuf, keybitsize, token, &tokensize);
 	if (rc) {
 		DEBUG_ERR(
 			"%s clear key import 1/4 with CSNBKPI2 failed, rc=%d\n",
@@ -1137,8 +1135,7 @@ int cca_clr2cipherkey(u16 card, u16 dom, u32 keybitsize, u32 keygenflags,
 		goto out;
 	}
 	rc = _ip_cprb_helper(card, dom, "AES     ", "ADD-PART", NULL,
-			     clrkey, keybitsize, token, &tokensize,
-			     true);
+			     clrkey, keybitsize, token, &tokensize);
 	if (rc) {
 		DEBUG_ERR(
 			"%s clear key import 2/4 with CSNBKPI2 failed, rc=%d\n",
@@ -1146,8 +1143,7 @@ int cca_clr2cipherkey(u16 card, u16 dom, u32 keybitsize, u32 keygenflags,
 		goto out;
 	}
 	rc = _ip_cprb_helper(card, dom, "AES     ", "ADD-PART", NULL,
-			     exorbuf, keybitsize, token, &tokensize,
-			     true);
+			     exorbuf, keybitsize, token, &tokensize);
 	if (rc) {
 		DEBUG_ERR(
 			"%s clear key import 3/4 with CSNBKPI2 failed, rc=%d\n",
@@ -1155,8 +1151,7 @@ int cca_clr2cipherkey(u16 card, u16 dom, u32 keybitsize, u32 keygenflags,
 		goto out;
 	}
 	rc = _ip_cprb_helper(card, dom, "AES     ", "COMPLETE", NULL,
-			     NULL, keybitsize, token, &tokensize,
-			     true);
+			     NULL, keybitsize, token, &tokensize);
 	if (rc) {
 		DEBUG_ERR(
 			"%s clear key import 4/4 with CSNBKPI2 failed, rc=%d\n",
@@ -1174,8 +1169,7 @@ int cca_clr2cipherkey(u16 card, u16 dom, u32 keybitsize, u32 keygenflags,
 	*keybufsize = tokensize;
 
 out:
-	memzero_explicit(exorbuf, sizeof(exorbuf));
-	kfree_sensitive(token);
+	kfree(token);
 	return rc;
 }
 EXPORT_SYMBOL(cca_clr2cipherkey);
@@ -1234,9 +1228,6 @@ int cca_cipher2protkey(u16 cardnr, u16 domain, const u8 *ckey,
 		} kb;
 	} __packed * prepparm;
 	int keytoklen = ((struct cipherkeytoken *)ckey)->len;
-
-	if (keytoklen > PARMBSIZE - sizeof(struct aureqparm))
-		return -EINVAL;
 
 	/* get already prepared memory for 2 cprbs with param block each */
 	rc = alloc_and_prep_cprbmem(PARMBSIZE, &mem, &preqcblk, &prepcblk);
@@ -1403,9 +1394,6 @@ int cca_ecc2protkey(u16 cardnr, u16 domain, const u8 *key,
 		} kb;
 	} __packed * prepparm;
 	int keylen = ((struct eccprivkeytoken *)key)->len;
-
-	if (keylen > PARMBSIZE - sizeof(struct aureqparm))
-		return -EINVAL;
 
 	/* get already prepared memory for 2 cprbs with param block each */
 	rc = alloc_and_prep_cprbmem(PARMBSIZE, &mem, &preqcblk, &prepcblk);

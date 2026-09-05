@@ -16,14 +16,14 @@
 #include "btree.h"
 
 static inline
-bool is_bnode_offset_valid(struct hfs_bnode *node, u32 off)
+bool is_bnode_offset_valid(struct hfs_bnode *node, int off)
 {
 	bool is_valid = off < node->tree->node_size;
 
 	if (!is_valid) {
 		pr_err("requested invalid offset: "
 		       "NODE: id %u, type %#x, height %u, "
-		       "node_size %u, offset %u\n",
+		       "node_size %u, offset %d\n",
 		       node->this, node->type, node->height,
 		       node->tree->node_size, off);
 	}
@@ -32,7 +32,7 @@ bool is_bnode_offset_valid(struct hfs_bnode *node, u32 off)
 }
 
 static inline
-u32 check_and_correct_requested_length(struct hfs_bnode *node, u32 off, u32 len)
+int check_and_correct_requested_length(struct hfs_bnode *node, int off, int len)
 {
 	unsigned int node_size;
 
@@ -41,13 +41,13 @@ u32 check_and_correct_requested_length(struct hfs_bnode *node, u32 off, u32 len)
 
 	node_size = node->tree->node_size;
 
-	if ((u64)off + len > node_size) {
-		u32 new_len = node_size - off;
+	if ((off + len) > node_size) {
+		int new_len = (int)node_size - off;
 
 		pr_err("requested length has been corrected: "
 		       "NODE: id %u, type %#x, height %u, "
-		       "node_size %u, offset %u, "
-		       "requested_len %u, corrected_len %u\n",
+		       "node_size %u, offset %d, "
+		       "requested_len %d, corrected_len %d\n",
 		       node->this, node->type, node->height,
 		       node->tree->node_size, off, len, new_len);
 
@@ -57,15 +57,13 @@ u32 check_and_correct_requested_length(struct hfs_bnode *node, u32 off, u32 len)
 	return len;
 }
 
-void hfs_bnode_read(struct hfs_bnode *node, void *buf, u32 off, u32 len)
+void hfs_bnode_read(struct hfs_bnode *node, void *buf, int off, int len)
 {
 	struct page *page;
-	u32 pagenum;
-	u32 bytes_read;
-	u32 bytes_to_read;
+	int pagenum;
+	int bytes_read;
+	int bytes_to_read;
 	void *vaddr;
-
-	memset(buf, 0, len);
 
 	if (!is_bnode_offset_valid(node, off))
 		return;
@@ -73,7 +71,7 @@ void hfs_bnode_read(struct hfs_bnode *node, void *buf, u32 off, u32 len)
 	if (len == 0) {
 		pr_err("requested zero length: "
 		       "NODE: id %u, type %#x, height %u, "
-		       "node_size %u, offset %u, len %u\n",
+		       "node_size %u, offset %d, len %d\n",
 		       node->this, node->type, node->height,
 		       node->tree->node_size, off, len);
 		return;
@@ -89,7 +87,7 @@ void hfs_bnode_read(struct hfs_bnode *node, void *buf, u32 off, u32 len)
 		if (pagenum >= node->tree->pages_per_bnode)
 			break;
 		page = node->page[pagenum];
-		bytes_to_read = min_t(u32, len - bytes_read, PAGE_SIZE - off);
+		bytes_to_read = min_t(int, len - bytes_read, PAGE_SIZE - off);
 
 		vaddr = kmap_atomic(page);
 		memcpy(buf + bytes_read, vaddr + off, bytes_to_read);
@@ -100,7 +98,7 @@ void hfs_bnode_read(struct hfs_bnode *node, void *buf, u32 off, u32 len)
 	}
 }
 
-u16 hfs_bnode_read_u16(struct hfs_bnode *node, u32 off)
+u16 hfs_bnode_read_u16(struct hfs_bnode *node, int off)
 {
 	__be16 data;
 	// optimize later...
@@ -108,7 +106,7 @@ u16 hfs_bnode_read_u16(struct hfs_bnode *node, u32 off)
 	return be16_to_cpu(data);
 }
 
-u8 hfs_bnode_read_u8(struct hfs_bnode *node, u32 off)
+u8 hfs_bnode_read_u8(struct hfs_bnode *node, int off)
 {
 	u8 data;
 	// optimize later...
@@ -116,10 +114,10 @@ u8 hfs_bnode_read_u8(struct hfs_bnode *node, u32 off)
 	return data;
 }
 
-void hfs_bnode_read_key(struct hfs_bnode *node, void *key, u32 off)
+void hfs_bnode_read_key(struct hfs_bnode *node, void *key, int off)
 {
 	struct hfs_btree *tree;
-	u32 key_len;
+	int key_len;
 
 	tree = node->tree;
 	if (node->type == HFS_NODE_LEAF ||
@@ -130,14 +128,14 @@ void hfs_bnode_read_key(struct hfs_bnode *node, void *key, u32 off)
 
 	if (key_len > sizeof(hfs_btree_key) || key_len < 1) {
 		memset(key, 0, sizeof(hfs_btree_key));
-		pr_err("hfs: Invalid key length: %u\n", key_len);
+		pr_err("hfs: Invalid key length: %d\n", key_len);
 		return;
 	}
 
 	hfs_bnode_read(node, key, off, key_len);
 }
 
-void hfs_bnode_write(struct hfs_bnode *node, void *buf, u32 off, u32 len)
+void hfs_bnode_write(struct hfs_bnode *node, void *buf, int off, int len)
 {
 	struct page *page;
 
@@ -147,7 +145,7 @@ void hfs_bnode_write(struct hfs_bnode *node, void *buf, u32 off, u32 len)
 	if (len == 0) {
 		pr_err("requested zero length: "
 		       "NODE: id %u, type %#x, height %u, "
-		       "node_size %u, offset %u, len %u\n",
+		       "node_size %u, offset %d, len %d\n",
 		       node->this, node->type, node->height,
 		       node->tree->node_size, off, len);
 		return;
@@ -163,20 +161,20 @@ void hfs_bnode_write(struct hfs_bnode *node, void *buf, u32 off, u32 len)
 	set_page_dirty(page);
 }
 
-void hfs_bnode_write_u16(struct hfs_bnode *node, u32 off, u16 data)
+void hfs_bnode_write_u16(struct hfs_bnode *node, int off, u16 data)
 {
 	__be16 v = cpu_to_be16(data);
 	// optimize later...
 	hfs_bnode_write(node, &v, off, 2);
 }
 
-void hfs_bnode_write_u8(struct hfs_bnode *node, u32 off, u8 data)
+void hfs_bnode_write_u8(struct hfs_bnode *node, int off, u8 data)
 {
 	// optimize later...
 	hfs_bnode_write(node, &data, off, 1);
 }
 
-void hfs_bnode_clear(struct hfs_bnode *node, u32 off, u32 len)
+void hfs_bnode_clear(struct hfs_bnode *node, int off, int len)
 {
 	struct page *page;
 
@@ -186,7 +184,7 @@ void hfs_bnode_clear(struct hfs_bnode *node, u32 off, u32 len)
 	if (len == 0) {
 		pr_err("requested zero length: "
 		       "NODE: id %u, type %#x, height %u, "
-		       "node_size %u, offset %u, len %u\n",
+		       "node_size %u, offset %d, len %d\n",
 		       node->this, node->type, node->height,
 		       node->tree->node_size, off, len);
 		return;
@@ -202,8 +200,8 @@ void hfs_bnode_clear(struct hfs_bnode *node, u32 off, u32 len)
 	set_page_dirty(page);
 }
 
-void hfs_bnode_copy(struct hfs_bnode *dst_node, u32 dst,
-		    struct hfs_bnode *src_node, u32 src, u32 len)
+void hfs_bnode_copy(struct hfs_bnode *dst_node, int dst,
+		struct hfs_bnode *src_node, int src, int len)
 {
 	struct page *src_page, *dst_page;
 
@@ -225,7 +223,7 @@ void hfs_bnode_copy(struct hfs_bnode *dst_node, u32 dst,
 	set_page_dirty(dst_page);
 }
 
-void hfs_bnode_move(struct hfs_bnode *node, u32 dst, u32 src, u32 len)
+void hfs_bnode_move(struct hfs_bnode *node, int dst, int src, int len)
 {
 	struct page *page;
 	void *ptr;

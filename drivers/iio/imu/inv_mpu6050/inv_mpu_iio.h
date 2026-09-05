@@ -9,17 +9,15 @@
 #include <linux/i2c.h>
 #include <linux/i2c-mux.h>
 #include <linux/mutex.h>
-#include <linux/platform_data/invensense_mpu6050.h>
-#include <linux/regmap.h>
-
-#include <linux/iio/buffer.h>
-#include <linux/iio/common/inv_sensors_timestamp.h>
 #include <linux/iio/iio.h>
+#include <linux/iio/buffer.h>
+#include <linux/regmap.h>
+#include <linux/iio/sysfs.h>
 #include <linux/iio/kfifo_buf.h>
 #include <linux/iio/trigger.h>
 #include <linux/iio/triggered_buffer.h>
 #include <linux/iio/trigger_consumer.h>
-#include <linux/iio/sysfs.h>
+#include <linux/platform_data/invensense_mpu6050.h>
 
 /**
  *  struct inv_mpu6050_reg_map - Notable registers.
@@ -165,7 +163,9 @@ struct inv_mpu6050_hw {
  *  @map		regmap pointer.
  *  @irq		interrupt number.
  *  @irq_mask		the int_pin_cfg mask to configure interrupt type.
- *  @timestamp:		timestamping module
+ *  @chip_period:	chip internal period estimation (~1kHz).
+ *  @it_timestamp:	timestamp from previous interrupt.
+ *  @data_timestamp:	timestamp for next data sample.
  *  @vdd_supply:	VDD voltage regulator for the chip.
  *  @vddio_supply	I/O voltage regulator for the chip.
  *  @magn_disabled:     magnetometer disabled for backward compatibility reason.
@@ -189,7 +189,9 @@ struct inv_mpu6050_state {
 	int irq;
 	u8 irq_mask;
 	unsigned skip_samples;
-	struct inv_sensors_timestamp timestamp;
+	s64 chip_period;
+	s64 it_timestamp;
+	s64 data_timestamp;
 	struct regulator *vdd_supply;
 	struct regulator *vddio_supply;
 	bool magn_disabled;

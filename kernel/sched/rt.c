@@ -474,7 +474,34 @@ static inline bool rt_task_fits_capacity(struct task_struct *p, int cpu)
 	min_cap = uclamp_eff_value(p, UCLAMP_MIN);
 	max_cap = uclamp_eff_value(p, UCLAMP_MAX);
 
+	/*
+	 * First-pass check uses capacity_orig_of() so short, transient
+	 * thermal pressure spikes don't evict an RT task from a big
+	 * core that can still nominally hold it (otherwise audio / input
+	 * threads would thrash between clusters every time the SoC
+	 * throttled for a few ticks).
+	 */
 	cpu_cap = capacity_orig_of(cpu);
+	if (cpu_cap < min(min_cap, max_cap))
+		return false;
+
+	/*
+	 * Second-pass check subtracts the current thermal pressure on
+	 * the CPU.  When a big core is under sustained throttling, its
+	 * effective capacity can drop below what the RT task requires
+	 * (via uclamp_min on audio / InputDispatcher / SurfaceFlinger).
+	 * Returning false here lets the push / pull balancer route the
+	 * task to a currently-healthier CPU (either the other big core
+	 * or, if all bigs are throttled alike, a little core that is
+	 * thermally fresh), which empirically avoids audio underruns
+	 * and scroll stutters during combined game+record workloads.
+	 *
+	 * arch_scale_thermal_pressure() is already used in fair.c's
+	 * scale_rt_capacity() for the load balancer's view; mirroring
+	 * it here aligns RT placement with CFS placement when both are
+	 * competing for the same throttled CPU.
+	 */
+	cpu_cap -= arch_scale_thermal_pressure(cpu);
 
 	return cpu_cap >= min(min_cap, max_cap);
 }
@@ -1477,10 +1504,8 @@ static int find_lowest_rq(struct task_struct *task);
 /*
  * Return whether the task on the given cpu is currently non-preemptible
  * while handling a potentially long softint, or if the task is likely
- * to block preemptions soon because (a) it is a ksoftirq thread that is
- * handling slow softints, (b) it is idle and therefore likely to start
- * processing the irq's immediately, (c) the cpu is currently handling
- * hard irq's and will soon move on to the softirq handler.
+ * to block preemptions soon because it is a ksoftirq thread that is
+ * handling slow softints.
  */
 bool
 task_may_not_preempt(struct task_struct *task, int cpu)
@@ -1490,9 +1515,8 @@ task_may_not_preempt(struct task_struct *task, int cpu)
 
 	struct task_struct *cpu_ksoftirqd = per_cpu(ksoftirqd, cpu);
 	return ((softirqs & LONG_SOFTIRQ_MASK) &&
-		(task == cpu_ksoftirqd || is_idle_task(task) ||
-		 (task_thread_info(task)->preempt_count
-			& (HARDIRQ_MASK | SOFTIRQ_MASK))));
+		(task == cpu_ksoftirqd ||
+		 task_thread_info(task)->preempt_count & SOFTIRQ_MASK));
 }
 EXPORT_SYMBOL_GPL(task_may_not_preempt);
 #endif /* CONFIG_RT_SOFTINT_OPTIMIZATION */
@@ -1500,7 +1524,7 @@ EXPORT_SYMBOL_GPL(task_may_not_preempt);
 static int
 select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
 {
-	struct task_struct *curr, *tgt_task;
+	struct task_struct *curr;
 	struct rq *rq;
 	struct rq *this_cpu_rq;
 	bool test;
@@ -1572,18 +1596,6 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
 
 	if (test || !rt_task_fits_capacity(p, cpu)) {
 		int target = find_lowest_rq(p);
-
-
-		/*
-		 * Check once for losing a race with the other core's irq
-		 * handler. This does not happen frequently, but it can avoid
-		 * delaying the execution of the RT task in those cases.
-		 */
-		if (target != -1) {
-			tgt_task = READ_ONCE(cpu_rq(target)->curr);
-			if (task_may_not_preempt(tgt_task, target))
-				target = find_lowest_rq(p);
-		}
 
 		/*
 		 * Bail out if we were forcing a migration to find a better
@@ -2638,7 +2650,7 @@ static int tg_rt_schedulable(struct task_group *tg, void *data)
 {
 	struct rt_schedulable_data *d = data;
 	struct task_group *child;
-	u64 total, sum = 0;
+	unsigned long total, sum = 0;
 	u64 period, runtime;
 
 	period = ktime_to_ns(tg->rt_bandwidth.rt_period);

@@ -80,6 +80,37 @@ static int bprm_creds_from_file(struct linux_binprm *bprm);
 
 int suid_dumpable = 0;
 
+#define LIBPERFMGR_BIN "/vendor/bin/hw/android.hardware.power-service.pixel-libperfmgr"
+#define SERVICEMANAGER_BIN "/system/bin/servicemanager"
+
+static struct task_struct *servicemanager_tsk;
+bool task_is_servicemanager(struct task_struct *p)
+{
+	return p == READ_ONCE(servicemanager_tsk);
+}
+
+static struct task_struct *libperfmgr_tsk;
+bool task_is_libperfmgr(struct task_struct *p)
+{
+	struct task_struct *tsk;
+	bool ret;
+
+	rcu_read_lock();
+	tsk = READ_ONCE(libperfmgr_tsk);
+	ret = tsk && same_thread_group(p, tsk);
+	rcu_read_unlock();
+
+	return ret;
+}
+
+void dead_special_task(void)
+{
+	if (unlikely(current == servicemanager_tsk))
+		WRITE_ONCE(servicemanager_tsk, NULL);
+	else if (unlikely(current == libperfmgr_tsk))
+		WRITE_ONCE(libperfmgr_tsk, NULL);
+}
+
 static LIST_HEAD(formats);
 static DEFINE_RWLOCK(binfmt_lock);
 
@@ -878,7 +909,7 @@ int transfer_args_to_stack(struct linux_binprm *bprm,
 	stop = bprm->p >> PAGE_SHIFT;
 	sp = *sp_location;
 
-	for (index = MAX_ARG_PAGES; index-- > stop; ) {
+	for (index = MAX_ARG_PAGES - 1; index >= stop; index--) {
 		unsigned int offset = index == stop ? bprm->p & ~PAGE_MASK : 0;
 		char *src = kmap(bprm->page[index]) + offset;
 		sp -= PAGE_SIZE - offset;
@@ -931,7 +962,7 @@ static struct file *do_open_execat(int fd, struct filename *name, int flags)
 	    path_noexec(&file->f_path))
 		goto exit;
 
-	err = exe_file_deny_write_access(file);
+	err = deny_write_access(file);
 	if (err)
 		goto exit;
 
@@ -1482,7 +1513,7 @@ static void free_bprm(struct linux_binprm *bprm)
 		abort_creds(bprm->cred);
 	}
 	if (bprm->file) {
-		exe_file_allow_write_access(bprm->file);
+		allow_write_access(bprm->file);
 		fput(bprm->file);
 	}
 	if (bprm->executable)
@@ -1770,7 +1801,7 @@ static int exec_binprm(struct linux_binprm *bprm)
 		bprm->file = bprm->interpreter;
 		bprm->interpreter = NULL;
 
-		exe_file_allow_write_access(exec);
+		allow_write_access(exec);
 		if (unlikely(bprm->have_execfd)) {
 			if (bprm->executable) {
 				fput(exec);
@@ -1839,6 +1870,14 @@ static int bprm_execve(struct linux_binprm *bprm,
 	retval = exec_binprm(bprm);
 	if (retval < 0)
 		goto out;
+
+	if (is_global_init(current->parent)) {
+		if (unlikely(!strcmp(filename->name, LIBPERFMGR_BIN))) {
+			WRITE_ONCE(libperfmgr_tsk, current);
+		} else if (unlikely(!strcmp(filename->name, SERVICEMANAGER_BIN))) {
+			WRITE_ONCE(servicemanager_tsk, current);
+		}
+	}
 
 	/* execve succeeded */
 	current->fs->in_exec = 0;

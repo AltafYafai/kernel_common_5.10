@@ -4,10 +4,7 @@
  *
  * Copyright (c) 2020 Tomasz Duszynski <tomasz.duszynski@octakon.com>
  */
-
-#include <linux/bitfield.h>
 #include <linux/bits.h>
-#include <linux/cleanup.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -44,11 +41,6 @@
 #define SCD30_FRC_MAX_PPM 2000
 #define SCD30_TEMP_OFFSET_MAX 655360
 #define SCD30_EXTRA_TIMEOUT_PER_S 250
-
-/* Floating point arithmetic macros */
-#define SCD30_FLOAT_MANTISSA_MSK GENMASK(22, 0)
-#define SCD30_FLOAT_EXP_MSK GENMASK(30, 23)
-#define SCD30_FLOAT_SIGN_MSK BIT(31)
 
 enum {
 	SCD30_CONC,
@@ -96,14 +88,10 @@ static int scd30_reset(struct scd30_state *state)
 /* simplified float to fixed point conversion with a scaling factor of 0.01 */
 static int scd30_float_to_fp(int float32)
 {
-	int fraction, shift, sign;
-	int mantissa = FIELD_GET(SCD30_FLOAT_MANTISSA_MSK, float32);
-	int exp = FIELD_GET(SCD30_FLOAT_EXP_MSK, float32);
-
-	if (float32 & SCD30_FLOAT_SIGN_MSK)
-		sign = -1;
-	else
-		sign = 1;
+	int fraction, shift,
+	    mantissa = float32 & GENMASK(22, 0),
+	    sign = (float32 & BIT(31)) ? -1 : 1,
+	    exp = (float32 & ~BIT(31)) >> 23;
 
 	/* special case 0 */
 	if (!exp && !mantissa)
@@ -210,104 +198,112 @@ static int scd30_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec const 
 			  int *val, int *val2, long mask)
 {
 	struct scd30_state *state = iio_priv(indio_dev);
-	int ret;
+	int ret = -EINVAL;
 	u16 tmp;
 
-	guard(mutex)(&state->lock);
+	mutex_lock(&state->lock);
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
 	case IIO_CHAN_INFO_PROCESSED:
 		if (chan->output) {
 			*val = state->pressure_comp;
-			return IIO_VAL_INT;
+			ret = IIO_VAL_INT;
+			break;
 		}
 
 		ret = iio_device_claim_direct_mode(indio_dev);
 		if (ret)
-			return ret;
+			break;
 
 		ret = scd30_read(state);
 		if (ret) {
 			iio_device_release_direct_mode(indio_dev);
-			return ret;
+			break;
 		}
 
 		*val = state->meas[chan->address];
 		iio_device_release_direct_mode(indio_dev);
-		return IIO_VAL_INT;
+		ret = IIO_VAL_INT;
+		break;
 	case IIO_CHAN_INFO_SCALE:
 		*val = 0;
 		*val2 = 1;
-		return IIO_VAL_INT_PLUS_MICRO;
+		ret = IIO_VAL_INT_PLUS_MICRO;
+		break;
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		ret = scd30_command_read(state, CMD_MEAS_INTERVAL, &tmp);
 		if (ret)
-			return ret;
+			break;
 
 		*val = 0;
 		*val2 = 1000000000 / tmp;
-		return IIO_VAL_INT_PLUS_NANO;
+		ret = IIO_VAL_INT_PLUS_NANO;
+		break;
 	case IIO_CHAN_INFO_CALIBBIAS:
 		ret = scd30_command_read(state, CMD_TEMP_OFFSET, &tmp);
 		if (ret)
-			return ret;
+			break;
 
 		*val = tmp;
-		return IIO_VAL_INT;
-	default:
-		return -EINVAL;
+		ret = IIO_VAL_INT;
+		break;
 	}
+	mutex_unlock(&state->lock);
+
+	return ret;
 }
 
 static int scd30_write_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *chan,
 			   int val, int val2, long mask)
 {
 	struct scd30_state *state = iio_priv(indio_dev);
-	int ret;
+	int ret = -EINVAL;
 
-	guard(mutex)(&state->lock);
+	mutex_lock(&state->lock);
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
-		if (val || !val2)
-			return -EINVAL;
+		if (val)
+			break;
 
 		val = 1000000000 / val2;
 		if (val < SCD30_MEAS_INTERVAL_MIN_S || val > SCD30_MEAS_INTERVAL_MAX_S)
-			return -EINVAL;
+			break;
 
 		ret = scd30_command_write(state, CMD_MEAS_INTERVAL, val);
 		if (ret)
-			return ret;
+			break;
 
 		state->meas_interval = val;
-		return 0;
+		break;
 	case IIO_CHAN_INFO_RAW:
 		switch (chan->type) {
 		case IIO_PRESSURE:
 			if (val < SCD30_PRESSURE_COMP_MIN_MBAR ||
 			    val > SCD30_PRESSURE_COMP_MAX_MBAR)
-				return -EINVAL;
+				break;
 
 			ret = scd30_command_write(state, CMD_START_MEAS, val);
 			if (ret)
-				return ret;
+				break;
 
 			state->pressure_comp = val;
-			return 0;
+			break;
 		default:
-			return -EINVAL;
+			break;
 		}
+		break;
 	case IIO_CHAN_INFO_CALIBBIAS:
 		if (val < 0 || val > SCD30_TEMP_OFFSET_MAX)
-			return -EINVAL;
+			break;
 		/*
 		 * Manufacturer does not explicitly specify min/max sensible
 		 * values hence check is omitted for simplicity.
 		 */
-		return scd30_command_write(state, CMD_TEMP_OFFSET / 10, val);
-	default:
-		return -EINVAL;
+		ret = scd30_command_write(state, CMD_TEMP_OFFSET / 10, val);
 	}
+	mutex_unlock(&state->lock);
+
+	return ret;
 }
 
 static int scd30_write_raw_get_fmt(struct iio_dev *indio_dev, struct iio_chan_spec const *chan,

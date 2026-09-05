@@ -81,9 +81,7 @@ static bool tb_xdomain_match(const struct tb_cfg_request *req,
 static bool tb_xdomain_copy(struct tb_cfg_request *req,
 			    const struct ctl_pkg *pkg)
 {
-	size_t len = min_t(size_t, pkg->frame.size, req->response_size);
-
-	memcpy(req->response, pkg->buffer, len);
+	memcpy(req->response, pkg->buffer, req->response_size);
 	req->result.err = 0;
 	return true;
 }
@@ -357,8 +355,6 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
 			}
 		}
 
-		if (req.offset + len > data_len)
-			len = data_len - req.offset;
 		memcpy(data + req.offset, res->data, len * 4);
 		req.offset += len;
 	} while (!data_len || req.offset < data_len);
@@ -604,12 +600,8 @@ static void tb_xdp_handle_request(struct work_struct *work)
 		 */
 		xd = tb_xdomain_find_by_uuid_locked(tb, &xchg->src_uuid);
 		if (xd) {
-			mutex_lock(&xd->lock);
-			if (!xd->removing)
-				queue_delayed_work(tb->wq,
-						   &xd->get_properties_work,
-						   msecs_to_jiffies(50));
-			mutex_unlock(&xd->lock);
+			queue_delayed_work(tb->wq, &xd->get_properties_work,
+					   msecs_to_jiffies(50));
 			tb_xdomain_put(xd);
 		}
 
@@ -788,7 +780,6 @@ static void tb_service_release(struct device *dev)
 	ida_simple_remove(&xd->service_ids, svc->id);
 	kfree(svc->key);
 	kfree(svc);
-	tb_xdomain_put(xd);
 }
 
 struct device_type tb_service_type = {
@@ -897,7 +888,7 @@ static void enumerate_services(struct tb_xdomain *xd)
 		svc->id = id;
 		svc->dev.bus = &tb_bus_type;
 		svc->dev.type = &tb_service_type;
-		svc->dev.parent = get_device(&xd->dev);
+		svc->dev.parent = &xd->dev;
 		dev_set_name(&svc->dev, "%s.%d", dev_name(&xd->dev), svc->id);
 
 		if (device_register(&svc->dev)) {
@@ -1362,50 +1353,32 @@ static int unregister_service(struct device *dev, void *data)
 }
 
 /**
- * tb_xdomain_remove() - Remove XDomain
+ * tb_xdomain_remove() - Remove XDomain from the bus
  * @xd: XDomain to remove
  *
- * This will stop all ongoing configuration work. XDomain is not removed
- * from the bus if it was added. That needs to be done separately by
- * calling tb_xdomain_unregister().
- *
- * Called with @tb->lock held.
+ * This will stop all ongoing configuration work and remove the XDomain
+ * along with any services from the bus. When the last reference to @xd
+ * is released the object will be released as well.
  */
 void tb_xdomain_remove(struct tb_xdomain *xd)
 {
-	mutex_lock(&xd->lock);
-	xd->removing = true;
-	mutex_unlock(&xd->lock);
-
 	stop_handshake(xd);
 
-	if (!device_is_registered(&xd->dev)) {
-		/*
-		 * Undo runtime PM here explicitly because it is
-		 * possible that the XDomain was never added to the bus
-		 * and thus device_del() is not called for it
-		 * (device_del() would handle this otherwise).
-		 */
-		pm_runtime_disable(&xd->dev);
-		pm_runtime_put_noidle(&xd->dev);
-		pm_runtime_set_suspended(&xd->dev);
-		put_device(&xd->dev);
-	}
-}
-
-/**
- * tb_xdomain_unregister() - Unregister XDomain
- * @xd: XDomain to unregister
- *
- * This will unregister the XDomain along with any services from the
- * bus. When the last reference to @xd is released the object will be
- * released as well.
- */
-void tb_xdomain_unregister(struct tb_xdomain *xd)
-{
 	device_for_each_child_reverse(&xd->dev, xd, unregister_service);
 
-	device_unregister(&xd->dev);
+	/*
+	 * Undo runtime PM here explicitly because it is possible that
+	 * the XDomain was never added to the bus and thus device_del()
+	 * is not called for it (device_del() would handle this otherwise).
+	 */
+	pm_runtime_disable(&xd->dev);
+	pm_runtime_put_noidle(&xd->dev);
+	pm_runtime_set_suspended(&xd->dev);
+
+	if (!device_is_registered(&xd->dev))
+		put_device(&xd->dev);
+	else
+		device_unregister(&xd->dev);
 }
 
 /**
@@ -1654,12 +1627,8 @@ static int update_xdomain(struct device *dev, void *data)
 
 	xd = tb_to_xdomain(dev);
 	if (xd) {
-		mutex_lock(&xd->lock);
-		if (!xd->removing)
-			queue_delayed_work(xd->tb->wq,
-					   &xd->properties_changed_work,
-					   msecs_to_jiffies(50));
-		mutex_unlock(&xd->lock);
+		queue_delayed_work(xd->tb->wq, &xd->properties_changed_work,
+				   msecs_to_jiffies(50));
 	}
 
 	return 0;

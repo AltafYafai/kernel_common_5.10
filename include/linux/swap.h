@@ -130,6 +130,9 @@ union swap_header {
  */
 struct reclaim_state {
 	unsigned long reclaimed_slab;
+#ifdef CONFIG_LRU_GEN
+	struct lru_gen_mm_walk *mm_walk;
+#endif
 };
 
 #ifdef __KERNEL__
@@ -281,6 +284,9 @@ struct swap_info_struct {
 					 */
 	struct work_struct discard_work; /* discard worker */
 	struct swap_cluster_list discard_clusters; /* discard clusters list */
+#ifdef CONFIG_LRU_GEN
+	struct lru_gen_mm_walk *mm_walk; /* MGLRU mm walk data */
+#endif
 	struct plist_node avail_lists[]; /*
 					   * entries in swap_avail_heads, one
 					   * entry per node.
@@ -350,6 +356,7 @@ extern void lru_add_drain_cpu(int cpu);
 extern void lru_add_drain_cpu_zone(struct zone *zone);
 extern void lru_add_drain_all(void);
 extern void rotate_reclaimable_page(struct page *page);
+extern void activate_page(struct page *page);
 extern void deactivate_file_page(struct page *page);
 extern void deactivate_page(struct page *page);
 extern void mark_page_lazyfree(struct page *page);
@@ -412,6 +419,8 @@ int add_swap_extent(struct swap_info_struct *sis, unsigned long start_page,
 		unsigned long nr_pages, sector_t start_block);
 int generic_swapfile_activate(struct swap_info_struct *, struct file *,
 		sector_t *);
+
+int kcompressd(void *p);
 
 /* linux/mm/swap_state.c */
 /* One swap address space for each 64M swap space */
@@ -651,6 +660,11 @@ static inline swp_entry_t get_swap_page(struct page *page)
 	swp_entry_t entry;
 	entry.val = 0;
 	return entry;
+}
+
+static inline int kcompressd(void *p)
+{
+	return 0;
 }
 
 #endif /* CONFIG_SWAP */

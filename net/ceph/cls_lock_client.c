@@ -253,8 +253,7 @@ static int decode_locker(void **p, void *end, struct ceph_locker *locker)
 	if (ret)
 		return ret;
 
-	ceph_decode_copy_safe(p, end, &locker->id.name,
-			      sizeof(locker->id.name), bad);
+	ceph_decode_copy(p, &locker->id.name, sizeof(locker->id.name));
 	s = ceph_extract_encoded_string(p, end, NULL, GFP_NOIO);
 	if (IS_ERR(s))
 		return PTR_ERR(s);
@@ -265,23 +264,19 @@ static int decode_locker(void **p, void *end, struct ceph_locker *locker)
 	if (ret)
 		return ret;
 
-	/* skip expiration */
-	ceph_decode_skip_n(p, end, sizeof(struct ceph_timespec), bad);
+	*p += sizeof(struct ceph_timespec); /* skip expiration */
 
 	ret = ceph_decode_entity_addr(p, end, &locker->info.addr);
 	if (ret)
 		return ret;
 
-	/* skip description */
-	ceph_decode_skip_string(p, end, bad);
+	len = ceph_decode_32(p);
+	*p += len; /* skip description */
 
 	dout("%s %s%llu cookie %s addr %s\n", __func__,
 	     ENTITY_NAME(locker->id.name), locker->id.cookie,
 	     ceph_pr_addr(&locker->info.addr));
 	return 0;
-
-bad:
-	return -EINVAL;
 }
 
 static int decode_lockers(void **p, void *end, u8 *type, char **tag,
@@ -298,7 +293,7 @@ static int decode_lockers(void **p, void *end, u8 *type, char **tag,
 	if (ret)
 		return ret;
 
-	ceph_decode_32_safe(p, end, *num_lockers, err_inval);
+	*num_lockers = ceph_decode_32(p);
 	*lockers = kcalloc(*num_lockers, sizeof(**lockers), GFP_NOIO);
 	if (!*lockers)
 		return -ENOMEM;
@@ -309,8 +304,7 @@ static int decode_lockers(void **p, void *end, u8 *type, char **tag,
 			goto err_free_lockers;
 	}
 
-	ret = -EINVAL;
-	ceph_decode_8_safe(p, end, *type, err_free_lockers);
+	*type = ceph_decode_8(p);
 	s = ceph_extract_encoded_string(p, end, NULL, GFP_NOIO);
 	if (IS_ERR(s)) {
 		ret = PTR_ERR(s);
@@ -319,9 +313,6 @@ static int decode_lockers(void **p, void *end, u8 *type, char **tag,
 
 	*tag = s;
 	return 0;
-
-err_inval:
-	return -EINVAL;
 
 err_free_lockers:
 	ceph_free_lockers(*lockers, *num_lockers);

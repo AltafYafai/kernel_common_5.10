@@ -84,6 +84,7 @@
 #include <linux/poll.h>
 #include <linux/nsproxy.h>
 #include <linux/oom.h>
+#include <linux/hikari.h>
 #include <linux/elf.h>
 #include <linux/pid_namespace.h>
 #include <linux/user_namespace.h>
@@ -219,24 +220,33 @@ static int get_task_root(struct task_struct *task, struct path *root)
 	return result;
 }
 
-static int proc_cwd_link(struct dentry *dentry, struct path *path,
-			 struct task_struct *task)
+static int proc_cwd_link(struct dentry *dentry, struct path *path)
 {
+	struct task_struct *task = get_proc_task(d_inode(dentry));
 	int result = -ENOENT;
 
-	task_lock(task);
-	if (task->fs) {
-		get_fs_pwd(task->fs, path);
-		result = 0;
+	if (task) {
+		task_lock(task);
+		if (task->fs) {
+			get_fs_pwd(task->fs, path);
+			result = 0;
+		}
+		task_unlock(task);
+		put_task_struct(task);
 	}
-	task_unlock(task);
 	return result;
 }
 
-static int proc_root_link(struct dentry *dentry, struct path *path,
-			  struct task_struct *task)
+static int proc_root_link(struct dentry *dentry, struct path *path)
 {
-	return get_task_root(task, path);
+	struct task_struct *task = get_proc_task(d_inode(dentry));
+	int result = -ENOENT;
+
+	if (task) {
+		result = get_task_root(task, path);
+		put_task_struct(task);
+	}
+	return result;
 }
 
 /*
@@ -415,24 +425,18 @@ static int proc_pid_wchan(struct seq_file *m, struct pid_namespace *ns,
 {
 	unsigned long wchan;
 	char symname[KSYM_NAME_LEN];
-	int err;
 
-	err = down_read_killable(&task->signal->exec_update_lock);
-	if (err)
-		return err;
 	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
 		goto print0;
 
 	wchan = get_wchan(task);
 	if (wchan && !lookup_symbol_name(wchan, symname)) {
 		seq_puts(m, symname);
-		up_read(&task->signal->exec_update_lock);
 		return 0;
 	}
 
 print0:
 	seq_putc(m, '0');
-	up_read(&task->signal->exec_update_lock);
 	return 0;
 }
 #endif /* CONFIG_KALLSYMS */
@@ -702,7 +706,24 @@ static int proc_pid_syscall(struct seq_file *m, struct pid_namespace *ns,
 /*                       Here the fs part begins                        */
 /************************************************************************/
 
-int proc_nochmod_setattr(struct dentry *dentry, struct iattr *attr)
+/* permission checks */
+static int proc_fd_access_allowed(struct inode *inode)
+{
+	struct task_struct *task;
+	int allowed = 0;
+	/* Allow access to a task's file descriptors if it is us or we
+	 * may use ptrace attach to the process and find out that
+	 * information.
+	 */
+	task = get_proc_task(inode);
+	if (task) {
+		allowed = ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
+		put_task_struct(task);
+	}
+	return allowed;
+}
+
+int proc_setattr(struct dentry *dentry, struct iattr *attr)
 {
 	int error;
 	struct inode *inode = d_inode(dentry);
@@ -774,7 +795,7 @@ static int proc_pid_permission(struct inode *inode, int mask)
 
 
 static const struct inode_operations proc_def_inode_operations = {
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 };
 
 static int proc_single_show(struct seq_file *m, void *v)
@@ -1284,6 +1305,148 @@ static const struct file_operations proc_oom_score_adj_operations = {
 	.llseek		= default_llseek,
 };
 
+#ifdef CONFIG_HIKARI
+/*
+ * /proc/<pid>/hikari_enable     R/W  per-task opt-in flag.
+ * /proc/<pid>/hikari_audio      R/W  per-task audio tag.
+ * /proc/<pid>/hikari_stats      R/O  human-readable per-task stats.
+ *
+ * Writes accept any non-zero unsigned int as "on" and 0 as "off".
+ * Reads emit a single ASCII digit "0\n" or "1\n".  All accesses
+ * resolve the task via get_proc_task(); a vanished task returns
+ * -ESRCH.
+ */
+static ssize_t hikari_proc_flag_read(struct file *file, char __user *buf,
+				     size_t count, loff_t *ppos, u32 bit)
+{
+	struct task_struct *task = get_proc_task(file_inode(file));
+	char out[4];
+	int len;
+	u32 val;
+
+	if (!task)
+		return -ESRCH;
+	val = hikari_task_get_flag(task, bit);
+	put_task_struct(task);
+
+	len = scnprintf(out, sizeof(out), "%u\n", val);
+	return simple_read_from_buffer(buf, count, ppos, out, len);
+}
+
+static ssize_t hikari_proc_flag_write(struct file *file, const char __user *buf,
+				      size_t count, loff_t *ppos, u32 bit)
+{
+	struct task_struct *task;
+	char tmp[12];
+	unsigned int v;
+	int err;
+
+	if (count == 0)
+		return 0;
+	if (count >= sizeof(tmp))
+		return -EINVAL;
+	memset(tmp, 0, sizeof(tmp));
+	if (copy_from_user(tmp, buf, count))
+		return -EFAULT;
+
+	err = kstrtouint(strstrip(tmp), 0, &v);
+	if (err)
+		return err;
+
+	task = get_proc_task(file_inode(file));
+	if (!task)
+		return -ESRCH;
+	hikari_task_set_flag(task, bit, v != 0);
+	put_task_struct(task);
+	return count;
+}
+
+static ssize_t hikari_enable_read(struct file *file, char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_read(file, buf, count, ppos,
+				     HIKARI_FLAG_OPT_IN);
+}
+
+static ssize_t hikari_enable_write(struct file *file, const char __user *buf,
+				   size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_write(file, buf, count, ppos,
+				      HIKARI_FLAG_OPT_IN);
+}
+
+static const struct file_operations proc_hikari_enable_operations = {
+	.read		= hikari_enable_read,
+	.write		= hikari_enable_write,
+	.llseek		= default_llseek,
+};
+
+static ssize_t hikari_audio_read(struct file *file, char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_read(file, buf, count, ppos,
+				     HIKARI_FLAG_AUDIO_TAGGED);
+}
+
+static ssize_t hikari_audio_write(struct file *file, const char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_write(file, buf, count, ppos,
+				      HIKARI_FLAG_AUDIO_TAGGED);
+}
+
+static const struct file_operations proc_hikari_audio_operations = {
+	.read		= hikari_audio_read,
+	.write		= hikari_audio_write,
+	.llseek		= default_llseek,
+};
+
+static ssize_t hikari_background_read(struct file *file, char __user *buf,
+				      size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_read(file, buf, count, ppos,
+				     HIKARI_FLAG_BACKGROUND);
+}
+
+static ssize_t hikari_background_write(struct file *file,
+				       const char __user *buf,
+				       size_t count, loff_t *ppos)
+{
+	return hikari_proc_flag_write(file, buf, count, ppos,
+				      HIKARI_FLAG_BACKGROUND);
+}
+
+static const struct file_operations proc_hikari_background_operations = {
+	.read		= hikari_background_read,
+	.write		= hikari_background_write,
+	.llseek		= default_llseek,
+};
+
+static int hikari_stats_show(struct seq_file *m, void *v)
+{
+	struct inode *inode = m->private;
+	struct task_struct *task = get_proc_task(inode);
+
+	if (!task)
+		return -ESRCH;
+	hikari_seq_print_stats(m, task);
+	put_task_struct(task);
+	return 0;
+}
+
+static int hikari_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hikari_stats_show, inode);
+}
+
+static const struct file_operations proc_hikari_stats_operations = {
+	.open		= hikari_stats_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+#endif /* CONFIG_HIKARI */
+
 #ifdef CONFIG_AUDIT
 #define TMPBUFLEN 11
 static ssize_t proc_loginuid_read(struct file * file, char __user * buf,
@@ -1756,12 +1919,16 @@ static const struct file_operations proc_pid_set_comm_operations = {
 	.release	= single_release,
 };
 
-static int proc_exe_link(struct dentry *dentry, struct path *exe_path,
-			 struct task_struct *task)
+static int proc_exe_link(struct dentry *dentry, struct path *exe_path)
 {
+	struct task_struct *task;
 	struct file *exe_file;
 
+	task = get_proc_task(d_inode(dentry));
+	if (!task)
+		return -ENOENT;
 	exe_file = get_task_exe_file(task);
+	put_task_struct(task);
 	if (exe_file) {
 		*exe_path = exe_file->f_path;
 		path_get(&exe_file->f_path);
@@ -1771,42 +1938,26 @@ static int proc_exe_link(struct dentry *dentry, struct path *exe_path,
 		return -ENOENT;
 }
 
-static int call_proc_get_link(struct dentry *dentry, struct inode *inode, struct path *path_out)
-{
-	struct task_struct *task;
-	int ret;
-
-	task = get_proc_task(inode);
-	if (!task)
-		return -ENOENT;
-	ret = down_read_killable(&task->signal->exec_update_lock);
-	if (ret)
-		goto out_put_task;
-	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
-		ret = -EACCES;
-		goto out;
-	}
-	ret = PROC_I(inode)->op.proc_get_link(dentry, path_out, task);
-
-out:
-	up_read(&task->signal->exec_update_lock);
-out_put_task:
-	put_task_struct(task);
-	return ret;
-}
-
 static const char *proc_pid_get_link(struct dentry *dentry,
 				     struct inode *inode,
 				     struct delayed_call *done)
 {
 	struct path path;
-	int error;
+	int error = -EACCES;
 
 	if (!dentry)
 		return ERR_PTR(-ECHILD);
-	error = call_proc_get_link(dentry, inode, &path);
-	if (!error)
-		error = nd_jump_link(&path);
+
+	/* Are we allowed to snoop on the tasks file descriptors? */
+	if (!proc_fd_access_allowed(inode))
+		goto out;
+
+	error = PROC_I(inode)->op.proc_get_link(dentry, &path);
+	if (error)
+		goto out;
+
+	error = nd_jump_link(&path);
+out:
 	return ERR_PTR(error);
 }
 
@@ -1840,18 +1991,24 @@ static int proc_pid_readlink(struct dentry * dentry, char __user * buffer, int b
 	struct inode *inode = d_inode(dentry);
 	struct path path;
 
-	error = call_proc_get_link(dentry, inode, &path);
-	if (!error) {
-		error = do_proc_readlink(&path, buffer, buflen);
-		path_put(&path);
-	}
+	/* Are we allowed to snoop on the tasks file descriptors? */
+	if (!proc_fd_access_allowed(inode))
+		goto out;
+
+	error = PROC_I(inode)->op.proc_get_link(dentry, &path);
+	if (error)
+		goto out;
+
+	error = do_proc_readlink(&path, buffer, buflen);
+	path_put(&path);
+out:
 	return error;
 }
 
 const struct inode_operations proc_pid_link_inode_operations = {
 	.readlink	= proc_pid_readlink,
 	.get_link	= proc_pid_get_link,
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 };
 
 
@@ -2230,16 +2387,21 @@ static const struct dentry_operations tid_map_files_dentry_operations = {
 	.d_delete	= pid_delete_dentry,
 };
 
-static int map_files_get_link(struct dentry *dentry, struct path *path,
-			      struct task_struct *task)
+static int map_files_get_link(struct dentry *dentry, struct path *path)
 {
 	unsigned long vm_start, vm_end;
 	struct vm_area_struct *vma;
+	struct task_struct *task;
 	struct mm_struct *mm;
 	int rc;
 
 	rc = -ENOENT;
+	task = get_proc_task(d_inode(dentry));
+	if (!task)
+		goto out;
+
 	mm = get_task_mm(task);
+	put_task_struct(task);
 	if (!mm)
 		goto out;
 
@@ -2294,7 +2456,7 @@ proc_map_files_get_link(struct dentry *dentry,
 static const struct inode_operations proc_map_files_link_inode_operations = {
 	.readlink	= proc_pid_readlink,
 	.get_link	= proc_map_files_get_link,
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 };
 
 static struct dentry *
@@ -2335,17 +2497,17 @@ static struct dentry *proc_map_files_lookup(struct inode *dir,
 	if (!task)
 		goto out;
 
+	result = ERR_PTR(-EACCES);
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
+		goto out_put_task;
+
 	result = ERR_PTR(-ENOENT);
 	if (dname_to_vma_addr(dentry, &vm_start, &vm_end))
 		goto out_put_task;
 
-	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
+	mm = get_task_mm(task);
 	if (!mm)
-		mm = ERR_PTR(-ESRCH);
-	if (IS_ERR(mm)) {
-		result = ERR_CAST(mm);
 		goto out_put_task;
-	}
 
 	result = ERR_PTR(-EINTR);
 	if (mmap_read_lock_killable(mm))
@@ -2373,7 +2535,7 @@ out:
 static const struct inode_operations proc_map_files_inode_operations = {
 	.lookup		= proc_map_files_lookup,
 	.permission	= proc_fd_permission,
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 };
 
 static int
@@ -2394,24 +2556,23 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
 	if (!task)
 		goto out;
 
+	ret = -EACCES;
+	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
+		goto out_put_task;
+
 	ret = 0;
 	if (!dir_emit_dots(file, ctx))
 		goto out_put_task;
 
-	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
+	mm = get_task_mm(task);
 	if (!mm)
-		mm = ERR_PTR(-ESRCH);
-	if (IS_ERR(mm)) {
-		ret = PTR_ERR(mm);
-		/* if the task has no mm, the directory should just be empty */
-		if (ret == -ESRCH)
-			ret = 0;
 		goto out_put_task;
-	}
 
 	ret = mmap_read_lock_killable(mm);
-	if (ret)
-		goto out_put_mm;
+	if (ret) {
+		mmput(mm);
+		goto out_put_task;
+	}
 
 	nr_files = 0;
 
@@ -2435,7 +2596,8 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
 		if (!p) {
 			ret = -ENOMEM;
 			mmap_read_unlock(mm);
-			goto out_put_mm;
+			mmput(mm);
+			goto out_put_task;
 		}
 
 		p->start = vma->vm_start;
@@ -2443,6 +2605,7 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
 		p->mode = vma->vm_file->f_mode;
 	}
 	mmap_read_unlock(mm);
+	mmput(mm);
 
 	for (i = 0; i < nr_files; i++) {
 		char buf[4 * sizeof(long) + 2];	/* max: %lx-%lx\0 */
@@ -2459,8 +2622,6 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
 		ctx->pos++;
 	}
 
-out_put_mm:
-	mmput(mm);
 out_put_task:
 	put_task_struct(task);
 out:
@@ -2866,7 +3027,7 @@ static struct dentry *proc_##LSM##_attr_dir_lookup(struct inode *dir, \
 static const struct inode_operations proc_##LSM##_attr_dir_inode_ops = { \
 	.lookup		= proc_##LSM##_attr_dir_lookup, \
 	.getattr	= pid_getattr, \
-	.setattr	= proc_nochmod_setattr, \
+	.setattr	= proc_setattr, \
 }
 
 #ifdef CONFIG_SECURITY_SMACK
@@ -2925,7 +3086,7 @@ static struct dentry *proc_attr_dir_lookup(struct inode *dir,
 static const struct inode_operations proc_attr_dir_inode_operations = {
 	.lookup		= proc_attr_dir_lookup,
 	.getattr	= pid_getattr,
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 };
 
 #endif
@@ -3314,6 +3475,12 @@ static const struct pid_entry tgid_base_stuff[] = {
 	ONE("oom_score",  S_IRUGO, proc_oom_score),
 	REG("oom_adj",    S_IRUGO|S_IWUSR, proc_oom_adj_operations),
 	REG("oom_score_adj", S_IRUGO|S_IWUSR, proc_oom_score_adj_operations),
+#ifdef CONFIG_HIKARI
+	REG("hikari_enable",     S_IRUGO|S_IWUSR, proc_hikari_enable_operations),
+	REG("hikari_audio",      S_IRUGO|S_IWUSR, proc_hikari_audio_operations),
+	REG("hikari_background", S_IRUGO|S_IWUSR, proc_hikari_background_operations),
+	REG("hikari_stats",      S_IRUGO,         proc_hikari_stats_operations),
+#endif
 #ifdef CONFIG_AUDIT
 	REG("loginuid",   S_IWUSR|S_IRUGO, proc_loginuid_operations),
 	REG("sessionid",  S_IRUGO, proc_sessionid_operations),
@@ -3382,7 +3549,7 @@ static struct dentry *proc_tgid_base_lookup(struct inode *dir, struct dentry *de
 static const struct inode_operations proc_tgid_base_inode_operations = {
 	.lookup		= proc_tgid_base_lookup,
 	.getattr	= pid_getattr,
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 	.permission	= proc_pid_permission,
 };
 
@@ -3581,7 +3748,7 @@ static int proc_tid_comm_permission(struct inode *inode, int mask)
 }
 
 static const struct inode_operations proc_tid_comm_inode_operations = {
-		.setattr	= proc_nochmod_setattr,
+		.setattr	= proc_setattr,
 		.permission	= proc_tid_comm_permission,
 };
 
@@ -3658,6 +3825,12 @@ static const struct pid_entry tid_base_stuff[] = {
 	ONE("oom_score", S_IRUGO, proc_oom_score),
 	REG("oom_adj",   S_IRUGO|S_IWUSR, proc_oom_adj_operations),
 	REG("oom_score_adj", S_IRUGO|S_IWUSR, proc_oom_score_adj_operations),
+#ifdef CONFIG_HIKARI
+	REG("hikari_enable",     S_IRUGO|S_IWUSR, proc_hikari_enable_operations),
+	REG("hikari_audio",      S_IRUGO|S_IWUSR, proc_hikari_audio_operations),
+	REG("hikari_background", S_IRUGO|S_IWUSR, proc_hikari_background_operations),
+	REG("hikari_stats",      S_IRUGO,         proc_hikari_stats_operations),
+#endif
 #ifdef CONFIG_AUDIT
 	REG("loginuid",  S_IWUSR|S_IRUGO, proc_loginuid_operations),
 	REG("sessionid",  S_IRUGO, proc_sessionid_operations),
@@ -3708,7 +3881,7 @@ static const struct file_operations proc_tid_base_operations = {
 static const struct inode_operations proc_tid_base_inode_operations = {
 	.lookup		= proc_tid_base_lookup,
 	.getattr	= pid_getattr,
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 };
 
 static struct dentry *proc_task_instantiate(struct dentry *dentry,
@@ -3903,7 +4076,7 @@ static int proc_task_getattr(const struct path *path, struct kstat *stat,
 static const struct inode_operations proc_task_inode_operations = {
 	.lookup		= proc_task_lookup,
 	.getattr	= proc_task_getattr,
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 	.permission	= proc_pid_permission,
 };
 

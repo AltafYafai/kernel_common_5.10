@@ -443,7 +443,8 @@ static void clear_serror(struct ata_port *ap)
 
 static void clear_interrupt_bit(struct sata_dwc_device *hsdev, u32 bit)
 {
-	sata_dwc_writel(&hsdev->sata_dwc_regs->intpr, bit);
+	sata_dwc_writel(&hsdev->sata_dwc_regs->intpr,
+			sata_dwc_readl(&hsdev->sata_dwc_regs->intpr));
 }
 
 static u32 qcmd_tag_to_mask(u8 tag)
@@ -511,7 +512,7 @@ static irqreturn_t sata_dwc_isr(int irq, void *dev_instance)
 	struct ata_queued_cmd *qc;
 	unsigned long flags;
 	u8 status, tag;
-	int handled, port = 0;
+	int handled, num_processed, port = 0;
 	uint intpr, sactive, sactive2, tag_mask;
 	struct sata_dwc_device_port *hsdevp;
 	hsdev->sactive_issued = 0;
@@ -650,9 +651,16 @@ DRVSTILLBUSY:
 	status = ap->ops->sff_check_status(ap);
 	dev_dbg(ap->dev, "%s ATA status register=0x%x\n", __func__, status);
 
+	tag = 0;
+	num_processed = 0;
 	while (tag_mask) {
-		tag = __ffs(tag_mask);
-		tag_mask &= ~(1U << tag);
+		num_processed++;
+		while (!(tag_mask & 0x00000001)) {
+			tag++;
+			tag_mask <<= 1;
+		}
+
+		tag_mask &= (~0x00000001);
 		qc = ata_qc_from_tag(ap, tag);
 
 		/* To be picked up by completion functions */
@@ -1238,6 +1246,9 @@ static int sata_dwc_probe(struct platform_device *ofdev)
 	/* Save dev for later use in dev_xxx() routines */
 	hsdev->dev = &ofdev->dev;
 
+	/* Enable SATA Interrupts */
+	sata_dwc_enable_interrupts(hsdev);
+
 	/* Get SATA interrupt number */
 	irq = irq_of_parse_and_map(np, 0);
 	if (irq == NO_IRQ) {
@@ -1270,8 +1281,6 @@ static int sata_dwc_probe(struct platform_device *ofdev)
 	if (err)
 		dev_err(&ofdev->dev, "failed to activate host");
 
-	/* Enable SATA Interrupts */
-	sata_dwc_enable_interrupts(hsdev);
 	return 0;
 
 error_out:

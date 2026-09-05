@@ -370,7 +370,6 @@ more_data:
 		break;
 	case __SK_REDIRECT:
 		sk_redir = psock->sk_redir;
-		sock_hold(sk_redir);
 		sk_msg_apply_bytes(psock, tosend);
 		if (!psock->apply_bytes) {
 			/* Clean up before releasing the sock lock. */
@@ -390,7 +389,6 @@ more_data:
 
 		if (eval == __SK_REDIRECT)
 			sock_put(sk_redir);
-		sock_put(sk_redir);
 
 		lock_sock(sk);
 		sk_mem_uncharge(sk, sent);
@@ -506,7 +504,7 @@ wait_for_sndbuf:
 wait_for_memory:
 		err = sk_stream_wait_memory(sk, &timeo);
 		if (err) {
-			if (msg_tx == &tmp)
+			if (msg_tx && msg_tx != psock->cork)
 				sk_msg_free(sk, msg_tx);
 			goto out_err;
 		}

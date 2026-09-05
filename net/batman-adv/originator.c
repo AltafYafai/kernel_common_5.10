@@ -823,10 +823,12 @@ int batadv_hardif_neigh_dump(struct sk_buff *msg, struct netlink_callback *cb)
  out:
 	if (hardif)
 		batadv_hardif_put(hardif);
-	dev_put(hard_iface);
+	if (hard_iface)
+		dev_put(hard_iface);
 	if (primary_if)
 		batadv_hardif_put(primary_if);
-	dev_put(soft_iface);
+	if (soft_iface)
+		dev_put(soft_iface);
 
 	return ret;
 }
@@ -863,6 +865,8 @@ static void batadv_orig_node_free_rcu(struct rcu_head *rcu)
 	struct batadv_orig_node *orig_node;
 
 	orig_node = container_of(rcu, struct batadv_orig_node, rcu);
+
+	batadv_mcast_purge_orig(orig_node);
 
 	batadv_frag_purge_orig(orig_node, NULL);
 
@@ -917,8 +921,6 @@ void batadv_orig_node_release(struct kref *ref)
 
 	/* Free nc_nodes */
 	batadv_nc_purge_orig(orig_node->bat_priv, orig_node, NULL);
-
-	batadv_mcast_purge_orig(orig_node);
 
 	call_rcu(&orig_node->rcu, batadv_orig_node_free_rcu);
 }
@@ -1500,10 +1502,12 @@ int batadv_orig_dump(struct sk_buff *msg, struct netlink_callback *cb)
  out:
 	if (hardif)
 		batadv_hardif_put(hardif);
-	dev_put(hard_iface);
+	if (hard_iface)
+		dev_put(hard_iface);
 	if (primary_if)
 		batadv_hardif_put(primary_if);
-	dev_put(soft_iface);
+	if (soft_iface)
+		dev_put(soft_iface);
 
 	return ret;
 }

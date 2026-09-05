@@ -756,7 +756,7 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 	}
 
 	if ((strstr(line, "healthd")) || (strstr(line, "logd")) ||
-	    strstr(line, "dashd")) {
+		 strstr(line, "dashd")) {
 		kfree(buf);
 		return len;
 	}

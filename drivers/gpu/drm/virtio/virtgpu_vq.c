@@ -329,7 +329,7 @@ static int virtio_gpu_queue_ctrl_sgs(struct virtio_gpu_device *vgdev,
 		if (fence && vbuf->objs)
 			virtio_gpu_array_unlock_resv(vbuf->objs);
 		free_vbuf(vgdev, vbuf);
-		return -ENODEV;
+		return -1;
 	}
 
 	if (vgdev->has_indirect)
@@ -393,7 +393,7 @@ static int virtio_gpu_queue_fenced_ctrl_buffer(struct virtio_gpu_device *vgdev,
 			if (!sgt) {
 				if (fence && vbuf->objs)
 					virtio_gpu_array_unlock_resv(vbuf->objs);
-				return -ENOMEM;
+				return -1;
 			}
 
 			elemcnt += sg_ents;
@@ -724,9 +724,8 @@ static int virtio_get_edid_block(void *data, u8 *buf,
 	struct virtio_gpu_resp_edid *resp = data;
 	size_t start = block * EDID_LENGTH;
 
-	if (start + len > le32_to_cpu(resp->size) ||
-	    start + len > sizeof(resp->edid))
-		return -EINVAL;
+	if (start + len > le32_to_cpu(resp->size))
+		return -1;
 	memcpy(buf, resp->edid + start, len);
 	return 0;
 }

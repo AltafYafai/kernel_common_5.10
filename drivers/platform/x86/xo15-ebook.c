@@ -40,7 +40,6 @@ MODULE_DEVICE_TABLE(acpi, ebook_device_ids);
 struct ebook_switch {
 	struct input_dev *input;
 	char phys[32];			/* for input device */
-	bool gpe_enabled;
 };
 
 static int ebook_send_state(struct acpi_device *device)
@@ -134,7 +133,7 @@ static int ebook_switch_add(struct acpi_device *device)
 		/* Button's GPE is run-wake GPE */
 		acpi_enable_gpe(device->wakeup.gpe_device,
 				device->wakeup.gpe_number);
-		button->gpe_enabled = true;
+		device_set_wakeup_enable(&device->dev, true);
 	}
 
 	return 0;
@@ -149,10 +148,6 @@ static int ebook_switch_add(struct acpi_device *device)
 static int ebook_switch_remove(struct acpi_device *device)
 {
 	struct ebook_switch *button = acpi_driver_data(device);
-
-	if (button->gpe_enabled)
-		acpi_disable_gpe(device->wakeup.gpe_device,
-				 device->wakeup.gpe_number);
 
 	input_unregister_device(button->input);
 	kfree(button);

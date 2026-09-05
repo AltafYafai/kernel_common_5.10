@@ -1020,6 +1020,10 @@ static inline bool arch_wants_old_prefaulted_pte(void)
 }
 #define arch_wants_old_prefaulted_pte	arch_wants_old_prefaulted_pte
 
+#ifdef CONFIG_LRU_GEN
+#define arch_has_hw_pte_young()		(1)
+#endif
+
 #endif /* !__ASSEMBLY__ */
 
 #endif /* __ASM_PGTABLE_H */

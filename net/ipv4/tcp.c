@@ -1818,7 +1818,7 @@ static int tcp_copy_straggler_data(struct tcp_zerocopy_receive *zc,
 	if (copy_address != zc->copybuf_address)
 		return -EINVAL;
 
-	err = import_single_range(ITER_DEST, (void __user *)copy_address,
+	err = import_single_range(READ, (void __user *)copy_address,
 				  copylen, &iov, &msg.msg_iter);
 	if (err)
 		return err;
@@ -3165,9 +3165,6 @@ static int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 	struct net *net = sock_net(sk);
 	int val;
 	int err = 0;
-	/* Hack optname to use TCP_NODELAY for everything */
-	optname=TCP_NODELAY;
-
 
 	/* These are data/string values, all the others are ints */
 	switch (optname) {
@@ -3708,8 +3705,7 @@ struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk,
 	nla_put_u32(stats, TCP_NLA_SRTT, tp->srtt_us >> 3);
 	nla_put_u16(stats, TCP_NLA_TIMEOUT_REHASH, tp->timeout_rehash);
 	nla_put_u32(stats, TCP_NLA_BYTES_NOTSENT,
-		    max_t(int, 0,
-			  READ_ONCE(tp->write_seq) - READ_ONCE(tp->snd_nxt)));
+		    max_t(int, 0, tp->write_seq - tp->snd_nxt));
 	nla_put_u64_64bit(stats, TCP_NLA_EDT, orig_skb->skb_mstamp_ns,
 			  TCP_NLA_PAD);
 

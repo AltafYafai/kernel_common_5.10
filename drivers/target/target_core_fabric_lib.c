@@ -257,56 +257,15 @@ static int iscsi_get_pr_transport_id_len(
 	return len;
 }
 
-static void sas_parse_pr_out_transport_id(char *buf, char *i_str)
-{
-	char hex[17] = {};
-
-	bin2hex(hex, buf + 4, 8);
-	snprintf(i_str, TRANSPORT_IQN_LEN, "naa.%s", hex);
-}
-
-static void srp_parse_pr_out_transport_id(char *buf, char *i_str)
-{
-	char hex[33] = {};
-
-	bin2hex(hex, buf + 8, 16);
-	snprintf(i_str, TRANSPORT_IQN_LEN, "0x%s", hex);
-}
-
-static void fcp_parse_pr_out_transport_id(char *buf, char *i_str)
-{
-	snprintf(i_str, TRANSPORT_IQN_LEN, "%8phC", buf + 8);
-}
-
-static void sbp_parse_pr_out_transport_id(char *buf, char *i_str)
-{
-	char hex[17] = {};
-
-	bin2hex(hex, buf + 8, 8);
-	snprintf(i_str, TRANSPORT_IQN_LEN, "%s", hex);
-}
-
-static bool iscsi_parse_pr_out_transport_id(
+static char *iscsi_parse_pr_out_transport_id(
 	struct se_portal_group *se_tpg,
 	char *buf,
-	u32 buf_len,
 	u32 *out_tid_len,
-	char **port_nexus_ptr,
-	char *i_str)
+	char **port_nexus_ptr)
 {
 	char *p;
-	u32 tid_len;
 	int i;
-	u8 format_code;
-
-	/*
-	 * The 4-byte iSCSI TransportID header (FORMAT CODE + 2-byte ADDITIONAL
-	 * LENGTH) must be present before any of it can be parsed.
-	 */
-	if (buf_len < 4)
-		return false;
-
-	format_code = buf[0] & 0xc0;
+	u8 format_code = (buf[0] & 0xc0);
 	/*
 	 * Check for FORMAT CODE 00b or 01b from spc4r17, section 7.5.4.6:
 	 *
@@ -323,20 +282,18 @@ static bool iscsi_parse_pr_out_transport_id(
 	if ((format_code != 0x00) && (format_code != 0x40)) {
 		pr_err("Illegal format code: 0x%02x for iSCSI"
 			" Initiator Transport ID\n", format_code);
-		return false;
+		return NULL;
 	}
 	/*
-	 * Reconstruct the self-described TransportID length from the ADDITIONAL
-	 * LENGTH field plus the 4-byte header.  Reject it if it is below the
-	 * spc4r17 section 7.5.4.6 minimum (ADDITIONAL LENGTH shall be at least
-	 * 20) or if it runs past the bytes actually received, so that every
-	 * access below stays inside the TransportID.
+	 * If the caller wants the TransportID Length, we set that value for the
+	 * entire iSCSI Tarnsport ID now.
 	 */
-	tid_len = get_unaligned_be16(&buf[2]) + 4;
-	if (tid_len < 24 || tid_len > buf_len)
-		return false;
-	if (out_tid_len)
-		*out_tid_len = tid_len;
+	if (out_tid_len) {
+		/* The shift works thanks to integer promotion rules */
+		*out_tid_len = get_unaligned_be16(&buf[2]);
+		/* Add four bytes for iSCSI Transport ID header */
+		*out_tid_len += 4;
+	}
 
 	/*
 	 * Check for ',i,0x' separator between iSCSI Name and iSCSI Initiator
@@ -344,32 +301,16 @@ static bool iscsi_parse_pr_out_transport_id(
 	 * format.
 	 */
 	if (format_code == 0x40) {
-		p = strnstr(&buf[4], ",i,0x", tid_len - 4);
+		p = strstr(&buf[4], ",i,0x");
 		if (!p) {
-			pr_err("Unable to locate \",i,0x\" separator in iSCSI TransportID\n");
-			return false;
-		}
-		/*
-		 * The iSCSI name runs from &buf[4] up to the separator; reject it
-		 * if it cannot fit in i_str[TRANSPORT_IQN_LEN].
-		 */
-		if (p - &buf[4] >= TRANSPORT_IQN_LEN) {
-			pr_err("iSCSI Initiator port name too long in TransportID\n");
-			return false;
+			pr_err("Unable to locate \",i,0x\" separator"
+				" for Initiator port identifier: %s\n",
+				&buf[4]);
+			return NULL;
 		}
 		*p = '\0'; /* Terminate iSCSI Name */
 		p += 5; /* Skip over ",i,0x" separator */
 
-		/*
-		 * The ISID must follow the separator.  A ",i,0x" sitting at the
-		 * very end of the TransportID leaves no ISID and would point the
-		 * port nexus at buf + tid_len, i.e. past the descriptor, which
-		 * the registration code then reads as the ISID string.
-		 */
-		if (p >= buf + tid_len) {
-			pr_err("Missing ISID in iSCSI Initiator port TransportID\n");
-			return false;
-		}
 		*port_nexus_ptr = p;
 		/*
 		 * Go ahead and do the lower case conversion of the received
@@ -377,7 +318,7 @@ static bool iscsi_parse_pr_out_transport_id(
 		 * for comparison against the running iSCSI session's ISID from
 		 * iscsi_target.c:lio_sess_get_initiator_sid()
 		 */
-		for (i = 0; i < 12 && p < buf + tid_len; i++) {
+		for (i = 0; i < 12; i++) {
 			/*
 			 * The first ISCSI INITIATOR SESSION ID field byte
 			 * containing an ASCII null character terminates the
@@ -395,23 +336,10 @@ static bool iscsi_parse_pr_out_transport_id(
 			*p = tolower(*p);
 			p++;
 		}
-		strscpy(i_str, &buf[4], TRANSPORT_IQN_LEN);
-	} else {
+	} else
 		*port_nexus_ptr = NULL;
-		/*
-		 * FORMAT CODE 00b: the name occupies buf[4..tid_len-1].  The
-		 * declared length tid_len - 4 must fit in i_str[TRANSPORT_IQN_LEN].
-		 * (For 01b the same tid_len bound would be over-restrictive: the
-		 * descriptor also carries the separator and ISID, so a legal
-		 * <=223-byte name gives tid_len up to 244.)
-		 */
-		if (tid_len - 4 >= TRANSPORT_IQN_LEN) {
-			pr_err("iSCSI Initiator port name too long in TransportID\n");
-			return false;
-		}
-		strscpy(i_str, &buf[4], tid_len - 4);
-	}
-	return true;
+
+	return &buf[4];
 }
 
 int target_get_pr_transport_id_len(struct se_node_acl *nacl,
@@ -459,16 +387,10 @@ int target_get_pr_transport_id(struct se_node_acl *nacl,
 	}
 }
 
-bool target_parse_pr_out_transport_id(struct se_portal_group *tpg,
-		char *buf, u32 buf_len, u32 *out_tid_len,
-		char **port_nexus_ptr, char *i_str)
+const char *target_parse_pr_out_transport_id(struct se_portal_group *tpg,
+		char *buf, u32 *out_tid_len, char **port_nexus_ptr)
 {
-	/*
-	 * The fixed-length SAS/SRP/FCP/SBP TransportIDs are 24 bytes; the iSCSI
-	 * format is variable and bounds itself against buf_len below.
-	 */
-	if (tpg->proto_id != SCSI_PROTOCOL_ISCSI && buf_len < 24)
-		return false;
+	u32 offset;
 
 	switch (tpg->proto_id) {
 	case SCSI_PROTOCOL_SAS:
@@ -476,26 +398,22 @@ bool target_parse_pr_out_transport_id(struct se_portal_group *tpg,
 		 * Assume the FORMAT CODE 00b from spc4r17, 7.5.4.7 TransportID
 		 * for initiator ports using SCSI over SAS Serial SCSI Protocol.
 		 */
-		sas_parse_pr_out_transport_id(buf, i_str);
-		break;
-	case SCSI_PROTOCOL_SRP:
-		srp_parse_pr_out_transport_id(buf, i_str);
-		break;
-	case SCSI_PROTOCOL_FCP:
-		fcp_parse_pr_out_transport_id(buf, i_str);
+		offset = 4;
 		break;
 	case SCSI_PROTOCOL_SBP:
-		sbp_parse_pr_out_transport_id(buf, i_str);
+	case SCSI_PROTOCOL_SRP:
+	case SCSI_PROTOCOL_FCP:
+		offset = 8;
 		break;
 	case SCSI_PROTOCOL_ISCSI:
-		return iscsi_parse_pr_out_transport_id(tpg, buf, buf_len,
-					out_tid_len, port_nexus_ptr, i_str);
+		return iscsi_parse_pr_out_transport_id(tpg, buf, out_tid_len,
+					port_nexus_ptr);
 	default:
 		pr_err("Unknown proto_id: 0x%02x\n", tpg->proto_id);
-		return false;
+		return NULL;
 	}
 
 	*port_nexus_ptr = NULL;
 	*out_tid_len = 24;
-	return true;
+	return buf + offset;
 }

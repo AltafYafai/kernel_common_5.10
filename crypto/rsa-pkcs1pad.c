@@ -535,7 +535,7 @@ static int pkcs1pad_verify(struct akcipher_request *req)
 	int err;
 
 	if (WARN_ON(req->dst) ||
-	    !req->dst_len ||
+	    WARN_ON(!req->dst_len) ||
 	    !ctx->key_size || req->src_len != ctx->key_size)
 		return -EINVAL;
 

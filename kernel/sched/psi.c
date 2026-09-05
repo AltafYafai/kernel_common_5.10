@@ -174,10 +174,51 @@ __setup("psi=", setup_psi);
 /* Sampling frequency in nanoseconds */
 static u64 psi_period __read_mostly;
 
-/* System-level pressure and stall tracking */
-static DEFINE_PER_CPU(struct psi_group_cpu, system_group_pcpu);
+/*
+ * Internal wrapper around struct psi_group_cpu that carries the
+ * MEMSTALL_RUNNING counter out of sight of the GKI kABI hash.
+ *
+ * The public struct psi_group_cpu (in <linux/psi_types.h>) must keep
+ * its 4-entry tasks[] array because any change to its layout
+ * propagates through struct psi_group (embedded in struct cgroup) and
+ * invalidates the __crc_* versioning of every exported symbol whose
+ * signature transitively reaches struct task_struct. We dodge that by
+ * allocating a larger struct privately inside psi.c and keeping
+ * ->pub as the first member, so the existing
+ *   struct psi_group_cpu __percpu *pcpu;
+ * pointer in struct psi_group still points at a valid
+ * psi_group_cpu header (first-member address equality per C11 6.7.2.1p15).
+ * container_of() recovers the ext wrapper for the fields that can't
+ * live in the public header.
+ */
+struct psi_group_cpu_ext {
+	struct psi_group_cpu	pub;
+	/*
+	 * Per-cpu count of tasks that are simultaneously in_memstall
+	 * and NR_ONCPU. Bumped/decremented by psi_group_change() in
+	 * response to the private TSK_MEMSTALL_RUNNING bit emitted from
+	 * psi_enqueue()/psi_dequeue() and psi_memstall_enter/leave().
+	 * Saturating decrement; never compared except against
+	 * groupc->tasks[NR_RUNNING].
+	 */
+	unsigned int		nr_memstall_running;
+};
+
+static inline struct psi_group_cpu_ext *psi_cpu_ext(struct psi_group_cpu *pub)
+{
+	return container_of(pub, struct psi_group_cpu_ext, pub);
+}
+
+/* System-level pressure and stall tracking.
+ *
+ * The percpu variable is declared with the extended wrapper type so the
+ * static reservation is large enough for ->nr_memstall_running.
+ * psi_system.pcpu casts back to the public type; pub is the first
+ * member so this is a same-address reinterpretation.
+ */
+static DEFINE_PER_CPU(struct psi_group_cpu_ext, system_group_pcpu_ext);
 struct psi_group psi_system = {
-	.pcpu = &system_group_pcpu,
+	.pcpu = (struct psi_group_cpu __percpu *)&system_group_pcpu_ext,
 };
 
 static void psi_avgs_work(struct work_struct *work);
@@ -223,8 +264,10 @@ void __init psi_init(void)
 	group_init(&psi_system);
 }
 
-static bool test_state(unsigned int *tasks, enum psi_states state)
+static bool test_state(struct psi_group_cpu *groupc, enum psi_states state)
 {
+	unsigned int *tasks = groupc->tasks;
+
 	switch (state) {
 	case PSI_IO_SOME:
 		return tasks[NR_IOWAIT];
@@ -233,7 +276,20 @@ static bool test_state(unsigned int *tasks, enum psi_states state)
 	case PSI_MEM_SOME:
 		return tasks[NR_MEMSTALL];
 	case PSI_MEM_FULL:
-		return tasks[NR_MEMSTALL] && !tasks[NR_RUNNING];
+		/*
+		 * FULL means "no productive task is running". A task that
+		 * is in memstall *and* on-CPU is burning CPU on reclaim,
+		 * so it counts as a runner here even though it's stalled.
+		 * Without this, a single direct-reclaim scan can falsely
+		 * push the cgroup into PSI_MEM_FULL = 100% and trigger
+		 * over-aggressive LMKD kills.
+		 *
+		 * nr_memstall_running is tracked in the percpu ext
+		 * wrapper, not in groupc->tasks[], so NR_PSI_TASK_COUNTS
+		 * stays at 4 and the GKI kABI chain is preserved.
+		 */
+		return tasks[NR_MEMSTALL] &&
+			tasks[NR_RUNNING] == psi_cpu_ext(groupc)->nr_memstall_running;
 	case PSI_CPU_SOME:
 		return tasks[NR_RUNNING] > tasks[NR_ONCPU];
 	case PSI_NONIDLE:
@@ -249,6 +305,8 @@ static void get_recent_times(struct psi_group *group, int cpu,
 			     u32 *pchanged_states)
 {
 	struct psi_group_cpu *groupc = per_cpu_ptr(group->pcpu, cpu);
+	int current_cpu = raw_smp_processor_id();
+	unsigned int tasks[NR_PSI_TASK_COUNTS];
 	u64 now, state_start;
 	enum psi_states s;
 	unsigned int seq;
@@ -263,6 +321,8 @@ static void get_recent_times(struct psi_group *group, int cpu,
 		memcpy(times, groupc->times, sizeof(groupc->times));
 		state_mask = groupc->state_mask;
 		state_start = groupc->state_start;
+		if (cpu == current_cpu)
+			memcpy(tasks, groupc->tasks, sizeof(groupc->tasks));
 	} while (read_seqcount_retry(&groupc->seq, seq));
 
 	/* Calculate state time deltas against the previous snapshot */
@@ -286,6 +346,34 @@ static void get_recent_times(struct psi_group *group, int cpu,
 		times[s] = delta;
 		if (delta)
 			*pchanged_states |= (1 << s);
+	}
+
+	/*
+	 * When collect_percpu_times() is called from psi_avgs_work(),
+	 * we don't want to re-arm avgs_work when all CPUs are IDLE.
+	 * But the current CPU running this avgs_work is never IDLE,
+	 * which would prevent the work from ever shutting off.
+	 *
+	 * For the current CPU, we re-arm avgs_work only when
+	 * (NR_RUNNING > 1 || NR_IOWAIT > 0 || NR_MEMSTALL > 0); for
+	 * other CPUs we can just check the PSI_NONIDLE delta. The flag
+	 * is consumed by psi_avgs_work() via *pchanged_states; the
+	 * current_work() check ensures we only emit it on the avgs_work
+	 * path and don't interfere with the trigger poll path that
+	 * shares this helper.
+	 */
+	if (current_work() == &group->avgs_work.work) {
+		bool reschedule;
+
+		if (cpu == current_cpu)
+			reschedule = tasks[NR_RUNNING] +
+				     tasks[NR_IOWAIT] +
+				     tasks[NR_MEMSTALL] > 1;
+		else
+			reschedule = *pchanged_states & (1 << PSI_NONIDLE);
+
+		if (reschedule)
+			*pchanged_states |= PSI_STATE_RESCHEDULE;
 	}
 }
 
@@ -422,7 +510,6 @@ static void psi_avgs_work(struct work_struct *work)
 	struct delayed_work *dwork;
 	struct psi_group *group;
 	u32 changed_states;
-	bool nonidle;
 	u64 now;
 
 	dwork = to_delayed_work(work);
@@ -433,7 +520,6 @@ static void psi_avgs_work(struct work_struct *work)
 	now = sched_clock();
 
 	collect_percpu_times(group, PSI_AVGS, &changed_states);
-	nonidle = changed_states & (1 << PSI_NONIDLE);
 	/*
 	 * If there is task activity, periodically fold the per-cpu
 	 * times and feed samples into the running averages. If things
@@ -444,8 +530,8 @@ static void psi_avgs_work(struct work_struct *work)
 	if (now >= group->avg_next_update)
 		group->avg_next_update = update_averages(group, now);
 
-	if (nonidle) {
-		queue_delayed_work(system_power_efficient_wq, dwork, nsecs_to_jiffies(
+	if (changed_states & PSI_STATE_RESCHEDULE) {
+		schedule_delayed_work(dwork, nsecs_to_jiffies(
 				group->avg_next_update - now) + 1);
 	}
 
@@ -766,24 +852,43 @@ static void psi_group_change(struct psi_group *group, int cpu,
 	for (t = 0, m = clear; m; m &= ~(1 << t), t++) {
 		if (!(m & (1 << t)))
 			continue;
-		if (groupc->tasks[t]) {
-			groupc->tasks[t]--;
-		} else if (!psi_bug) {
-			printk_deferred(KERN_ERR "psi: task underflow! cpu=%d t=%d tasks=[%u %u %u %u] clear=%x set=%x\n",
-					cpu, t, groupc->tasks[0],
-					groupc->tasks[1], groupc->tasks[2],
-					groupc->tasks[3], clear, set);
-			psi_bug = 1;
+		if (t < NR_PSI_TASK_COUNTS) {
+			if (groupc->tasks[t]) {
+				groupc->tasks[t]--;
+			} else if (!psi_bug) {
+				printk_deferred(KERN_ERR "psi: task underflow! cpu=%d t=%d tasks=[%u %u %u %u] clear=%x set=%x\n",
+						cpu, t, groupc->tasks[0],
+						groupc->tasks[1], groupc->tasks[2],
+						groupc->tasks[3], clear, set);
+				psi_bug = 1;
+			}
+		} else if (t == NR_PSI_TASK_COUNTS) {
+			/*
+			 * TSK_MEMSTALL_RUNNING — private counter kept in
+			 * the per-cpu ext wrapper to avoid growing
+			 * groupc->tasks[]. Guarded decrement: underflow
+			 * here would mean an enqueue/dequeue mismatch but
+			 * must not wedge the LMKD fast path.
+			 */
+			struct psi_group_cpu_ext *ext = psi_cpu_ext(groupc);
+
+			if (ext->nr_memstall_running)
+				ext->nr_memstall_running--;
 		}
 	}
 
-	for (t = 0; set; set &= ~(1 << t), t++)
-		if (set & (1 << t))
+	for (t = 0; set; set &= ~(1 << t), t++) {
+		if (!(set & (1 << t)))
+			continue;
+		if (t < NR_PSI_TASK_COUNTS)
 			groupc->tasks[t]++;
+		else if (t == NR_PSI_TASK_COUNTS)
+			psi_cpu_ext(groupc)->nr_memstall_running++;
+	}
 
 	/* Calculate state mask representing active states */
 	for (s = 0; s < NR_PSI_STATES; s++) {
-		if (test_state(groupc->tasks, s))
+		if (test_state(groupc, s))
 			state_mask |= (1 << s);
 	}
 	groupc->state_mask = state_mask;
@@ -794,7 +899,7 @@ static void psi_group_change(struct psi_group *group, int cpu,
 		psi_schedule_poll_work(group, 1, false);
 
 	if (wake_clock && !delayed_work_pending(&group->avgs_work))
-		queue_delayed_work(system_power_efficient_wq, &group->avgs_work, PSI_FREQ);
+		schedule_delayed_work(&group->avgs_work, PSI_FREQ);
 }
 
 static struct psi_group *iterate_groups(struct task_struct *task, void **iter)
@@ -948,7 +1053,7 @@ void psi_memstall_enter(unsigned long *flags)
 	rq = this_rq_lock_irq(&rf);
 
 	current->in_memstall = 1;
-	psi_task_change(current, 0, TSK_MEMSTALL);
+	psi_task_change(current, 0, TSK_MEMSTALL | TSK_MEMSTALL_RUNNING);
 
 	rq_unlock_irq(rq, &rf);
 }
@@ -977,7 +1082,7 @@ void psi_memstall_leave(unsigned long *flags)
 	rq = this_rq_lock_irq(&rf);
 
 	current->in_memstall = 0;
-	psi_task_change(current, TSK_MEMSTALL, 0);
+	psi_task_change(current, TSK_MEMSTALL | TSK_MEMSTALL_RUNNING, 0);
 
 	rq_unlock_irq(rq, &rf);
 }
@@ -985,12 +1090,24 @@ void psi_memstall_leave(unsigned long *flags)
 #ifdef CONFIG_CGROUPS
 int psi_cgroup_alloc(struct cgroup *cgroup)
 {
+	struct psi_group_cpu_ext __percpu *ext;
+
 	if (static_branch_likely(&psi_disabled))
 		return 0;
 
-	cgroup->psi.pcpu = alloc_percpu(struct psi_group_cpu);
-	if (!cgroup->psi.pcpu)
+	/*
+	 * Allocate the larger ext wrapper so ->nr_memstall_running has
+	 * backing storage. Cast back to the public type for the pointer
+	 * stored in psi_group, relying on ext->pub being the first
+	 * member (C first-member address equality). free_percpu() of the
+	 * cast-back pointer is fine because the chunk header stored by
+	 * the percpu allocator records the allocation size, not the
+	 * declared element type.
+	 */
+	ext = alloc_percpu(struct psi_group_cpu_ext);
+	if (!ext)
 		return -ENOMEM;
+	cgroup->psi.pcpu = (struct psi_group_cpu __percpu *)ext;
 	group_init(&cgroup->psi);
 	return 0;
 }
@@ -1178,7 +1295,8 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group,
 	t->state = state;
 	t->threshold = threshold_us * NSEC_PER_USEC;
 	t->win.size = window_us * NSEC_PER_USEC;
-	window_reset(&t->win, 0, 0, 0);
+	window_reset(&t->win, sched_clock(),
+			group->total[PSI_POLL][t->state], 0);
 
 	t->event = 0;
 	t->last_event_time = 0;

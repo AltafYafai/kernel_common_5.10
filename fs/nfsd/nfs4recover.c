@@ -815,8 +815,7 @@ __cld_pipe_inprogress_downcall(const struct cld_msg_v2 __user *cmsg,
 			if (IS_ERR_OR_NULL(name.data))
 				return -EFAULT;
 			name.len = namelen;
-			if (get_user(princhashlen, &ci->cc_princhash.cp_len))
-				return -EFAULT;
+			get_user(princhashlen, &ci->cc_princhash.cp_len);
 			if (princhashlen > 0) {
 				princhash.data = memdup_user(
 						&ci->cc_princhash.cp_data,

@@ -3366,10 +3366,7 @@ static long kvm_vcpu_ioctl(struct file *filp,
 				synchronize_rcu();
 			put_pid(oldpid);
 		}
-		vcpu->wants_to_run = !READ_ONCE(vcpu->run->immediate_exit);
 		r = kvm_arch_vcpu_ioctl_run(vcpu);
-		vcpu->wants_to_run = false;
-
 		trace_kvm_userspace_exit(vcpu->run->exit_reason, r);
 		break;
 	}
@@ -4561,19 +4558,25 @@ struct kvm_io_device *kvm_io_bus_get_dev(struct kvm *kvm, enum kvm_bus bus_idx,
 					 gpa_t addr)
 {
 	struct kvm_io_bus *bus;
-	int dev_idx;
+	int dev_idx, srcu_idx;
+	struct kvm_io_device *iodev = NULL;
 
-	lockdep_assert_held(&kvm->srcu);
+	srcu_idx = srcu_read_lock(&kvm->srcu);
 
 	bus = srcu_dereference(kvm->buses[bus_idx], &kvm->srcu);
 	if (!bus)
-		return NULL;
+		goto out_unlock;
 
 	dev_idx = kvm_io_bus_get_first_dev(bus, addr, 1);
 	if (dev_idx < 0)
-		return NULL;
+		goto out_unlock;
 
-	return bus->range[dev_idx].dev;
+	iodev = bus->range[dev_idx].dev;
+
+out_unlock:
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+
+	return iodev;
 }
 EXPORT_SYMBOL_GPL(kvm_io_bus_get_dev);
 

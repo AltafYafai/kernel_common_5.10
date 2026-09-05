@@ -243,7 +243,7 @@ static irqreturn_t sh_msiof_spi_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-static int sh_msiof_spi_reset_regs(struct sh_msiof_spi_priv *p)
+static void sh_msiof_spi_reset_regs(struct sh_msiof_spi_priv *p)
 {
 	u32 mask = SICTR_TXRST | SICTR_RXRST;
 	u32 data;
@@ -252,8 +252,8 @@ static int sh_msiof_spi_reset_regs(struct sh_msiof_spi_priv *p)
 	data |= mask;
 	sh_msiof_write(p, SICTR, data);
 
-	return readl_poll_timeout_atomic(p->mapbase + SICTR, data,
-					 !(data & mask), 1, 100);
+	readl_poll_timeout_atomic(p->mapbase + SICTR, data, !(data & mask), 1,
+				  100);
 }
 
 static const u32 sh_msiof_spi_div_array[] = {
@@ -923,9 +923,7 @@ static int sh_msiof_transfer_one(struct spi_controller *ctlr,
 	int ret;
 
 	/* reset registers */
-	ret = sh_msiof_spi_reset_regs(p);
-	if (ret)
-		return ret;
+	sh_msiof_spi_reset_regs(p);
 
 	/* setup clocks (clock already enabled in chipselect()) */
 	if (!spi_controller_is_slave(p->ctlr))

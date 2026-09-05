@@ -67,7 +67,7 @@
  * After a CPU has dirtied this many pages, balance_dirty_pages_ratelimited
  * will look to see if it needs to force writeback or throttling.
  */
-static long ratelimit_pages = 256;
+static long ratelimit_pages = 32;
 
 /* The following parameters are exported via /proc/sys/vm */
 
@@ -75,6 +75,7 @@ static long ratelimit_pages = 256;
  * Start background writeback (via writeback threads) at this percentage
  */
 int dirty_background_ratio = 10;
+EXPORT_SYMBOL_GPL(dirty_background_ratio);
 
 /*
  * dirty_background_bytes starts at 0 (disabled) so that it is a function of
@@ -92,6 +93,7 @@ int vm_highmem_is_dirtyable;
  * The generator of dirty data starts writeback at this percentage
  */
 int vm_dirty_ratio = 20;
+EXPORT_SYMBOL_GPL(vm_dirty_ratio);
 
 /*
  * vm_dirty_bytes starts at 0 (disabled) so that it is a function of
@@ -101,15 +103,31 @@ unsigned long vm_dirty_bytes;
 
 /*
  * The interval between `kupdate'-style writebacks
+ *
+ * Default raised from 5 s to 15 s.  On modern flash (UFS / NVMe / eMMC
+ * with internal write-coalescing) the periodic flusher wakeup is the
+ * single biggest writeback overhead under light load, and the flash
+ * already groups dirty pages internally; firing kupdate every 5 s
+ * mostly buys frequent CPU wakeups for no measurable durability win.
+ * 15 s gives writeback more grouping room (longer batch of adjacent
+ * dirty pages reaches the device per flush) and visibly reduces idle
+ * CPU wakeups on Android-class workloads.  fsync(), explicit sync(),
+ * and the dirty-ratio path are unaffected by this change.
  */
-unsigned int dirty_writeback_interval = 5 * 100; /* centiseconds */
+unsigned int dirty_writeback_interval = 15 * 100; /* centiseconds */
 
 EXPORT_SYMBOL_GPL(dirty_writeback_interval);
 
 /*
  * The longest time for which data is allowed to remain dirty
+ *
+ * Raised from 20 s to 30 s to track the writeback interval bump
+ * above; without this, dirty_writeback_interval > dirty_expire_interval
+ * would force the flusher to age pages out faster than the periodic
+ * wakeup can collect them, defeating the point of the longer interval.
  */
 unsigned int dirty_expire_interval = 30 * 100; /* centiseconds */
+EXPORT_SYMBOL_GPL(dirty_expire_interval);
 
 /*
  * Flag that makes the machine dump writes/reads and block dirtyings.

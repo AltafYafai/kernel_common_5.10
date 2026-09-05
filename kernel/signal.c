@@ -1354,7 +1354,6 @@ int zap_other_threads(struct task_struct *p)
 	int count = 0;
 
 	p->signal->group_stop_count = 0;
-	task_clear_jobctl_pending(p, JOBCTL_PENDING_MASK);
 
 	while_each_thread(p, t) {
 		task_clear_jobctl_pending(t, JOBCTL_PENDING_MASK);
@@ -1378,16 +1377,8 @@ struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 	rcu_read_lock();
 	for (;;) {
 		sighand = rcu_dereference(tsk->sighand);
-		if (unlikely(sighand == NULL)) {
-			/*
-			 * Pairs with the smp_store_release() in
-			 * __exit_signal().  It ensures that all state
-			 * modifications to the task preceeding the store are
-			 * visible to the callers of lock_task_sighand().
-			 */
-			smp_acquire__after_ctrl_dep();
+		if (unlikely(sighand == NULL))
 			break;
-		}
 
 		/*
 		 * This sighand can be already freed and even reused, but
@@ -2463,7 +2454,7 @@ static void do_jobctl_trap(void)
  * Must be called with @current->sighand->siglock held,
  * which is always released before returning.
  */
-static void do_freezer_trap(void)
+noinline static void do_freezer_trap(void)
 	__releases(&current->sighand->siglock)
 {
 	/*

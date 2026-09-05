@@ -69,14 +69,16 @@ struct vmap_area {
 	struct list_head list;          /* address sorted list */
 
 	/*
-	 * The following two variables can be packed, because
-	 * a vmap_area object can be either:
+	 * The following three variables can be packed, because
+	 * a vmap_area object is always one of the three states:
 	 *    1) in "free" tree (root is vmap_area_root)
-	 *    2) or "busy" tree (root is free_vmap_area_root)
+	 *    2) in "busy" tree (root is free_vmap_area_root)
+	 *    3) in purge list  (head is vmap_purge_list)
 	 */
 	union {
 		unsigned long subtree_max_size; /* in "free" tree */
 		struct vm_struct *vm;           /* in "busy" tree */
+		struct llist_node purge_list;   /* in purge list */
 	};
 };
 

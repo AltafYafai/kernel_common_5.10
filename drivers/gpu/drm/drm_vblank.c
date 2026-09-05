@@ -24,6 +24,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include <linux/cpufreq_zenith.h>
 #include <linux/export.h>
 #include <linux/kthread.h>
 #include <linux/moduleparam.h>
@@ -646,6 +647,18 @@ void drm_calc_timestamping_constants(struct drm_crtc *crtc,
 		     mode->crtc_vtotal, mode->crtc_vdisplay);
 	drm_dbg_core(dev, "crtc %u: clock %d kHz framedur %d linedur %d\n",
 		     crtc->base.id, dotclock, framedur_ns, linedur_ns);
+
+	/* Publish the just-computed framedur to the zenith cpufreq
+	 * governor's adaptive frame-budget cache so frame_budget_us_auto
+	 * can drop the wall-clock guess and use the real panel period.
+	 * Stub-out via the linux/cpufreq_zenith.h header when zenith is
+	 * not built; otherwise the call is lock-free and safe from any
+	 * context (it is a single atomic_set).  Skip the publish when
+	 * framedur_ns is 0 (mode disable path: dotclock == 0) so a CRTC
+	 * teardown does not clobber another CRTC's still-active cache.
+	 */
+	if (framedur_ns > 0)
+		zenith_set_drm_vblank_us((unsigned int)(framedur_ns / 1000));
 }
 EXPORT_SYMBOL(drm_calc_timestamping_constants);
 
@@ -1962,6 +1975,80 @@ bool drm_handle_vblank(struct drm_device *dev, unsigned int pipe)
 	drm_handle_vblank_works(vblank);
 
 	spin_unlock_irqrestore(&dev->event_lock, irqflags);
+
+	/* Notify the zenith cpufreq governor of this vblank tick.  K3
+	 * frame-overrun rescue compares the gap between consecutive
+	 * ticks against the panel period published by
+	 * zenith_set_drm_vblank_us() and lifts a recovery floor when
+	 * the gap exceeds the slack budget.  Stubs out via the
+	 * linux/cpufreq_zenith.h header when zenith is not built;
+	 * otherwise the call is lock-free and safe from any context
+	 * (single atomic_set, no allocator, no sleep).
+	 *
+	 * On multi-CRTC devices every pipe's vblank funnels through
+	 * here, so the governor sees ticks at the union frequency of
+	 * all active displays; the overrun detection effectively
+	 * tracks the fastest active panel.  Phones with one panel
+	 * (the primary K3 target) observe exactly one tick per vblank.
+	 */
+	zenith_drm_vblank_event();
+
+	/* Audit fix K6: auto-publish the *measured* vblank period.
+	 *
+	 * drm_calc_timestamping_constants() publishes the panel period
+	 * derived from the modeline (1e9 / dotclock).  That works for
+	 * fixed-rate panels but underestimates the active period on
+	 * variable-refresh-rate (VRR / freesync) panels where the
+	 * compositor can dynamically slow the vblank rate down to match
+	 * the producer's frame rate.  In that mode the modeline says
+	 * "120 Hz" while the actual vblank arrives every 16.6 ms because
+	 * the source is 60 Hz video.  zenith's frame-overrun detection
+	 * then trips spuriously because it expected one tick every 8.3 ms.
+	 *
+	 * Track the inter-vblank gap with a single-EMA smoother (alpha
+	 * 1/8 -> ~5-vblank time constant) and re-publish to zenith every
+	 * 16 vblanks (~133 ms at 120 Hz, ~266 ms at 60 Hz).  Both are
+	 * file-scope statics; the protection is the implicit serialization
+	 * provided by drm_handle_vblank() being called per-pipe under the
+	 * vblank_time_lock.  Multi-pipe interleaving introduces a small
+	 * jitter into the EMA but the smoother absorbs it; the worst case
+	 * is one extra published-period drift cycle which is harmless.
+	 *
+	 * Bound: clamp computed period to [1ms, 50ms] before publishing.
+	 * Anything outside that range is either an IRQ storm (gap too
+	 * small) or a display-off / suspend path (gap too large) and we
+	 * don't want either to corrupt the cache.
+	 */
+	{
+		static u64 zenith_k6_last_ts;
+		static u64 zenith_k6_period_ema_ns;
+		static unsigned int zenith_k6_publish_ctr;
+		u64 now = ktime_get_ns();
+		u64 gap;
+
+		if (zenith_k6_last_ts) {
+			gap = now - zenith_k6_last_ts;
+			/* Clamp to sensible vblank range: 1ms..50ms. */
+			if (gap >= 1000000ULL && gap <= 50000000ULL) {
+				/* alpha = 1/8 EMA: ema += (gap - ema) / 8 */
+				if (zenith_k6_period_ema_ns)
+					zenith_k6_period_ema_ns +=
+						((s64)gap -
+						 (s64)zenith_k6_period_ema_ns) / 8;
+				else
+					zenith_k6_period_ema_ns = gap;
+
+				if (++zenith_k6_publish_ctr >= 16) {
+					unsigned int period_us =
+						zenith_k6_period_ema_ns / 1000;
+
+					zenith_k6_publish_ctr = 0;
+					zenith_set_drm_vblank_us(period_us);
+				}
+			}
+		}
+		zenith_k6_last_ts = now;
+	}
 
 	if (disable_irq)
 		vblank_disable_fn(&vblank->disable_timer);

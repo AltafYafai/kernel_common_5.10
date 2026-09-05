@@ -365,6 +365,10 @@ static struct request *__blk_mq_alloc_request(struct blk_mq_alloc_data *data)
 	if (data->cmd_flags & REQ_NOWAIT)
 		data->flags |= BLK_MQ_REQ_NOWAIT;
 
+retry:
+	data->ctx = blk_mq_get_ctx(q);
+	data->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);
+
 	if (e) {
 		/*
 		 * Flush requests are special and go directly to the
@@ -375,12 +379,7 @@ static struct request *__blk_mq_alloc_request(struct blk_mq_alloc_data *data)
 		    e->type->ops.limit_depth &&
 		    !(data->flags & BLK_MQ_REQ_RESERVED))
 			e->type->ops.limit_depth(data->cmd_flags, data);
-	}
-
-retry:
-	data->ctx = blk_mq_get_ctx(q);
-	data->hctx = blk_mq_map_queue(q, data->cmd_flags, data->ctx);
-	if (!e)
+	} else
 		blk_mq_tag_busy(data->hctx);
 
 	/*
@@ -4109,6 +4108,19 @@ unsigned int blk_mq_rq_cpu(struct request *rq)
 	return rq->mq_ctx->cpu;
 }
 EXPORT_SYMBOL(blk_mq_rq_cpu);
+
+void blk_mq_cancel_work_sync(struct request_queue *q)
+{
+	if (queue_is_mq(q)) {
+		struct blk_mq_hw_ctx *hctx;
+		int i;
+
+		cancel_delayed_work_sync(&q->requeue_work);
+
+		queue_for_each_hw_ctx(q, hctx, i)
+			cancel_delayed_work_sync(&hctx->run_work);
+	}
+}
 
 static int __init blk_mq_init(void)
 {

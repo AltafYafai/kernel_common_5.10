@@ -84,6 +84,8 @@
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
 typedef int __bitwise fpi_t;
 
+extern struct kcompress_t kcompress_data[MAX_NUMNODES];
+
 /* No special request */
 #define FPI_NONE		((__force fpi_t)0)
 
@@ -186,7 +188,7 @@ DEFINE_STATIC_KEY_FALSE(init_on_free);
 EXPORT_SYMBOL(init_on_free);
 
 static bool _init_on_alloc_enabled_early __read_mostly
-				= false;
+				= IS_ENABLED(CONFIG_INIT_ON_ALLOC_DEFAULT_ON);
 static int __init early_init_on_alloc(char *buf)
 {
 
@@ -195,7 +197,7 @@ static int __init early_init_on_alloc(char *buf)
 early_param("init_on_alloc", early_init_on_alloc);
 
 static bool _init_on_free_enabled_early __read_mostly
-				= false;
+				= IS_ENABLED(CONFIG_INIT_ON_FREE_DEFAULT_ON);
 static int __init early_init_on_free(char *buf)
 {
 	return kstrtobool(buf, &_init_on_free_enabled_early);
@@ -337,9 +339,34 @@ compound_page_dtor * const compound_page_dtors[NR_COMPOUND_DTORS] = {
  * tuned according to the amount of memory in the system.
  */
 int min_free_kbytes = 1024;
+EXPORT_SYMBOL_GPL(min_free_kbytes);
 int user_min_free_kbytes = -1;
+#ifdef CONFIG_DISCONTIGMEM
+/*
+ * DiscontigMem defines memory ranges as separate pg_data_t even if the ranges
+ * are not on separate NUMA nodes. Functionally this works but with
+ * watermark_boost_factor, it can reclaim prematurely as the ranges can be
+ * quite small. By default, do not boost watermarks on discontigmem as in
+ * many cases very high-order allocations like THP are likely to be
+ * unsupported and the premature reclaim offsets the advantage of long-term
+ * fragmentation avoidance.
+ */
 int watermark_boost_factor __read_mostly;
-int watermark_scale_factor = 10;
+#else
+int watermark_boost_factor __read_mostly = 15000;
+#endif
+/*
+ * watermark_scale_factor is expressed in units of 0.01% of total memory.
+ * The upstream default is 10 (0.1%); we already ship 100 (1%) from the
+ * phone-class mm/TCP defaults drop. Bumping to 300 (3%) widens the
+ * low..high watermark band further so kswapd wakes earlier and direct
+ * reclaim is correspondingly rarer on 8 GiB+ devices running with a
+ * bursty foreground allocator (camera, games, Chrome). This trades a
+ * small amount of steady-state "free" memory for noticeably fewer
+ * allocation stalls under load; userspace can still lower it at runtime
+ * via /proc/sys/vm/watermark_scale_factor.
+ */
+int watermark_scale_factor = 300;
 
 /*
  * Extra memory for the system to try freeing. Used to temporarily
@@ -2548,7 +2575,8 @@ static void change_pageblock_range(struct page *pageblock_page,
  * is worse than movable allocations stealing from unmovable and reclaimable
  * pageblocks.
  */
-static bool can_steal_fallback(unsigned int order, int start_mt)
+static bool can_steal_fallback(unsigned int order, int start_mt,
+				int fallback_type, unsigned int start_order)
 {
 	/*
 	 * Leaving this order check is intended, although there is
@@ -2560,9 +2588,18 @@ static bool can_steal_fallback(unsigned int order, int start_mt)
 	if (order >= pageblock_order)
 		return true;
 
-	if (order >= pageblock_order / 2 ||
+	// don't let unmovable allocations cause migrations simply because of free pages
+	if ((start_mt != MIGRATE_UNMOVABLE &&
+		order >= pageblock_order / 2) ||
+		// only steal reclaimable page blocks for unmovable allocations
+		(start_mt == MIGRATE_UNMOVABLE &&
+		fallback_type != MIGRATE_MOVABLE &&
+		order >= pageblock_order / 2) ||
+		// reclaimable can steal aggressively
 		start_mt == MIGRATE_RECLAIMABLE ||
-		start_mt == MIGRATE_UNMOVABLE ||
+		// allow unmovable allocs up to 64K without migrating blocks
+		(start_mt == MIGRATE_UNMOVABLE &&
+		start_order >= 5) ||
 		page_group_by_mobility_disabled)
 		return true;
 
@@ -2697,7 +2734,8 @@ single_page:
  * fragmentation due to mixed migratetype pages in one pageblock.
  */
 int find_suitable_fallback(struct free_area *area, unsigned int order,
-			int migratetype, bool only_stealable, bool *can_steal)
+			int migratetype, bool only_stealable, bool *can_steal,
+			unsigned int start_order)
 {
 	int i;
 	int fallback_mt;
@@ -2714,7 +2752,7 @@ int find_suitable_fallback(struct free_area *area, unsigned int order,
 		if (free_area_empty(area, fallback_mt))
 			continue;
 
-		if (can_steal_fallback(order, migratetype))
+		if (can_steal_fallback(order, migratetype, fallback_mt, start_order))
 			*can_steal = true;
 
 		if (!only_stealable)
@@ -2889,7 +2927,7 @@ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype,
 				--current_order) {
 		area = &(zone->free_area[current_order]);
 		fallback_mt = find_suitable_fallback(area, current_order,
-				start_migratetype, false, &can_steal);
+				start_migratetype, false, &can_steal, order);
 		if (fallback_mt == -1)
 			continue;
 
@@ -2915,7 +2953,7 @@ find_smallest:
 							current_order++) {
 		area = &(zone->free_area[current_order]);
 		fallback_mt = find_suitable_fallback(area, current_order,
-				start_migratetype, false, &can_steal);
+				start_migratetype, false, &can_steal, order);
 		if (fallback_mt != -1)
 			break;
 	}
@@ -7198,6 +7236,7 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
 	pgdat_init_kcompactd(pgdat);
 
 	init_waitqueue_head(&pgdat->kswapd_wait);
+	init_waitqueue_head(&kcompress_data[pgdat->node_id].kcompressd_wait);
 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
 
 	pgdat_page_ext_init(pgdat);

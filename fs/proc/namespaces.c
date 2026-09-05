@@ -46,7 +46,7 @@ static const char *proc_ns_get_link(struct dentry *dentry,
 	const struct proc_ns_operations *ns_ops = PROC_I(inode)->ns_ops;
 	struct task_struct *task;
 	struct path ns_path;
-	int error;
+	int error = -EACCES;
 
 	if (!dentry)
 		return ERR_PTR(-ECHILD);
@@ -55,11 +55,6 @@ static const char *proc_ns_get_link(struct dentry *dentry,
 	if (!task)
 		return ERR_PTR(-EACCES);
 
-	error = down_read_killable(&task->signal->exec_update_lock);
-	if (error)
-		goto out_put_task;
-
-	error = -EACCES;
 	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
 		goto out;
 
@@ -69,8 +64,6 @@ static const char *proc_ns_get_link(struct dentry *dentry,
 
 	error = nd_jump_link(&ns_path);
 out:
-	up_read(&task->signal->exec_update_lock);
-out_put_task:
 	put_task_struct(task);
 	return ERR_PTR(error);
 }
@@ -87,18 +80,11 @@ static int proc_ns_readlink(struct dentry *dentry, char __user *buffer, int bufl
 	if (!task)
 		return res;
 
-	res = down_read_killable(&task->signal->exec_update_lock);
-	if (res)
-		goto out_put_task;
-
-	res = -EACCES;
 	if (ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
 		res = ns_get_name(name, sizeof(name), task, ns_ops);
 		if (res >= 0)
 			res = readlink_copy(buffer, buflen, name);
 	}
-	up_read(&task->signal->exec_update_lock);
-out_put_task:
 	put_task_struct(task);
 	return res;
 }
@@ -106,7 +92,7 @@ out_put_task:
 static const struct inode_operations proc_ns_link_inode_operations = {
 	.readlink	= proc_ns_readlink,
 	.get_link	= proc_ns_get_link,
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 };
 
 static struct dentry *proc_ns_instantiate(struct dentry *dentry,
@@ -193,5 +179,5 @@ out_no_task:
 const struct inode_operations proc_ns_dir_inode_operations = {
 	.lookup		= proc_ns_dir_lookup,
 	.getattr	= pid_getattr,
-	.setattr	= proc_nochmod_setattr,
+	.setattr	= proc_setattr,
 };

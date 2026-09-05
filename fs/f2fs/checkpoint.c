@@ -728,7 +728,6 @@ int f2fs_recover_orphan_inodes(struct f2fs_sb_info *sbi)
 	for (i = 0; i < orphan_blocks; i++) {
 		struct page *page;
 		struct f2fs_orphan_block *orphan_blk;
-		unsigned int entry_count;
 
 		page = f2fs_get_meta_page(sbi, start_blk + i);
 		if (IS_ERR(page)) {
@@ -737,17 +736,7 @@ int f2fs_recover_orphan_inodes(struct f2fs_sb_info *sbi)
 		}
 
 		orphan_blk = (struct f2fs_orphan_block *)page_address(page);
-		entry_count = le32_to_cpu(orphan_blk->entry_count);
-		if (entry_count > F2FS_ORPHANS_PER_BLOCK) {
-			f2fs_err(sbi, "invalid orphan inode entry count %u",
-				 entry_count);
-			set_sbi_flag(sbi, SBI_NEED_FSCK);
-			err = -EFSCORRUPTED;
-			f2fs_put_page(page, 1);
-			goto out;
-		}
-
-		for (j = 0; j < entry_count; j++) {
+		for (j = 0; j < le32_to_cpu(orphan_blk->entry_count); j++) {
 			nid_t ino = le32_to_cpu(orphan_blk->ino[j]);
 
 			err = recover_orphan_inode(sbi, ino);
@@ -1405,7 +1394,7 @@ static void commit_checkpoint(struct f2fs_sb_info *sbi,
 
 	f2fs_wait_on_page_writeback(page, META, true, true);
 
-	copy_page(page_address(page), src);
+	memcpy(page_address(page), src, PAGE_SIZE);
 
 	set_page_dirty(page);
 	if (unlikely(!clear_page_dirty_for_io(page)))

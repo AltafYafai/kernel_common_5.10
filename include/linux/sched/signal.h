@@ -164,9 +164,6 @@ struct signal_struct {
 
 	struct tty_struct *tty; /* NULL if no tty */
 
-#ifdef CONFIG_SCHED_AUTOGROUP
-	struct autogroup *autogroup;
-#endif
 	/*
 	 * Cumulative resource counters for dead threads in the group,
 	 * and for reaped dead child processes forked by this group.
@@ -237,7 +234,11 @@ struct signal_struct {
 						 * permissions.
 						 */
 
+#ifdef CONFIG_SCHED_AUTOGROUP
+	ANDROID_KABI_USE(1, struct autogroup *autogroup);
+#else
 	ANDROID_KABI_RESERVE(1);
+#endif
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);

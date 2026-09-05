@@ -4993,7 +4993,7 @@ static int decode_watchers(void **p, void *end,
 	if (ret)
 		return ret;
 
-	ceph_decode_32_safe(p, end, *num_watchers, bad);
+	*num_watchers = ceph_decode_32(p);
 	*watchers = kcalloc(*num_watchers, sizeof(**watchers), GFP_NOIO);
 	if (!*watchers)
 		return -ENOMEM;
@@ -5007,9 +5007,6 @@ static int decode_watchers(void **p, void *end,
 	}
 
 	return 0;
-
-bad:
-	return -EINVAL;
 }
 
 /*

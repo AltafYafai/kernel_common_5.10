@@ -5,7 +5,17 @@
 #include <linux/nospec.h>
 #include "sched.h"
 
-unsigned int __read_mostly sysctl_sched_autogroup_enabled = 1;
+/*
+ * Default to disabled.  Android already places every userspace task in
+ * a uid-keyed task_group via cgroup-v1's cpu controller, so the
+ * autogroup layer (which would create yet another per-session group
+ * on every fork from a tty / pgrp leader) is pure scheduler hot-path
+ * cost with no win on a non-tty UX.  Userspace can still flip this on
+ * at runtime via /proc/sys/kernel/sched_autogroup_enabled or via the
+ * absence of the "noautogroup" cmdline arg if anyone ever wants the
+ * legacy behaviour back.
+ */
+unsigned int __read_mostly sysctl_sched_autogroup_enabled;
 static struct autogroup autogroup_default;
 static atomic_t autogroup_seq_nr;
 

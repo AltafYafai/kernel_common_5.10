@@ -104,6 +104,20 @@ extern long calc_load_fold_active(struct rq *this_rq, long adjust);
 
 extern void call_trace_sched_update_nr_running(struct rq *rq, int count);
 /*
+ * Asymmetric CPU capacity bits
+ */
+struct asym_cap_data {
+	struct list_head link;
+	struct rcu_head rcu;
+	unsigned long capacity;
+	unsigned long cpus[];
+};
+
+extern struct list_head asym_cap_list;
+
+#define cpu_capacity_span(asym_data) to_cpumask((asym_data)->cpus)
+
+/*
  * Helpers for converting nanosecond timing to jiffy resolution
  */
 #define NS_TO_JIFFIES(TIME)	((unsigned long)(TIME) / (NSEC_PER_SEC / HZ))
@@ -233,7 +247,7 @@ static inline void update_avg(u64 *avg, u64 sample)
 
 static inline bool dl_entity_is_special(struct sched_dl_entity *dl_se)
 {
-#ifdef CONFIG_CPU_FREQ_GOV_SCHEDUTIL
+#if defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL) || defined(CONFIG_CPU_FREQ_GOV_SCHEDHORIZON)
 	return unlikely(dl_se->flags & SCHED_FLAG_SUGOV);
 #else
 	return false;
@@ -420,10 +434,6 @@ struct task_group {
 	struct list_head	siblings;
 	struct list_head	children;
 
-#ifdef CONFIG_SCHED_AUTOGROUP
-	struct autogroup	*autogroup;
-#endif
-
 	struct cfs_bandwidth	cfs_bandwidth;
 
 #ifdef CONFIG_UCLAMP_TASK_GROUP
@@ -439,7 +449,11 @@ struct task_group {
 	ANDROID_VENDOR_DATA_ARRAY(1, 4);
 #endif
 
+#ifdef CONFIG_SCHED_AUTOGROUP
+	ANDROID_KABI_USE(1, struct autogroup *autogroup);
+#else
 	ANDROID_KABI_RESERVE(1);
+#endif
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
@@ -485,7 +499,7 @@ extern void unregister_fair_sched_group(struct task_group *tg);
 extern void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
 			struct sched_entity *se, int cpu,
 			struct sched_entity *parent);
-extern void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
+extern void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b, struct cfs_bandwidth *parent);
 
 extern void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b);
 extern void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
@@ -1509,6 +1523,8 @@ DECLARE_PER_CPU(struct sched_domain __rcu *, sd_asym_packing);
 DECLARE_PER_CPU(struct sched_domain __rcu *, sd_asym_cpucapacity);
 extern struct static_key_false sched_asym_cpucapacity;
 
+extern bool sched_asym_cpucap_active(void);
+
 struct sched_group_capacity {
 	atomic_t		ref;
 	/*
@@ -2012,7 +2028,7 @@ extern void init_dl_inactive_task_timer(struct sched_dl_entity *dl_se);
 #define RATIO_SHIFT		8
 #define MAX_BW_BITS		(64 - BW_SHIFT)
 #define MAX_BW			((1ULL << MAX_BW_BITS) - 1)
-u64 to_ratio(u64 period, u64 runtime);
+unsigned long to_ratio(u64 period, u64 runtime);
 
 extern void init_entity_runnable_average(struct sched_entity *se);
 extern void post_init_entity_util_avg(struct task_struct *p);
@@ -2655,7 +2671,7 @@ enum schedutil_type {
 	ENERGY_UTIL,
 };
 
-#ifdef CONFIG_CPU_FREQ_GOV_SCHEDUTIL
+#if defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL) || defined(CONFIG_CPU_FREQ_GOV_SCHEDHORIZON)
 
 unsigned long schedutil_cpu_util(int cpu, unsigned long util_cfs,
 				 unsigned long max, enum schedutil_type type,
@@ -2687,14 +2703,14 @@ static inline unsigned long cpu_util_rt(struct rq *rq)
 {
 	return READ_ONCE(rq->avg_rt.util_avg);
 }
-#else /* CONFIG_CPU_FREQ_GOV_SCHEDUTIL */
+#else /* CONFIG_CPU_FREQ_GOV_SCHEDUTIL || CONFIG_CPU_FREQ_GOV_SCHEDHORIZON */
 static inline unsigned long schedutil_cpu_util(int cpu, unsigned long util_cfs,
 				 unsigned long max, enum schedutil_type type,
 				 struct task_struct *p)
 {
 	return 0;
 }
-#endif /* CONFIG_CPU_FREQ_GOV_SCHEDUTIL */
+#endif /* CONFIG_CPU_FREQ_GOV_SCHEDUTIL || CONFIG_CPU_FREQ_GOV_SCHEDHORIZON */
 
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 static inline unsigned long cpu_util_irq(struct rq *rq)
@@ -2724,7 +2740,7 @@ unsigned long scale_irq_capacity(unsigned long util, unsigned long irq, unsigned
 }
 #endif
 
-#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+#if defined(CONFIG_ENERGY_MODEL) && (defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL) || defined(CONFIG_CPU_FREQ_GOV_SCHEDHORIZON))
 
 #define perf_domain_span(pd) (to_cpumask(((pd)->em_pd->cpus)))
 
@@ -2735,12 +2751,12 @@ static inline bool sched_energy_enabled(void)
 	return static_branch_unlikely(&sched_energy_present);
 }
 
-#else /* ! (CONFIG_ENERGY_MODEL && CONFIG_CPU_FREQ_GOV_SCHEDUTIL) */
+#else /* ! (CONFIG_ENERGY_MODEL && CONFIG_CPU_FREQ_GOV_SCHEDUTIL || CONFIG_CPU_FREQ_GOV_SCHEDHORIZON) */
 
 #define perf_domain_span(pd) NULL
 static inline bool sched_energy_enabled(void) { return false; }
 
-#endif /* CONFIG_ENERGY_MODEL && CONFIG_CPU_FREQ_GOV_SCHEDUTIL */
+#endif /* CONFIG_ENERGY_MODEL && CONFIG_CPU_FREQ_GOV_SCHEDUTIL || CONFIG_CPU_FREQ_GOV_SCHEDHORIZON */
 
 #ifdef CONFIG_MEMBARRIER
 /*

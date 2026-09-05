@@ -245,6 +245,11 @@ void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
 {
 	struct fuse_iqueue *fiq = &fc->iq;
 
+	if (nodeid == 0) {
+		kfree(forget);
+		return;
+	}
+
 	forget->forget_one.nodeid = nodeid;
 	forget->forget_one.nlookup = nlookup;
 
@@ -487,6 +492,7 @@ static void fuse_args_to_req(struct fuse_req *req, struct fuse_args *args)
 {
 	req->in.h.opcode = args->opcode;
 	req->in.h.nodeid = args->nodeid;
+	req->in.h.error_in = args->error_in;
 	req->args = args;
 	if (args->end)
 		__set_bit(FR_ASYNC, &req->flags);
@@ -939,7 +945,7 @@ static int fuse_ref_page(struct fuse_copy_state *cs, struct page *page,
 	cs->nr_segs++;
 	cs->len = 0;
 
-	return lock_request(cs->req);
+	return 0;
 }
 
 /*
@@ -1615,10 +1621,6 @@ static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
 	inode = fuse_ilookup(fc, nodeid,  NULL);
 	if (!inode)
 		goto out_up_killsb;
-	if (!S_ISREG(inode->i_mode)) {
-		err = -EINVAL;
-		goto out_iput;
-	}
 
 	mapping = inode->i_mapping;
 	index = outarg.offset >> PAGE_SHIFT;
@@ -1740,10 +1742,6 @@ static int fuse_retrieve(struct fuse_mount *fm, struct inode *inode,
 		page = find_get_page(mapping, index);
 		if (!page)
 			break;
-		if (!PageUptodate(page)) {
-			put_page(page);
-			break;
-		}
 
 		this_num = min_t(unsigned, num, PAGE_SIZE - offset);
 		ap->pages[ap->num_pages] = page;
@@ -1794,10 +1792,7 @@ static int fuse_notify_retrieve(struct fuse_conn *fc, unsigned int size,
 
 	inode = fuse_ilookup(fc, nodeid, &fm);
 	if (inode) {
-		if (!S_ISREG(inode->i_mode))
-			err = -EINVAL;
-		else
-			err = fuse_retrieve(fm, inode, &outarg);
+		err = fuse_retrieve(fm, inode, &outarg);
 		iput(inode);
 	}
 	up_read(&fc->killsb);
@@ -1959,12 +1954,25 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 		err = copy_out_args(cs, req->args, nbytes);
 	fuse_copy_finish(cs);
 
-	if (!err && req->in.h.opcode == FUSE_CANONICAL_PATH) {
+	if (!err && req->in.h.opcode == FUSE_CANONICAL_PATH && !oh.error) {
 		char *path = (char *)req->args->out_args[0].value;
 
 		path[req->args->out_args[0].size - 1] = 0;
 		req->out.h.error =
 			kern_path(path, 0, req->args->canonical_path);
+	}
+
+	if (!err && (req->in.h.opcode == FUSE_LOOKUP ||
+		     req->in.h.opcode == (FUSE_LOOKUP | FUSE_POSTFILTER)) &&
+		req->args->out_args[1].size == sizeof(struct fuse_entry_bpf_out)) {
+		struct fuse_entry_bpf_out *febo = (struct fuse_entry_bpf_out *)
+				req->args->out_args[1].value;
+		struct fuse_entry_bpf *feb = container_of(febo, struct fuse_entry_bpf, out);
+
+		if (febo->backing_action == FUSE_ACTION_REPLACE)
+			feb->backing_file = fget(febo->backing_fd);
+		if (febo->bpf_action == FUSE_ACTION_REPLACE)
+			feb->bpf_file = fget(febo->bpf_fd);
 	}
 
 	spin_lock(&fpq->lock);

@@ -1063,10 +1063,8 @@ static int mlxbf_i2c_init_resource(struct platform_device *pdev,
 
 	tmp_res->io = devm_ioremap_resource(dev, tmp_res->params);
 	if (IS_ERR(tmp_res->io)) {
-		int ret = PTR_ERR(tmp_res->io);
-
 		devm_kfree(dev, tmp_res);
-		return ret;
+		return PTR_ERR(tmp_res->io);
 	}
 
 	tmp_res->type = type;

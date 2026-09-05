@@ -1092,17 +1092,6 @@ static void lan78xx_deferred_multicast_write(struct work_struct *param)
 	lan78xx_write_reg(dev, RFE_CTL, pdata->rfe_ctl);
 }
 
-static void lan78xx_update_vlan_filter(struct lan78xx_priv *pdata,
-				       struct net_device *netdev,
-				       netdev_features_t features)
-{
-	if ((features & NETIF_F_HW_VLAN_CTAG_FILTER) &&
-	    !(netdev->flags & IFF_PROMISC))
-		pdata->rfe_ctl |= RFE_CTL_VLAN_FILTER_;
-	else
-		pdata->rfe_ctl &= ~RFE_CTL_VLAN_FILTER_;
-}
-
 static void lan78xx_set_multicast(struct net_device *netdev)
 {
 	struct lan78xx_net *dev = netdev_priv(netdev);
@@ -1136,8 +1125,6 @@ static void lan78xx_set_multicast(struct net_device *netdev)
 			pdata->rfe_ctl |= RFE_CTL_MCAST_EN_;
 		}
 	}
-
-	lan78xx_update_vlan_filter(pdata, dev->net, dev->net->features);
 
 	if (netdev_mc_count(dev->net)) {
 		struct netdev_hw_addr *ha;
@@ -2410,7 +2397,10 @@ static int lan78xx_set_features(struct net_device *netdev,
 	else
 		pdata->rfe_ctl &= ~RFE_CTL_VLAN_STRIP_;
 
-	lan78xx_update_vlan_filter(pdata, netdev, features);
+	if (features & NETIF_F_HW_VLAN_CTAG_FILTER)
+		pdata->rfe_ctl |= RFE_CTL_VLAN_FILTER_;
+	else
+		pdata->rfe_ctl &= ~RFE_CTL_VLAN_FILTER_;
 
 	spin_unlock_irqrestore(&pdata->rfe_ctl_lock, flags);
 
@@ -4067,30 +4057,29 @@ static int lan78xx_probe(struct usb_interface *intf,
 
 	period = ep_intr->desc.bInterval;
 	maxp = usb_maxpacket(dev->udev, dev->pipe_intr, 0);
-
-	dev->urb_intr = usb_alloc_urb(0, GFP_KERNEL);
-	if (!dev->urb_intr) {
+	buf = kmalloc(maxp, GFP_KERNEL);
+	if (!buf) {
 		ret = -ENOMEM;
 		goto out3;
 	}
 
-	buf = kmalloc(maxp, GFP_KERNEL);
-	if (!buf) {
+	dev->urb_intr = usb_alloc_urb(0, GFP_KERNEL);
+	if (!dev->urb_intr) {
 		ret = -ENOMEM;
-		goto free_urbs;
+		goto out4;
+	} else {
+		usb_fill_int_urb(dev->urb_intr, dev->udev,
+				 dev->pipe_intr, buf, maxp,
+				 intr_complete, dev, period);
+		dev->urb_intr->transfer_flags |= URB_FREE_BUFFER;
 	}
-
-	usb_fill_int_urb(dev->urb_intr, dev->udev,
-			 dev->pipe_intr, buf, maxp,
-			 intr_complete, dev, period);
-	dev->urb_intr->transfer_flags |= URB_FREE_BUFFER;
 
 	dev->maxpacket = usb_maxpacket(dev->udev, dev->pipe_out, 1);
 
 	/* Reject broken descriptors. */
 	if (dev->maxpacket == 0) {
 		ret = -ENODEV;
-		goto free_urbs;
+		goto out5;
 	}
 
 	/* driver requires remote-wakeup capability during autosuspend. */
@@ -4098,7 +4087,7 @@ static int lan78xx_probe(struct usb_interface *intf,
 
 	ret = lan78xx_phy_init(dev);
 	if (ret < 0)
-		goto free_urbs;
+		goto out5;
 
 	ret = register_netdev(netdev);
 	if (ret != 0) {
@@ -4120,8 +4109,10 @@ static int lan78xx_probe(struct usb_interface *intf,
 
 out6:
 	phy_disconnect(netdev->phydev);
-free_urbs:
+out5:
 	usb_free_urb(dev->urb_intr);
+out4:
+	kfree(buf);
 out3:
 	lan78xx_unbind(dev, intf);
 out2:
