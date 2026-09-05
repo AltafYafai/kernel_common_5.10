@@ -2589,25 +2589,6 @@ out:
 	}
 }
 
-#ifdef CONFIG_CMA
-/*
- * It is waste of effort to scan and reclaim CMA pages if it is not available
- * for current allocation context. Kswapd can not be enrolled as it can not
- * distinguish this scenario by using sc->gfp_mask = GFP_KERNEL
- */
-static bool skip_cma(struct page *page, struct scan_control *sc)
-{
-	return !current_is_kswapd() &&
-			gfp_migratetype(sc->gfp_mask) != MIGRATE_MOVABLE &&
-			get_pageblock_migratetype(page) == MIGRATE_CMA;
-}
-#else
-static bool skip_cma(struct page *page, struct scan_control *sc)
-{
-	return false;
-}
-#endif
-
 static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc);
 
 static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
