@@ -11,6 +11,11 @@
 #include <linux/mm.h>
 #include <linux/pagemap.h>
 #include <linux/tracepoint-defs.h>
+#include <linux/nodemask.h>
+#include <linux/memcontrol.h>
+#include <linux/mmzone.h>
+#include <linux/swap.h>
+
 
 /*
  * The set of flags that only affect watermark checking and reclaim

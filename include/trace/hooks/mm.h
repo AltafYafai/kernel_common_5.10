@@ -44,6 +44,7 @@ struct readahead_control;
 #endif /* __GENKSYMS__ */
 struct cma;
 struct swap_slots_cache;
+struct compact_control;
 struct page_vma_mapped_walk;
 
 DECLARE_RESTRICTED_HOOK(android_rvh_set_skip_swapcache_flags,
@@ -406,6 +407,43 @@ DECLARE_HOOK(android_vh_uprobes_replace_page,
 DECLARE_HOOK(android_vh_shmem_swapin_page,
 	TP_PROTO(struct page *page),
 	TP_ARGS(page));
+DECLARE_HOOK(android_vh_mm_compaction_begin,
+	TP_PROTO(struct compact_control *cc, long *vendor_ret),
+	TP_ARGS(cc, vendor_ret));
+DECLARE_HOOK(android_vh_mm_compaction_end,
+	TP_PROTO(struct compact_control *cc, long vendor_ret),
+	TP_ARGS(cc, vendor_ret));
+DECLARE_HOOK(android_vh_calc_alloc_flags,
+	TP_PROTO(unsigned int pflags, gfp_t gfp_mask, unsigned int *alloc_flags,
+		bool *bypass),
+	TP_ARGS(pflags, gfp_mask, alloc_flags, bypass));
+DECLARE_HOOK(android_vh_pagevec_drain,
+	TP_PROTO(struct page *page, bool *ret),
+	TP_ARGS(page, ret));
+DECLARE_HOOK(android_vh_zap_pte_range_tlb_start,
+	TP_PROTO(long *v_ret),
+	TP_ARGS(v_ret));
+DECLARE_HOOK(android_vh_zap_pte_range_tlb_force_flush,
+	TP_PROTO(struct page *page, bool *flush),
+	TP_ARGS(page, flush));
+DECLARE_HOOK(android_vh_zap_pte_range_tlb_end,
+	TP_PROTO(long *v_ret),
+	TP_ARGS(v_ret));
+DECLARE_HOOK(android_vh_shrink_inactive_list_blk_plug,
+	TP_PROTO(bool *do_plug),
+	TP_ARGS(do_plug));
+DECLARE_HOOK(android_vh_shrink_lruvec_blk_plug,
+	TP_PROTO(bool *do_plug),
+	TP_ARGS(do_plug));
+DECLARE_HOOK(android_vh_reclaim_pages_plug,
+	TP_PROTO(bool *do_plug),
+	TP_ARGS(do_plug));
+DECLARE_HOOK(android_vh_skip_lru_disable,
+	TP_PROTO(bool *skip),
+	TP_ARGS(skip));
+DECLARE_HOOK(android_vh_do_madvise_blk_plug,
+	TP_PROTO(int behavior, bool *do_plug),
+	TP_ARGS(behavior, do_plug));
 #endif /* _TRACE_HOOK_MM_H */
 
 /* This part must be outside protection */

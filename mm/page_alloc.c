@@ -3961,6 +3961,11 @@ static inline unsigned int current_alloc_flags(gfp_t gfp_mask,
 {
 #ifdef CONFIG_CMA
 	unsigned int pflags = current->flags;
+	bool bypass = false;
+
+	trace_android_vh_calc_alloc_flags(pflags, gfp_mask, &alloc_flags, &bypass);
+	if (bypass)
+		return alloc_flags;
 
 	if (!(pflags & PF_MEMALLOC_NOCMA) &&
 			gfp_migratetype(gfp_mask) == MIGRATE_MOVABLE &&
@@ -8787,6 +8792,7 @@ static int __alloc_contig_migrate_range(struct compact_control *cc,
 	unsigned int max_tries = 5;
 	int ret = 0;
 	struct page *page;
+	bool skip = false;
 	struct migration_target_control mtc = {
 		.nid = zone_to_nid(cc->zone),
 		.gfp_mask = GFP_USER | __GFP_MOVABLE | __GFP_RETRY_MAYFAIL,
@@ -8795,7 +8801,9 @@ static int __alloc_contig_migrate_range(struct compact_control *cc,
 	if (cc->alloc_contig && cc->mode == MIGRATE_ASYNC)
 		max_tries = 1;
 
-	lru_cache_disable();
+	trace_android_vh_skip_lru_disable(&skip);
+	if (!skip)
+		lru_cache_disable();
 
 	while (pfn < end || !list_empty(&cc->migratepages)) {
 		if (fatal_signal_pending(current)) {
