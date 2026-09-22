@@ -1014,8 +1014,6 @@ static inline bool arch_faults_on_old_pte(void)
  * Experimentally, it's cheap to set the access flag in hardware and we
  * benefit from prefaulting mappings as 'old' to start with.
  */
-#define arch_has_hw_pte_young		cpu_has_hw_af
-
 static inline bool arch_wants_old_prefaulted_pte(void)
 {
 	return !arch_faults_on_old_pte();

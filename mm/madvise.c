@@ -1106,7 +1106,6 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 	int write;
 	size_t len;
 	struct blk_plug plug;
-	bool do_plug = false;
 
 	start = untagged_addr(start);
 
@@ -1151,9 +1150,7 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 	if (vma && start > vma->vm_start)
 		prev = vma;
 
-	trace_android_vh_do_madvise_blk_plug(behavior, &do_plug);
-	if (do_plug)
-		blk_start_plug(&plug);
+	blk_start_plug(&plug);
 	for (;;) {
 		/* Still start < end. */
 		error = -ENOMEM;
