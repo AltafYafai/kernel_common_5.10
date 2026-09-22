@@ -39,9 +39,9 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
  *
  * (default: 6ms * (1 + ilog(ncpus)), units: nanoseconds)
  */
-unsigned int sysctl_sched_latency			= 5000000ULL;
+unsigned int sysctl_sched_latency			= 6000000ULL;
 EXPORT_SYMBOL_GPL(sysctl_sched_latency);
-static unsigned int normalized_sysctl_sched_latency	= 5000000ULL;
+static unsigned int normalized_sysctl_sched_latency	= 6000000ULL;
 
 /*
  * The initial- and re-scaling of tunables is configurable
@@ -235,25 +235,22 @@ static void __update_inv_weight(struct load_weight *lw)
 static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight *lw)
 {
 	u64 fact = scale_load_down(weight);
-	u32 fact_hi = (u32)(fact >> 32);
 	int shift = WMULT_SHIFT;
-	int fs;
 
 	__update_inv_weight(lw);
 
-	if (unlikely(fact_hi)) {
-		fs = fls(fact_hi);
-		shift -= fs;
-		fact >>= fs;
+	if (unlikely(fact >> 32)) {
+		while (fact >> 32) {
+			fact >>= 1;
+			shift--;
+		}
 	}
 
 	fact = mul_u32_u32(fact, lw->inv_weight);
 
-	fact_hi = (u32)(fact >> 32);
-	if (fact_hi) {
-		fs = fls(fact_hi);
-		shift -= fs;
-		fact >>= fs;
+	while (fact >> 32) {
+		fact >>= 1;
+		shift--;
 	}
 
 	return mul_u64_u32_shr(delta_exec, fact, shift);
@@ -2655,8 +2652,7 @@ void task_numa_fault(int last_cpupid, int mem_node, int pages, int flags)
 	struct numa_group *ng;
 	int priv;
 
-	if (!IS_ENABLED(CONFIG_NUMA_BALANCING) ||
-	    !static_branch_likely(&sched_numa_balancing))
+	if (!static_branch_likely(&sched_numa_balancing))
 		return;
 
 	/* for example, ksmd faulting in a user's mm */
@@ -11115,8 +11111,7 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 		entity_tick(cfs_rq, se, queued);
 	}
 
-	if (IS_ENABLED(CONFIG_NUMA_BALANCING) &&
-	    static_branch_unlikely(&sched_numa_balancing))
+	if (static_branch_unlikely(&sched_numa_balancing))
 		task_tick_numa(rq, curr);
 
 	update_misfit_status(curr, rq);
